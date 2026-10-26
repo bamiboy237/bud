@@ -3,7 +3,13 @@ name = "bud"
 version = "0.1.0"
 description = "A personal AI teammate"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "pydantic>=2.14.1",
+    "pydantic-ai-harness>=0.61.0",
+    "pydantic-ai-slim[openai]>=2.61.0",
+    "pydantic-settings>=2.16.1",
+    "python-dotenv>=1.2.4",
+]
 
 [project.scripts]
 bud = "bud.cli:main"
