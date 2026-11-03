@@ -41,6 +41,12 @@ uv run bud world show
 uv run bud world reset
 ```
 
+Run the eval suite, which spends a few cents on model calls:
+
+```sh
+uv run bud eval
+```
+
 The server listens on `127.0.0.1:8420` and has no authentication, so keep it on your own machine. Conversations and cost records are stored in `data/bud.db`, which git ignores.
 
 ## Layout
@@ -49,6 +55,7 @@ The server listens on `127.0.0.1:8420` and has no authentication, so keep it on 
 - `src/bud/core/`: the event log, agent runner, server, and terminal client.
 - `src/bud/harness/`: the system prompt, tool policy, action gateway, and run limits.
 - `src/bud/world/`: the simulated inbox, calendar, contacts, and their tools.
+- `src/bud/evals/`: the task suite and the runner that scores it.
 - `src/bud/cli.py`: the `bud` command.
 
 ## License

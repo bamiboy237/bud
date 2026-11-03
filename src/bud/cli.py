@@ -12,6 +12,7 @@ from pydantic_ai import Agent
 from bud import __version__
 from bud.config import get_settings
 from bud.core.client import chat
+from bud.evals.runner import evaluate
 from bud.gateway import Ledger, build_gateway
 from bud.world.store import World
 
@@ -71,6 +72,9 @@ def main(argv: list[str] | None = None) -> None:
     commands.add_parser("costs", help="print spend by day and model")
     world_parser = commands.add_parser("world", help="inspect or reset the simulated world")
     world_parser.add_argument("action", choices=["show", "reset"])
+    eval_parser = commands.add_parser("eval", help="run the task suite on the simulated world")
+    eval_parser.add_argument("--trials", type=int, default=3)
+    eval_parser.add_argument("--task", help="run one task by id")
     commands.add_parser("serve", help="run the core server on localhost")
     chat_parser = commands.add_parser("chat", help="open or attach to a session")
     chat_parser.add_argument("session", nargs="?", help="session id to attach to")
@@ -83,6 +87,8 @@ def main(argv: list[str] | None = None) -> None:
         costs()
     elif args.command == "world":
         world(args.action)
+    elif args.command == "eval":
+        evaluate(args.trials, args.task)
     elif args.command == "serve":
         uvicorn.run("bud.core.server:create_app", factory=True, host=HOST, port=PORT)
     elif args.command == "chat":

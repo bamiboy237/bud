@@ -95,6 +95,17 @@ class Ledger:
         except sqlite3.Error:
             logger.exception("could not write ledger entry for %s", entry.model)
 
+    def session_totals(self, session_id: str) -> tuple[float, int]:
+        """USD and tokens for one session."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0),"
+                " COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0)"
+                " FROM model_requests WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return row[0], row[1]
+
     def costs_by_day_and_model(self) -> list[CostRow]:
         with self._connect() as db:
             rows = db.execute(
