@@ -2,6 +2,8 @@
 name = "bud"
 version = "0.1.0"
 description = "A personal AI teammate"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.162.0",
