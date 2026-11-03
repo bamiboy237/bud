@@ -21,9 +21,20 @@ class Hub:
 
     def publish(self, session_id: str, type: EventType, data: dict | None = None) -> Event:
         event = self.log.append(session_id, type, data)
-        for waiter in self._waiters[session_id]:
-            waiter.set()
+        self._wake(session_id)
         return event
+
+    def publish_once(
+        self, session_id: str, type: EventType, data: dict | None = None
+    ) -> Event | None:
+        event = self.log.append_once(session_id, type, data)
+        if event is not None:
+            self._wake(session_id)
+        return event
+
+    def _wake(self, session_id: str) -> None:
+        for waiter in self._waiters.get(session_id, ()):
+            waiter.set()
 
     async def subscribe(self, session_id: str, after: int = 0) -> AsyncIterator[Event | None]:
         waiter = asyncio.Event()

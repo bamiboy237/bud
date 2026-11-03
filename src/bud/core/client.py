@@ -5,10 +5,9 @@ user types as a message.
 
 import asyncio
 import json
+from uuid import uuid4
 
 import httpx
-
-TERMINAL = ("run.completed", "run.failed")
 
 
 def render(event: dict) -> None:
@@ -24,13 +23,20 @@ def render(event: dict) -> None:
             print(f"\n[tool] {data['tool']}({data['args']})", flush=True)
         case "tool.result":
             print(f"[result] {data['result'][:200]}", flush=True)
-        case "run.completed":
+        case "approval.requested":
+            print(f"\n[approval needed] {data['tool']}({data['args']})", flush=True)
+            print("Type /approve or /deny.", flush=True)
+        case "approval.granted":
+            print("[approved]", flush=True)
+        case "approval.denied":
+            print("[denied]", flush=True)
+        case "run.waiting" | "run.completed":
             print(flush=True)
         case "run.failed":
             print(f"\n[run failed] {data['reason']}", flush=True)
 
 
-async def follow(client: httpx.AsyncClient, session_id: str) -> None:
+async def follow(client: httpx.AsyncClient, session_id: str, pending: set[str]) -> None:
     last_seq = 0
     while True:
         try:
@@ -46,9 +52,25 @@ async def follow(client: httpx.AsyncClient, session_id: str) -> None:
                         event = json.loads(line.removeprefix("data: "))
                         last_seq = event["seq"]
                         render(event)
+                        if event["type"] == "approval.requested":
+                            pending.add(event["data"]["approval_id"])
+                        elif event["type"] in ("approval.granted", "approval.denied"):
+                            pending.discard(event["data"]["approval_id"])
         except httpx.TransportError:
             print("\n[reconnecting]", flush=True)
             await asyncio.sleep(1)
+
+
+async def resolve(
+    client: httpx.AsyncClient, session_id: str, pending: set[str], approved: bool
+) -> None:
+    if not pending:
+        print("[nothing is waiting for approval]")
+    for approval_id in list(pending):
+        response = await client.post(
+            f"/sessions/{session_id}/approvals/{approval_id}", json={"approved": approved}
+        )
+        response.raise_for_status()
 
 
 async def chat(base_url: str, session_id: str | None) -> None:
@@ -59,17 +81,22 @@ async def chat(base_url: str, session_id: str | None) -> None:
             session_id = response.json()["session_id"]
         print(f"session {session_id}\nCtrl-D to leave.")
 
-        follower = asyncio.create_task(follow(client, session_id))
+        pending: set[str] = set()
+        follower = asyncio.create_task(follow(client, session_id, pending))
         try:
             while True:
                 text = await asyncio.to_thread(input)
                 if not text.strip():
                     continue
+                if text.strip() in ("/approve", "/deny"):
+                    await resolve(client, session_id, pending, text.strip() == "/approve")
+                    continue
                 response = await client.post(
-                    f"/sessions/{session_id}/messages", json={"text": text}
+                    f"/sessions/{session_id}/messages",
+                    json={"text": text, "message_id": uuid4().hex},
                 )
                 if response.status_code == 409:
-                    print("[a run is already active]")
+                    print(f"[{response.json()['detail']}]")
                 else:
                     response.raise_for_status()
         except EOFError:

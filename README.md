@@ -2,7 +2,7 @@
 
 bud is a personal AI agent you run yourself. It keeps every conversation in an append-only event log, so any number of clients can follow one session live and pick up where they left off after a disconnect or a server crash. Model calls go through a gateway that falls back to another provider on failure and records what each request cost.
 
-bud is under active development. Today it can chat and call one sample tool. It does not connect to email, calendars, or other accounts yet.
+bud is under active development. Today it can chat, call tools, and hold write actions for your approval. Its `send_email` tool writes to a simulated outbox, and bud does not connect to real email, calendars, or other accounts yet.
 
 ## Install
 
@@ -33,10 +33,11 @@ uv run bud chat                # terminal 2, prints a session id
 uv run bud chat <session-id>   # terminal 3, attaches to the same session
 ```
 
-See what you've spent:
+Ask bud to email someone in `bud chat`, then answer with `/approve` or `/deny`. See what you've spent and what bud has "sent":
 
 ```sh
 uv run bud costs
+uv run bud outbox
 ```
 
 The server listens on `127.0.0.1:8420` and has no authentication, so keep it on your own machine. Conversations and cost records are stored in `data/bud.db`, which git ignores.

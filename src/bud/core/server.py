@@ -17,12 +17,18 @@ from bud.core.events import Event
 from bud.core.hub import Hub
 from bud.core.log import EventLog
 from bud.core.projection import Snapshot, snapshot
-from bud.core.runner import RunInProgress, Runner
+from bud.core.runner import AwaitingApproval, RunInProgress, Runner, UnknownApproval
+from bud.core.tools import Outbox, build_tools
 from bud.gateway import build_gateway
 
 
 class NewMessage(BaseModel):
     text: str
+    message_id: str | None = None
+
+
+class Decision(BaseModel):
+    approved: bool
 
 
 def sse_frame(event: Event) -> str:
@@ -30,9 +36,10 @@ def sse_frame(event: Event) -> str:
 
 
 def create_app() -> FastAPI:
-    log = EventLog(get_settings().data_dir / "bud.db")
+    db_path = get_settings().data_dir / "bud.db"
+    log = EventLog(db_path)
     hub = Hub(log)
-    runner = Runner(hub, build_gateway())
+    runner = Runner(hub, build_gateway(), build_tools(Outbox(db_path)))
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -58,12 +65,23 @@ def create_app() -> FastAPI:
         return snapshot(session_id, log.read(session_id))
 
     @app.post("/sessions/{session_id}/messages", status_code=202)
-    async def post_message(session_id: str, message: NewMessage) -> Event:
+    async def post_message(session_id: str, message: NewMessage) -> dict[str, bool]:
         require_session(session_id)
         try:
-            return runner.start(session_id, message.text)
+            event = runner.start(session_id, message.text, message.message_id or uuid4().hex)
         except RunInProgress:
             raise HTTPException(409, "a run is already active") from None
+        except AwaitingApproval:
+            raise HTTPException(409, "an approval is pending") from None
+        return {"duplicate": event is None}
+
+    @app.post("/sessions/{session_id}/approvals/{approval_id}")
+    async def decide(session_id: str, approval_id: str, decision: Decision) -> dict[str, bool]:
+        require_session(session_id)
+        try:
+            return {"applied": runner.decide(session_id, approval_id, decision.approved)}
+        except UnknownApproval:
+            raise HTTPException(404, "unknown approval") from None
 
     @app.get("/sessions/{session_id}/events")
     async def stream_events(

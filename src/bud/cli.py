@@ -12,6 +12,7 @@ from pydantic_ai import Agent
 from bud import __version__
 from bud.config import get_settings
 from bud.core.client import chat
+from bud.core.tools import Outbox
 from bud.gateway import Ledger, build_gateway
 
 HOST = "127.0.0.1"
@@ -42,6 +43,14 @@ def costs() -> None:
     print(f"\nTotal: ${sum(row.cost_usd for row in rows):.6f}")
 
 
+def outbox() -> None:
+    rows = Outbox(get_settings().data_dir / "bud.db").rows()
+    if not rows:
+        print("The simulated outbox is empty.")
+    for sent_at, approval_id, recipient, subject in rows:
+        print(f"{sent_at[:19]}  {approval_id[:8]}  {recipient}  {subject}")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="bud", description="bud, a personal AI teammate.")
     parser.add_argument("--version", action="version", version=f"bud {__version__}")
@@ -51,6 +60,7 @@ def main(argv: list[str] | None = None) -> None:
     ask_parser.add_argument("prompt")
     ask_parser.add_argument("--tier", choices=["fast", "frontier"], default="fast")
     commands.add_parser("costs", help="print spend by day and model")
+    commands.add_parser("outbox", help="print the simulated emails bud has sent")
     commands.add_parser("serve", help="run the core server on localhost")
     chat_parser = commands.add_parser("chat", help="open or attach to a session")
     chat_parser.add_argument("session", nargs="?", help="session id to attach to")
@@ -61,6 +71,8 @@ def main(argv: list[str] | None = None) -> None:
         ask(args.prompt, args.tier)
     elif args.command == "costs":
         costs()
+    elif args.command == "outbox":
+        outbox()
     elif args.command == "serve":
         uvicorn.run("bud.core.server:create_app", factory=True, host=HOST, port=PORT)
     elif args.command == "chat":

@@ -1,13 +1,13 @@
 """Runs the agent for each session in a background task and translates Pydantic AI stream
-events into bud events. On startup it also closes runs that a previous process left open.
+events into bud events. A run that needs approval saves itself to the log and exits, and a new
+run continues after the decision. On startup it closes runs a previous process left open.
 """
 
 import asyncio
 import json
-from datetime import UTC, datetime
 from uuid import uuid4
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
@@ -17,27 +17,37 @@ from pydantic_ai.messages import (
     TextPartDelta,
 )
 from pydantic_ai.run import AgentRunResultEvent
+from pydantic_ai.tools import Tool
 
 from bud.core.events import Event
 from bud.core.hub import Hub
-from bud.core.projection import model_history
+from bud.core.projection import decisions, model_history, undecided_approvals, waiting_batch
 from bud.gateway import Gateway
 from bud.gateway.registry import Tier
 
-
-def current_time() -> str:
-    """Return the current UTC date and time."""
-    return datetime.now(UTC).isoformat(timespec="seconds")
+INSTRUCTIONS = """You are bud, a personal AI teammate. Be brief.
+When the user asks for an action, call the tool directly. The system asks the user to approve
+write actions, so never ask for confirmation in chat. If a tool call is denied, say so and stop.
+"""
 
 
 class RunInProgress(Exception):
     pass
 
 
+class AwaitingApproval(Exception):
+    pass
+
+
+class UnknownApproval(Exception):
+    pass
+
+
 class Runner:
-    def __init__(self, hub: Hub, gateway: Gateway, tier: Tier = "fast") -> None:
+    def __init__(self, hub: Hub, gateway: Gateway, tools: list[Tool], tier: Tier = "fast") -> None:
         self.hub = hub
         self.gateway = gateway
+        self.tools = tools
         self.tier = tier
         self.tasks: dict[str, asyncio.Task[None]] = {}
 
@@ -45,15 +55,62 @@ class Runner:
         """The log only gains facts, so an interrupted run is closed with a new event."""
         for session_id, run_id in self.hub.log.unfinished_runs():
             self.hub.publish(session_id, "run.failed", {"run_id": run_id, "reason": "interrupted"})
+        for session_id in self.hub.log.sessions_with_decisions():
+            self._resume_if_ready(session_id)
 
-    def start(self, session_id: str, text: str) -> Event:
+    def start(self, session_id: str, text: str, message_id: str) -> Event | None:
         if session_id in self.tasks:
             raise RunInProgress(session_id)
-        message = self.hub.publish(session_id, "user.message", {"text": text})
-        task = asyncio.create_task(self._run(session_id, text))
+        if undecided_approvals(self.hub.log.read(session_id)):
+            raise AwaitingApproval(session_id)
+        message = self.hub.publish_once(
+            session_id, "user.message", {"text": text, "message_id": message_id}
+        )
+        if message is not None:
+            self._launch(session_id, self._run(session_id, text))
+        return message
+
+    def decide(self, session_id: str, approval_id: str, approved: bool) -> bool:
+        """Return True when this call made the decision, False when an earlier one did."""
+        events = self.hub.log.read(session_id)
+        requested = any(
+            event.type == "approval.requested" and event.data["approval_id"] == approval_id
+            for event in events
+        )
+        if not requested:
+            raise UnknownApproval(approval_id)
+        event_type = "approval.granted" if approved else "approval.denied"
+        event = self.hub.publish_once(session_id, event_type, {"approval_id": approval_id})
+        if event is None:
+            return False
+        self._resume_if_ready(session_id)
+        return True
+
+    def _resume_if_ready(self, session_id: str) -> None:
+        events = self.hub.log.read(session_id)
+        batch = waiting_batch(events)
+        if not batch or undecided_approvals(events) or session_id in self.tasks:
+            return
+        decided = decisions(events)
+        results = DeferredToolResults(
+            approvals={
+                request["call_id"]: (
+                    ToolApproved()
+                    if decided[request["approval_id"]]
+                    else ToolDenied("The user denied this action.")
+                )
+                for request in batch
+            },
+            metadata={
+                request["call_id"]: {"approval_id": request["approval_id"]} for request in batch
+            },
+        )
+        self._launch(session_id, self._run(session_id, None, results))
+
+    def _launch(self, session_id: str, run) -> None:
+        task = asyncio.create_task(run)
         self.tasks[session_id] = task
         task.add_done_callback(lambda _: self.tasks.pop(session_id, None))
-        return message
 
     async def stop(self) -> None:
         tasks = list(self.tasks.values())
@@ -61,13 +118,23 @@ class Runner:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _run(self, session_id: str, text: str) -> None:
+    async def _run(
+        self, session_id: str, text: str | None, results: DeferredToolResults | None = None
+    ) -> None:
         run_id = uuid4().hex
-        self.hub.publish(session_id, "run.started", {"run_id": run_id, "trigger": "message"})
+        trigger = "message" if results is None else "approval"
+        history = model_history(self.hub.log.read(session_id))
+        self.hub.publish(session_id, "run.started", {"run_id": run_id, "trigger": trigger})
         try:
-            history = model_history(self.hub.log.read(session_id))
-            agent = Agent(self.gateway.model(self.tier, session_id), tools=[current_time])
-            async with agent.run_stream_events(text, message_history=history) as stream:
+            agent = Agent(
+                self.gateway.model(self.tier, session_id),
+                instructions=INSTRUCTIONS,
+                tools=self.tools,
+                output_type=[str, DeferredToolRequests],
+            )
+            async with agent.run_stream_events(
+                text, message_history=history, deferred_tool_results=results
+            ) as stream:
                 async for event in stream:
                     self._translate(session_id, run_id, event)
         except asyncio.CancelledError:
@@ -104,15 +171,31 @@ class Runner:
                     {
                         "run_id": run_id,
                         "call_id": result.tool_call_id,
-                        "result": str(result.content),
+                        "result": str(result.part.content),
                     },
                 )
             case AgentRunResultEvent(result=result):
-                self.hub.publish(
-                    session_id,
-                    "run.completed",
-                    {"run_id": run_id, "messages": json.loads(result.new_messages_json())},
-                )
+                messages = json.loads(result.new_messages_json())
+                if isinstance(result.output, DeferredToolRequests):
+                    for call in result.output.approvals:
+                        self.hub.publish(
+                            session_id,
+                            "approval.requested",
+                            {
+                                "run_id": run_id,
+                                "approval_id": uuid4().hex,
+                                "call_id": call.tool_call_id,
+                                "tool": call.tool_name,
+                                "args": call.args_as_dict(),
+                            },
+                        )
+                    self.hub.publish(
+                        session_id, "run.waiting", {"run_id": run_id, "messages": messages}
+                    )
+                else:
+                    self.hub.publish(
+                        session_id, "run.completed", {"run_id": run_id, "messages": messages}
+                    )
 
     def _text(self, session_id: str, run_id: str, text: str) -> None:
         self.hub.publish(session_id, "text.delta", {"run_id": run_id, "text": text})

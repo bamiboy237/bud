@@ -14,11 +14,15 @@ EventType = Literal[
     "text.delta",
     "tool.call",
     "tool.result",
+    "approval.requested",
+    "approval.granted",
+    "approval.denied",
+    "run.waiting",
     "run.completed",
     "run.failed",
 ]
 
-TERMINAL_RUN_EVENTS = ("run.completed", "run.failed")
+RUN_END_EVENTS = ("run.waiting", "run.completed", "run.failed")
 
 
 class Event(BaseModel):
