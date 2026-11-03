@@ -1,6 +1,6 @@
 """Tools the agent can call.
-`send_email` is bud's first write action. It requires approval and writes to a simulated
-outbox table, so no real mail leaves the machine.
+`send_email` is bud's first write action. It writes to a simulated outbox table, so no real
+mail leaves the machine. Whether a tool may run is decided in `actions.py`.
 """
 
 import sqlite3
@@ -61,4 +61,4 @@ def build_tools(outbox: Outbox) -> list[Tool]:
             return f"Sent to {to}."
         return f"Already sent to {to}; nothing new was sent."
 
-    return [Tool(current_time), Tool(send_email, requires_approval=True)]
+    return [Tool(current_time), Tool(send_email)]

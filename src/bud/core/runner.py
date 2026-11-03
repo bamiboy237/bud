@@ -7,7 +7,7 @@ import asyncio
 import json
 from uuid import uuid4
 
-from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
+from pydantic_ai import DeferredToolRequests, DeferredToolResults, ToolApproved, ToolDenied
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
@@ -17,18 +17,13 @@ from pydantic_ai.messages import (
     TextPartDelta,
 )
 from pydantic_ai.run import AgentRunResultEvent
-from pydantic_ai.tools import Tool
 
 from bud.core.events import Event
 from bud.core.hub import Hub
 from bud.core.projection import decisions, model_history, undecided_approvals, waiting_batch
 from bud.gateway import Gateway
 from bud.gateway.registry import Tier
-
-INSTRUCTIONS = """You are bud, a personal AI teammate. Be brief.
-When the user asks for an action, call the tool directly. The system asks the user to approve
-write actions, so never ask for confirmation in chat. If a tool call is denied, say so and stop.
-"""
+from bud.harness.agent import RUN_LIMITS, Harness
 
 
 class RunInProgress(Exception):
@@ -44,10 +39,10 @@ class UnknownApproval(Exception):
 
 
 class Runner:
-    def __init__(self, hub: Hub, gateway: Gateway, tools: list[Tool], tier: Tier = "fast") -> None:
+    def __init__(self, hub: Hub, gateway: Gateway, harness: Harness, tier: Tier = "fast") -> None:
         self.hub = hub
         self.gateway = gateway
-        self.tools = tools
+        self.harness = harness
         self.tier = tier
         self.tasks: dict[str, asyncio.Task[None]] = {}
 
@@ -124,16 +119,23 @@ class Runner:
         run_id = uuid4().hex
         trigger = "message" if results is None else "approval"
         history = model_history(self.hub.log.read(session_id))
-        self.hub.publish(session_id, "run.started", {"run_id": run_id, "trigger": trigger})
+        self.hub.publish(
+            session_id,
+            "run.started",
+            {"run_id": run_id, "trigger": trigger, "prompt": self.harness.prompt_version},
+        )
         try:
-            agent = Agent(
+            agent = self.harness.agent(
                 self.gateway.model(self.tier, session_id),
-                instructions=INSTRUCTIONS,
-                tools=self.tools,
-                output_type=[str, DeferredToolRequests],
+                lambda decision: self.hub.publish(
+                    session_id, "action.decided", {"run_id": run_id, **decision}
+                ),
             )
             async with agent.run_stream_events(
-                text, message_history=history, deferred_tool_results=results
+                text,
+                message_history=history,
+                deferred_tool_results=results,
+                usage_limits=RUN_LIMITS,
             ) as stream:
                 async for event in stream:
                     self._translate(session_id, run_id, event)

@@ -3,9 +3,11 @@ It creates sessions, accepts messages, and streams session events as server-sent
 `create_app` wires the log, hub, runner, and gateway together.
 """
 
+import fcntl
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Annotated
+from pathlib import Path
+from typing import Annotated, TextIO
 from uuid import uuid4
 
 from fastapi import FastAPI, Header, HTTPException
@@ -18,8 +20,10 @@ from bud.core.hub import Hub
 from bud.core.log import EventLog
 from bud.core.projection import Snapshot, snapshot
 from bud.core.runner import AwaitingApproval, RunInProgress, Runner, UnknownApproval
-from bud.core.tools import Outbox, build_tools
 from bud.gateway import build_gateway
+from bud.harness.actions import load_policy
+from bud.harness.agent import Harness
+from bud.harness.tools import Outbox, build_tools
 
 
 class NewMessage(BaseModel):
@@ -35,17 +39,31 @@ def sse_frame(event: Event) -> str:
     return f"id: {event.seq}\nevent: {event.type}\ndata: {event.model_dump_json()}\n\n"
 
 
+def hold_single_server_lock(path: Path) -> TextIO:
+    """Recovery closes every open run, so a second server would fail a live server's runs."""
+    lock = path.open("w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(f"Another bud server is already using {path.parent}.") from None
+    return lock
+
+
 def create_app() -> FastAPI:
     db_path = get_settings().data_dir / "bud.db"
     log = EventLog(db_path)
     hub = Hub(log)
-    runner = Runner(hub, build_gateway(), build_tools(Outbox(db_path)))
+    gateway = build_gateway()
+    harness = Harness(build_tools(Outbox(db_path)), load_policy(), gateway.registry)
+    runner = Runner(hub, gateway, harness)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        lock = hold_single_server_lock(db_path.with_suffix(".lock"))
         runner.recover()
         yield
         await runner.stop()
+        lock.close()
 
     app = FastAPI(title="bud core", lifespan=lifespan)
 

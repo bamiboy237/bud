@@ -12,8 +12,8 @@ from pydantic_ai import Agent
 from bud import __version__
 from bud.config import get_settings
 from bud.core.client import chat
-from bud.core.tools import Outbox
 from bud.gateway import Ledger, build_gateway
+from bud.harness.tools import Outbox
 
 HOST = "127.0.0.1"
 PORT = 8420

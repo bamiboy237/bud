@@ -46,6 +46,7 @@ The server listens on `127.0.0.1:8420` and has no authentication, so keep it on 
 
 - `src/bud/gateway/`: the model list, fallback, and cost ledger. Prices are in `models.toml`.
 - `src/bud/core/`: the event log, agent runner, server, and terminal client.
+- `src/bud/harness/`: the system prompt, tools, tool policy, action gateway, and run limits.
 - `src/bud/cli.py`: the `bud` command.
 
 ## License

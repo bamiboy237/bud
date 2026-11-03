@@ -1,0 +1,8 @@
+# What each tool may do. A tool missing from this file is denied.
+#   allow: run without asking
+#   ask:   wait for the person's approval
+#   deny:  always refuse
+
+[tools]
+current_time = "allow"
+send_email = "ask"

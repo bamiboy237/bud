@@ -13,6 +13,7 @@ EventType = Literal[
     "run.started",
     "text.delta",
     "tool.call",
+    "action.decided",
     "tool.result",
     "approval.requested",
     "approval.granted",
