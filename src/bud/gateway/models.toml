@@ -1,0 +1,39 @@
+# bud's model registry. Order inside a tier is the fallback order.
+# Prices are USD per million tokens. Checked 2026-11-02:
+#   https://developers.openai.com/api/docs/pricing
+#   https://api-docs.deepseek.com/quick_start/pricing
+# DeepSeek prices are peak rates; off-peak is half, so ledger costs for DeepSeek are an upper bound.
+
+[[models]]
+provider = "deepseek"
+name = "deepseek-flash"
+tier = "fast"
+input = 0.30
+output = 1.20
+cached = 0.006
+
+[[models]]
+provider = "openai"
+name = "gpt-6-luna"
+tier = "fast"
+input = 0.10
+output = 0.50
+cached = 0.01
+cache_write = 0.125
+
+[[models]]
+provider = "openai"
+name = "gpt-6.1-sol"
+tier = "frontier"
+input = 2.00
+output = 10.00
+cached = 0.10
+cache_write = 2.50
+
+[[models]]
+provider = "deepseek"
+name = "deepseek-v4-pro"
+tier = "frontier"
+input = 1.32
+output = 3.96
+cached = 0.044

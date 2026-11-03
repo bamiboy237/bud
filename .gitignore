@@ -1,0 +1,37 @@
+# Secrets: never commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Tools
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local data: personal data stays on this machine
+*.sqlite
+*.sqlite3
+*.db
+data/
+
+# OS and editors
+.DS_Store
+.vscode/
+.idea/
+
+# Private course material and working notes
+AGENTS.md
+CLAUDE.md
+COURSE.md
+PROGRESS.md
+modules/
+notes/
