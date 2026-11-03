@@ -2,7 +2,7 @@
 
 bud is a personal AI agent you run yourself. It keeps every conversation in an append-only event log, so any number of clients can follow one session live and pick up where they left off after a disconnect or a server crash. Model calls go through a gateway that falls back to another provider on failure and records what each request cost.
 
-bud is under active development. Today it can chat, call tools, and hold write actions for your approval. Its `send_email` tool writes to a simulated outbox, and bud does not connect to real email, calendars, or other accounts yet.
+bud is under active development. Today it can chat, call tools, and hold write actions for your approval. Its tools work on a simulated inbox and calendar for a fictional person, and bud does not connect to real email, calendars, or other accounts yet.
 
 ## Install
 
@@ -33,11 +33,12 @@ uv run bud chat                # terminal 2, prints a session id
 uv run bud chat <session-id>   # terminal 3, attaches to the same session
 ```
 
-Ask bud to email someone in `bud chat`, then answer with `/approve` or `/deny`. See what you've spent and what bud has "sent":
+Ask bud to check the inbox or move a meeting in `bud chat`. Writes wait for you to answer `/approve` or `/deny`. See what you've spent, inspect the simulated world, or restore it:
 
 ```sh
 uv run bud costs
-uv run bud outbox
+uv run bud world show
+uv run bud world reset
 ```
 
 The server listens on `127.0.0.1:8420` and has no authentication, so keep it on your own machine. Conversations and cost records are stored in `data/bud.db`, which git ignores.
@@ -46,7 +47,8 @@ The server listens on `127.0.0.1:8420` and has no authentication, so keep it on 
 
 - `src/bud/gateway/`: the model list, fallback, and cost ledger. Prices are in `models.toml`.
 - `src/bud/core/`: the event log, agent runner, server, and terminal client.
-- `src/bud/harness/`: the system prompt, tools, tool policy, action gateway, and run limits.
+- `src/bud/harness/`: the system prompt, tool policy, action gateway, and run limits.
+- `src/bud/world/`: the simulated inbox, calendar, contacts, and their tools.
 - `src/bud/cli.py`: the `bud` command.
 
 ## License

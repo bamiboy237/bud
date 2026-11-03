@@ -7,7 +7,7 @@ from decimal import Decimal
 from hashlib import sha256
 from importlib import resources
 
-from pydantic_ai import Agent, DeferredToolRequests
+from pydantic_ai import Agent, DeferredToolRequests, Tool
 from pydantic_ai.messages import ModelResponse
 from pydantic_ai.models import Model
 from pydantic_ai.toolsets import FunctionToolset
@@ -17,7 +17,6 @@ from pydantic_ai_harness.spend import Budget
 
 from bud.gateway.registry import Registry
 from bud.harness.actions import Policy, RecordDecision, guard
-from bud.harness.tools import Tool
 
 MAX_USD_PER_RUN = Decimal("0.50")
 # Counted in memory, so a server restart resets the day's total.
@@ -31,11 +30,11 @@ def load_system_prompt() -> str:
 
 
 class Harness:
-    def __init__(self, tools: list[Tool], policy: Policy, registry: Registry) -> None:
+    def __init__(self, tools: list[Tool], policy: Policy, registry: Registry, profile: str) -> None:
         self.toolset = FunctionToolset[None](tools)
         self.policy = policy
         self.registry = registry
-        self.system_prompt = load_system_prompt()
+        self.system_prompt = f"{load_system_prompt()}\n{profile}"
         self.prompt_version = sha256(self.system_prompt.encode()).hexdigest()[:12]
         self.spend = SpendLimits(
             budgets=[

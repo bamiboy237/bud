@@ -13,7 +13,7 @@ from bud import __version__
 from bud.config import get_settings
 from bud.core.client import chat
 from bud.gateway import Ledger, build_gateway
-from bud.harness.tools import Outbox
+from bud.world.store import World
 
 HOST = "127.0.0.1"
 PORT = 8420
@@ -43,12 +43,21 @@ def costs() -> None:
     print(f"\nTotal: ${sum(row.cost_usd for row in rows):.6f}")
 
 
-def outbox() -> None:
-    rows = Outbox(get_settings().data_dir / "bud.db").rows()
-    if not rows:
-        print("The simulated outbox is empty.")
-    for sent_at, approval_id, recipient, subject in rows:
-        print(f"{sent_at[:19]}  {approval_id[:8]}  {recipient}  {subject}")
+def world(action: str) -> None:
+    store = World(get_settings().data_dir / "world.db")
+    if action == "reset":
+        store.reset()
+        print("World reset to its seed.")
+        return
+    state = store.snapshot()
+    print(f"Now: {store.now}. {len(state['messages'])} messages, {len(state['events'])} events.")
+    print("\nSent or drafted by bud:")
+    for message in state["messages"]:
+        if message["id"].startswith(("t-", "draft-")):
+            print(f"  [{message['folder']}] to {message['recipients']}: {message['body'][:70]}")
+    print("\nCalendar:")
+    for event in state["events"]:
+        print(f"  {event['start']} to {event['end'][11:16]}  {event['title']}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -60,7 +69,8 @@ def main(argv: list[str] | None = None) -> None:
     ask_parser.add_argument("prompt")
     ask_parser.add_argument("--tier", choices=["fast", "frontier"], default="fast")
     commands.add_parser("costs", help="print spend by day and model")
-    commands.add_parser("outbox", help="print the simulated emails bud has sent")
+    world_parser = commands.add_parser("world", help="inspect or reset the simulated world")
+    world_parser.add_argument("action", choices=["show", "reset"])
     commands.add_parser("serve", help="run the core server on localhost")
     chat_parser = commands.add_parser("chat", help="open or attach to a session")
     chat_parser.add_argument("session", nargs="?", help="session id to attach to")
@@ -71,8 +81,8 @@ def main(argv: list[str] | None = None) -> None:
         ask(args.prompt, args.tier)
     elif args.command == "costs":
         costs()
-    elif args.command == "outbox":
-        outbox()
+    elif args.command == "world":
+        world(args.action)
     elif args.command == "serve":
         uvicorn.run("bud.core.server:create_app", factory=True, host=HOST, port=PORT)
     elif args.command == "chat":

@@ -5,4 +5,11 @@
 
 [tools]
 current_time = "allow"
+search_email = "allow"
+read_thread = "allow"
+list_events = "allow"
+search_contacts = "allow"
+draft_reply = "allow"
 send_email = "ask"
+create_event = "ask"
+move_event = "ask"

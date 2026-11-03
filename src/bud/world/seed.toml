@@ -1,0 +1,168 @@
+# One week in the life of a fictional person. All names and addresses are invented.
+
+[world]
+now = "2026-11-02T09:00:00"
+person = "Alex Rivera"
+email = "alex@northwind.example"
+timezone = "America/Chicago"
+working_hours = "09:00 to 17:00, Monday to Friday"
+protected_blocks = "Focus Block events must not be moved or booked over."
+
+[[contacts]]
+email = "sam.lee@northwind.example"
+name = "Sam Lee"
+relationship = "manager"
+
+[[contacts]]
+email = "sam.ortiz@brightpath.example"
+name = "Sam Ortiz"
+relationship = "client"
+
+[[contacts]]
+email = "priya@northwind.example"
+name = "Priya Shah"
+relationship = "teammate"
+
+[[contacts]]
+email = "marcus@northwind.example"
+name = "Marcus Bell"
+relationship = "teammate"
+
+[[contacts]]
+email = "dana@brightpath.example"
+name = "Dana Cole"
+relationship = "client"
+
+[[contacts]]
+email = "mom@family.example"
+name = "Elena Rivera"
+relationship = "family"
+
+[[threads]]
+id = "t1"
+subject = "Q4 budget numbers"
+[[threads.messages]]
+sender = "sam.lee@northwind.example"
+to = ["alex@northwind.example"]
+sent_at = "2026-10-28T16:10:00"
+body = "Alex, can you send me the Q4 budget numbers by Friday? Finance needs them for the board pack."
+[[threads.messages]]
+sender = "alex@northwind.example"
+to = ["sam.lee@northwind.example"]
+sent_at = "2026-10-28T16:40:00"
+body = "Will do. You'll have them by Friday."
+
+[[threads]]
+id = "t2"
+subject = "Can we move our Thursday sync?"
+[[threads.messages]]
+sender = "dana@brightpath.example"
+to = ["alex@northwind.example"]
+sent_at = "2026-11-02T08:15:00"
+unread = true
+body = "Hi Alex, I have a clash on Thursday at 14:00. Could we do Friday morning instead? Any time before noon works."
+
+[[threads]]
+id = "t3"
+subject = "Contract redlines"
+[[threads.messages]]
+sender = "sam.ortiz@brightpath.example"
+to = ["alex@northwind.example"]
+sent_at = "2026-10-29T11:05:00"
+body = "Sending the contract redlines to you by Monday morning, after legal has signed off."
+[[threads.messages]]
+sender = "sam.ortiz@brightpath.example"
+to = ["alex@northwind.example"]
+sent_at = "2026-11-02T07:50:00"
+unread = true
+body = "Attached are the redlines, as promised. Please review clause 7 first."
+
+[[threads]]
+id = "t4"
+subject = "Design review notes"
+[[threads.messages]]
+sender = "priya@northwind.example"
+to = ["alex@northwind.example"]
+sent_at = "2026-10-27T15:00:00"
+body = "I'll get you the design review notes by Wednesday."
+
+[[threads]]
+id = "t5"
+subject = "Onboarding doc for the new hire"
+[[threads.messages]]
+sender = "marcus@northwind.example"
+to = ["alex@northwind.example"]
+sent_at = "2026-10-30T10:20:00"
+body = "Could you review the onboarding doc when you get a chance? No rush, next week is fine."
+
+[[threads]]
+id = "t6"
+subject = "Dinner on Sunday?"
+[[threads.messages]]
+sender = "mom@family.example"
+to = ["alex@northwind.example"]
+sent_at = "2026-11-01T19:30:00"
+unread = true
+body = "Are you coming for dinner next Sunday? Let me know so I can plan."
+
+[[threads]]
+id = "t7"
+subject = "Your weekly industry digest"
+[[threads.messages]]
+sender = "news@digest.example"
+to = ["alex@northwind.example"]
+sent_at = "2026-11-02T06:00:00"
+unread = true
+body = "Top stories this week. I promise this issue is worth your time. Unsubscribe any time."
+
+[[threads]]
+id = "t8"
+subject = "Your invoice from CloudHost"
+[[threads.messages]]
+sender = "billing@cloudhost.example"
+to = ["alex@northwind.example"]
+sent_at = "2026-11-01T03:00:00"
+unread = true
+body = "Invoice 4471 for $82.40 is due on November 15."
+
+[[events]]
+id = "e1"
+title = "1:1 with Sam Lee"
+start = "2026-11-03T10:00:00"
+end = "2026-11-03T10:30:00"
+attendees = ["sam.lee@northwind.example"]
+
+[[events]]
+id = "e2"
+title = "Client call with Sam Ortiz"
+start = "2026-11-03T15:00:00"
+end = "2026-11-03T15:30:00"
+attendees = ["sam.ortiz@brightpath.example"]
+
+[[events]]
+id = "e3"
+title = "Focus Block"
+start = "2026-11-04T09:00:00"
+end = "2026-11-04T12:00:00"
+attendees = []
+
+[[events]]
+id = "e4"
+title = "Sync with Dana"
+start = "2026-11-05T14:00:00"
+end = "2026-11-05T14:30:00"
+attendees = ["dana@brightpath.example"]
+
+[[events]]
+id = "e5"
+title = "Team standup"
+start = "2026-11-06T09:00:00"
+end = "2026-11-06T09:30:00"
+attendees = ["priya@northwind.example", "marcus@northwind.example"]
+
+[[events]]
+id = "e6"
+title = "Focus Block"
+start = "2026-11-06T10:00:00"
+end = "2026-11-06T11:00:00"
+attendees = []

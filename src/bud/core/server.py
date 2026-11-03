@@ -23,7 +23,8 @@ from bud.core.runner import AwaitingApproval, RunInProgress, Runner, UnknownAppr
 from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
-from bud.harness.tools import Outbox, build_tools
+from bud.world.store import World
+from bud.world.tools import build_tools
 
 
 class NewMessage(BaseModel):
@@ -54,7 +55,8 @@ def create_app() -> FastAPI:
     log = EventLog(db_path)
     hub = Hub(log)
     gateway = build_gateway()
-    harness = Harness(build_tools(Outbox(db_path)), load_policy(), gateway.registry)
+    world = World(get_settings().data_dir / "world.db")
+    harness = Harness(build_tools(world), load_policy(), gateway.registry, world.profile())
     runner = Runner(hub, gateway, harness)
 
     @asynccontextmanager
