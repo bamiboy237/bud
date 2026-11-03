@@ -58,12 +58,12 @@ def provider_model_factory(settings: Settings) -> ModelFactory:
 
     def build(spec: ModelSpec) -> Model | None:
         if spec.provider == "deepseek":
-            if settings.deepseek_api_key is None:
+            if not settings.deepseek_api_key:
                 return None
             provider = DeepSeekProvider(api_key=settings.deepseek_api_key.get_secret_value())
             return OpenAIChatModel(spec.name, provider=provider, settings=model_settings)
         if spec.provider == "openai":
-            if settings.openai_api_key is None:
+            if not settings.openai_api_key:
                 return None
             provider = OpenAIProvider(api_key=settings.openai_api_key.get_secret_value())
             return OpenAIResponsesModel(spec.name, provider=provider, settings=model_settings)
