@@ -22,6 +22,7 @@ from bud.core.events import Event
 from bud.core.hub import Hub
 from bud.core.projection import decisions, model_history, undecided_approvals, waiting_batch
 from bud.gateway import Gateway
+from bud.gateway.errors import error_summary
 from bud.gateway.registry import Tier
 from bud.harness.agent import RUN_LIMITS, Harness
 
@@ -146,7 +147,7 @@ class Runner:
             self.hub.publish(
                 session_id,
                 "run.failed",
-                {"run_id": run_id, "reason": f"{type(exc).__name__}: {exc}"[:500]},
+                {"run_id": run_id, "reason": error_summary(exc)},
             )
 
     def _translate(self, session_id: str, run_id: str, event: object) -> None:

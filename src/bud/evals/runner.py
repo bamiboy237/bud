@@ -22,6 +22,7 @@ from bud.evals.tasks import SUITE, Outcome, Task
 from bud.gateway import Gateway, build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
+from bud.harness.memory import build_memory
 from bud.world.store import World
 from bud.world.tools import build_tools
 
@@ -38,6 +39,8 @@ class Attempt:
     cost_usd: float
     tokens: int
     session_id: str
+    prompt_version: str
+    models: list[dict[str, str]]
 
 
 def failure_reason(events: list[Event]) -> str | None:
@@ -66,7 +69,13 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
     with TemporaryDirectory() as folder:
         log = EventLog(Path(folder) / "events.db")
         world = World(Path(folder) / "world.db")
-        harness = Harness(build_tools(world), load_policy(), gateway.registry, world.profile())
+        harness = Harness(
+            build_tools(world),
+            load_policy(),
+            gateway.registry,
+            world.profile(),
+            memory=build_memory(Path(folder) / "memory.db", namespace="world"),
+        )
         runner = Runner(Hub(log), gateway, harness)
         log.append(session_id, "session.created")
         before = world.snapshot()
@@ -99,6 +108,8 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
         cost_usd=cost,
         tokens=tokens,
         session_id=session_id,
+        prompt_version=harness.prompt_version,
+        models=gateway.ledger.session_models(session_id),
     )
 
 
@@ -110,7 +121,10 @@ async def run_suite(tasks: list[Task], trials: int) -> list[Attempt]:
         async with limit:
             return await run_attempt(task, gateway)
 
-    return list(await asyncio.gather(*(one(task) for task in tasks for _ in range(trials))))
+    try:
+        return list(await asyncio.gather(*(one(task) for task in tasks for _ in range(trials))))
+    finally:
+        gateway.close()
 
 
 def report(attempts: list[Attempt], trials: int, prompt_version: str) -> Path:
@@ -118,7 +132,7 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str) -> Path:
     for attempt in attempts:
         by_task.setdefault(attempt.task, []).append(attempt)
 
-    print(f"{'Task':<20} {'Passed':>7} {'Seconds':>8} {'USD':>9}")
+    print(f"{'Task':<20} {'Passed':>7} {'Seconds':>8} {'API USD':>9}")
     for task, runs in by_task.items():
         passed = sum(run.passed for run in runs)
         seconds = sum(run.seconds for run in runs) / len(runs)
@@ -128,7 +142,12 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str) -> Path:
     pass_rate = sum(a.passed for a in attempts) / len(attempts)
     pass_all = sum(all(r.passed for r in runs) for runs in by_task.values()) / len(by_task)
     total = sum(a.cost_usd for a in attempts)
-    print(f"\nPass rate: {pass_rate:.0%}   pass^{trials}: {pass_all:.0%}   Total: ${total:.4f}")
+    print(
+        f"\nPass rate: {pass_rate:.0%}   pass^{trials}: {pass_all:.0%}   "
+        f"Metered API total: ${total:.4f}"
+    )
+    if any(model["billing"] == "subscription" for a in attempts for model in a.models):
+        print("ChatGPT plan usage is included in token counts, not API USD.")
 
     failures = [a for a in attempts if not a.passed]
     if failures:
@@ -161,5 +180,5 @@ def evaluate(trials: int, task_id: str | None) -> None:
     if not tasks:
         raise SystemExit(f"Unknown task: {task_id}")
     attempts = asyncio.run(run_suite(tasks, trials))
-    version = Harness([], load_policy(), build_gateway().registry, "").prompt_version
+    version = attempts[0].prompt_version
     report(attempts, trials, version)

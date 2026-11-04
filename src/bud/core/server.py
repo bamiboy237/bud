@@ -24,6 +24,7 @@ from bud.core.runner import AwaitingApproval, RunInProgress, Runner, UnknownAppr
 from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
+from bud.harness.memory import build_memory
 from bud.world.store import World
 from bud.world.tools import build_tools
 
@@ -51,16 +52,12 @@ def hold_single_server_lock(path: Path) -> TextIO:
     return lock
 
 
-def create_app(*, simulate: bool = False) -> FastAPI:
+def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAPI:
     settings = get_settings()
     if not simulate:
-        from bud.composio.connection import ConnectionError, Connections
+        from bud.composio.connection import Connections
         from bud.composio.tools import PROFILE, build_toolset, policy
 
-        if not settings.openai_api_key:
-            raise ConnectionError(
-                "Real-account mode requires OPENAI_API_KEY. DeepSeek is disabled."
-            )
         connections = Connections(settings)
         accounts = connections.active_accounts()
         # Reconnecting a different account must not resume the old account's approvals.
@@ -68,15 +65,28 @@ def create_app(*, simulate: bool = False) -> FastAPI:
         session_dir = connections.folder / "sessions" / scope
         session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         db_path = session_dir / "bud.db"
-        gateway = build_gateway(settings, providers={"openai"})
+        gateway = build_gateway(
+            settings, providers={"openai-chatgpt", "openai", "meta"}, model_id=model_id
+        )
         harness = Harness(
-            build_toolset(connections, accounts, session_dir), policy(), gateway.registry, PROFILE
+            build_toolset(connections, accounts, session_dir),
+            policy(),
+            gateway.registry,
+            PROFILE,
+            memory=build_memory(session_dir / "memory.db", namespace="owner"),
         )
     else:
         db_path = settings.data_dir / "bud.db"
-        gateway = build_gateway(settings)
+        gateway = build_gateway(settings, model_id=model_id)
         world = World(settings.data_dir / "world.db")
-        harness = Harness(build_tools(world), load_policy(), gateway.registry, world.profile())
+        harness = Harness(
+            build_tools(world),
+            load_policy(),
+            gateway.registry,
+            world.profile(),
+            memory=build_memory(settings.data_dir / "world-memory.db", namespace="world"),
+        )
+    gateway.model("fast")
     log = EventLog(db_path)
     hub = Hub(log)
     runner = Runner(hub, gateway, harness)
@@ -84,10 +94,13 @@ def create_app(*, simulate: bool = False) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         lock = hold_single_server_lock(db_path.with_suffix(".lock"))
-        runner.recover()
-        yield
-        await runner.stop()
-        lock.close()
+        try:
+            runner.recover()
+            yield
+        finally:
+            await runner.stop()
+            gateway.close()
+            lock.close()
 
     app = FastAPI(title="bud core", lifespan=lifespan)
 

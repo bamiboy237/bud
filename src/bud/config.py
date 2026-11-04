@@ -12,6 +12,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     deepseek_api_key: SecretStr | None = None
     openai_api_key: SecretStr | None = None
+    muse_api_key: SecretStr | None = None
     composio_api_key: SecretStr | None = None
 
     debug: bool = False

@@ -15,6 +15,7 @@ from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RequestUsage
 
+from bud.gateway.errors import error_summary
 from bud.gateway.ledger import Ledger, LedgerEntry
 from bud.gateway.registry import ModelSpec
 
@@ -83,12 +84,13 @@ class TrackedModel(WrapperModel):
         )
 
     def _record_failure(self, exc: BaseException, started: float) -> None:
-        self._write("failed", started, error=f"{type(exc).__name__}: {exc}"[:500])
+        self._write("failed", started, error=error_summary(exc))
 
     def _write(self, status: str, started: float, **fields: Any) -> None:
         self.ledger.record(
             LedgerEntry(
                 model=self.spec.id,
+                billing=self.spec.billing,
                 status=status,
                 latency_ms=(perf_counter() - started) * 1000,
                 session_id=self.session_id,

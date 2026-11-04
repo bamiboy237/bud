@@ -2,6 +2,7 @@
 # Prices are USD per million tokens. Checked 2026-11-02:
 #   https://developers.openai.com/api/docs/pricing
 #   https://api-docs.deepseek.com/quick_start/pricing
+# Meta prices checked 2026-11-03: https://dev.meta.ai/models/muse-wonder
 # DeepSeek prices are peak rates; off-peak is half, so ledger costs for DeepSeek are an upper bound.
 
 [[models]]
@@ -37,3 +38,19 @@ tier = "frontier"
 input = 1.32
 output = 3.96
 cached = 0.044
+
+[[models]]
+provider = "meta"
+name = "muse-wonder-1.0"
+tier = "fast"
+input = 4.00
+output = 20.00
+cached = 0.20
+
+[[models]]
+provider = "meta"
+name = "muse-wonder-1.0"
+tier = "frontier"
+input = 4.00
+output = 20.00
+cached = 0.20

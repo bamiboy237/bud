@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS model_requests (
     created_at TEXT NOT NULL,
     session_id TEXT,
     model TEXT NOT NULL,
+    billing TEXT NOT NULL DEFAULT 'api',
     status TEXT NOT NULL CHECK (status IN ('ok', 'failed', 'incomplete')),
     input_tokens INTEGER,
     output_tokens INTEGER,
@@ -42,12 +43,14 @@ class LedgerEntry:
     reasoning_tokens: int | None = None
     cost_usd: float | None = None
     error: str | None = None
+    billing: str = "api"
 
 
 @dataclass(frozen=True)
 class CostRow:
     day: str
     model: str
+    billing: str
     requests: int
     failed: int
     unknown_cost: int
@@ -63,6 +66,11 @@ class Ledger:
         with self._connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(SCHEMA)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(model_requests)")}
+            if "billing" not in columns:
+                db.execute(
+                    "ALTER TABLE model_requests ADD COLUMN billing TEXT NOT NULL DEFAULT 'api'"
+                )
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, timeout=5)
@@ -75,8 +83,8 @@ class Ledger:
                     """
                     INSERT INTO model_requests (
                         created_at, session_id, model, status, input_tokens, output_tokens,
-                        cached_tokens, reasoning_tokens, latency_ms, cost_usd, error
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        cached_tokens, reasoning_tokens, latency_ms, cost_usd, error, billing
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         datetime.now(UTC).isoformat(),
@@ -90,6 +98,7 @@ class Ledger:
                         entry.latency_ms,
                         entry.cost_usd,
                         entry.error,
+                        entry.billing,
                     ),
                 )
         except sqlite3.Error:
@@ -106,21 +115,31 @@ class Ledger:
             ).fetchone()
         return row[0], row[1]
 
+    def session_models(self, session_id: str) -> list[dict[str, str]]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT DISTINCT model, billing FROM model_requests WHERE session_id = ? "
+                "ORDER BY model, billing",
+                (session_id,),
+            ).fetchall()
+        return [{"model": model, "billing": billing} for model, billing in rows]
+
     def costs_by_day_and_model(self) -> list[CostRow]:
         with self._connect() as db:
             rows = db.execute(
                 """
                 SELECT substr(created_at, 1, 10) AS day,
                        model,
+                       billing,
                        COUNT(*),
                        SUM(status != 'ok'),
-                       SUM(cost_usd IS NULL),
+                       SUM(billing = 'api' AND cost_usd IS NULL),
                        COALESCE(SUM(input_tokens), 0),
                        COALESCE(SUM(output_tokens), 0),
                        COALESCE(SUM(cost_usd), 0)
                 FROM model_requests
-                GROUP BY day, model
-                ORDER BY day DESC, model
+                GROUP BY day, model, billing
+                ORDER BY day DESC, model, billing
                 """
             ).fetchall()
         return [CostRow(*row) for row in rows]

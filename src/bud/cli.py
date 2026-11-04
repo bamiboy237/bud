@@ -4,14 +4,20 @@ import argparse
 import asyncio
 import webbrowser
 
+import httpx
 import uvicorn
+from openai import OpenAIError
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import ModelAPIError, UserError
 
 from bud import __version__
 from bud.config import get_settings
 from bud.core.client import chat
 from bud.evals.runner import evaluate
-from bud.gateway import Ledger, build_gateway
+from bud.gateway import Ledger, NoModelAvailable, build_gateway
+from bud.gateway.chatgpt import ChatGPTError, ChatGPTStore, login, refresh_models
+from bud.gateway.errors import error_summary
+from bud.gateway.registry import load_registry
 from bud.world.store import World
 
 HOST = "127.0.0.1"
@@ -19,9 +25,38 @@ PORT = 8420
 DEFAULT_URL = f"http://{HOST}:{PORT}"
 
 
-def ask(prompt: str, tier: str) -> None:
-    agent = Agent(build_gateway().model(tier))
-    print(agent.run_sync(prompt).output)
+async def ask(prompt: str, tier: str, model_id: str | None) -> None:
+    gateway = build_gateway(model_id=model_id)
+    try:
+        agent = Agent(gateway.model(tier))
+        print((await agent.run(prompt)).output)
+    finally:
+        gateway.close()
+
+
+async def models() -> None:
+    settings = get_settings()
+    store = ChatGPTStore(settings.data_dir)
+    print(f"{'Model ID':<48} {'Billing':<14} Status")
+    if store.connected:
+        for model in await refresh_models(store):
+            selected = model["slug"] == store.state().get("selected_model")
+            print(
+                f"{'openai-chatgpt:' + model['slug']:<48} {'subscription':<14} "
+                f"{'default' if selected else 'available'}"
+            )
+    else:
+        print("ChatGPT: not connected. Run `bud login chatgpt`.")
+    keys = {
+        "deepseek": settings.deepseek_api_key,
+        "openai": settings.openai_api_key,
+        "meta": settings.muse_api_key,
+    }
+    seen = set()
+    for spec in load_registry().models:
+        if spec.id not in seen:
+            print(f"{spec.id:<48} {'API':<14} {'key set' if keys[spec.provider] else 'no key'}")
+            seen.add(spec.id)
 
 
 def costs() -> None:
@@ -30,16 +65,18 @@ def costs() -> None:
         print("No requests recorded.")
         return
     print(
-        f"{'Day':<11} {'Model':<28} {'Reqs':>5} {'Failed':>6} {'Input':>9} {'Output':>9} "
-        f"{'USD':>10} {'Unpriced':>8}"
+        f"{'Day':<11} {'Model':<38} {'Billing':<12} {'Reqs':>5} {'Failed':>6} "
+        f"{'Input':>9} {'Output':>9} {'USD':>10} {'Unpriced':>8}"
     )
     for row in rows:
+        usd = f"{row.cost_usd:.6f}" if row.billing == "api" else "plan"
         print(
-            f"{row.day:<11} {row.model:<28} {row.requests:>5} {row.failed:>6} "
-            f"{row.input_tokens:>9} {row.output_tokens:>9} {row.cost_usd:>10.6f} "
+            f"{row.day:<11} {row.model:<38} {row.billing:<12} {row.requests:>5} {row.failed:>6} "
+            f"{row.input_tokens:>9} {row.output_tokens:>9} {usd:>10} "
             f"{row.unknown_cost:>8}"
         )
-    print(f"\nTotal: ${sum(row.cost_usd for row in rows):.6f}")
+    print(f"\nMetered API total: ${sum(row.cost_usd for row in rows):.6f}")
+    print("Subscription tokens use the ChatGPT plan; its subscription fee is not allocated here.")
 
 
 def world(action: str) -> None:
@@ -83,7 +120,7 @@ def connections() -> None:
         print(f"{toolkit}: {statuses.get(toolkit, 'NOT_CONNECTED')}")
 
 
-def main(argv: list[str] | None = None) -> None:
+def _main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="bud", description="bud, a personal AI teammate.")
     parser.add_argument("--version", action="version", version=f"bud {__version__}")
     commands = parser.add_subparsers(dest="command")
@@ -91,6 +128,13 @@ def main(argv: list[str] | None = None) -> None:
     ask_parser = commands.add_parser("ask", help="send one prompt through the gateway")
     ask_parser.add_argument("prompt")
     ask_parser.add_argument("--tier", choices=["fast", "frontier"], default="fast")
+    ask_parser.add_argument("--model", help="pin a model ID from `bud models`, without fallback")
+    login_parser = commands.add_parser("login", help="sign in to a model provider")
+    login_parser.add_argument("provider", choices=["chatgpt"])
+    login_parser.add_argument("--no-browser", action="store_true", help="print a sign-in link")
+    logout_parser = commands.add_parser("logout", help="remove local model-provider credentials")
+    logout_parser.add_argument("provider", choices=["chatgpt"])
+    commands.add_parser("models", help="list model IDs and refresh the ChatGPT account catalog")
     commands.add_parser("costs", help="print spend by day and model")
     world_parser = commands.add_parser("world", help="inspect or reset the simulated world")
     world_parser.add_argument("action", choices=["show", "reset"])
@@ -109,13 +153,21 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="use the simulated inbox and calendar instead of real accounts",
     )
+    serve_parser.add_argument("--model", help="pin a model ID from `bud models`, without fallback")
     chat_parser = commands.add_parser("chat", help="open or attach to a session")
     chat_parser.add_argument("session", nargs="?", help="session id to attach to")
     chat_parser.add_argument("--url", default=DEFAULT_URL)
 
     args = parser.parse_args(argv)
     if args.command == "ask":
-        ask(args.prompt, args.tier)
+        asyncio.run(ask(args.prompt, args.tier, args.model))
+    elif args.command == "login":
+        asyncio.run(login(get_settings().data_dir, no_browser=args.no_browser))
+    elif args.command == "logout":
+        ChatGPTStore(get_settings().data_dir).logout()
+        print("Local ChatGPT credentials removed.")
+    elif args.command == "models":
+        asyncio.run(models())
     elif args.command == "costs":
         costs()
     elif args.command == "world":
@@ -131,8 +183,18 @@ def main(argv: list[str] | None = None) -> None:
 
         mode = "simulated tools" if args.simulate else "real accounts"
         print(f"Starting bud with {mode} at {DEFAULT_URL}.", flush=True)
-        uvicorn.run(lambda: create_app(simulate=args.simulate), factory=True, host=HOST, port=PORT)
+        app = create_app(simulate=args.simulate, model_id=args.model)
+        uvicorn.run(app, host=HOST, port=PORT)
     elif args.command == "chat":
         asyncio.run(chat(args.url, args.session))
     else:
         parser.print_help()
+
+
+def main(argv: list[str] | None = None) -> None:
+    try:
+        _main(argv)
+    except (ChatGPTError, NoModelAvailable) as exc:
+        raise SystemExit(str(exc)) from None
+    except (ModelAPIError, UserError, OpenAIError, httpx.HTTPError, OSError, ExceptionGroup) as exc:
+        raise SystemExit(error_summary(exc)) from None

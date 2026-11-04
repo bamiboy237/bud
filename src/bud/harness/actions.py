@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 from pydantic_ai import RunContext
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.exceptions import ApprovalRequired
 from pydantic_ai.toolsets import AbstractToolset, ToolsetTool, WrapperToolset
 
@@ -59,5 +60,11 @@ class ActionGateway(WrapperToolset[None]):
         return await super().call_tool(name, tool_args, ctx, tool)
 
 
-def guard(toolset: AbstractToolset[None], policy: Policy, record: RecordDecision) -> ActionGateway:
-    return ActionGateway(toolset, policy=policy, record=record)
+@dataclass(kw_only=True)
+class GuardTools(AbstractCapability[None]):
+    policy: Policy
+    record: RecordDecision
+    id: str | None = "bud_action_gateway"
+
+    def get_wrapper_toolset(self, toolset: AbstractToolset[None]) -> ActionGateway:
+        return ActionGateway(toolset, policy=self.policy, record=self.record)
