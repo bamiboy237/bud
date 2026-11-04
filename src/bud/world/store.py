@@ -1,6 +1,7 @@
-"""The simulated world: one fictional person's inbox, calendar, and contacts in SQLite.
-`reset` restores the seed from `seed.toml`, and `snapshot` returns the full state so a checker
-can judge what really changed. Time is frozen at the seed's `now` so runs repeat exactly.
+"""A fictional inbox, calendar, and contacts stored in SQLite.
+
+`reset` restores the seed, and `snapshot` returns the state used by eval checkers.
+The simulated clock uses the seed's `now`; generated IDs are not fixed.
 """
 
 import json

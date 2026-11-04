@@ -10,13 +10,24 @@ from uuid import uuid4
 import httpx
 
 
-def render(event: dict) -> None:
+def render(event: dict, seen_requests: set[str]) -> None:
     data = event["data"]
     match event["type"]:
         case "user.message":
             print(f"\nyou: {data['text']}")
         case "run.started":
             print("bud: ", end="", flush=True)
+        case "run.recovered":
+            print("\n[recovering interrupted work]", flush=True)
+        case "text.reset":
+            request = data["request"]
+            if request in seen_requests:
+                print(
+                    "\n[discard the partial response above; generating its replacement]\nbud: ",
+                    end="",
+                    flush=True,
+                )
+            seen_requests.add(request)
         case "text.delta":
             print(data["text"], end="", flush=True)
         case "tool.call":
@@ -38,6 +49,7 @@ def render(event: dict) -> None:
 
 async def follow(client: httpx.AsyncClient, session_id: str, pending: set[str]) -> None:
     last_seq = 0
+    seen_requests: set[str] = set()
     while True:
         try:
             async with client.stream(
@@ -51,7 +63,7 @@ async def follow(client: httpx.AsyncClient, session_id: str, pending: set[str]) 
                     if line.startswith("data: "):
                         event = json.loads(line.removeprefix("data: "))
                         last_seq = event["seq"]
-                        render(event)
+                        render(event, seen_requests)
                         if event["type"] == "approval.requested":
                             pending.add(event["data"]["approval_id"])
                         elif event["type"] in ("approval.granted", "approval.denied"):

@@ -10,7 +10,10 @@ from pydantic import BaseModel
 EventType = Literal[
     "session.created",
     "user.message",
+    "run.queued",
     "run.started",
+    "run.recovered",
+    "text.reset",
     "text.delta",
     "tool.call",
     "action.decided",

@@ -1,5 +1,6 @@
-"""SQLite record of every model request: tokens, latency, status, and cost.
-`Ledger.costs_by_day_and_model` aggregates these rows for `bud costs`.
+"""SQLite ledger of model request outcomes, usage, and cost.
+
+Ledger write errors are logged, so the ledger may not contain every request.
 """
 
 import logging
@@ -31,7 +32,7 @@ CREATE TABLE IF NOT EXISTS model_requests (
 
 @dataclass(frozen=True)
 class LedgerEntry:
-    """One model request. None means the provider never told us, which is different from 0."""
+    """A request record. Missing usage or cost is distinct from zero."""
 
     model: str
     status: str
@@ -76,7 +77,7 @@ class Ledger:
         return sqlite3.connect(self.path, timeout=5)
 
     def record(self, entry: LedgerEntry) -> None:
-        """A ledger fault is logged and never fails a request already paid for."""
+        """Log SQLite errors without failing the model request."""
         try:
             with self._connect() as db:
                 db.execute(

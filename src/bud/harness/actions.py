@@ -1,6 +1,6 @@
-"""The action gateway: the one checkpoint every tool call passes through.
-`Policy` decides allow, ask, or deny for each tool, and `ActionGateway` records that decision
-before the tool runs. Tools themselves carry no safety rules.
+"""Apply tool policy and record decisions before dispatch.
+
+Tools may also enforce their own safety checks.
 """
 
 import tomllib
@@ -10,6 +10,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Literal
 
+from dbos import DBOS
 from pydantic import BaseModel
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
@@ -57,6 +58,15 @@ class ActionGateway(WrapperToolset[None]):
         self.record({"call_id": ctx.tool_call_id, "tool": name, "rule": action, "outcome": outcome})
         if action == "deny":
             return f"Refused by policy: {name} is not allowed."
+        if DBOS.workflow_id is not None and DBOS.step_id is None:
+            return await DBOS.run_step_async(
+                {"name": "bud.tool_call", "retries_allowed": False},
+                super().call_tool,
+                name,
+                tool_args,
+                ctx,
+                tool,
+            )
         return await super().call_tool(name, tool_args, ctx, tool)
 
 

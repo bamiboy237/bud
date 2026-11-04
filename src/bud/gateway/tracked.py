@@ -1,9 +1,12 @@
-"""Wraps a Pydantic AI model so each request writes one ledger entry.
-The entry is `ok`, `failed`, or `incomplete` when the stream ends before usage arrives.
+"""Record model request outcomes and available usage in the ledger.
+
+Requests with zero reported tokens are incomplete; exceptions are failures.
+Ledger writes can fail without failing the request.
 """
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Any
@@ -18,6 +21,8 @@ from pydantic_ai.usage import RequestUsage
 from bud.gateway.errors import error_summary
 from bud.gateway.ledger import Ledger, LedgerEntry
 from bud.gateway.registry import ModelSpec
+
+request_session: ContextVar[str | None] = ContextVar("request_session", default=None)
 
 
 @dataclass(init=False)
@@ -69,7 +74,7 @@ class TrackedModel(WrapperModel):
         self._record_usage(stream.usage, started)
 
     def _record_usage(self, usage: RequestUsage, started: float) -> None:
-        # Usage arrives at the end of a stream, so a stream the caller abandoned reports nothing.
+
         if usage.total_tokens == 0:
             self._write("incomplete", started)
             return
@@ -93,7 +98,7 @@ class TrackedModel(WrapperModel):
                 billing=self.spec.billing,
                 status=status,
                 latency_ms=(perf_counter() - started) * 1000,
-                session_id=self.session_id,
+                session_id=self.session_id or request_session.get(),
                 **fields,
             )
         )

@@ -1,4 +1,7 @@
-"""Native MCP tools with a fixed allowlist and one local dispatch per approval."""
+"""Allowlisted MCP tools with at most one local dispatch claim per approval.
+
+A claimed write may still have an unknown remote outcome.
+"""
 
 import sqlite3
 from dataclasses import dataclass, field

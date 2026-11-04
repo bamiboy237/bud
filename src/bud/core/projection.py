@@ -37,16 +37,26 @@ class Snapshot(BaseModel):
 def snapshot(session_id: str, events: list[Event]) -> Snapshot:
     transcript: list[Turn] = []
     run_active = False
+    blocks: dict[str, str] = {}
     for event in events:
         match event.type:
             case "user.message":
                 transcript.append(Turn(role="user", text=event.data["text"]))
-            case "run.started":
+                blocks = {}
+            case "run.queued" | "run.started":
                 run_active = True
-            case "text.delta":
+            case "text.reset" | "text.delta":
                 if not transcript or transcript[-1].role != "assistant":
                     transcript.append(Turn(role="assistant", text=""))
-                transcript[-1].text += event.data["text"]
+                block = event.data.get("block", "legacy")
+                if event.type == "text.reset":
+                    request = event.data["request"] + ":"
+                    blocks = {
+                        key: value for key, value in blocks.items() if not key.startswith(request)
+                    }
+                else:
+                    blocks[block] = blocks.get(block, "") + event.data["text"]
+                transcript[-1].text = "".join(blocks.values())
             case "run.waiting" | "run.completed" | "run.failed":
                 run_active = False
     return Snapshot(
@@ -66,7 +76,7 @@ def waiting_batch(events: list[Event]) -> list[dict[str, Any]]:
     batch: list[dict[str, Any]] = []
     waiting = False
     for event in events:
-        if event.type == "run.started":
+        if event.type in ("run.queued", "run.started"):
             batch, waiting = [], False
         elif event.type == "approval.requested":
             batch.append(event.data)
@@ -89,8 +99,9 @@ def undecided_approvals(events: list[Event]) -> list[dict[str, Any]]:
 
 
 def model_history(events: list[Event]) -> list[ModelMessage]:
-    """Finished runs replay verbatim. A failed run becomes a note, because its tool calls may
-    have no results, which providers reject, and the model must not repeat what already ran.
+    """Rebuild model history, replacing failed runs with a note about their tool calls.
+
+    The note distinguishes completed calls from calls with unknown outcomes.
     """
     history: list[ModelMessage] = []
     unfinished: list[ModelMessage] = []

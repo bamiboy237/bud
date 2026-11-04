@@ -5,7 +5,7 @@ The gateway and the core server read API keys and the data directory through `ge
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +17,7 @@ class Settings(BaseSettings):
 
     debug: bool = False
     data_dir: Path = Path("data")
+    tool_result_retention_hours: float = Field(default=24, gt=0, allow_inf_nan=False)
 
     model_config = SettingsConfigDict(
         env_file=".env",

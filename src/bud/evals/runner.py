@@ -24,7 +24,7 @@ from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
 from bud.harness.memory import build_memory
 from bud.world.store import World
-from bud.world.tools import build_tools
+from bud.world.tools import READ_TOOLS, build_tools
 
 ATTEMPT_TIMEOUT_SECONDS = 180
 MAX_CONCURRENT_ATTEMPTS = 4
@@ -75,6 +75,9 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
             gateway.registry,
             world.profile(),
             memory=build_memory(Path(folder) / "memory.db", namespace="world"),
+            spend_path=Path(folder) / "spend.db",
+            result_path=log.path,
+            read_tools=READ_TOOLS,
         )
         runner = Runner(Hub(log), gateway, harness)
         log.append(session_id, "session.created")

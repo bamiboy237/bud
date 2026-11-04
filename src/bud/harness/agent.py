@@ -1,13 +1,13 @@
-"""Builds the agent bud runs: its system prompt, guarded tools, and limits.
-The core calls `Harness.agent` once per run, so each run gets a gateway that records to its
-own session. Spend counters live on the `Harness` and carry across runs.
-"""
+"""Builds bud's agent with its system prompt, guarded tools, and persistent limits."""
 
+from datetime import timedelta
 from decimal import Decimal
 from hashlib import sha256
 from importlib import resources
+from pathlib import Path
 
 from pydantic_ai import Agent, DeferredToolRequests, Tool
+from pydantic_ai.capabilities import AbstractCapability, Capability
 from pydantic_ai.messages import ModelResponse
 from pydantic_ai.models import Model
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
@@ -18,9 +18,11 @@ from pydantic_ai_harness.spend import Budget
 from bud.gateway.registry import Registry
 from bud.harness.actions import GuardTools, Policy, RecordDecision
 from bud.harness.memory import MEMORY_RULES
+from bud.harness.results import SqliteResultStore, build_output_limits
+from bud.harness.spend import SqliteSpendStore
 
 MAX_USD_PER_RUN = Decimal("0.50")
-# Counted in memory, so a server restart resets the day's total.
+
 MAX_USD_PER_DAY = Decimal("5.00")
 
 RUN_LIMITS = UsageLimits(request_limit=25, tool_calls_limit=20)
@@ -39,16 +41,26 @@ class Harness:
         profile: str,
         *,
         memory: Memory | None = None,
+        spend_path: Path,
+        result_path: Path,
+        read_tools: set[str],
+        result_retention: timedelta = timedelta(hours=24),
     ) -> None:
         self.toolset = tools if isinstance(tools, AbstractToolset) else FunctionToolset[None](tools)
         self.memory = memory
-        self.policy = Policy(tools=policy.tools | MEMORY_RULES) if memory else policy
+        tools_policy = policy.tools | MEMORY_RULES if memory else policy.tools
+        self.policy = Policy(
+            tools=tools_policy | {"read_tool_result": "allow", "read_tool_result_chars": "allow"}
+        )
+        self.results = SqliteResultStore(result_path, retention=result_retention)
+        self.output_limits = build_output_limits(self.results, read_tools)
         self.registry = registry
         self.system_prompt = f"{load_system_prompt()}\n{profile}"
         memory_guidance = (memory.guidance or "") if memory is not None else ""
         prompt = self.system_prompt + memory_guidance
         self.prompt_version = sha256(prompt.encode()).hexdigest()[:12]
         self.spend = SpendLimits(
+            store=SqliteSpendStore(spend_path),
             budgets=[
                 Budget(usd=MAX_USD_PER_RUN, window="run"),
                 Budget(usd=MAX_USD_PER_DAY, window="day"),
@@ -67,16 +79,22 @@ class Harness:
         return None
 
     def agent(
-        self, model: Model, record: RecordDecision
+        self, model: Model, record: RecordDecision, *, durability: AbstractCapability | None = None
     ) -> Agent[None, str | DeferredToolRequests]:
         return Agent(
             model,
+            name="bud",
             instructions=self.system_prompt,
             toolsets=[self.toolset],
             output_type=[str, DeferredToolRequests],
             capabilities=[
                 GuardTools(policy=self.policy, record=record),
                 self.spend,
+                self.output_limits,
+                Capability(
+                    id="bud_result_readback", tools=[Tool(self.results.read_tool_result_chars)]
+                ),
                 *([self.memory] if self.memory is not None else []),
+                *([durability] if durability is not None else []),
             ],
         )

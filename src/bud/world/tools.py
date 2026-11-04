@@ -7,6 +7,8 @@ from pydantic_ai import RunContext, Tool
 
 from bud.world.store import World, WorldError
 
+READ_TOOLS = {"current_time", "search_email", "read_thread", "list_events", "search_contacts"}
+
 
 def _action_key(ctx: RunContext[None]) -> str:
     metadata = ctx.tool_call_metadata or {}

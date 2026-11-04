@@ -1,7 +1,4 @@
-"""SQLite-backed event log for session history.
-Each session's events are numbered by `seq`, and `unfinished_runs` finds runs that never
-reached a terminal event.
-"""
+"""SQLite session events, accepted runs, and idempotent workflow projections."""
 
 import json
 import sqlite3
@@ -38,38 +35,72 @@ class EventLog:
         with self._connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(SCHEMA)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(events)")}
+            if "event_key" not in columns:
+                db.execute("ALTER TABLE events ADD COLUMN event_key TEXT")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS event_key_once ON events(event_key)")
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, timeout=5)
 
     def append(self, session_id: str, type: EventType, data: dict[str, Any] | None = None) -> Event:
-        event = self._insert(session_id, type, data, "INSERT")
+        with self._connect() as db:
+            event = self._insert(db, session_id, type, data or {})
         assert event is not None
         return event
 
     def append_once(
-        self, session_id: str, type: EventType, data: dict[str, Any] | None = None
+        self,
+        session_id: str,
+        type: EventType,
+        data: dict[str, Any] | None = None,
+        *,
+        key: str | None = None,
     ) -> Event | None:
-        """Return None when a unique index already holds this fact, so the first writer wins."""
-        return self._insert(session_id, type, data, "INSERT OR IGNORE")
+        with self._connect() as db:
+            return self._insert(db, session_id, type, data or {}, once=True, key=key)
 
+    def append_batch_once(
+        self,
+        session_id: str,
+        entries: list[tuple[EventType, dict[str, Any], str]],
+    ) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for type, data, key in entries:
+                self._insert(db, session_id, type, data, once=True, key=key)
+
+    def enqueue_message(self, session_id: str, message: dict, run: dict) -> Event | None:
+        """An accepted message and its recoverable inputs commit together."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            event = self._insert(db, session_id, "user.message", message, once=True)
+            if event is not None:
+                self._insert(db, session_id, "run.queued", run, key=f"{run['run_id']}:queued")
+            return event
+
+    @staticmethod
     def _insert(
-        self, session_id: str, type: EventType, data: dict[str, Any] | None, verb: str
+        db: sqlite3.Connection,
+        session_id: str,
+        type: EventType,
+        data: dict,
+        *,
+        once: bool = False,
+        key: str | None = None,
     ) -> Event | None:
-        """One INSERT computes seq, so two writers can't claim the same number."""
         event_id = uuid4().hex
         created_at = datetime.now(UTC).isoformat()
-        payload = json.dumps(data or {})
-        with self._connect() as db:
-            row = db.execute(
-                f"""
-                {verb} INTO events (id, session_id, seq, type, data, created_at)
-                SELECT ?, ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?
-                FROM events WHERE session_id = ?
-                RETURNING seq
-                """,
-                (event_id, session_id, type, payload, created_at, session_id),
-            ).fetchone()
+        verb = "INSERT OR IGNORE" if once else "INSERT"
+        row = db.execute(
+            f"""
+            {verb} INTO events (id, session_id, seq, type, data, created_at, event_key)
+            SELECT ?, ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?
+            FROM events WHERE session_id = ?
+            RETURNING seq
+            """,
+            (event_id, session_id, type, json.dumps(data), created_at, key, session_id),
+        ).fetchone()
         if row is None:
             return None
         return Event(
@@ -77,15 +108,15 @@ class EventLog:
             session_id=session_id,
             seq=row[0],
             type=type,
-            data=data or {},
+            data=data,
             created_at=created_at,
         )
 
     def read(self, session_id: str, after: int = 0) -> list[Event]:
         with self._connect() as db:
             rows = db.execute(
-                "SELECT id, session_id, seq, type, data, created_at FROM events"
-                " WHERE session_id = ? AND seq > ? ORDER BY seq",
+                "SELECT id, session_id, seq, type, data, created_at FROM events "
+                "WHERE session_id = ? AND seq > ? ORDER BY seq",
                 (session_id, after),
             ).fetchall()
         return [
@@ -102,35 +133,45 @@ class EventLog:
 
     def exists(self, session_id: str) -> bool:
         with self._connect() as db:
-            row = db.execute(
-                "SELECT 1 FROM events WHERE session_id = ? LIMIT 1", (session_id,)
-            ).fetchone()
-        return row is not None
+            return (
+                db.execute(
+                    "SELECT 1 FROM events WHERE session_id = ? LIMIT 1", (session_id,)
+                ).fetchone()
+                is not None
+            )
 
     def sessions_with_decisions(self) -> list[str]:
         with self._connect() as db:
             rows = db.execute(
-                "SELECT DISTINCT session_id FROM events"
-                " WHERE type IN ('approval.granted', 'approval.denied')"
+                "SELECT DISTINCT session_id FROM events "
+                "WHERE type IN ('approval.granted', 'approval.denied')"
             ).fetchall()
         return [row[0] for row in rows]
+
+    def pending_runs(self) -> list[dict]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT queued.data FROM events AS queued
+                WHERE queued.type = 'run.queued' AND NOT EXISTS (
+                    SELECT 1 FROM events AS ended
+                    WHERE ended.session_id = queued.session_id
+                    AND ended.type IN ('run.waiting', 'run.completed', 'run.failed')
+                    AND json_extract(ended.data, '$.run_id') = json_extract(queued.data, '$.run_id')
+                ) ORDER BY queued.created_at"""
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
 
     def unfinished_runs(self) -> list[tuple[str, str]]:
         placeholders = ", ".join("?" for _ in RUN_END_EVENTS)
         with self._connect() as db:
             rows = db.execute(
-                f"""
-                SELECT started.session_id, json_extract(started.data, '$.run_id')
-                FROM events AS started
-                WHERE started.type = 'run.started'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM events AS ended
-                    WHERE ended.session_id = started.session_id
-                      AND ended.type IN ({placeholders})
-                      AND json_extract(ended.data, '$.run_id')
-                          = json_extract(started.data, '$.run_id')
-                  )
-                """,
+                f"""SELECT started.session_id, json_extract(started.data, '$.run_id')
+                FROM events AS started WHERE started.type = 'run.started' AND NOT EXISTS (
+                    SELECT 1 FROM events AS ended WHERE ended.session_id = started.session_id
+                    AND ended.type IN ({placeholders})
+                    AND json_extract(ended.data, '$.run_id')
+                        = json_extract(started.data, '$.run_id')
+                )""",
                 RUN_END_EVENTS,
             ).fetchall()
         return [(row[0], row[1]) for row in rows]

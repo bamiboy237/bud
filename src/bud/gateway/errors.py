@@ -4,13 +4,14 @@ import re
 
 from pydantic_ai.exceptions import ModelAPIError
 
+from bud.composio.connection import ConnectionError as AccountConnectionError
 from bud.gateway.chatgpt import ChatGPTError
 
 
 def error_summary(exc: BaseException) -> str:
     if isinstance(exc, BaseExceptionGroup):
         return "; ".join(error_summary(error) for error in exc.exceptions)[:500]
-    if isinstance(exc, ChatGPTError):
+    if isinstance(exc, (ChatGPTError, AccountConnectionError)):
         return str(exc)
     fields = [type(exc).__name__]
     status = getattr(exc, "status_code", None)
