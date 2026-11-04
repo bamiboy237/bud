@@ -1,10 +1,8 @@
-"""Command-line entry point for bud.
-It parses the subcommands (ask, costs, serve, chat) and hands each one to the gateway,
-the ledger, the core server, or the chat client.
-"""
+"""Command-line entry point for bud."""
 
 import argparse
 import asyncio
+import webbrowser
 
 import uvicorn
 from pydantic_ai import Agent
@@ -61,6 +59,30 @@ def world(action: str) -> None:
         print(f"  {event['start']} to {event['end'][11:16]}  {event['title']}")
 
 
+def connect(toolkit: str, no_browser: bool) -> None:
+    from bud.composio.connection import ConnectionError, Connections
+
+    try:
+        url = Connections(get_settings()).connect(toolkit)
+    except ConnectionError as exc:
+        raise SystemExit(str(exc)) from None
+    print(url)
+    if not no_browser:
+        webbrowser.open(url)
+    print("Sign in at this URL, then run `bud connections` to check the connection.")
+
+
+def connections() -> None:
+    from bud.composio.connection import ConnectionError, Connections
+
+    try:
+        statuses = Connections(get_settings()).statuses()
+    except ConnectionError as exc:
+        raise SystemExit(str(exc)) from None
+    for toolkit in ("gmail", "googlecalendar"):
+        print(f"{toolkit}: {statuses.get(toolkit, 'NOT_CONNECTED')}")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="bud", description="bud, a personal AI teammate.")
     parser.add_argument("--version", action="version", version=f"bud {__version__}")
@@ -72,10 +94,21 @@ def main(argv: list[str] | None = None) -> None:
     commands.add_parser("costs", help="print spend by day and model")
     world_parser = commands.add_parser("world", help="inspect or reset the simulated world")
     world_parser.add_argument("action", choices=["show", "reset"])
+    connect_parser = commands.add_parser("connect", help="connect an account through Composio")
+    connect_parser.add_argument("toolkit", choices=["gmail", "calendar"])
+    connect_parser.add_argument(
+        "--no-browser", action="store_true", help="only print the sign-in URL"
+    )
+    commands.add_parser("connections", help="show connection status metadata, not mailbox data")
     eval_parser = commands.add_parser("eval", help="run the task suite on the simulated world")
     eval_parser.add_argument("--trials", type=int, default=3)
     eval_parser.add_argument("--task", help="run one task by id")
-    commands.add_parser("serve", help="run the core server on localhost")
+    serve_parser = commands.add_parser("serve", help="run the core server on localhost")
+    serve_parser.add_argument(
+        "--simulate",
+        action="store_true",
+        help="use the simulated inbox and calendar instead of real accounts",
+    )
     chat_parser = commands.add_parser("chat", help="open or attach to a session")
     chat_parser.add_argument("session", nargs="?", help="session id to attach to")
     chat_parser.add_argument("--url", default=DEFAULT_URL)
@@ -87,10 +120,18 @@ def main(argv: list[str] | None = None) -> None:
         costs()
     elif args.command == "world":
         world(args.action)
+    elif args.command == "connect":
+        connect("googlecalendar" if args.toolkit == "calendar" else args.toolkit, args.no_browser)
+    elif args.command == "connections":
+        connections()
     elif args.command == "eval":
         evaluate(args.trials, args.task)
     elif args.command == "serve":
-        uvicorn.run("bud.core.server:create_app", factory=True, host=HOST, port=PORT)
+        from bud.core.server import create_app
+
+        mode = "simulated tools" if args.simulate else "real accounts"
+        print(f"Starting bud with {mode} at {DEFAULT_URL}.", flush=True)
+        uvicorn.run(lambda: create_app(simulate=args.simulate), factory=True, host=HOST, port=PORT)
     elif args.command == "chat":
         asyncio.run(chat(args.url, args.session))
     else:

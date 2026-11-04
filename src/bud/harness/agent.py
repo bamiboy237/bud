@@ -10,7 +10,7 @@ from importlib import resources
 from pydantic_ai import Agent, DeferredToolRequests, Tool
 from pydantic_ai.messages import ModelResponse
 from pydantic_ai.models import Model
-from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 from pydantic_ai.usage import UsageLimits
 from pydantic_ai_harness import SpendLimits
 from pydantic_ai_harness.spend import Budget
@@ -30,8 +30,14 @@ def load_system_prompt() -> str:
 
 
 class Harness:
-    def __init__(self, tools: list[Tool], policy: Policy, registry: Registry, profile: str) -> None:
-        self.toolset = FunctionToolset[None](tools)
+    def __init__(
+        self,
+        tools: list[Tool] | AbstractToolset[None],
+        policy: Policy,
+        registry: Registry,
+        profile: str,
+    ) -> None:
+        self.toolset = tools if isinstance(tools, AbstractToolset) else FunctionToolset[None](tools)
         self.policy = policy
         self.registry = registry
         self.system_prompt = f"{load_system_prompt()}\n{profile}"

@@ -6,6 +6,7 @@ It creates sessions, accepts messages, and streams session events as server-sent
 import fcntl
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, TextIO
 from uuid import uuid4
@@ -50,13 +51,34 @@ def hold_single_server_lock(path: Path) -> TextIO:
     return lock
 
 
-def create_app() -> FastAPI:
-    db_path = get_settings().data_dir / "bud.db"
+def create_app(*, simulate: bool = False) -> FastAPI:
+    settings = get_settings()
+    if not simulate:
+        from bud.composio.connection import ConnectionError, Connections
+        from bud.composio.tools import PROFILE, build_toolset, policy
+
+        if not settings.openai_api_key:
+            raise ConnectionError(
+                "Real-account mode requires OPENAI_API_KEY. DeepSeek is disabled."
+            )
+        connections = Connections(settings)
+        accounts = connections.active_accounts()
+        # Reconnecting a different account must not resume the old account's approvals.
+        scope = sha256(repr(sorted(accounts.items())).encode()).hexdigest()[:16]
+        session_dir = connections.folder / "sessions" / scope
+        session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        db_path = session_dir / "bud.db"
+        gateway = build_gateway(settings, providers={"openai"})
+        harness = Harness(
+            build_toolset(connections, accounts, session_dir), policy(), gateway.registry, PROFILE
+        )
+    else:
+        db_path = settings.data_dir / "bud.db"
+        gateway = build_gateway(settings)
+        world = World(settings.data_dir / "world.db")
+        harness = Harness(build_tools(world), load_policy(), gateway.registry, world.profile())
     log = EventLog(db_path)
     hub = Hub(log)
-    gateway = build_gateway()
-    world = World(get_settings().data_dir / "world.db")
-    harness = Harness(build_tools(world), load_policy(), gateway.registry, world.profile())
     runner = Runner(hub, gateway, harness)
 
     @asynccontextmanager

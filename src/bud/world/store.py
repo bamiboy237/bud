@@ -41,12 +41,12 @@ CREATE TABLE IF NOT EXISTS applied_actions (key TEXT PRIMARY KEY);
 TABLES = ("threads", "messages", "events", "contacts")
 
 
-class WorldError(Exception):
-    """A tool call the model can correct, so the message tells it what to do next."""
-
-
 def load_seed() -> dict[str, Any]:
     return tomllib.loads(resources.files("bud.world").joinpath("seed.toml").read_text())
+
+
+class WorldError(Exception):
+    """An invalid operation on the simulated world."""
 
 
 class World:
