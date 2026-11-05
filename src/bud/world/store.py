@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS applied_actions (key TEXT PRIMARY KEY);
 """
 
 TABLES = ("threads", "messages", "events", "contacts")
+MAX_DRAFT_BODY_CHARS = 20_000
 
 
 def load_seed() -> dict[str, Any]:
@@ -59,6 +60,10 @@ class World:
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.executescript(SCHEMA)
+            db.execute("BEGIN IMMEDIATE")
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(applied_actions)")}
+            if "draft_id" not in columns:
+                db.execute("ALTER TABLE applied_actions ADD COLUMN draft_id TEXT")
             empty = db.execute("SELECT COUNT(*) FROM threads").fetchone()[0] == 0
         if empty:
             self.reset()
@@ -67,7 +72,10 @@ class World:
         info = self.info
         return (
             f"The person is {info['person']} <{info['email']}>, timezone {info['timezone']}.\n"
-            f"Working hours: {info['working_hours']}\n{info['protected_blocks']}"
+            f"Working hours: {info['working_hours']}\n{info['protected_blocks']}\n"
+            "Save reply drafts only after approval, then read_draft to verify the saved result. "
+            "Use list_drafts and read_draft to find drafts in new conversations. "
+            "A denied draft must not be saved or sent."
         )
 
     def _connect(self) -> sqlite3.Connection:
@@ -124,7 +132,7 @@ class World:
 
     def _apply_once(self, db: sqlite3.Connection, key: str) -> bool:
         """The key commits with the write itself, so a replay can't apply it twice."""
-        cursor = db.execute("INSERT OR IGNORE INTO applied_actions VALUES (?)", (key,))
+        cursor = db.execute("INSERT OR IGNORE INTO applied_actions (key) VALUES (?)", (key,))
         return cursor.rowcount == 1
 
     def search_email(
@@ -161,11 +169,80 @@ class World:
 
         return {"subject": thread["subject"], "messages": [dict(row) for row in messages]}
 
-    def draft_reply(self, thread_id: str, body: str) -> str:
+    def list_drafts(self, query: str = "", limit: int = 10, offset: int = 0) -> dict[str, Any]:
+        if not 1 <= limit <= 25 or offset < 0:
+            raise WorldError("Use a draft limit from 1 to 25 and a nonnegative offset.")
+        if len(query) > 500:
+            raise WorldError("Draft queries must be at most 500 characters.")
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
         with self._connect() as db:
+            rows = db.execute(
+                "SELECT m.id AS draft_id, m.thread_id, t.subject, m.sender, m.recipients,"
+                " m.sent_at, substr(m.body, 1, 160) AS snippet"
+                " FROM messages m JOIN threads t ON t.id = m.thread_id"
+                " WHERE m.folder = 'draft' AND"
+                " (t.subject LIKE ? ESCAPE '\\' OR m.body LIKE ? ESCAPE '\\'"
+                " OR m.recipients LIKE ? ESCAPE '\\')"
+                " ORDER BY m.sent_at DESC, m.id DESC LIMIT ? OFFSET ?",
+                (pattern, pattern, pattern, limit + 1, offset),
+            ).fetchall()
+        return {
+            "drafts": [
+                {**dict(row), "recipients": json.loads(row["recipients"])} for row in rows[:limit]
+            ],
+            "next_offset": offset + limit if len(rows) > limit else None,
+        }
+
+    def _draft(self, db: sqlite3.Connection, draft_id: str) -> dict[str, Any]:
+        row = db.execute(
+            "SELECT m.id AS draft_id, m.thread_id, t.subject, m.sender, m.recipients,"
+            " m.sent_at, m.body FROM messages m JOIN threads t ON t.id = m.thread_id"
+            " WHERE m.id = ? AND m.folder = 'draft'",
+            (draft_id,),
+        ).fetchone()
+        if row is None:
+            raise WorldError(f"No draft {draft_id}. Use list_drafts to find draft ids.")
+        return {**dict(row), "recipients": json.loads(row["recipients"])}
+
+    def read_draft(
+        self, draft_id: str, body_offset: int = 0, max_chars: int = 8_000
+    ) -> dict[str, Any]:
+        if body_offset < 0 or not 1 <= max_chars <= MAX_DRAFT_BODY_CHARS:
+            raise WorldError("Use a nonnegative body offset and 1 to 20,000 characters.")
+        with self._connect() as db:
+            draft = self._draft(db, draft_id)
+        body = draft["body"]
+        if body_offset > len(body):
+            raise WorldError("The body offset is past the end of the draft.")
+        end = min(body_offset + max_chars, len(body))
+        return {
+            **draft,
+            "body": body[body_offset:end],
+            "body_offset": body_offset,
+            "body_total_chars": len(body),
+            "next_body_offset": end if end < len(body) else None,
+        }
+
+    def draft_reply(self, key: str, thread_id: str, body: str) -> dict[str, Any]:
+        if not key.strip():
+            raise WorldError("Saving a draft requires an action key.")
+        if not body.strip() or len(body) > MAX_DRAFT_BODY_CHARS:
+            raise WorldError("Draft bodies must contain text and be at most 20,000 characters.")
+        with self._connect() as db:
+            if not self._apply_once(db, key):
+                saved = db.execute(
+                    "SELECT draft_id FROM applied_actions WHERE key = ?", (key,)
+                ).fetchone()
+                if saved["draft_id"] is None:
+                    raise WorldError("This action key was already used for another write.")
+                draft = self._draft(db, saved["draft_id"])
+                if draft["thread_id"] != thread_id or draft["body"] != body:
+                    raise WorldError("This action key already saved a different draft.")
+                return draft
             last = db.execute(
                 "SELECT sender FROM messages WHERE thread_id = ? AND folder = 'inbox'"
-                " ORDER BY sent_at DESC LIMIT 1",
+                " ORDER BY sent_at DESC, id DESC LIMIT 1",
                 (thread_id,),
             ).fetchone()
             if last is None:
@@ -182,7 +259,8 @@ class World:
                     body,
                 ),
             )
-        return draft_id
+            db.execute("UPDATE applied_actions SET draft_id = ? WHERE key = ?", (draft_id, key))
+            return self._draft(db, draft_id)
 
     def send_email(self, key: str, to: list[str], subject: str, body: str) -> bool:
         """Return False when this key already sent, so nothing new goes out."""

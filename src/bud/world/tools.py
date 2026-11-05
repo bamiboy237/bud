@@ -7,7 +7,15 @@ from pydantic_ai import RunContext, Tool
 
 from bud.world.store import World, WorldError
 
-READ_TOOLS = {"current_time", "search_email", "read_thread", "list_events", "search_contacts"}
+READ_TOOLS = {
+    "current_time",
+    "search_email",
+    "read_thread",
+    "list_drafts",
+    "read_draft",
+    "list_events",
+    "search_contacts",
+}
 
 
 def _action_key(ctx: RunContext[None]) -> str:
@@ -41,14 +49,49 @@ def build_tools(world: World) -> list[Tool]:
         """
         return _safely(lambda: world.read_thread(thread_id))
 
-    def draft_reply(thread_id: str, body: str) -> Any:
-        """Save a draft reply to a thread. This does not send anything.
+    def list_drafts(query: str = "", limit: int = 10, offset: int = 0) -> Any:
+        """Find saved drafts without needing a previous conversation.
+
+        Results contain draft ids, thread ids, recipients, subjects, and short snippets.
+        Continue with next_offset until it is null. Read a candidate with read_draft.
 
         Args:
-            thread_id: The thread to reply to.
-            body: Plain text of the reply.
+            query: Literal text in the subject, body, or recipient address; at most 500 characters.
+            limit: Maximum drafts per page, from 1 to 25.
+            offset: Number of matching drafts to skip; use next_offset for the next page.
         """
-        return _safely(lambda: {"draft_id": world.draft_reply(thread_id, body)})
+        return _safely(lambda: world.list_drafts(query, limit, offset))
+
+    def read_draft(draft_id: str, body_offset: int = 0, max_chars: int = 8_000) -> Any:
+        """Read a saved draft and its exact thread and recipients without changing it.
+
+        The body is a character page, not a summary. Continue with next_body_offset
+        until it is null before claiming the whole body was read.
+
+        Args:
+            draft_id: Exact draft id from list_drafts or draft_reply.
+            body_offset: Character offset in the body, starting at zero.
+            max_chars: Maximum body characters to return, from 1 to 20,000.
+        """
+        return _safely(lambda: world.read_draft(draft_id, body_offset, max_chars))
+
+    def draft_reply(ctx: RunContext[None], thread_id: str, body: str) -> Any:
+        """Save an approved draft reply, without sending it, then use read_draft to verify it.
+
+        Returns the exact saved draft id, thread, recipients, and body. Replaying the
+        same approval returns the original draft instead of creating another one.
+
+        Args:
+            thread_id: The thread to reply to. Read it first to confirm the recipient.
+            body: Exact plain text of the reply, from 1 to 20,000 characters.
+        """
+
+        def draft() -> Any:
+            if not ctx.tool_call_approved or not (ctx.tool_call_metadata or {}).get("approval_id"):
+                raise WorldError("Saving a draft requires an explicit approval.")
+            return world.draft_reply(_action_key(ctx), thread_id, body)
+
+        return _safely(draft)
 
     def send_email(ctx: RunContext[None], to: list[str], subject: str, body: str) -> Any:
         """Send an email.
@@ -117,6 +160,8 @@ def build_tools(world: World) -> list[Tool]:
             current_time,
             search_email,
             read_thread,
+            list_drafts,
+            read_draft,
             draft_reply,
             send_email,
             list_events,

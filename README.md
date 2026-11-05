@@ -178,6 +178,10 @@ uv run bud serve  # terminal 1, public web and connected accounts
 uv run bud chat   # terminal 2
 ```
 
+Reply drafts use a single recipient and plain text. Bud requires a thread ID, omits the subject to preserve Gmail threading, and disables signature insertion. The creation path reads the draft back and reports whether its thread, recipient, and body match. If creation succeeds but verification is unavailable or mismatched, inspect the saved draft instead of creating another. Native Gmail execution of this new workflow is not yet verified.
+
+In a fresh conversation, bud can list draft metadata with `GMAIL_LIST_DRAFTS`, then read a selected ID with `GMAIL_GET_DRAFT`. Draft listing has no query filter. Bud must match candidates from returned pages and report incomplete searches. Simulation has separate bounded `list_drafts` and `read_draft` tools. Simulated draft creation now requires approval and records its replay key atomically with the draft.
+
 Every real-account write, including draft creation, waits for `/approve` or `/deny`. Before dispatch, bud saves a claim for that approval in `dispatches.db`. A completed DBOS step receipt skips another execution during recovery. If a write has a claim but no confirmed result, the claim blocks another dispatch under the same approval. This is not a guarantee of exactly-once delivery by Google. Inspect the account before you request a new action or give a new approval. The original action may already have completed.
 
 With the default `DATA_DIR`, simulated conversations use `data/bud.db`, the durable journal uses `data/runtime.db`, and persistent spend counters use `data/world-spend.db`. Real-account state stays in `data/composio/sessions/<account-hash>/`, with separate `bud.db`, `runtime.db`, `spend.db`, and `dispatches.db` files. The request cost ledger remains in `data/bud.db` for both modes. Git ignores `data/`.
