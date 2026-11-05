@@ -139,6 +139,16 @@ Large results use the existing stored-result readers and read-only Code Mode. We
 
 `--simulate` keeps the fictional inbox and calendar. It does not add public web access.
 
+## Text workspace
+
+Ask bud to save a research brief as a `.md` or `.txt` file. It requests approval before creating or updating a file. In a new conversation, ask it to list or search the workspace and read the saved brief. Workspace reads also work in read-only Code Mode.
+
+The dedicated `workspace/` directory sits beside the session database, separately for simulation and each account mapping. Bud does not get access to your home directory or course notes. Paths must be visible and relative. Traversal, symlinks, hard links, special files, and credential-like names are refused. Content must be UTF-8 text of at most 128 KiB. These path checks do not detect secrets within ordinary text. Put only material approved for the agent in this directory.
+
+Creates never overwrite an existing file. Updates need the SHA-256 revision returned by a recent read. A conflicting edit requires a new read and approval. Writes publish the complete file atomically and claim the approval before dispatch, so recovery cannot reuse that approval. An interrupted write needs inspection rather than an automatic retry. Keep `workspace-dispatches.jsonl` with the session state.
+
+List and search inspect one directory at a time, at most 500 entries, and mark incomplete results. Listing returns at most 100 safe entries; literal text search returns at most 50 matches. Reads return at most 32,000 characters and report truncation. Local editors must not edit the same file during an approved update. This is a scoped tool boundary, not isolation from hostile local processes.
+
 ## Connect real accounts
 
 Real-account data goes through Composio and the selected model provider. The default signed-in route uses ChatGPT and can use Meta as backup. API-key routes incur metered charges.

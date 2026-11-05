@@ -18,7 +18,7 @@ from dbos import DBOS
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from pydantic_ai.toolsets import CombinedToolset
+from pydantic_ai.toolsets import CombinedToolset, FunctionToolset
 
 from bud.config import get_settings
 from bud.core.events import Event
@@ -33,6 +33,10 @@ from bud.harness.memory import build_memory
 from bud.web import GUIDANCE as WEB_GUIDANCE
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
 from bud.web import build_tools as build_web_tools
+from bud.workspace import GUIDANCE as WORKSPACE_GUIDANCE
+from bud.workspace import READ_TOOLS as WORKSPACE_READ_TOOLS
+from bud.workspace import WRITE_TOOLS as WORKSPACE_WRITE_TOOLS
+from bud.workspace import build_tools as build_workspace_tools
 from bud.world.store import World
 from bud.world.tools import READ_TOOLS as WORLD_READ_TOOLS
 from bud.world.tools import build_tools
@@ -69,6 +73,12 @@ def hold_single_server_lock(path: Path) -> TextIO:
     return lock
 
 
+def workspace_tools(directory: Path) -> FunctionToolset[None]:
+    root = directory / "workspace"
+    root.mkdir(exist_ok=True, mode=0o700)
+    return FunctionToolset(build_workspace_tools(root, directory / "workspace-dispatches.jsonl"))
+
+
 def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAPI:
     settings = get_settings()
     if not simulate:
@@ -86,33 +96,47 @@ def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAP
             settings, providers={"openai-chatgpt", "openai", "meta"}, model_id=model_id
         )
         tools_policy = policy()
-        tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS, "allow"))
+        tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS | WORKSPACE_READ_TOOLS, "allow"))
+        tools_policy.tools.update(dict.fromkeys(WORKSPACE_WRITE_TOOLS, "ask"))
         harness = Harness(
             CombinedToolset(
-                [build_toolset(connections, accounts, session_dir), build_web_tools(settings)]
+                [
+                    build_toolset(connections, accounts, session_dir),
+                    build_web_tools(settings),
+                    workspace_tools(session_dir),
+                ]
             ),
             tools_policy,
             gateway.registry,
-            PROFILE + "\nConnected apps: " + (", ".join(sorted(accounts)) or "none") + WEB_GUIDANCE,
+            PROFILE
+            + "\nConnected apps: "
+            + (", ".join(sorted(accounts)) or "none")
+            + WEB_GUIDANCE
+            + WORKSPACE_GUIDANCE,
             memory=build_memory(session_dir / "memory.db", namespace="owner"),
             spend_path=session_dir / "spend.db",
             result_path=db_path,
-            read_tools=READ_TOOLS | WEB_READ_TOOLS | {"current_time"},
+            read_tools=READ_TOOLS | WEB_READ_TOOLS | WORKSPACE_READ_TOOLS | {"current_time"},
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
         )
     else:
         db_path = settings.data_dir / "bud.db"
         gateway = build_gateway(settings, model_id=model_id)
         world = World(settings.data_dir / "world.db")
+        tools_policy = load_policy()
+        tools_policy.tools.update(dict.fromkeys(WORKSPACE_READ_TOOLS, "allow"))
+        tools_policy.tools.update(dict.fromkeys(WORKSPACE_WRITE_TOOLS, "ask"))
         harness = Harness(
-            build_tools(world),
-            load_policy(),
+            CombinedToolset(
+                [FunctionToolset(build_tools(world)), workspace_tools(settings.data_dir)]
+            ),
+            tools_policy,
             gateway.registry,
-            world.profile(),
+            world.profile() + WORKSPACE_GUIDANCE,
             memory=build_memory(settings.data_dir / "world-memory.db", namespace="world"),
             spend_path=settings.data_dir / "world-spend.db",
             result_path=db_path,
-            read_tools=WORLD_READ_TOOLS,
+            read_tools=WORLD_READ_TOOLS | WORKSPACE_READ_TOOLS,
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
         )
     gateway.model("fast")
