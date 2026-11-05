@@ -38,6 +38,7 @@ from bud.gateway.errors import error_summary
 from bud.gateway.registry import Tier
 from bud.gateway.tracked import request_session
 from bud.harness.agent import RUN_LIMITS, Harness
+from bud.harness.context import BackgroundCompaction
 
 RESULTS = TypeAdapter(DeferredToolResults)
 
@@ -101,8 +102,14 @@ class Runner(DBOSConfiguredInstance):
             if durable
             else None
         )
+        self.context = BackgroundCompaction(
+            spend_for_run=harness.spend_for_run, record=self._record_context
+        )
         self.agent = harness.agent(
-            gateway.model(tier), self._record_decision, durability=durability
+            gateway.model(tier),
+            self._record_decision,
+            context=self.context,
+            durability=durability,
         )
 
     def recover(self) -> None:
@@ -273,6 +280,7 @@ class Runner(DBOSConfiguredInstance):
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self.context.close()
 
     @DBOS.workflow(name="bud.run", max_recovery_attempts=5)
     async def _workflow(self, run: dict) -> None:
@@ -399,6 +407,15 @@ class Runner(DBOSConfiguredInstance):
         entries.append((type, data, f"{run['run_id']}:terminal"))
         self.hub.log.append_batch_once(run["session_id"], entries)
         self.hub.wake(run["session_id"])
+
+    def _record_context(self, event: dict) -> None:
+        session_id = event["session_id"]
+        self.hub.publish_once(
+            session_id,
+            f"context.{event['stage']}",
+            event,
+            key=f"context:{event['id']}:{event['stage']}",
+        )
 
     def _record_decision(self, decision: dict) -> None:
         run = self._current.get()

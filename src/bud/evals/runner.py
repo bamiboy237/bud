@@ -89,7 +89,7 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
             timed_out = False
         except TimeoutError:
             approvals, timed_out = [], True
-            await runner.stop()
+        await runner.stop()
         events = log.read(session_id)
         transcript = snapshot(session_id, events).transcript
         outcome = Outcome(

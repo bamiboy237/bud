@@ -1,17 +1,22 @@
 """Temporary tool results, retained while their session is running or awaiting approval."""
 
 import asyncio
+import json
 import sqlite3
 import time
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import Field
+from pydantic_ai import RunContext
+from pydantic_ai.tools import ToolDefinition
 from pydantic_ai_harness import ToolOutputLimits
 from pydantic_ai_harness.tool_output_limits import Band, Spill, Truncate
+
+from bud.harness.code import inside_code_mode
 
 SPILL_CHARS = 10_000
 PREVIEW_CHARS = 1_000
@@ -67,14 +72,18 @@ class SqliteResultStore:
     async def read(self, handle: str) -> bytes:
         return await asyncio.to_thread(self._read, handle)
 
-    def _read(self, handle: str) -> bytes:
+    def _read(self, handle: str, max_bytes: int | None = None) -> bytes:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT payload FROM tool_results WHERE handle = ?", (handle,)
+                """SELECT CASE WHEN ? IS NULL OR length(payload) <= ? THEN payload END
+                   FROM tool_results WHERE handle = ?""",
+                (max_bytes, max_bytes, handle),
             ).fetchone()
             if row is None:
                 raise FileNotFoundError("Tool result expired or is unavailable")
+            if row[0] is None:
+                raise ValueError("Stored result exceeds 8 MB. Read source data in smaller batches.")
             db.execute(
                 "UPDATE tool_results SET last_used = ? WHERE handle = ?", (time.time(), handle)
             )
@@ -107,6 +116,19 @@ class SqliteResultStore:
             end = min(start + limit, len(text))
         return f"[Characters {start}:{end} of {len(text)}]\n{text[start:end]}"
 
+    async def load_tool_result(self, handle: str) -> Any:
+        """Load a full stored result for sandbox processing, decoding JSON when possible.
+
+        Args:
+            handle: Exact handle from a saved read or Code Mode result.
+        """
+        payload = await asyncio.to_thread(self._read, handle, 8_000_000)
+        text = payload.decode("utf-8", errors="replace")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+
     async def prune(self) -> int:
         return await asyncio.to_thread(self._prune)
 
@@ -133,9 +155,15 @@ class SqliteResultStore:
 
 
 def build_output_limits(store: SqliteResultStore, read_tools: set[str]) -> ToolOutputLimits:
+    limited = read_tools | {"read_memory", "search_memory", "load_tool_result"}
+
+    def model_visible_result(ctx: RunContext[None], tool: ToolDefinition) -> bool:
+        # Inner data stays whole; only the sandbox's public answer enters model context.
+        return tool.name == "run_code" or (tool.name in limited and not inside_code_mode.get())
+
     return ToolOutputLimits(
         store=store,
-        tool_filter=sorted(read_tools | {"read_memory", "search_memory"}),
+        tool_filter=model_visible_result,
         bands=[
             Band(
                 over=SPILL_CHARS,

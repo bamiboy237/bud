@@ -17,6 +17,8 @@ from pydantic_ai_harness.spend import Budget
 
 from bud.gateway.registry import Registry
 from bud.harness.actions import GuardTools, Policy, RecordDecision
+from bud.harness.code import CODE_GUIDANCE, build_code_mode
+from bud.harness.context import BackgroundCompaction
 from bud.harness.memory import MEMORY_RULES
 from bud.harness.results import SqliteResultStore, build_output_limits
 from bud.harness.spend import SqliteSpendStore
@@ -50,19 +52,45 @@ class Harness:
         self.memory = memory
         tools_policy = policy.tools | MEMORY_RULES if memory else policy.tools
         self.policy = Policy(
-            tools=tools_policy | {"read_tool_result": "allow", "read_tool_result_chars": "allow"}
+            tools={"load_tool_result": "allow", "run_code": "allow"}
+            | tools_policy
+            | {"read_tool_result": "allow", "read_tool_result_chars": "allow"}
         )
         self.results = SqliteResultStore(result_path, retention=result_retention)
         self.output_limits = build_output_limits(self.results, read_tools)
         self.registry = registry
-        self.system_prompt = f"{load_system_prompt()}\n{profile}"
+        self.code_mode = build_code_mode(
+            {
+                name
+                for name in read_tools
+                | {
+                    "read_memory",
+                    "search_memory",
+                    "read_tool_result",
+                    "read_tool_result_chars",
+                    "load_tool_result",
+                }
+                if self.policy.decide(name) == "allow"
+            }
+        )
+        self.system_prompt = f"{load_system_prompt()}\n{profile}\n{CODE_GUIDANCE}"
         memory_guidance = (memory.guidance or "") if memory is not None else ""
         prompt = self.system_prompt + memory_guidance
         self.prompt_version = sha256(prompt.encode()).hexdigest()[:12]
-        self.spend = SpendLimits(
-            store=SqliteSpendStore(spend_path),
+        self.spend_store = SqliteSpendStore(spend_path)
+        self.spend = self.spend_for_run()
+
+    def spend_for_run(self, run_id: str | None = None) -> SpendLimits:
+        return SpendLimits(
+            store=self.spend_store,
             budgets=[
-                Budget(usd=MAX_USD_PER_RUN, window="run"),
+                Budget(
+                    usd=MAX_USD_PER_RUN,
+                    window="total",
+                    name="execution",
+                    scope=lambda ctx: run_id if run_id is not None else str(ctx.run_id),
+                    retain="forever",
+                ),
                 Budget(usd=MAX_USD_PER_DAY, window="day"),
             ],
             price=self._price,
@@ -79,7 +107,12 @@ class Harness:
         return None
 
     def agent(
-        self, model: Model, record: RecordDecision, *, durability: AbstractCapability | None = None
+        self,
+        model: Model,
+        record: RecordDecision,
+        *,
+        context: BackgroundCompaction,
+        durability: AbstractCapability | None = None,
     ) -> Agent[None, str | DeferredToolRequests]:
         return Agent(
             model,
@@ -91,8 +124,14 @@ class Harness:
                 GuardTools(policy=self.policy, record=record),
                 self.spend,
                 self.output_limits,
+                self.code_mode,
+                context,
                 Capability(
-                    id="bud_result_readback", tools=[Tool(self.results.read_tool_result_chars)]
+                    id="bud_result_readback",
+                    tools=[
+                        Tool(self.results.read_tool_result_chars),
+                        Tool(self.results.load_tool_result),
+                    ],
                 ),
                 *([self.memory] if self.memory is not None else []),
                 *([durability] if durability is not None else []),

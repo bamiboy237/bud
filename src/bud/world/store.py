@@ -158,7 +158,7 @@ class World:
                 " WHERE thread_id = ? ORDER BY sent_at",
                 (thread_id,),
             ).fetchall()
-            db.execute("UPDATE messages SET unread = 0 WHERE thread_id = ?", (thread_id,))
+
         return {"subject": thread["subject"], "messages": [dict(row) for row in messages]}
 
     def draft_reply(self, thread_id: str, body: str) -> str:

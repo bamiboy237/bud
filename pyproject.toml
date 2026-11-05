@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2.14.1",
     "pydantic-ai-harness>=0.61.0",
     "pydantic-ai-slim[dbos,mcp,openai]>=2.61.0",
+    "pydantic-monty>=1.0.0,<2",
     "pydantic-settings>=2.16.1",
     "uvicorn>=0.54.0",
 ]

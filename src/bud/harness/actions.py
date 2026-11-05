@@ -14,7 +14,10 @@ from dbos import DBOS
 from pydantic import BaseModel
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.exceptions import ApprovalRequired
+from pydantic_ai.capabilities.abstract import ValidatedToolArgs
+from pydantic_ai.exceptions import ApprovalRequired, UserError
+from pydantic_ai.messages import ToolCallPart
+from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, ToolsetTool, WrapperToolset
 
 Action = Literal["allow", "ask", "deny"]
@@ -75,6 +78,28 @@ class GuardTools(AbstractCapability[None]):
     policy: Policy
     record: RecordDecision
     id: str | None = "bud_action_gateway"
+
+    async def before_tool_execute(
+        self,
+        ctx: RunContext[None],
+        *,
+        call: ToolCallPart,
+        tool_def: ToolDefinition,
+        args: ValidatedToolArgs,
+    ) -> ValidatedToolArgs:
+        # CodeMode creates run_code outside this wrapper; its nested reads still use it.
+        if call.tool_name == "run_code":
+            if self.policy.decide(call.tool_name) != "allow":
+                raise UserError("Code Mode is not allowed by the action policy")
+            self.record(
+                {
+                    "call_id": ctx.tool_call_id,
+                    "tool": call.tool_name,
+                    "rule": "allow",
+                    "outcome": "allowed",
+                }
+            )
+        return args
 
     def get_wrapper_toolset(self, toolset: AbstractToolset[None]) -> ActionGateway:
         return ActionGateway(toolset, policy=self.policy, record=self.record)

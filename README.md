@@ -92,7 +92,7 @@ The server saves Pydantic AI's `Conversation`, including state needed to continu
 
 If recovery restarts an unfinished model request, `text.reset` replaces partial text for that request, not the entire turn. Session snapshots discard that request's old text blocks. The terminal cannot erase printed text, so it marks the partial response as discarded and prints its replacement.
 
-Recovery refuses queued executions when their saved code version or run configuration differs from the current server. The version includes packaged code and configuration files, plus the DBOS, Pydantic AI, and Harness versions. Changed work fails before tools run rather than replaying across an upgrade. Interrupted runs from before durable execution have no recoverable inputs or journal and are marked failed.
+Recovery refuses queued executions when their saved code version or run configuration differs from the current server. The version includes packaged code and configuration files, plus the DBOS, Pydantic AI, Harness, and Monty versions. Changed work fails before tools run rather than replaying across an upgrade. Interrupted runs from before durable execution have no recoverable inputs or journal and are marked failed.
 
 Earlier live recovery after `SIGKILL` was verified with DeepSeek and synthetic tools. Successful ChatGPT execution under DBOS and recovery of real Google writes have not been verified. The server remains local and unauthenticated. Durable execution does not add scheduling or an always-on deployment.
 
@@ -155,21 +155,51 @@ Memory content enters the model context, so local storage does not mean local-on
 
 ## Large tool results and cleanup
 
-Read-only tool results of 10,000 characters or more use Pydantic AI Harness `ToolOutputLimits`. Bud stores their full serialized content in the session database's `tool_results` table and sends the model a preview of about 1,000 characters plus a handle. Real-account stores remain separated by account mapping. Write receipts are not reduced by this capability.
+Model-visible read results and `run_code` answers of 10,000 characters or more use Pydantic AI Harness `ToolOutputLimits`. Bud stores their full serialized content in the session database's `tool_results` table and sends the model a preview of about 1,000 characters plus a handle. Reads inside Code Mode keep their full values for processing. Real-account stores remain separated by account mapping. Write receipts are not reduced by this capability.
 
-The model can use `read_tool_result` to read or search bounded line ranges. That native reader caps a response at 1,000 lines and 50,000 characters. For oversized single-line JSON, `read_tool_result_chars` returns at most 4,000 characters from an offset or from the end. Both readers pass through the action gateway. An unavailable handle produces a clear response rather than a file path or an automatic source-tool call.
+Inside `run_code`, the model can use `read_tool_result` to read or search bounded line ranges. That native reader caps a response at 1,000 lines and 50,000 characters. For oversized single-line JSON, `read_tool_result_chars` returns at most 4,000 characters from an offset or from the end. Both readers pass through the action gateway. An unavailable handle produces a clear response rather than a file path or an automatic source-tool call.
 
 Temporary results become eligible for cleanup 24 hours after their last write or read. Set `TOOL_RESULT_RETENTION_HOURS` in the environment or `.env` to change this positive, finite number of hours. Successful reads renew the lifetime. The server sweeps on startup and every 60 seconds while running. It protects every result belonging to a session with queued work, a running execution, or an approval pause. Once that protection ends, already-old results can expire on the next sweep. Approvals do not yet expire automatically, so an unresolved approval can protect results indefinitely.
 
 The store checks session state and removes expired rows in one SQLite transaction, so cleanup cannot race an already-accepted message or a read renewal. Saved memory and the source Gmail messages or Calendar events are not deleted. Row deletion is not secure erasure: audit events, DBOS receipts, SQLite recovery files, and backups have separate retention concerns. This cleanup does not claim to remove all copies of a result.
 
-If storage fails, the native capability warns and falls back to marked truncation at 4,000 characters. This slice bounds new read results; it does not yet summarize long conversations, impose a whole-request token budget, or add Code Mode. Local storage, readers, approval protection, and startup/periodic cleanup have been exercised with synthetic data. The new flow has not completed a live-model walkthrough.
+If storage fails, the native capability warns and falls back to marked truncation at 4,000 characters. Local storage, readers, approval protection, and startup/periodic cleanup have been exercised with synthetic data.
+
+## Read-only Code Mode
+
+The server exposes selected read tools as Python functions inside Pydantic AI Harness Code Mode. The model calls `run_code` to filter, group, and calculate over their results. Sends, drafts, Calendar changes, and memory changes remain ordinary tools with their existing approval rules. The action gateway records `run_code` and its nested reads.
+
+Monty runs the Python subset in a local sandbox process. No host directories, OS handler, or remote worker are configured. Sandbox code cannot directly read host files, environment variables, or network sockets. It can call only the selected read functions. It does not provide arbitrary Python packages such as pandas or NumPy.
+
+Each snippet has a 10-second execution limit, a 128 MiB heap limit, and a limit of 2,000 suspensions. It can call at most 12 nested tools. Nested calls also count toward the execution's 20-tool limit, together with `run_code` itself. Eager execution and speculative calls are off.
+
+`load_tool_result(handle=...)` loads a saved result into the sandbox, decoding JSON when possible. SQLite refuses payloads above 8 MB before returning the bytes to the host. Reads renew the result's existing lifetime. Missing or expired results fail explicitly. Large source queries need smaller batches rather than silent truncation.
+
+Full nested results stay available to code, while only the snippet's returned value and printed output enter model context. Oversized snippet answers still use the stored-result preview described above. Full nested results remain in audit metadata and recovery records. Code Mode is not a data-erasure feature.
+
+Variables survive between snippets within one agent run. Under DBOS recovery, code runs again using completed read-step receipts to rebuild that state. Variables do not carry into a new message or approval-continuation run. Saved result handles, approved memory, and conversation history have separate lifetimes.
+
+A live synthetic job processed 1,000 records in two snippets and recovered after `SIGKILL` with identical conversation and tool usage. Recovery issued no new model request. Local checks exercised file, environment, network, write, time, memory, tool-count, and output limits. Real-account Code Mode has not been live-verified. Simulated `read_thread` no longer marks messages as read.
+
+## Long conversations
+
+Bud prepares a summary in the background while the current request continues. Preparation starts at 80% of the compaction threshold. The threshold is 65% of the model's resolved context window, with a 64,000-token fallback when the framework cannot resolve the window. These are initial estimates, not a provider-enforced request-size guarantee.
+
+The summary records the goal, current constraints, decisions, confirmed work, relevant failures, source identifiers, and next action. Native Pydantic AI `SummarizingCompaction` retains an unchanged recent suffix of at least 12,000 estimated content tokens, extended where necessary to keep tool calls with their results. A prepared result can replace only the exact history snapshot it summarized. Bud preserves every newer message and rejects preparation if the history, instructions, tool definitions, model route, or request settings change.
+
+When compaction becomes necessary, bud uses a valid prepared result or waits for it to finish. A missing, failed, or unsuitable preparation uses blocking summarization. If the recent content and tool definitions still do not fit, the run stops with a request to reduce the input instead of repeatedly summarizing it.
+
+The DBOS selection step saves the exact replacement history, including newer messages. Recovery reuses a completed selection receipt. Unused preparations live only in memory and can be lost on restart without losing the saved conversation. The cache holds at most 64 preparations. Access removes preparations older than five minutes, capacity pressure evicts the oldest preparation, and shutdown cancels remaining preparation tasks. There is no separate idle cleanup timer.
+
+Summary calls use the same tracked model route as the conversation, with no tools. They share the originating execution's dollar budget and the daily budget, even if preparation finishes after that execution. Each preparation reserves one request from its originating execution. Summary token usage is recorded separately in the request ledger and `context.ready` events; the conversation's main-agent token totals do not include those auxiliary calls. An unused preparation still consumes model allowance and may cost money.
+
+Compaction changes working history, not the original event log, approval records, or approved memory. Summaries cannot grant approval or create saved user memory. Older records remain stored, but a model-facing search tool for the full conversation archive is not implemented yet.
 
 ## Layout
 
 - `src/bud/gateway/`: the model list, fallback, and cost ledger. Prices are in `models.toml`.
 - `src/bud/core/`: the event log, durable agent runner, recovery version checks, server, and terminal client.
-- `src/bud/harness/`: the system prompt, tool policy, action gateway, memory configuration, temporary results, persistent spend counters, and execution limits.
+- `src/bud/harness/`: the system prompt, tool policy, action gateway, approved memory, background compaction, read-only Code Mode, temporary results, and persistent limits.
 - `src/bud/world/`: the simulated inbox, calendar, contacts, and their tools.
 - `src/bud/composio/`: hosted account connections and real tools through SDK MCP.
 - `src/bud/evals/`: the task suite and the runner that scores it.

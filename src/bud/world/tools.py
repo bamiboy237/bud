@@ -34,7 +34,7 @@ def build_tools(world: World) -> list[Tool]:
         return _safely(lambda: world.search_email(query, sender, unread_only, limit))
 
     def read_thread(thread_id: str) -> Any:
-        """Read every message in a thread and mark it as read.
+        """Read every message in a thread without changing its unread state.
 
         Args:
             thread_id: The thread id from search_email.

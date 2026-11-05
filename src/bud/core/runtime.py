@@ -15,6 +15,6 @@ def replay_version() -> str:
         if path.is_file() and path.suffix in {".py", ".toml", ".md"}:
             digest.update(path.relative_to(root).as_posix().encode())
             digest.update(path.read_bytes())
-    for package in ("dbos", "pydantic-ai-slim", "pydantic-ai-harness"):
+    for package in ("dbos", "pydantic-ai-slim", "pydantic-ai-harness", "pydantic-monty"):
         digest.update(f"{package}:{version(package)}".encode())
     return digest.hexdigest()
