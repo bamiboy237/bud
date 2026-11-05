@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr | None = None
     muse_api_key: SecretStr | None = None
     composio_api_key: SecretStr | None = None
+    exa_api_key: SecretStr | None = None
 
     debug: bool = False
     data_dir: Path = Path("data")

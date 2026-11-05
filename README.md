@@ -64,7 +64,7 @@ uv run bud chat               # terminal 2, prints a session id
 uv run bud chat <session-id>  # terminal 3, attaches to the same session
 ```
 
-`uv run bud serve` provides public web research and tools for your active connected accounts. It needs a Composio project key and model access. Google connections are optional. See [Connect real accounts](#connect-real-accounts) to add Gmail or Calendar.
+`uv run bud serve` provides public web research and tools for your active connected accounts. It needs model access. Composio and Google connections are optional for public research. See [Connect real accounts](#connect-real-accounts) to add Gmail or Calendar.
 
 Ask bud to check the inbox or move a meeting in `bud chat`. Writes wait for you to answer `/approve` or `/deny`. See what you've spent, inspect the simulated world, or restore it:
 
@@ -80,7 +80,7 @@ Run the eval suite, which spends a few cents on model calls:
 uv run bud eval
 ```
 
-The server listens on `127.0.0.1:8420` and has no authentication, so keep it on your own machine. `--simulate` is the only mode switch. The old `--backend` flag and `BACKEND` setting are no longer used. Missing model or Composio credentials stop normal startup. Bud exposes account tools only for active connections and never silently switches to simulation.
+The server listens on `127.0.0.1:8420` and has no authentication, so keep it on your own machine. `--simulate` is the only mode switch. The old `--backend` flag and `BACKEND` setting are no longer used. Missing model access stops normal startup. Without a Composio key, account tools are unavailable but public research still works. Bud exposes account tools only for active connections and never silently switches to simulation.
 
 ## Durable server and recovery
 
@@ -131,11 +131,11 @@ In normal `bud serve` mode, ask for research with sources, for example:
 Find the official Pydantic AI documentation for human tool approval. Read it and explain how denial works. Include source links.
 ```
 
-Bud uses Composio's public web search and HTML page-reading tools. They need the existing `COMPOSIO_API_KEY`, not another search-provider key or a connected Google account. Search results are leads. Bud can read source pages, cite their returned URLs, and disclose cached or unavailable content. The provider can return cached pages, so a successful read does not prove that the page is current.
+Bud's `search_web` and `read_webpage` tools call [Exa's hosted MCP service](https://docs.exa.ai/reference/exa-mcp) directly. They do not need Composio or connected accounts. Keyless access has a free rate limit and requires a direct IPv4 connection. Set optional `EXA_API_KEY` in `.env` to use your own Exa plan; it is sent only in an authentication header. A failed keyless call never switches to paid access. Search excerpts are leads, not proof that bud read the page. Retrieved content can be cached, so a successful read does not prove freshness.
 
-Page reads accept 1 to 3 public HTTP or HTTPS URLs per call. They extract 20,000 characters per page by default, with a maximum of 50,000. URL credentials, private literal IP addresses, local hostnames, summaries, and extras are refused. The tools use the remote provider, not your computer's browser, local network, or signed-in accounts. Direct PDF and image URLs are not supported by this HTML reader.
+Search returns up to 10 sources. Page reads accept 1 to 3 public HTTP or HTTPS URLs per call, with 20,000 characters per page by default and a 50,000 maximum. Bud refuses URL credentials, private literal IP addresses, and local hostnames. Exa owns fetching, redirects, DNS resolution, and extraction. These are remote public-source tools, not your browser, local network, or signed-in accounts.
 
-Large results use the existing stored-result readers and read-only Code Mode. Web content remains untrusted data. The guidance tells bud to keep private account details out of queries unless you explicitly request sharing them. This guidance is not a complete defense against prompt injection. Composio usage is separate from the model costs shown by `bud costs` and is not covered by its model-dollar brake.
+Large results use the existing stored-result readers and read-only Code Mode. Web content remains untrusted data. The guidance tells bud to keep private account details out of queries unless you explicitly request sharing them. This guidance is not a complete defense against prompt injection. Authenticated Exa usage is separate from the model costs shown by `bud costs` and is not covered by its model-dollar brake.
 
 `--simulate` keeps the fictional inbox and calendar. It does not add public web access.
 

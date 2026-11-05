@@ -18,6 +18,7 @@ from dbos import DBOS
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from pydantic_ai.toolsets import CombinedToolset
 
 from bud.config import get_settings
 from bud.core.events import Event
@@ -29,6 +30,9 @@ from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
 from bud.harness.memory import build_memory
+from bud.web import GUIDANCE as WEB_GUIDANCE
+from bud.web import READ_TOOLS as WEB_READ_TOOLS
+from bud.web import build_tools as build_web_tools
 from bud.world.store import World
 from bud.world.tools import READ_TOOLS as WORLD_READ_TOOLS
 from bud.world.tools import build_tools
@@ -69,10 +73,10 @@ def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAP
     settings = get_settings()
     if not simulate:
         from bud.composio.connection import Connections
-        from bud.composio.tools import PROFILE, READ_TOOLS, WEB_GUIDANCE, build_toolset, policy
+        from bud.composio.tools import PROFILE, READ_TOOLS, build_toolset, policy
 
         connections = Connections(settings)
-        accounts = connections.active_accounts()
+        accounts = connections.active_accounts() if settings.composio_api_key else {}
         # Reconnecting a different account must not resume the old account's approvals.
         scope = sha256(repr(sorted(accounts.items())).encode()).hexdigest()[:16]
         session_dir = connections.folder / "sessions" / scope
@@ -81,15 +85,19 @@ def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAP
         gateway = build_gateway(
             settings, providers={"openai-chatgpt", "openai", "meta"}, model_id=model_id
         )
+        tools_policy = policy()
+        tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS, "allow"))
         harness = Harness(
-            build_toolset(connections, accounts, session_dir),
-            policy(),
+            CombinedToolset(
+                [build_toolset(connections, accounts, session_dir), build_web_tools(settings)]
+            ),
+            tools_policy,
             gateway.registry,
             PROFILE + "\nConnected apps: " + (", ".join(sorted(accounts)) or "none") + WEB_GUIDANCE,
             memory=build_memory(session_dir / "memory.db", namespace="owner"),
             spend_path=session_dir / "spend.db",
             result_path=db_path,
-            read_tools=READ_TOOLS | {"current_time"},
+            read_tools=READ_TOOLS | WEB_READ_TOOLS | {"current_time"},
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
         )
     else:
