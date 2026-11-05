@@ -10,6 +10,12 @@ from pydantic import BaseModel
 EventType = Literal[
     "session.created",
     "user.message",
+    "message.queued",
+    "message.edited",
+    "message.cancelled",
+    "message.dispatched",
+    "queue.paused",
+    "queue.resumed",
     "run.queued",
     "run.started",
     "run.recovered",
@@ -29,9 +35,11 @@ EventType = Literal[
     "run.waiting",
     "run.completed",
     "run.failed",
+    "run.stop_requested",
+    "run.cancelled",
 ]
 
-RUN_END_EVENTS = ("run.waiting", "run.completed", "run.failed")
+RUN_END_EVENTS = ("run.waiting", "run.completed", "run.failed", "run.cancelled")
 
 
 class Event(BaseModel):

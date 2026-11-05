@@ -104,10 +104,8 @@ class Connections:
     def active_accounts(self) -> dict[str, str]:
         accounts = self.accounts()
         statuses = self._statuses(accounts)
-        missing = [name for name in TOOLKITS if statuses[name] != "ACTIVE"]
-        if missing:
-            names = ", ".join("calendar" if name == "googlecalendar" else name for name in missing)
-            raise ConnectionError(
-                f"Connect {names} first with 'bud connect <name>', then check 'bud connections'."
-            )
-        return accounts
+        return {
+            toolkit: account_id
+            for toolkit, account_id in accounts.items()
+            if statuses[toolkit] == "ACTIVE"
+        }

@@ -64,7 +64,7 @@ uv run bud chat               # terminal 2, prints a session id
 uv run bud chat <session-id>  # terminal 3, attaches to the same session
 ```
 
-`uv run bud serve` uses real accounts. Complete [Connect real accounts](#connect-real-accounts) before starting it.
+`uv run bud serve` provides public web research and tools for your active connected accounts. It needs a Composio project key and model access. Google connections are optional. See [Connect real accounts](#connect-real-accounts) to add Gmail or Calendar.
 
 Ask bud to check the inbox or move a meeting in `bud chat`. Writes wait for you to answer `/approve` or `/deny`. See what you've spent, inspect the simulated world, or restore it:
 
@@ -80,11 +80,13 @@ Run the eval suite, which spends a few cents on model calls:
 uv run bud eval
 ```
 
-The server listens on `127.0.0.1:8420` and has no authentication, so keep it on your own machine. `--simulate` is the only mode switch. The old `--backend` flag and `BACKEND` setting are no longer used. Missing credentials or connections stop real-account startup; bud never silently switches to simulation.
+The server listens on `127.0.0.1:8420` and has no authentication, so keep it on your own machine. `--simulate` is the only mode switch. The old `--backend` flag and `BACKEND` setting are no longer used. Missing model or Composio credentials stop normal startup. Bud exposes account tools only for active connections and never silently switches to simulation.
 
 ## Durable server and recovery
 
-`bud serve` uses Pydantic AI's native `DBOSDurability` integration with a local SQLite journal, `runtime.db`, beside the session database. The server saves each accepted message and its `run.queued` inputs in one transaction before launching work. Restart recovery can launch accepted work even if the process stopped before its DBOS workflow started. Each session permits one active execution and rejects new messages while work or an approval is pending.
+`bud serve` uses Pydantic AI's native `DBOSDurability` integration with a local SQLite journal, `runtime.db`, beside the session database. Each session runs one execution at a time. Messages received while bud is busy or waiting for approval enter a persistent queue in arrival order.
+
+The queue holds up to 20 waiting messages. Waiting messages do not enter the conversation until their turn starts. At dispatch, the server saves the message and its `run.queued` inputs in one transaction, using the latest completed conversation. Restart recovery preserves waiting messages and can launch a dispatched message even if its DBOS workflow had not started. A completed approval batch continues before the next queued message.
 
 DBOS records model and tool steps. During recovery, completed step receipts supply saved results and skip execution. A step without a completed receipt may execute again. This is not exactly-once delivery to Google or any other remote service. Real writes also use a persistent approval dispatch claim, described in [Connect real accounts](#connect-real-accounts).
 
@@ -96,6 +98,23 @@ Recovery refuses queued executions when their saved code version or run configur
 
 Earlier live recovery after `SIGKILL` was verified with DeepSeek and synthetic tools. Successful ChatGPT execution under DBOS and recovery of real Google writes have not been verified. The server remains local and unauthenticated. Durable execution does not add scheduling or an always-on deployment.
 
+## Queue and Stop controls
+
+Use these commands in `bud chat`:
+
+| Command                     | Result                                                                          |
+| --------------------------- | ------------------------------------------------------------------------------- |
+| `/status`                   | Show the current state, queued message IDs, approvals, and recent runs.         |
+| `/pause`                    | Hold waiting messages. The current run continues.                               |
+| `/resume`                   | Allow queued messages to run. This does not restart a stopped run.              |
+| `/edit <message-id> <text>` | Replace a message that is still waiting.                                        |
+| `/cancel <message-id>`      | Remove a message that is still waiting.                                         |
+| `/stop`                     | Pause the queue, close pending approvals, and request Stop for the current run. |
+
+Stop prevents new tool permissions. A tool authorized before Stop may still finish, even if its network request starts later. Stop does not undo an action. The state remains `stopping` until the execution exits. If an approved tool has no recorded result, the run becomes `needs_review` and the queue stays paused. Check the external result before retrying the action. After a failed run, the queue also pauses instead of starting all remaining messages.
+
+Session snapshots include `status`, `queue_paused`, `queued_messages`, and `recent_runs`. HTTP clients can edit or cancel `/sessions/{id}/queue/{message_id}`, post to `/sessions/{id}/queue/pause` or `/sessions/{id}/queue/resume`, and post to `/sessions/{id}/stop`. Stop returns HTTP 202. Message submissions return HTTP 429 when the waiting queue is full. Supply a stable `message_id` to deduplicate delivery retries. New IDs accept 1 to 128 ASCII letters, digits, hyphens, or underscores. Omit the ID to generate one.
+
 ## Spend and execution limits
 
 The server uses a spend brake of **$0.50 per run** and **$5 per UTC day**, shared across sessions in the same account or simulated-world spend database. Spend counters persist across restarts. Each execution has a limit of **25 model requests** and **20 tool calls**. An approval continuation is a new execution with fresh per-run limits. The runner offsets the saved conversation's cumulative usage to enforce these request and tool limits per execution, not across the whole conversation. Recovery of the same execution keeps its run ID.
@@ -103,6 +122,22 @@ The server uses a spend brake of **$0.50 per run** and **$5 per UTC day**, share
 The spend brake checks recorded usage before the next model request. A request that crosses the dollar limit can finish and take spend above the threshold. Provider usage that bud never receives remains unknown, not proof of zero cost. These are metered API spend limits, not a guaranteed provider bill ceiling. ChatGPT subscription responses add no API dollars, but request and tool limits still apply.
 
 The spend counters are separate from the request ledger shown by `bud costs`. Gateway-only `bud ask` does not use these runner limits. Eval attempts use temporary spend stores, not the server's persistent daily counter.
+
+## Public web research
+
+In normal `bud serve` mode, ask for research with sources, for example:
+
+```text
+Find the official Pydantic AI documentation for human tool approval. Read it and explain how denial works. Include source links.
+```
+
+Bud uses Composio's public web search and HTML page-reading tools. They need the existing `COMPOSIO_API_KEY`, not another search-provider key or a connected Google account. Search results are leads. Bud can read source pages, cite their returned URLs, and disclose cached or unavailable content. The provider can return cached pages, so a successful read does not prove that the page is current.
+
+Page reads accept 1 to 3 public HTTP or HTTPS URLs per call. They extract 20,000 characters per page by default, with a maximum of 50,000. URL credentials, private literal IP addresses, local hostnames, summaries, and extras are refused. The tools use the remote provider, not your computer's browser, local network, or signed-in accounts. Direct PDF and image URLs are not supported by this HTML reader.
+
+Large results use the existing stored-result readers and read-only Code Mode. Web content remains untrusted data. The guidance tells bud to keep private account details out of queries unless you explicitly request sharing them. This guidance is not a complete defense against prompt injection. Composio usage is separate from the model costs shown by `bud costs` and is not covered by its model-dollar brake.
+
+`--simulate` keeps the fictional inbox and calendar. It does not add public web access.
 
 ## Connect real accounts
 
@@ -126,10 +161,10 @@ The connect commands do not wait or poll. `bud connections` reads only connectio
 
 Composio manages the hosted OAuth sign-in flow, so you do not need your own Google Cloud console setup. Managed OAuth availability depends on your Composio project. These commands are the current developer setup; in-chat connection links are not implemented yet.
 
-3. After both connections are active, start real-account mode and open a chat in another terminal:
+3. Start normal mode and open a chat in another terminal. Only active connections add account tools. Public web research works without either Google connection:
 
 ```sh
-uv run bud serve  # terminal 1, real accounts
+uv run bud serve  # terminal 1, public web and connected accounts
 uv run bud chat   # terminal 2
 ```
 

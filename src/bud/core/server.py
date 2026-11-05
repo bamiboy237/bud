@@ -17,14 +17,14 @@ from uuid import uuid4
 from dbos import DBOS
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from bud.config import get_settings
 from bud.core.events import Event
 from bud.core.hub import Hub
-from bud.core.log import EventLog
+from bud.core.log import EventLog, QueueFull
 from bud.core.projection import Snapshot, snapshot
-from bud.core.runner import AwaitingApproval, RunInProgress, Runner, UnknownApproval
+from bud.core.runner import Runner, UnknownApproval
 from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
@@ -37,8 +37,14 @@ logger = logging.getLogger(__name__)
 
 
 class NewMessage(BaseModel):
-    text: str
-    message_id: str | None = None
+    text: str = Field(min_length=1, max_length=100_000)
+    message_id: str | None = Field(
+        default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"
+    )
+
+
+class EditMessage(BaseModel):
+    text: str = Field(min_length=1, max_length=100_000)
 
 
 class Decision(BaseModel):
@@ -63,7 +69,7 @@ def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAP
     settings = get_settings()
     if not simulate:
         from bud.composio.connection import Connections
-        from bud.composio.tools import PROFILE, READ_TOOLS, build_toolset, policy
+        from bud.composio.tools import PROFILE, READ_TOOLS, WEB_GUIDANCE, build_toolset, policy
 
         connections = Connections(settings)
         accounts = connections.active_accounts()
@@ -79,7 +85,7 @@ def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAP
             build_toolset(connections, accounts, session_dir),
             policy(),
             gateway.registry,
-            PROFILE,
+            PROFILE + "\nConnected apps: " + (", ".join(sorted(accounts)) or "none") + WEB_GUIDANCE,
             memory=build_memory(session_dir / "memory.db", namespace="owner"),
             spend_path=session_dir / "spend.db",
             result_path=db_path,
@@ -134,7 +140,7 @@ def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAP
                 }
             )
             DBOS.launch()
-            runner.recover()
+            await runner.recover()
             cleanup = asyncio.create_task(cleanup_results())
             yield
         finally:
@@ -168,11 +174,40 @@ def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAP
         require_session(session_id)
         try:
             event = runner.start(session_id, message.text, message.message_id or uuid4().hex)
-        except RunInProgress:
-            raise HTTPException(409, "a run is already active") from None
-        except AwaitingApproval:
-            raise HTTPException(409, "an approval is pending") from None
+        except QueueFull as exc:
+            raise HTTPException(429, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
         return {"duplicate": event is None}
+
+    @app.patch("/sessions/{session_id}/queue/{message_id}")
+    async def edit_queued_message(session_id: str, message_id: str, message: EditMessage) -> dict:
+        require_session(session_id)
+        try:
+            runner.edit_message(session_id, message_id, message.text)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return {"edited": True}
+
+    @app.delete("/sessions/{session_id}/queue/{message_id}")
+    async def cancel_queued_message(session_id: str, message_id: str) -> dict:
+        require_session(session_id)
+        return {"cancelled": runner.cancel_message(session_id, message_id)}
+
+    @app.post("/sessions/{session_id}/queue/pause")
+    async def pause_queue(session_id: str) -> dict:
+        require_session(session_id)
+        return {"changed": runner.pause_queue(session_id, True), "queue_paused": True}
+
+    @app.post("/sessions/{session_id}/queue/resume")
+    async def resume_queue(session_id: str) -> dict:
+        require_session(session_id)
+        return {"changed": runner.pause_queue(session_id, False), "queue_paused": False}
+
+    @app.post("/sessions/{session_id}/stop", status_code=202)
+    async def stop_session(session_id: str) -> dict:
+        require_session(session_id)
+        return await runner.stop_session(session_id)
 
     @app.post("/sessions/{session_id}/approvals/{approval_id}")
     async def decide(session_id: str, approval_id: str, decision: Decision) -> dict[str, bool]:

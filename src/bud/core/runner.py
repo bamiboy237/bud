@@ -31,7 +31,16 @@ from pydantic_ai.messages import (
 
 from bud.core.events import Event
 from bud.core.hub import Hub
-from bud.core.projection import decisions, model_history, undecided_approvals, waiting_batch
+from bud.core.log import StopRequested
+from bud.core.projection import (
+    decisions,
+    model_history,
+    queue_paused,
+    queued_messages,
+    runs,
+    undecided_approvals,
+    waiting_batch,
+)
 from bud.core.runtime import replay_version
 from bud.gateway import Gateway
 from bud.gateway.errors import error_summary
@@ -41,14 +50,6 @@ from bud.harness.agent import RUN_LIMITS, Harness
 from bud.harness.context import BackgroundCompaction
 
 RESULTS = TypeAdapter(DeferredToolResults)
-
-
-class RunInProgress(Exception):
-    pass
-
-
-class AwaitingApproval(Exception):
-    pass
 
 
 class UnknownApproval(Exception):
@@ -77,6 +78,9 @@ class Runner(DBOSConfiguredInstance):
         self.durable = durable
         self.tasks: dict[str, asyncio.Task] = {}
         self._monitors: set[asyncio.Task] = set()
+        self._executing: dict[str, asyncio.Task] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._closing = False
         self._current: ContextVar[dict] = ContextVar("bud_run")
         self.version = replay_version()
         self.fingerprint = sha256(
@@ -112,25 +116,36 @@ class Runner(DBOSConfiguredInstance):
             durability=durability,
         )
 
-    def recover(self) -> None:
+    async def recover(self) -> None:
+        self._loop = asyncio.get_running_loop()
         pending = self.hub.log.pending_runs()
         known = {run["run_id"] for run in pending}
         # Old runs have no immutable inputs or journal and cannot be replayed safely.
         for session_id, run_id in self.hub.log.unfinished_runs():
             if run_id not in known:
-                self.hub.publish(
+                self.hub.log.finish_run(
                     session_id,
+                    run_id,
                     "run.failed",
                     {
                         "run_id": run_id,
                         "reason": "interrupted before durable execution was enabled",
                     },
+                    [],
                 )
         for run in pending:
+            if self.hub.log.stop_requested(run["run_id"]):
+                if self.durable:
+                    await DBOS.cancel_workflow_async(run["run_id"])
+                if run["run_id"] not in self._executing:
+                    self.hub.log.acknowledge_stop(run["session_id"], run["run_id"])
+                continue
             self.hub.publish(run["session_id"], "run.recovered", {"run_id": run["run_id"]})
             self._launch(run, recovering=True)
-        for session_id in self.hub.log.sessions_with_decisions():
-            self._resume_if_ready(session_id)
+        for session_id in set(
+            self.hub.log.sessions_with_decisions() + self.hub.log.queue_sessions()
+        ):
+            self._drain(session_id)
 
     def _inputs(
         self, session_id: str, text: str | None, results: DeferredToolResults | None = None
@@ -140,7 +155,7 @@ class Runner(DBOSConfiguredInstance):
             (
                 event.data.get("conversation")
                 for event in reversed(events)
-                if event.type in ("run.waiting", "run.completed", "run.failed")
+                if event.type in ("run.waiting", "run.completed", "run.failed", "run.cancelled")
             ),
             None,
         )
@@ -159,25 +174,72 @@ class Runner(DBOSConfiguredInstance):
         }
 
     def start(self, session_id: str, text: str, message_id: str) -> Event | None:
-        if self._busy(session_id):
-            raise RunInProgress(session_id)
-        if undecided_approvals(self.hub.log.read(session_id)):
-            raise AwaitingApproval(session_id)
-        run = self._inputs(session_id, text)
-        event = self.hub.log.enqueue_message(
-            session_id, {"text": text, "message_id": message_id}, run
-        )
+        self._loop = asyncio.get_running_loop()
+        self._validate_text(text)
+        event = self.hub.log.accept_message(session_id, text, message_id)
         if event is not None:
             self.hub.wake(session_id)
-            self._launch(run)
+        self._drain(session_id)
         return event
+
+    @staticmethod
+    def _validate_text(text: str) -> None:
+        if not text.strip() or len(text) > 100_000:
+            raise ValueError("Message must contain text and be at most 100,000 characters")
+
+    def edit_message(self, session_id: str, message_id: str, text: str) -> None:
+        self._validate_text(text)
+        self.hub.log.edit_message(session_id, message_id, text)
+        self.hub.wake(session_id)
+
+    def cancel_message(self, session_id: str, message_id: str) -> bool:
+        changed = self.hub.log.cancel_message(session_id, message_id)
+        self.hub.wake(session_id)
+        return changed
+
+    def pause_queue(self, session_id: str, paused: bool) -> bool:
+        changed = self.hub.log.set_queue_paused(session_id, paused)
+        self.hub.wake(session_id)
+        if not paused:
+            self._drain(session_id)
+        return changed
+
+    def _drain(self, session_id: str) -> None:
+        if self._closing or self._busy(session_id):
+            return
+        events = self.hub.log.read(session_id)
+        if waiting_batch(events):
+            self._resume_if_ready(session_id)
+            return
+        pending = queued_messages(events)
+        if queue_paused(events) or not pending:
+            return
+        run = self._inputs(session_id, pending[0].text)
+        run["message_id"] = pending[0].message_id
+        if self.hub.log.dispatch_message(session_id, pending[0].message_id, run):
+            self.hub.wake(session_id)
+            self._launch(run)
+
+    async def stop_session(self, session_id: str) -> dict:
+        request = self.hub.log.request_stop(session_id)
+        self.hub.wake(session_id)
+        await self.context.discard(session_id)
+        if request is not None:
+            run_id = request["run_id"]
+            if self.durable:
+                await DBOS.cancel_workflow_async(run_id)
+            elif session_id in self.tasks:
+                self.tasks[session_id].cancel()
+            if run_id not in self._executing:
+                self.hub.log.acknowledge_stop(session_id, run_id)
+            self.hub.wake(session_id)
+        return {"stop_requested": request is not None, "queue_paused": True}
 
     def decide(self, session_id: str, approval_id: str, approved: bool) -> bool:
         events = self.hub.log.read(session_id)
-        if not any(
-            event.type == "approval.requested" and event.data["approval_id"] == approval_id
-            for event in events
-        ):
+        if approval_id in decisions(events):
+            return False
+        if not any(request["approval_id"] == approval_id for request in waiting_batch(events)):
             raise UnknownApproval(approval_id)
         event_type = "approval.granted" if approved else "approval.denied"
         event = self.hub.publish_once(session_id, event_type, {"approval_id": approval_id})
@@ -218,6 +280,8 @@ class Runner(DBOSConfiguredInstance):
         task.add_done_callback(lambda done: self._finished(session_id, run["run_id"], done))
 
     def _handle(self, run: dict, recovering: bool):
+        if self.hub.log.stop_requested(run["run_id"]):
+            raise StopRequested("Stopped before workflow launch")
         status = DBOS.get_workflow_status(run["run_id"]) if recovering else None
         if (
             run.get("version") != self.version
@@ -240,46 +304,44 @@ class Runner(DBOSConfiguredInstance):
         await handle.get_result()
 
     def _busy(self, session_id: str) -> bool:
-        if session_id not in self.tasks:
-            return False
-        last = next(
-            (
-                event
-                for event in reversed(self.hub.log.read(session_id))
-                if event.type
-                in ("run.queued", "run.started", "run.waiting", "run.completed", "run.failed")
-            ),
-            None,
-        )
-        if last is not None and last.type in ("run.waiting", "run.completed", "run.failed"):
-            self.tasks.pop(session_id)
-            return False
-        return True
+        states = runs(self.hub.log.read(session_id))
+        return bool(states and states[-1].status in ("queued", "running", "stopping"))
 
     def _finished(self, session_id: str, run_id: str, task: asyncio.Task) -> None:
         self._monitors.discard(task)
         if self.tasks.get(session_id) is task:
             self.tasks.pop(session_id)
-        if not task.cancelled() and task.exception() is not None:
-            self.hub.publish_once(
+        error = None if task.cancelled() else task.exception()
+        stopped = self.hub.log.stop_requested(run_id)
+        if stopped:
+            if run_id not in self._executing:
+                self.hub.log.acknowledge_stop(session_id, run_id)
+                self.hub.wake(session_id)
+        elif error is not None:
+            self.hub.log.finish_run(
                 session_id,
+                run_id,
                 "run.failed",
                 {
                     "run_id": run_id,
-                    "reason": str(task.exception())
-                    if isinstance(task.exception(), RecoveryRefused)
-                    else error_summary(task.exception()),
+                    "reason": str(error)
+                    if isinstance(error, RecoveryRefused)
+                    else error_summary(error),
                 },
-                key=f"{run_id}:terminal",
+                [],
             )
+            self.hub.wake(session_id)
         if not task.cancelled():
-            self._resume_if_ready(session_id)
+            self._drain(session_id)
 
     async def stop(self) -> None:
-        tasks = list(self._monitors)
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        self._closing = True
+        if not self.durable:
+            for task in self._monitors:
+                task.cancel()
+        # Keep ownership until launch submissions and actual executions have exited.
+        await asyncio.gather(*self._monitors, return_exceptions=True)
+        await asyncio.gather(*self._executing.values(), return_exceptions=True)
         await self.context.close()
 
     @DBOS.workflow(name="bud.run", max_recovery_attempts=5)
@@ -296,7 +358,10 @@ class Runner(DBOSConfiguredInstance):
     async def _execute(self, run: dict) -> None:
         token = self._current.set(run)
         session_token = request_session.set(run["session_id"])
+        self._executing[run["run_id"]] = asyncio.current_task()
         try:
+            if self.hub.log.stop_requested(run["run_id"]):
+                return
             if run["config"] != self.fingerprint or run.get("version") != self.version:
                 self._finish(
                     run,
@@ -367,14 +432,17 @@ class Runner(DBOSConfiguredInstance):
                 approvals,
             )
         except asyncio.CancelledError:
-            if not self.durable:
-                self.hub.publish(
-                    run["session_id"],
+            if not self.durable and not self.hub.log.stop_requested(run["run_id"]):
+                self._finish(
+                    run,
                     "run.failed",
                     {"run_id": run["run_id"], "reason": "cancelled"},
+                    [],
                 )
             raise
         except Exception as exc:
+            if self.hub.log.stop_requested(run["run_id"]):
+                return
             await self._step(
                 "bud.failed",
                 self._finish,
@@ -384,6 +452,12 @@ class Runner(DBOSConfiguredInstance):
                 [],
             )
         finally:
+            if self.hub.log.stop_requested(run["run_id"]):
+                self.hub.log.acknowledge_stop(run["session_id"], run["run_id"])
+                self.hub.wake(run["session_id"])
+                if self._loop is not None and not self._loop.is_closed():
+                    self._loop.call_soon_threadsafe(self._drain, run["session_id"])
+            self._executing.pop(run["run_id"], None)
             request_session.reset(session_token)
             self._current.reset(token)
 
@@ -400,12 +474,7 @@ class Runner(DBOSConfiguredInstance):
         )
 
     def _finish(self, run: dict, type: str, data: dict, approvals: list[dict]) -> None:
-        entries = [
-            ("approval.requested", request, f"{run['run_id']}:approval:{request['call_id']}")
-            for request in approvals
-        ]
-        entries.append((type, data, f"{run['run_id']}:terminal"))
-        self.hub.log.append_batch_once(run["session_id"], entries)
+        self.hub.log.finish_run(run["session_id"], run["run_id"], type, data, approvals)
         self.hub.wake(run["session_id"])
 
     def _record_context(self, event: dict) -> None:
@@ -419,12 +488,8 @@ class Runner(DBOSConfiguredInstance):
 
     def _record_decision(self, decision: dict) -> None:
         run = self._current.get()
-        self.hub.publish_once(
-            run["session_id"],
-            "action.decided",
-            {"run_id": run["run_id"], **decision},
-            key=f"{run['run_id']}:decision:{decision['call_id']}",
-        )
+        self.hub.log.record_action(run["session_id"], run["run_id"], decision)
+        self.hub.wake(run["session_id"])
 
     async def _stream(self, ctx: RunContext, events: AsyncIterable) -> None:
         run = self._current.get()

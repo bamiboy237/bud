@@ -148,7 +148,7 @@ class BackgroundCompaction(AbstractCapability[None]):
                     else "history_changed",
                 }
             )
-            await self._discard(session_id)
+            await self.discard(session_id)
             prepared = None
 
         if not exceeds(
@@ -227,7 +227,7 @@ class BackgroundCompaction(AbstractCapability[None]):
         self, ctx: RunContext[None], request: ModelRequestContext, signature: str
     ) -> None:
         while len(self._prepared) >= self.max_preparations:
-            await self._discard(next(iter(self._prepared)))
+            await self.discard(next(iter(self._prepared)))
         snapshot = ModelMessagesTypeAdapter.validate_json(
             ModelMessagesTypeAdapter.dump_json(request.messages)
         )
@@ -310,7 +310,7 @@ class BackgroundCompaction(AbstractCapability[None]):
         finally:
             request_session.reset(token)
 
-    async def _discard(self, session_id: str) -> None:
+    async def discard(self, session_id: str) -> None:
         preparation = self._prepared.pop(session_id, None)
         if preparation is not None:
             preparation.task.cancel()
@@ -319,8 +319,8 @@ class BackgroundCompaction(AbstractCapability[None]):
     async def _prune(self) -> None:
         for session_id, preparation in list(self._prepared.items()):
             if monotonic() - preparation.created > self.max_age_seconds:
-                await self._discard(session_id)
+                await self.discard(session_id)
 
     async def close(self) -> None:
         for session_id in list(self._prepared):
-            await self._discard(session_id)
+            await self.discard(session_id)

@@ -141,13 +141,16 @@ class SqliteResultStore:
                     SELECT session_id, type,
                         ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY seq DESC) AS rank
                     FROM events WHERE type IN (
-                        'run.queued', 'run.started', 'run.waiting', 'run.completed', 'run.failed'
+                        'run.queued', 'run.started', 'run.waiting', 'run.completed', 'run.failed',
+                        'run.stop_requested', 'run.cancelled'
                     )
                 )
                 DELETE FROM tool_results WHERE last_used < ? AND NOT EXISTS (
                     SELECT 1 FROM latest WHERE latest.session_id = tool_results.session_id
                     AND latest.rank = 1
-                    AND latest.type IN ('run.queued', 'run.started', 'run.waiting')
+                    AND latest.type IN (
+                        'run.queued', 'run.started', 'run.waiting', 'run.stop_requested'
+                    )
                 ) RETURNING handle""",
                 (time.time() - self.retention.total_seconds(),),
             ).fetchall()

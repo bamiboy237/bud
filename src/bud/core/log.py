@@ -8,6 +8,16 @@ from typing import Any
 from uuid import uuid4
 
 from bud.core.events import RUN_END_EVENTS, Event, EventType
+from bud.core.projection import queue_paused, queued_messages, runs, undecided_approvals
+
+
+class QueueFull(Exception):
+    pass
+
+
+class StopRequested(Exception):
+    pass
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -60,25 +70,6 @@ class EventLog:
         with self._connect() as db:
             return self._insert(db, session_id, type, data or {}, once=True, key=key)
 
-    def append_batch_once(
-        self,
-        session_id: str,
-        entries: list[tuple[EventType, dict[str, Any], str]],
-    ) -> None:
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            for type, data, key in entries:
-                self._insert(db, session_id, type, data, once=True, key=key)
-
-    def enqueue_message(self, session_id: str, message: dict, run: dict) -> Event | None:
-        """An accepted message and its recoverable inputs commit together."""
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            event = self._insert(db, session_id, "user.message", message, once=True)
-            if event is not None:
-                self._insert(db, session_id, "run.queued", run, key=f"{run['run_id']}:queued")
-            return event
-
     @staticmethod
     def _insert(
         db: sqlite3.Connection,
@@ -114,11 +105,15 @@ class EventLog:
 
     def read(self, session_id: str, after: int = 0) -> list[Event]:
         with self._connect() as db:
-            rows = db.execute(
-                "SELECT id, session_id, seq, type, data, created_at FROM events "
-                "WHERE session_id = ? AND seq > ? ORDER BY seq",
-                (session_id, after),
-            ).fetchall()
+            return self._read(db, session_id, after)
+
+    @staticmethod
+    def _read(db: sqlite3.Connection, session_id: str, after: int = 0) -> list[Event]:
+        rows = db.execute(
+            "SELECT id, session_id, seq, type, data, created_at FROM events "
+            "WHERE session_id = ? AND seq > ? ORDER BY seq",
+            (session_id, after),
+        ).fetchall()
         return [
             Event(
                 id=row[0],
@@ -140,6 +135,207 @@ class EventLog:
                 is not None
             )
 
+    def accept_message(self, session_id: str, text: str, message_id: str) -> Event | None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute(
+                """SELECT 1 FROM events WHERE session_id = ?
+                   AND type IN ('message.queued', 'user.message')
+                   AND json_extract(data, '$.message_id') = ?""",
+                (session_id, message_id),
+            ).fetchone():
+                return None
+            if len(queued_messages(self._read(db, session_id))) >= 20:
+                raise QueueFull("This conversation already has 20 waiting messages")
+            return self._insert(
+                db, session_id, "message.queued", {"message_id": message_id, "text": text}
+            )
+
+    def edit_message(self, session_id: str, message_id: str, text: str) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not any(
+                m.message_id == message_id for m in queued_messages(self._read(db, session_id))
+            ):
+                raise ValueError("Message is no longer queued")
+            self._insert(db, session_id, "message.edited", {"message_id": message_id, "text": text})
+
+    def cancel_message(self, session_id: str, message_id: str) -> bool:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not any(
+                m.message_id == message_id for m in queued_messages(self._read(db, session_id))
+            ):
+                return False
+            self._insert(db, session_id, "message.cancelled", {"message_id": message_id})
+            return True
+
+    def set_queue_paused(self, session_id: str, paused: bool) -> bool:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if queue_paused(self._read(db, session_id)) == paused:
+                return False
+            self._insert(db, session_id, "queue.paused" if paused else "queue.resumed", {})
+            return True
+
+    def dispatch_message(self, session_id: str, message_id: str, run: dict) -> bool:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            events = self._read(db, session_id)
+            pending = queued_messages(events)
+            states = runs(events)
+            if (
+                queue_paused(events)
+                or not pending
+                or pending[0].message_id != message_id
+                or (
+                    states
+                    and states[-1].status in ("queued", "running", "stopping", "awaiting_approval")
+                )
+            ):
+                return False
+            item = pending[0]
+            self._insert(db, session_id, "user.message", item.model_dump(), once=True)
+            self._insert(
+                db,
+                session_id,
+                "message.dispatched",
+                {"message_id": message_id, "run_id": run["run_id"]},
+            )
+            self._insert(db, session_id, "run.queued", run, key=f"{run['run_id']}:queued")
+            return True
+
+    def queue_sessions(self) -> list[str]:
+        with self._connect() as db:
+            return [
+                row[0]
+                for row in db.execute(
+                    "SELECT DISTINCT session_id FROM events WHERE type = 'message.queued'"
+                )
+            ]
+
+    def stop_requested(self, run_id: str) -> bool:
+        with self._connect() as db:
+            return self._stopped(db, run_id)
+
+    @staticmethod
+    def _stopped(db: sqlite3.Connection, run_id: str) -> bool:
+        return (
+            db.execute("SELECT 1 FROM events WHERE event_key = ?", (f"{run_id}:stop",)).fetchone()
+            is not None
+        )
+
+    def request_stop(self, session_id: str) -> dict | None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            events = self._read(db, session_id)
+            if not queue_paused(events):
+                self._insert(db, session_id, "queue.paused", {})
+            states = runs(events)
+            if not states or states[-1].status not in (
+                "queued",
+                "running",
+                "awaiting_approval",
+                "stopping",
+            ):
+                return None
+            current = states[-1]
+            data = {"run_id": current.run_id, "reason": "Stopped by the user."}
+            self._insert(
+                db, session_id, "run.stop_requested", data, once=True, key=f"{current.run_id}:stop"
+            )
+            for request in undecided_approvals(events):
+                self._insert(
+                    db,
+                    session_id,
+                    "approval.denied",
+                    {"approval_id": request["approval_id"], "reason": "Stopped by the user."},
+                    once=True,
+                )
+            if current.status == "awaiting_approval":
+                self._ack_stop(db, session_id, current.run_id)
+            return data
+
+    def acknowledge_stop(self, session_id: str, run_id: str) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if self._stopped(db, run_id):
+                self._ack_stop(db, session_id, run_id)
+
+    def _ack_stop(self, db: sqlite3.Connection, session_id: str, run_id: str) -> None:
+        events = self._read(db, session_id)
+        returned = {
+            e.data["call_id"]
+            for e in events
+            if e.type == "tool.result" and e.data["run_id"] == run_id
+        }
+        uncertain = [
+            e.data["tool"]
+            for e in events
+            if e.type == "action.decided"
+            and e.data["run_id"] == run_id
+            and e.data["outcome"] == "approved"
+            and e.data["call_id"] not in returned
+        ]
+        cancelled = self._insert(
+            db,
+            session_id,
+            "run.cancelled",
+            {
+                "run_id": run_id,
+                "reason": (
+                    f"Stopped. Check the outcome of {', '.join(uncertain)} before retrying."
+                    if uncertain
+                    else "Stopped by the user."
+                ),
+                "uncertain_tools": uncertain,
+            },
+            once=True,
+            key=f"{run_id}:stopped",
+        )
+        if cancelled is not None and uncertain and not queue_paused(self._read(db, session_id)):
+            self._insert(db, session_id, "queue.paused", {})
+
+    def record_action(self, session_id: str, run_id: str, decision: dict) -> None:
+        # Permission and Stop serialize on the same database transaction.
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if self._stopped(db, run_id):
+                raise StopRequested("This run was stopped before another tool received permission")
+            self._insert(
+                db,
+                session_id,
+                "action.decided",
+                {"run_id": run_id, **decision},
+                once=True,
+                key=f"{run_id}:decision:{decision['call_id']}",
+            )
+
+    def finish_run(
+        self, session_id: str, run_id: str, kind: EventType, data: dict, approvals: list[dict]
+    ) -> None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if self._stopped(db, run_id):
+                self._ack_stop(db, session_id, run_id)
+                return
+            for request in approvals:
+                self._insert(
+                    db,
+                    session_id,
+                    "approval.requested",
+                    request,
+                    once=True,
+                    key=f"{run_id}:approval:{request['call_id']}",
+                )
+            terminal = self._insert(db, session_id, kind, data, once=True, key=f"{run_id}:terminal")
+            if (
+                terminal is not None
+                and kind == "run.failed"
+                and not queue_paused(self._read(db, session_id))
+            ):
+                self._insert(db, session_id, "queue.paused", {})
+
     def sessions_with_decisions(self) -> list[str]:
         with self._connect() as db:
             rows = db.execute(
@@ -155,7 +351,9 @@ class EventLog:
                 WHERE queued.type = 'run.queued' AND NOT EXISTS (
                     SELECT 1 FROM events AS ended
                     WHERE ended.session_id = queued.session_id
-                    AND ended.type IN ('run.waiting', 'run.completed', 'run.failed')
+                    AND ended.type IN (
+                        'run.waiting', 'run.completed', 'run.failed', 'run.cancelled'
+                    )
                     AND json_extract(ended.data, '$.run_id') = json_extract(queued.data, '$.run_id')
                 ) ORDER BY queued.created_at"""
             ).fetchall()
