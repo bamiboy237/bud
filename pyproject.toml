@@ -9,18 +9,14 @@ dependencies = [
     "composio>=0.22.0",
     "fastapi>=0.162.0",
     "httpx>=0.28.1",
+    "photonhq-api>=0.6.0,<0.7",
     "pydantic>=2.14.1",
     "pydantic-ai-harness>=0.61.0",
     "pydantic-ai-slim[dbos,mcp,openai]>=2.61.0",
     "pydantic-monty>=1.0.0,<2",
     "pydantic-settings>=2.16.1",
-    "uvicorn>=0.54.0",
-]
-
-[project.optional-dependencies]
-photon = [
-    "photonhq-api>=0.6.0,<0.7",
     "python-socketio[asyncio-client]>=5.14,<6",
+    "uvicorn>=0.54.0",
 ]
 
 [project.scripts]

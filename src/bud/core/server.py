@@ -8,7 +8,7 @@ import fcntl
 import hashlib
 import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 from typing import Annotated, TextIO
@@ -32,6 +32,7 @@ from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
 from bud.harness.memory import build_memory
+from bud.photon_config import PhotonConfig
 from bud.web import GUIDANCE as WEB_GUIDANCE
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
 from bud.web import build_tools as build_web_tools
@@ -117,6 +118,24 @@ def _create_app(
     model_id: str | None,
 ) -> FastAPI:
     connections = None
+    photon = None
+    if not simulate and any(
+        (
+            settings.photon_api_key,
+            settings.photon_project_id,
+            settings.photon_owner_handle,
+            settings.photon_agent_handle,
+        )
+    ):
+        # Partial/invalid configuration fails before account construction/recovery.
+        photon = PhotonConfig.load(settings)
+    messaging_state = {
+        "status": "disabled_in_simulation"
+        if simulate
+        else "starting"
+        if photon
+        else "not_configured"
+    }
     if not simulate:
         from bud.composio.tools import PROFILE, READ_TOOLS, build_toolset, policy
 
@@ -196,6 +215,7 @@ def _create_app(
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         lock = live_lock or hold_single_server_lock(db_path.with_suffix(".lock"))
         cleanup = None
+        services = AsyncExitStack()
         try:
             hub.bind_loop()
             DBOS(
@@ -213,15 +233,43 @@ def _create_app(
             if connections is not None and connections.restart_required():
                 raise ConnectionError("Account binding changed during startup. Restart bud.")
             await runner.recover()
+            if photon is not None:
+                from bud.photon_chat import messaging
+
+                try:
+                    await services.enter_async_context(
+                        messaging(
+                            settings,
+                            photon,
+                            app,
+                            token,
+                            {"scope": scope_id, "mode": "accounts"},
+                            messaging_events,
+                            lambda status: messaging_state.update(status=status),
+                        )
+                    )
+                except Exception:
+                    # Keep authenticated status/Stop available, but never advertise
+                    # a failed messaging connection as ready or restart uncertain sends.
+                    messaging_state["status"] = "failed"
+                    logger.error(
+                        "iMessage could not start. Inspect its configuration/state "
+                        "and restart bud. "
+                        "The authenticated core remains available; sends were not retried."
+                    )
             cleanup = asyncio.create_task(cleanup_results())
             yield
         finally:
             try:
-                if cleanup is not None:
-                    cleanup.cancel()
-                    await asyncio.gather(cleanup, return_exceptions=True)
-                await runner.stop()
-                await asyncio.to_thread(DBOS.destroy, workflow_completion_timeout_sec=5)
+                try:
+                    # Stop accepting/sending messages before stopping core work.
+                    await services.aclose()
+                finally:
+                    if cleanup is not None:
+                        cleanup.cancel()
+                        await asyncio.gather(cleanup, return_exceptions=True)
+                    await runner.stop()
+                    await asyncio.to_thread(DBOS.destroy, workflow_completion_timeout_sec=5)
             finally:
                 try:
                     gateway.close()
@@ -236,6 +284,15 @@ def _create_app(
     app = FastAPI(title="bud core", lifespan=lifespan)
     app.add_middleware(OwnerAuthentication, token=token, scope_id=scope_id)
 
+    async def messaging_events(session_id: str, after: int) -> AsyncIterator[dict]:
+        # The server-owned adapter reads this scope's hub directly. ASGITransport
+        # is used for finite commands, not an indefinitely buffered SSE response.
+        if not log.exists(session_id):
+            raise RuntimeError("Saved iMessage conversation is unavailable.")
+        async for event in hub.subscribe(session_id, after=after):
+            if event is not None:
+                yield event.model_dump(mode="json")
+
     @app.get("/runtime")
     def runtime() -> JSONResponse:
         """Authenticated transport handshake; no keys or account identifiers."""
@@ -244,6 +301,7 @@ def _create_app(
                 "mode": "simulate" if simulate else "accounts",
                 "scope": scope_id,
                 "restart_required": connections is not None and connections.restart_required(),
+                "messaging": messaging_state["status"],
             },
             headers={"Cache-Control": "no-store"},
         )

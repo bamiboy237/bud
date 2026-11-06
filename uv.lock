@@ -262,18 +262,14 @@ dependencies = [
     { name = "composio" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "photonhq-api" },
     { name = "pydantic" },
     { name = "pydantic-ai-harness" },
     { name = "pydantic-ai-slim", extra = ["dbos", "mcp", "openai"] },
     { name = "pydantic-monty" },
     { name = "pydantic-settings" },
-    { name = "uvicorn" },
-]
-
-[package.optional-dependencies]
-photon = [
-    { name = "photonhq-api" },
     { name = "python-socketio", extra = ["asyncio-client"] },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -286,16 +282,15 @@ requires-dist = [
     { name = "composio", specifier = ">=0.22.0" },
     { name = "fastapi", specifier = ">=0.162.0" },
     { name = "httpx", specifier = ">=0.28.1" },
-    { name = "photonhq-api", marker = "extra == 'photon'", specifier = ">=0.6.0,<0.7" },
+    { name = "photonhq-api", specifier = ">=0.6.0,<0.7" },
     { name = "pydantic", specifier = ">=2.14.1" },
     { name = "pydantic-ai-harness", specifier = ">=0.61.0" },
     { name = "pydantic-ai-slim", extras = ["dbos", "mcp", "openai"], specifier = ">=2.61.0" },
     { name = "pydantic-monty", specifier = ">=1.0.0,<2" },
     { name = "pydantic-settings", specifier = ">=2.16.1" },
-    { name = "python-socketio", extras = ["asyncio-client"], marker = "extra == 'photon'", specifier = ">=5.14,<6" },
+    { name = "python-socketio", extras = ["asyncio-client"], specifier = ">=5.14,<6" },
     { name = "uvicorn", specifier = ">=0.54.0" },
 ]
-provides-extras = ["photon"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "ruff", specifier = ">=0.17.2" }]

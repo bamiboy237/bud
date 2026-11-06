@@ -7,22 +7,25 @@ SQLite records transport claims/cursors; the core alone owns conversation histor
 from __future__ import annotations
 
 import asyncio
-import json
+import logging
 import os
 import stat
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 import httpx
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
+from starlette.types import ASGIApp
 
 from bud.config import Settings
-from bud.core.client import owner_client
 from bud.core.controls import approval_text, session_snapshot, submit
 from bud.core.events import MessageOrigin
 from bud.photon_config import PhotonConfig, owner_message
 from bud.photon_store import TransportError, TransportStore, digest, fingerprint
 
 API_VERSION = "2026-07-01"
+logger = logging.getLogger(__name__)
 
 
 def notification(event: dict, origin: MessageOrigin) -> str | None:
@@ -70,12 +73,14 @@ class PhotonChat:
         api,
         runtime: dict,
         *,
-        session: str | None = None,
-        session_seq: int = 0,
+        events: Callable[[str, int], AsyncIterator[dict]],
+        status: Callable[[str], None],
     ) -> None:
         self.config, self.core, self.api, self.runtime = config, core, api, runtime
-        self.session = session
-        self.session_seq = session_seq
+        self.session: str | None = None
+        self.session_seq = 0
+        self.events = events
+        self.status = status
         consumer = digest(f"{config.project}:{config.owner}:{config.agent}:{core.base_url}")
         root = settings.data_dir / "photon"
         # Check each application-owned parent rather than following a preexisting
@@ -94,6 +99,7 @@ class PhotonChat:
         self.followers: dict[str, asyncio.Task] = {}
         self.deliveries = asyncio.Queue(maxsize=128)
         self.stopping = asyncio.Event()
+        self.ready = asyncio.Event()
         self.failure: str | None = None
         self.epoch = 0
         if not self.store.get("not_before"):
@@ -101,6 +107,7 @@ class PhotonChat:
 
     def fail(self, reason: str) -> None:
         self.failure = reason
+        self.status("failed")
         self.stopping.set()
 
     def origin(self, space: str) -> MessageOrigin:
@@ -112,7 +119,7 @@ class PhotonChat:
             legacy = {route["session"] for route in routes}
             if len(legacy) > 1:
                 raise TransportError(
-                    "Choose an existing conversation explicitly; none were merged."
+                    "Multiple saved iMessage conversations need review; none were merged."
                 )
             response = await self.core.post(
                 "/sessions/primary",
@@ -146,11 +153,7 @@ class PhotonChat:
     async def ensure_session(self, route: dict) -> None:
         response = await self.core.get(f"/sessions/{route['session']}")
         if response.status_code == 404:
-            if self.session or route["ready"]:
-                raise TransportError(
-                    "The saved core conversation is unavailable; it was not replaced."
-                )
-            response = await self.core.post("/sessions", json={"session_id": route["session"]})
+            raise TransportError("The saved core conversation is unavailable; it was not replaced.")
         response.raise_for_status()
         self.store.ready(route["space"])
         if route["space"] not in self.followers:
@@ -278,32 +281,10 @@ class PhotonChat:
             route = next(item for item in self.store.routes() if item["space"] == space)
             try:
                 await self.check_scope()
-                async with self.core.stream(
-                    "GET",
-                    f"/sessions/{route['session']}/events",
-                    headers={"Last-Event-ID": str(route["core_seq"])},
-                    timeout=httpx.Timeout(10, read=None),
-                ) as response:
-                    response.raise_for_status()
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        event = json.loads(line[6:])
-                        # Re-read the latest reply route, not the parent message
-                        # captured before a burst of owner follow-ups arrived.
-                        route = next(item for item in self.store.routes() if item["space"] == space)
-                        text = notification(event, self.origin(space))
-                        if text and self.runtime["mode"] == "simulate":
-                            text = "[Simulation]\n" + text
-                        self.store.project(route, event["seq"], text)
-            except (httpx.RequestError, httpx.HTTPStatusError) as exc:
-                if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (
-                    401,
-                    404,
-                ):
-                    self.fail("Core session access changed; restart the adapter.")
-                    return
-                await asyncio.sleep(1)
+                async for event in self.events(route["session"], route["core_seq"]):
+                    route = next(item for item in self.store.routes() if item["space"] == space)
+                    text = notification(event, self.origin(space))
+                    self.store.project(route, event["seq"], text)
             except Exception:
                 self.fail("Core event projection stopped; its cursor was preserved.")
                 return
@@ -401,12 +382,16 @@ class PhotonChat:
                         "Only the configured owner direct conversation is accepted.",
                         flush=True,
                     )
+                    self.status("connected")
+                    self.ready.set()
                 except Exception:
                     self.fail("Photon subscription failed; check project access and API version.")
 
             @socket.event
             async def disconnect(*_):
                 self.epoch += 1
+                if not self.stopping.is_set():
+                    self.status("reconnecting")
 
             @socket.on("delivery")
             async def delivery(event, meta):
@@ -436,6 +421,8 @@ class PhotonChat:
                 stopped = asyncio.create_task(self.stopping.wait())
                 tasks.append(stopped)
                 await asyncio.wait((tasks[-2], stopped), return_when=asyncio.FIRST_COMPLETED)
+                if not self.stopping.is_set():
+                    self.fail("Photon stream ended. Restart bud to reconnect using saved state.")
             except TransportError as exc:
                 self.fail(str(exc))
             except Exception:
@@ -443,59 +430,84 @@ class PhotonChat:
                     "Photon connection stopped; inspect access, connectivity and saved state."
                 )
             finally:
-                await socket.disconnect()
-                for task in [*tasks, *self.followers.values()]:
-                    task.cancel()
-                await asyncio.gather(*tasks, *self.followers.values(), return_exceptions=True)
-                self.store.close()
+                try:
+                    await socket.disconnect()
+                finally:
+                    try:
+                        for task in [*tasks, *self.followers.values()]:
+                            task.cancel()
+                        await asyncio.gather(
+                            *tasks, *self.followers.values(), return_exceptions=True
+                        )
+                    finally:
+                        self.store.close()
             if self.failure:
                 raise TransportError(self.failure)
 
 
-async def chat(
-    settings: Settings, base_url: str, *, simulate: bool = False, session: str | None = None
-) -> None:
-    """Run only the explicitly selected core mode; never silently switch accounts/world."""
-    config = PhotonConfig.load(settings)
-    try:
-        import socketio  # noqa: F401
-        from photon_api import AsyncPhoton
-    except ImportError:
-        raise TransportError("Install Photon support with `uv sync --extra photon`.") from None
-    async with owner_client(base_url) as core:
-        response = await core.get("/runtime")
-        response.raise_for_status()
-        runtime = response.json()
-        if runtime["mode"] != ("simulate" if simulate else "accounts"):
-            raise TransportError(
-                "Core mode differs. Use --simulate on both commands for synthetic work."
+@asynccontextmanager
+async def messaging(
+    settings: Settings,
+    config: PhotonConfig,
+    app: ASGIApp,
+    token: SecretStr,
+    runtime: dict,
+    events: Callable[[str, int], AsyncIterator[dict]],
+    status: Callable[[str], None],
+) -> AsyncIterator[None]:
+    """One server-owned lifetime; in-process commands keep the normal auth/scope gates."""
+    from photon_api import AsyncPhoton
+
+    async with (
+        httpx.AsyncClient(
+            # Preserve the previous default adapter's consumer identity/state.
+            # ASGITransport dispatches locally; no loopback listener is needed.
+            base_url="http://127.0.0.1:8420",
+            transport=httpx.ASGITransport(app=app),
+            headers={
+                "Authorization": f"Bearer {token.get_secret_value()}",
+                "X-Bud-Scope": runtime["scope"],
+            },
+            trust_env=False,
+            follow_redirects=False,
+        ) as core,
+        httpx.AsyncClient(trust_env=False, follow_redirects=False) as http,
+        AsyncPhoton(
+            headers={"Authorization": f"Bearer {config.key.get_secret_value()}"},
+            client=http,
+            timeout=10,
+            max_attempts=1,
+        ) as api,
+    ):
+        adapter = PhotonChat(settings, config, core, api, runtime, events=events, status=status)
+        service = asyncio.create_task(adapter.run())
+        ready = asyncio.create_task(adapter.ready.wait())
+
+        def finished(task: asyncio.Task) -> None:
+            if not task.cancelled():
+                error = task.exception()
+                status("failed")
+                logger.error(
+                    "%s",
+                    str(error)
+                    if isinstance(error, TransportError)
+                    else "iMessage service stopped. Inspect state and restart bud.",
+                )
+
+        service.add_done_callback(finished)
+        try:
+            done, _ = await asyncio.wait(
+                (service, ready), timeout=30, return_when=asyncio.FIRST_COMPLETED
             )
-        if runtime["restart_required"]:
-            raise TransportError("Restart Bud after the account change before starting Photon.")
-        # Enforced by the core before routing, closing the namespace-change race
-        # between a handshake check and a subsequent HTTP operation.
-        core.headers["X-Bud-Scope"] = runtime["scope"]
-        if session:
-            snapshot = await session_snapshot(core, session)
-            # A separately chosen session is attached only after its existence
-            # has been verified under this runtime's authenticated account scope.
-            assert snapshot["session_id"] == session
-        async with (
-            httpx.AsyncClient(trust_env=False, follow_redirects=False) as http,
-            AsyncPhoton(
-                headers={"Authorization": f"Bearer {config.key.get_secret_value()}"},
-                client=http,
-                timeout=10,
-                max_attempts=1,
-            ) as api,
-        ):
-            adapter = PhotonChat(
-                settings,
-                config,
-                core,
-                api,
-                runtime,
-                session=session,
-                session_seq=snapshot["last_seq"] if session else 0,
-            )
-            await adapter.run()
+            if service in done:
+                await service
+                raise TransportError("iMessage service stopped during startup.")
+            if ready not in done:
+                raise TransportError("iMessage startup timed out; inspect state before restarting.")
+            yield
+        finally:
+            adapter.stopping.set()
+            ready.cancel()
+            service.cancel()
+            await asyncio.gather(ready, service, return_exceptions=True)
+            status("stopped")

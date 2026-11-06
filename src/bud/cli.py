@@ -20,6 +20,7 @@ from bud.gateway import Ledger, NoModelAvailable, build_gateway
 from bud.gateway.chatgpt import ChatGPTError, ChatGPTStore, login, refresh_models
 from bud.gateway.errors import error_summary
 from bud.gateway.registry import load_registry
+from bud.photon_config import PhotonSetupError
 from bud.world.store import World
 
 HOST = "127.0.0.1"
@@ -153,7 +154,9 @@ def _main(argv: list[str] | None = None) -> None:
     eval_parser = commands.add_parser("eval", help="run the task suite on the simulated world")
     eval_parser.add_argument("--trials", type=int, default=3)
     eval_parser.add_argument("--task", help="run one task by id")
-    serve_parser = commands.add_parser("serve", help="run the core server on localhost")
+    serve_parser = commands.add_parser(
+        "serve", help="run bud and its configured iMessage connection on localhost"
+    )
     serve_parser.add_argument(
         "--simulate",
         action="store_true",
@@ -164,13 +167,6 @@ def _main(argv: list[str] | None = None) -> None:
     chat_parser.add_argument("session", nargs="?", help="session id to attach to")
     chat_parser.add_argument("--new", action="store_true", help="start a separate conversation")
     chat_parser.add_argument("--url", default=DEFAULT_URL)
-    photon_parser = commands.add_parser(
-        "photon", help="talk to bud through the owner-only Photon 2.0 iMessage connection"
-    )
-    photon_parser.add_argument("--url", default=DEFAULT_URL)
-    photon_parser.add_argument("--session", help="attach to an existing core conversation")
-    photon_parser.add_argument("--simulate", action="store_true", help="require a simulated core")
-
     args = parser.parse_args(argv)
     if args.command == "ask":
         asyncio.run(ask(args.prompt, args.tier, args.model))
@@ -202,17 +198,6 @@ def _main(argv: list[str] | None = None) -> None:
         if args.new and args.session:
             parser.error("Use either a session ID or --new, not both.")
         asyncio.run(chat(args.url, args.session, new=args.new))
-    elif args.command == "photon":
-        from bud.photon_chat import chat as photon_chat
-        from bud.photon_config import PhotonSetupError
-        from bud.photon_store import TransportError
-
-        try:
-            asyncio.run(
-                photon_chat(get_settings(), args.url, simulate=args.simulate, session=args.session)
-            )
-        except (PhotonSetupError, TransportError) as exc:
-            raise SystemExit(str(exc)) from None
     else:
         parser.print_help()
 
@@ -220,7 +205,13 @@ def _main(argv: list[str] | None = None) -> None:
 def main(argv: list[str] | None = None) -> None:
     try:
         _main(argv)
-    except (ChatGPTError, NoModelAvailable, OwnerAuthError, ConnectionError) as exc:
+    except (
+        ChatGPTError,
+        NoModelAvailable,
+        OwnerAuthError,
+        ConnectionError,
+        PhotonSetupError,
+    ) as exc:
         raise SystemExit(str(exc)) from None
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 401:
