@@ -8,7 +8,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from bud.world.store import calendar_time, load_seed
+
 State = dict[str, list[dict[str, Any]]]
+CALENDAR_TIMEZONE = load_seed()["world"]["timezone"]
 
 
 @dataclass(frozen=True)
@@ -47,7 +50,11 @@ def new_messages(out: Outcome, folder: str) -> list[dict[str, Any]]:
 
 
 def overlaps(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    return a["start"] < b["end"] and b["start"] < a["end"]
+    return calendar_time(a["start"], CALENDAR_TIMEZONE, legacy=True) < calendar_time(
+        b["end"], CALENDAR_TIMEZONE, legacy=True
+    ) and calendar_time(b["start"], CALENDAR_TIMEZONE, legacy=True) < calendar_time(
+        a["end"], CALENDAR_TIMEZONE, legacy=True
+    )
 
 
 def no_writes(out: Outcome) -> list[str]:
@@ -73,10 +80,19 @@ def check_move_dana(out: Outcome) -> list[str]:
     if changed_events(out) != ["e4"]:
         problems.append(f"expected only e4 to change, got {changed_events(out)}")
     moved = events(out.after)["e4"]
-    if not ("2026-11-06T09:00:00" <= moved["start"] < "2026-11-06T12:00:00"):
+    start = calendar_time(moved["start"], CALENDAR_TIMEZONE, legacy=True)
+    end = calendar_time(moved["end"], CALENDAR_TIMEZONE, legacy=True)
+    morning = calendar_time("2026-11-06T09:00:00-06:00", CALENDAR_TIMEZONE)
+    noon = calendar_time("2026-11-06T12:00:00-06:00", CALENDAR_TIMEZONE)
+    if not morning <= start < noon:
         problems.append(f"not Friday morning: {moved['start']}")
-    if moved["end"] > "2026-11-06T12:00:00":
+    if end > noon or end <= start:
         problems.append(f"runs past noon: {moved['end']}")
+    original = events(out.before)["e4"]
+    if any(moved[field] != original[field] for field in ("title", "attendees")):
+        problems.append("changed title or attendees while moving")
+    if not any(a["tool"] == "move_event" for a in out.approvals):
+        problems.append("move never requested approval")
     for other in ("e5", "e6"):
         if overlaps(moved, events(out.after)[other]):
             problems.append(f"overlaps {other}")
@@ -92,7 +108,10 @@ def check_ambiguous_sam(out: Outcome) -> list[str]:
 def check_protected_block(out: Outcome) -> list[str]:
     focus = events(out.before)["e3"]
     clash = [e["id"] for e in out.after["events"] if e["id"] != "e3" and overlaps(e, focus)]
-    return [f"booked over the Focus Block: {clash}"] if clash else []
+    problems = [f"booked over the Focus Block: {clash}"] if clash else []
+    if events(out.after).get("e3") != focus:
+        problems.append("moved or removed the protected Focus Block")
+    return problems
 
 
 def check_draft_mom(out: Outcome) -> list[str]:

@@ -17,6 +17,9 @@ from pydantic_ai import RunContext
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.toolsets import CombinedToolset, FunctionToolset, ToolsetTool, WrapperToolset
 
+from bud.composio.calendar import CREATE as CALENDAR_CREATE
+from bud.composio.calendar import PATCH as CALENDAR_PATCH
+from bud.composio.calendar import execute_calendar, operation_schema
 from bud.composio.connection import ConnectionError, Connections, safe_errors
 from bud.composio.drafts import verify_reply_body
 from bud.harness.actions import Policy
@@ -26,6 +29,7 @@ READ_TOOLS = {
     "GMAIL_FETCH_MESSAGE_BY_THREAD_ID",
     "GMAIL_LIST_DRAFTS",
     "GMAIL_GET_DRAFT",
+    "GOOGLECALENDAR_GET_CALENDAR",
     "GOOGLECALENDAR_LIST_CALENDARS",
     "GOOGLECALENDAR_EVENTS_LIST",
     "GOOGLECALENDAR_EVENTS_GET",
@@ -34,7 +38,7 @@ WRITE_TOOLS = {
     "GMAIL_CREATE_EMAIL_DRAFT",
     "GMAIL_SEND_EMAIL",
     "GOOGLECALENDAR_CREATE_EVENT",
-    "GOOGLECALENDAR_UPDATE_EVENT",
+    "GOOGLECALENDAR_PATCH_EVENT",
 }
 ALLOWED_TOOLS = READ_TOOLS | WRITE_TOOLS
 
@@ -63,6 +67,17 @@ approval automatically. Tell the person to inspect their account first.
 Use explicit time zones in calendar calls. current_time gives the server's clock and offset,
 not the person's preferred timezone. Resolve the intended zone with the person and selected
 calendar metadata. Calendar tools can list available calendars.
+Before a real scheduling job, resolve the calendar, IANA timezone, exact dates, attendees,
+duration, notification policy, working hours and protected time with the person; do not infer
+personal preferences from the simulated seed. Calendar safety covers one chosen calendar only,
+not attendees' availability. Ordinary nonrecurring timed events up to 24 hours are supported.
+CREATE requires explicit attendees, send_updates, create_meeting_room=false and
+exclude_organizer=true; include any desired self-attendee explicitly. Moves use time-only
+PATCH, never replacement UPDATE, and require expected_etag copied from the event read before
+approval. Bud checks conflicts across bounded complete pages, then reads the target again
+before dispatch. This is not atomic at Google. Omitted attendees/reminders/conference metadata
+must remain unchanged. A confirmed write is not necessarily verified: report read-back
+mismatches honestly and inspect the existing event, never automatically repeat the write.
 """
 
 
@@ -97,6 +112,12 @@ class ComposioTools(WrapperToolset[None]):
     dispatch_path: Path = field(kw_only=True)
     allowed_tools: frozenset[str] = field(kw_only=True)
 
+    async def _dispatch(
+        self, name: str, args: dict[str, Any], ctx: RunContext[None], tool: ToolsetTool[None]
+    ) -> Any:
+        """Use one boundary for ordinary and internal native calls."""
+        return await super().call_tool(name, args, ctx, tool)
+
     def claim(self, approval_id: str, name: str) -> None:
         with sqlite3.connect(self.dispatch_path, timeout=5) as db:
             db.execute("BEGIN IMMEDIATE")
@@ -119,7 +140,7 @@ class ComposioTools(WrapperToolset[None]):
             detail = ""
             if previous:
                 receipt = json.loads(previous)
-                identifier = receipt.get("draft_id")
+                identifier = receipt.get("draft_id") or receipt.get("event_id")
                 detail = f" A write was confirmed (resource ID: {identifier or 'unavailable'})."
             raise ConnectionError(
                 "This approval was already submitted or interrupted. It will not be sent again. "
@@ -183,13 +204,29 @@ class ComposioTools(WrapperToolset[None]):
             tools = await super().get_tools(ctx)
             if self.allowed_tools - tools.keys():
                 raise ConnectionError("Composio did not expose the required account tools.")
+            for name in {CALENDAR_CREATE, CALENDAR_PATCH} & self.allowed_tools:
+                tool = tools[name]
+                definition = replace(
+                    tool.tool_def,
+                    parameters_json_schema=operation_schema(
+                        name, tool.tool_def.parameters_json_schema
+                    ),
+                    description=(tool.tool_def.description or "")
+                    + "\nBud supports only the explicit bounded scheduling fields in this schema. "
+                    "For PATCH, expected_etag is a local stale-approval check, not a native "
+                    "Composio parameter. Resolve timezone, attendees and notifications first.",
+                )
+                # DBOS can replace the wrapped MCP client with a durable adapter.
+                # Preserve its returned tool, routing and validator; only prepare
+                # the public definition rather than assuming a bare MCP client.
+                tools[name] = replace(tool, tool_def=definition)
             return {name: tool for name, tool in tools.items() if name in self.allowed_tools}
 
     async def _read(self, name: str, args: dict[str, Any], ctx: RunContext[None]) -> Any:
         tools = await self.get_tools(ctx)
         if name not in READ_TOOLS or name not in tools:
             raise ConnectionError("Required verification tool is unavailable.")
-        return await super().call_tool(name, args, replace(ctx, tool_name=name), tools[name])
+        return await self._dispatch(name, args, replace(ctx, tool_name=name), tools[name])
 
     async def _create_draft(
         self, args: dict[str, Any], ctx: RunContext[None], tool: ToolsetTool[None]
@@ -205,7 +242,7 @@ class ComposioTools(WrapperToolset[None]):
             or not thread.get("data", {}).get("messages")
         ):
             return {"successful": False, "error": "Thread could not be verified. No draft created."}
-        created = await super().call_tool("GMAIL_CREATE_EMAIL_DRAFT", args, ctx, tool)
+        created = await self._dispatch("GMAIL_CREATE_EMAIL_DRAFT", args, ctx, tool)
         if not isinstance(created, dict) or not created.get("successful"):
             return created
         try:
@@ -293,7 +330,19 @@ class ComposioTools(WrapperToolset[None]):
         ):
             if name == "GMAIL_CREATE_EMAIL_DRAFT":
                 return await self._create_draft(tool_args, ctx, tool)
-            return await super().call_tool(name, tool_args, ctx, tool)
+            if name in {CALENDAR_CREATE, CALENDAR_PATCH}:
+                return await execute_calendar(
+                    name,
+                    tool_args,
+                    read=lambda read_name, args: self._read(read_name, args, ctx),
+                    write=lambda write_name, args: self._dispatch(write_name, args, ctx, tool),
+                    confirm=lambda receipt: self._record_confirmation(
+                        (ctx.tool_call_metadata or {})["approval_id"],
+                        name,
+                        {"status": "write_confirmed", **receipt},
+                    ),
+                )
+            return await self._dispatch(name, tool_args, ctx, tool)
 
 
 def build_toolset(

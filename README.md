@@ -2,7 +2,7 @@
 
 bud is a personal AI agent you run yourself. It keeps every conversation in an append-only event log, so multiple clients can follow one session and reconnect after a disconnect. The server uses native DBOS durable execution to recover accepted work after a crash. Model calls go through a gateway that falls back to another provider on failure and records reported usage and cost.
 
-bud is under active development. It can chat, call tools, remember approved facts across sessions, and hold write actions for your approval. By default, bud uses real Gmail and Google Calendar connections through the Composio SDK and MCP (Model Context Protocol). Use `bud serve --simulate` to work with a fictional person's inbox and calendar instead. Live email and event listing, approved email sending, and approval pause/denial have been checked. One harmless unsent Gmail draft and fresh-conversation read-back have also been checked. Calendar writes remain unverified.
+bud is under active development. It can chat, call tools, remember approved facts across sessions, and hold write actions for your approval. By default, bud uses real Gmail and Google Calendar connections through the Composio SDK and MCP (Model Context Protocol). Use `bud serve --simulate` to work with a fictional person's inbox and calendar instead. Live email and event listing, approved email sending, and approval pause/denial have been checked. One harmless unsent Gmail draft and fresh-conversation read-back have also been checked. One separately approved harmless Calendar create/time-only move and fresh-conversation read-back have also been checked, without attendees or a conference link.
 
 ## Install
 
@@ -122,6 +122,20 @@ The server uses a spend brake of **$0.50 per run** and **$5 per UTC day**, share
 The spend brake checks recorded usage before the next model request. A request that crosses the dollar limit can finish and take spend above the threshold. Provider usage that bud never receives remains unknown, not proof of zero cost. These are metered API spend limits, not a guaranteed provider bill ceiling. ChatGPT subscription responses add no API dollars, but request and tool limits still apply.
 
 The spend counters are separate from the request ledger shown by `bud costs`. Gateway-only `bud ask` does not use these runner limits. Eval attempts use temporary spend stores, not the server's persistent daily counter.
+
+## Synthetic calendar scheduling
+
+In `bud serve --simulate`, ask to find a meeting, move it to a free time, and verify it after approval. The fictional calendar uses `America/Chicago`, weekday 09:00–17:00 working hours, and protected Focus Block events. These are seed preferences, not inferred rules for your real calendar.
+
+New calendar tool inputs require an explicit UTC offset consistent with their IANA timezone. For UTC inputs, specify `timezone="UTC"`. Missing offsets, nonexistent local times, inconsistent offsets, and unclear daylight-saving occurrences must be resolved rather than guessed. Existing stored naive timestamps are interpreted in the seed zone without rewriting them; ambiguous or invalid legacy rows fail closed.
+
+Listing and conflict checks compare instants in UTC. An approved create or move checks conflicts and commits its replay key in the same SQLite transaction. Overlapping bookings are refused, Focus Blocks cannot move, and moves preserve titles and attendees. Use `read_event` after approval to inspect the saved event. Replaying the same approved operation returns `applied=false` and the event's current state; it does not undo a later approved move. Reusing that key for a different operation is refused.
+
+The working-hour restrictions and transactional booking guarantees above are synthetic. A separately approved live test created one harmless event, moved that same event, and read it back in a fresh conversation. It used no attendees or conference link; nonvolatile event metadata stayed unchanged. Normal calendar reminders were left intact. Rich attendee/conference preservation and uncertain external-write outcomes were checked with constructed data, not live guest invitations or process kills. Do not treat simulated booking guarantees as atomic conflict prevention in Google Calendar.
+
+The native Calendar path resolves an explicit calendar ID and timezone, checks all pages of one-calendar availability up to four pages/1,000 events, and refuses incomplete coverage. It supports ordinary, nonrecurring timed events of at most 24 hours; recurring, special, all-day conversions and attendee edits are outside scope. Creates require an explicit title, times, timezone, attendee list and notification policy, with Meet creation disabled and no automatic self-attendee insertion.
+
+Moves use time-only `GOOGLECALENDAR_PATCH_EVENT`, not replacement UPDATE. Bud adds a local `expected_etag` argument from the event read before approval, compares it with a fresh pre-write read, and removes it before the native call. It is not a Google `If-Match` precondition: another change can still race the write. After a confirmed write, Bud saves its identifiers before read-back, then verifies times and preserved nonvolatile metadata—including attendee RSVP details, reminders and conference data. A mismatch or unknown outcome requires inspection, not another automatic write. Real working hours, protected-time rules and a specific live mutation still need your choices and permission.
 
 ## Public web research
 

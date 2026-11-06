@@ -7,10 +7,15 @@ The simulated clock uses the seed's `now`; generated IDs are not fixed.
 import json
 import sqlite3
 import tomllib
+from datetime import datetime, time
 from importlib import resources
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
+
+from bud.timezones import CalendarTimeError
+from bud.timezones import calendar_time as resolve_calendar_time
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, subject TEXT NOT NULL);
@@ -43,6 +48,14 @@ TABLES = ("threads", "messages", "events", "contacts")
 MAX_DRAFT_BODY_CHARS = 20_000
 
 
+def calendar_time(value: str, timezone: str, *, legacy: bool = False) -> datetime:
+    """Use the shared instant rule, retaining the World's domain error."""
+    try:
+        return resolve_calendar_time(value, timezone, stored=legacy)
+    except CalendarTimeError as exc:
+        raise WorldError(str(exc)) from exc
+
+
 def load_seed() -> dict[str, Any]:
     return tomllib.loads(resources.files("bud.world").joinpath("seed.toml").read_text())
 
@@ -64,8 +77,9 @@ class World:
             columns = {row["name"] for row in db.execute("PRAGMA table_info(applied_actions)")}
             if "draft_id" not in columns:
                 db.execute("ALTER TABLE applied_actions ADD COLUMN draft_id TEXT")
-            if "send_payload" not in columns:
-                db.execute("ALTER TABLE applied_actions ADD COLUMN send_payload TEXT")
+            for column in ("calendar_payload", "event_id", "send_payload"):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE applied_actions ADD COLUMN {column} TEXT")
             empty = all(
                 db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
                 for table in (*TABLES, "applied_actions")
@@ -77,7 +91,13 @@ class World:
         info = self.info
         return (
             f"The person is {info['person']} <{info['email']}>, timezone {info['timezone']}.\n"
-            f"Working hours: {info['working_hours']}\n{info['protected_blocks']}\n"
+            f"Synthetic scheduling hours only: {info['working_hours']} in {info['timezone']}.\n"
+            f"{info['protected_blocks']}\n"
+            "Resolve unclear dates, people, timezone, or DST folds with the user; do not guess. "
+            "Calendar input times need explicit offsets matching the supplied IANA timezone "
+            "(default: the person's timezone; use timezone='UTC' for UTC inputs). "
+            "Check list_events before proposing a change. Calendar writes require approval; "
+            "read_event after each approved write before claiming it is verified. "
             "Save reply drafts only after approval, then read_draft to verify the saved result. "
             "Use list_drafts and read_draft to find drafts in new conversations. "
             "A denied draft must not be saved or sent."
@@ -302,34 +322,160 @@ class World:
             )
         return True
 
-    def list_events(self, start: str, end: str) -> list[dict[str, Any]]:
+    def _calendar_range(
+        self, start: str, end: str, timezone: str | None = None, *, legacy: bool = False
+    ) -> tuple[datetime, datetime]:
+        zone = self.info["timezone"] if timezone is None else timezone
+        begin = calendar_time(start, zone, legacy=legacy)
+        finish = calendar_time(end, zone, legacy=legacy)
+        if begin >= finish:
+            raise WorldError("Calendar end must be after start.")
+        return begin, finish
+
+    def _event(self, row: sqlite3.Row) -> dict[str, Any]:
+        begin, finish = self._calendar_range(row["start"], row["end"], legacy=True)
+        zone = ZoneInfo(self.info["timezone"])
+        return {
+            **dict(row),
+            "start": begin.astimezone(zone).isoformat(),
+            "end": finish.astimezone(zone).isoformat(),
+            "timezone": self.info["timezone"],
+            "start_utc": begin.isoformat(),
+            "end_utc": finish.isoformat(),
+            "attendees": json.loads(row["attendees"]),
+            "protected": row["title"].strip().casefold() == "focus block",
+        }
+
+    def _read_event(self, db: sqlite3.Connection, event_id: str) -> dict[str, Any]:
+        row = db.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        if row is None:
+            raise WorldError(f"No event {event_id}. Use list_events to find event ids.")
+        return self._event(row)
+
+    def read_event(self, event_id: str) -> dict[str, Any]:
         with self._connect() as db:
-            rows = db.execute(
-                "SELECT * FROM events WHERE start < ? AND end > ? ORDER BY start", (end, start)
-            ).fetchall()
-        return [{**dict(row), "attendees": json.loads(row["attendees"])} for row in rows]
+            return self._read_event(db, event_id)
+
+    def _overlapping_events(
+        self, db: sqlite3.Connection, begin: datetime, finish: datetime, exclude: str = ""
+    ) -> list[dict[str, Any]]:
+        matches = []
+        for row in db.execute("SELECT * FROM events WHERE id != ?", (exclude,)):
+            start, end = self._calendar_range(row["start"], row["end"], legacy=True)
+            if start < finish and end > begin:
+                matches.append((start, row["id"], self._event(row)))
+        return [event for _, _, event in sorted(matches)]
+
+    def list_events(
+        self, start: str, end: str, timezone: str | None = None
+    ) -> list[dict[str, Any]]:
+        begin, finish = self._calendar_range(start, end, timezone)
+        with self._connect() as db:
+            return self._overlapping_events(db, begin, finish)
+
+    def _check_booking(
+        self, db: sqlite3.Connection, begin: datetime, finish: datetime, exclude: str = ""
+    ) -> None:
+        # This is the fictional seed's work calendar, not a real user's personal policy.
+        zone = ZoneInfo(self.info["timezone"])
+        start, end = begin.astimezone(zone), finish.astimezone(zone)
+        if (
+            start.weekday() >= 5
+            or start.date() != end.date()
+            or start.time() < time(9)
+            or end.time() > time(17)
+        ):
+            raise WorldError(
+                "Synthetic work calendar bookings must fit Monday–Friday "
+                f"09:00–17:00 in {self.info['timezone']}."
+            )
+        conflicts = self._overlapping_events(db, begin, finish, exclude)
+        if conflicts:
+            details = ", ".join(f"{event['id']} ({event['title']})" for event in conflicts)
+            raise WorldError(
+                f"Calendar conflict with {details}. Check list_events and choose "
+                "a free time; Focus Block events cannot be moved or booked over."
+            )
+
+    def _calendar_replay(
+        self, db: sqlite3.Connection, key: str, payload: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if not key.strip():
+            raise WorldError("Calendar writes require an action key.")
+        encoded = json.dumps(payload, sort_keys=True)
+        if self._apply_once(db, key):
+            db.execute(
+                "UPDATE applied_actions SET calendar_payload = ? WHERE key = ?", (encoded, key)
+            )
+            return None
+        saved = db.execute(
+            "SELECT calendar_payload, event_id FROM applied_actions WHERE key = ?", (key,)
+        ).fetchone()
+        if saved["calendar_payload"] != encoded or saved["event_id"] is None:
+            raise WorldError("This action key was already used for a different write.")
+        # Read current state, not a cached acknowledgement: a later approval may have moved it.
+        return {"applied": False, "event": self._read_event(db, saved["event_id"])}
 
     def create_event(
-        self, key: str, title: str, start: str, end: str, attendees: list[str]
-    ) -> str | None:
+        self,
+        key: str,
+        title: str,
+        start: str,
+        end: str,
+        attendees: list[str],
+        timezone: str | None = None,
+    ) -> dict[str, Any]:
+        begin, finish = self._calendar_range(start, end, timezone)
+        if not title.strip():
+            raise WorldError("An event title is required.")
+        payload = {
+            "action": "create_event",
+            "title": title,
+            "start": begin.isoformat(),
+            "end": finish.isoformat(),
+            "attendees": attendees,
+        }
         with self._connect() as db:
-            if not self._apply_once(db, key):
-                return None
+            # Reserve the writer before checking conflicts; another connection cannot
+            # insert or move an event into the checked range before this write commits.
+            db.execute("BEGIN IMMEDIATE")
+            replay = self._calendar_replay(db, key, payload)
+            if replay is not None:
+                return replay
+            self._check_booking(db, begin, finish)
             event_id = f"e-{uuid4().hex[:8]}"
             db.execute(
                 "INSERT INTO events VALUES (?, ?, ?, ?, ?)",
-                (event_id, title, start, end, json.dumps(attendees)),
+                (event_id, title, begin.isoformat(), finish.isoformat(), json.dumps(attendees)),
             )
-        return event_id
+            db.execute("UPDATE applied_actions SET event_id = ? WHERE key = ?", (event_id, key))
+            return {"applied": True, "event": self._read_event(db, event_id)}
 
-    def move_event(self, key: str, event_id: str, start: str, end: str) -> bool:
+    def move_event(
+        self, key: str, event_id: str, start: str, end: str, timezone: str | None = None
+    ) -> dict[str, Any]:
+        begin, finish = self._calendar_range(start, end, timezone)
+        payload = {
+            "action": "move_event",
+            "event_id": event_id,
+            "start": begin.isoformat(),
+            "end": finish.isoformat(),
+        }
         with self._connect() as db:
-            if db.execute("SELECT 1 FROM events WHERE id = ?", (event_id,)).fetchone() is None:
-                raise WorldError(f"No event {event_id}. Use list_events to find event ids.")
-            if not self._apply_once(db, key):
-                return False
-            db.execute("UPDATE events SET start = ?, end = ? WHERE id = ?", (start, end, event_id))
-        return True
+            db.execute("BEGIN IMMEDIATE")
+            replay = self._calendar_replay(db, key, payload)
+            if replay is not None:
+                return replay
+            event = self._read_event(db, event_id)
+            if event["protected"]:
+                raise WorldError("Focus Block events are protected and cannot be moved.")
+            self._check_booking(db, begin, finish, exclude=event_id)
+            db.execute(
+                "UPDATE events SET start = ?, end = ? WHERE id = ?",
+                (begin.isoformat(), finish.isoformat(), event_id),
+            )
+            db.execute("UPDATE applied_actions SET event_id = ? WHERE key = ?", (event_id, key))
+            return {"applied": True, "event": self._read_event(db, event_id)}
 
     def search_contacts(self, query: str) -> list[dict[str, Any]]:
         pattern = f"%{query}%"

@@ -14,6 +14,7 @@ READ_TOOLS = {
     "list_drafts",
     "read_draft",
     "list_events",
+    "read_event",
     "search_contacts",
 }
 
@@ -89,7 +90,6 @@ def build_tools(world: World) -> list[Tool]:
         """
 
         def draft() -> Any:
-
             return world.draft_reply(_action_key(ctx), thread_id, body)
 
         return _safely(draft)
@@ -110,42 +110,84 @@ def build_tools(world: World) -> list[Tool]:
 
         return _safely(send)
 
-    def list_events(start: str, end: str) -> Any:
-        """List calendar events that overlap a time range.
+    def list_events(start: str, end: str, timezone: str | None = None) -> Any:
+        """Check calendar events overlapping a range, in UTC order, before proposing a write.
+
+        Resolve unclear dates or timezone with the user first. Times need explicit
+        offsets consistent with timezone; DST folds require choosing the intended offset.
+        Results include ids, local/UTC times, attendees, and protected status.
 
         Args:
-            start: Range start, for example 2026-11-02T00:00:00.
-            end: Range end, for example 2026-11-09T00:00:00.
+            start: Range start, for example 2026-11-02T00:00:00-06:00.
+            end: Range end, for example 2026-11-09T00:00:00-06:00.
+            timezone: IANA zone matching the input offsets; defaults to America/Chicago.
+                For Z or +00:00 inputs use UTC.
         """
-        return _safely(lambda: world.list_events(start, end))
+        return _safely(lambda: world.list_events(start, end, timezone))
+
+    def read_event(event_id: str) -> Any:
+        """Read the persisted event to verify an approved calendar write.
+
+        Confirm the exact title, attendees, and local/UTC times before reporting success.
+
+        Args:
+            event_id: Exact event id from list_events, create_event, or move_event.
+        """
+        return _safely(lambda: world.read_event(event_id))
 
     def create_event(
-        ctx: RunContext[None], title: str, start: str, end: str, attendees: list[str]
+        ctx: RunContext[None],
+        title: str,
+        start: str,
+        end: str,
+        attendees: list[str],
+        timezone: str | None = None,
     ) -> Any:
-        """Create a calendar event.
+        """Create an approved synthetic event, then use read_event to verify it.
+
+        Check list_events first. Never guess an unclear date, person, timezone, or
+        DST fold; ask the user. Bookings must fit the fictional seed's weekday
+        09:00–17:00 America/Chicago hours and cannot overlap any event, including
+        Focus Blocks. Returns applied and the saved event; a replay has applied=false
+        and returns current state without writing again.
 
         Args:
             title: Event title.
-            start: Start time, for example 2026-11-05T14:00:00.
-            end: End time.
+            start: Explicit-offset start, for example 2026-11-05T14:00:00-06:00.
+            end: Explicit-offset end, strictly after start.
             attendees: Attendee email addresses.
+            timezone: IANA zone matching the input offsets; defaults to America/Chicago.
+                For Z or +00:00 inputs use UTC.
         """
 
-        def create() -> str:
-            event_id = world.create_event(_action_key(ctx), title, start, end, attendees)
-            return f"Created {event_id}." if event_id else "Already created; nothing changed."
+        def create() -> Any:
+            return world.create_event(_action_key(ctx), title, start, end, attendees, timezone)
 
         return _safely(create)
 
-    def move_event(ctx: RunContext[None], event_id: str, start: str, end: str) -> Any:
-        """Move an existing calendar event to a new time.
+    def move_event(
+        ctx: RunContext[None], event_id: str, start: str, end: str, timezone: str | None = None
+    ) -> Any:
+        """Move an approved synthetic event, preserving its title and attendees.
+
+        Check list_events for the target range first; resolve ambiguity with the user.
+        Focus Blocks cannot be moved, and no booking may overlap another event or
+        fall outside the fictional seed's weekday 09:00–17:00 America/Chicago hours.
+        Returns applied and the saved event. A replay returns current state with
+        applied=false, never moves again. Use read_event after approval to verify.
 
         Args:
             event_id: The event id from list_events.
-            start: New start time.
-            end: New end time.
+            start: Explicit-offset new start, for example 2026-11-06T11:00:00-06:00.
+            end: Explicit-offset new end, strictly after start.
+            timezone: IANA zone matching the input offsets; defaults to America/Chicago.
+                For Z or +00:00 inputs use UTC.
         """
-        return _safely(lambda: {"moved": world.move_event(_action_key(ctx), event_id, start, end)})
+
+        def move() -> Any:
+            return world.move_event(_action_key(ctx), event_id, start, end, timezone)
+
+        return _safely(move)
 
     def search_contacts(query: str) -> Any:
         """Find people by name or email address.
@@ -166,6 +208,7 @@ def build_tools(world: World) -> list[Tool]:
             draft_reply,
             send_email,
             list_events,
+            read_event,
             create_event,
             move_event,
             search_contacts,
