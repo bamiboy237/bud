@@ -5,6 +5,7 @@ It creates sessions, accepts messages, and streams session events as server-sent
 
 import asyncio
 import fcntl
+import hashlib
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -50,6 +51,10 @@ class NewMessage(BaseModel):
     message_id: str | None = Field(
         default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"
     )
+
+
+class NewSession(BaseModel):
+    session_id: str = Field(pattern=r"^[a-f0-9]{32}$")
 
 
 class EditMessage(BaseModel):
@@ -221,8 +226,25 @@ def _create_app(
                 finally:
                     lock.close()
 
+    scope_id = (
+        binding.scope
+        if connections is not None
+        else hashlib.sha256(str(db_path.resolve()).encode()).hexdigest()
+    )
     app = FastAPI(title="bud core", lifespan=lifespan)
-    app.add_middleware(OwnerAuthentication, token=token)
+    app.add_middleware(OwnerAuthentication, token=token, scope_id=scope_id)
+
+    @app.get("/runtime")
+    def runtime() -> JSONResponse:
+        """Authenticated transport handshake; no keys or account identifiers."""
+        return JSONResponse(
+            {
+                "mode": "simulate" if simulate else "accounts",
+                "scope": scope_id,
+                "restart_required": connections is not None and connections.restart_required(),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     def live_connections() -> Connections:
         if connections is None:
@@ -273,10 +295,16 @@ def _create_app(
             raise HTTPException(409, "Account binding changed. Restart bud and start a new chat.")
 
     @app.post("/sessions", status_code=201)
-    def create_session() -> dict[str, str]:
+    def create_session(request: NewSession | None = None) -> dict[str, str]:
         require_current_binding()
-        session_id = uuid4().hex
-        hub.publish(session_id, "session.created")
+        session_id = request.session_id if request else uuid4().hex
+        # A transport persists its chosen ID before this request. A lost HTTP
+        # response must not create a second conversation on retry.
+        if (
+            log.append_once(session_id, "session.created", key=f"session-created:{session_id}")
+            is not None
+        ):
+            hub.wake(session_id)
         return {"session_id": session_id}
 
     @app.get("/sessions/{session_id}")

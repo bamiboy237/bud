@@ -121,9 +121,10 @@ class OwnerAuthentication:
     entire app (including docs and future endpoints), rather than a route list.
     """
 
-    def __init__(self, app: ASGIApp, token: SecretStr) -> None:
+    def __init__(self, app: ASGIApp, token: SecretStr, scope_id: str | None = None) -> None:
         self.app = app
         self.token = token
+        self.scope_id = scope_id
         self.bearer = HTTPBearer(auto_error=False)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -149,6 +150,19 @@ class OwnerAuthentication:
                 {"detail": "Owner authentication required"},
                 status_code=401,
                 headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+            )
+            await response(scope, receive, send)
+            return
+        expected = request.headers.getlist("x-bud-scope")
+        if expected and (len(expected) != 1 or expected[0] != self.scope_id):
+            response = JSONResponse(
+                {
+                    "detail": (
+                        "Bud account scope changed. Restart the client; do not reuse old approvals."
+                    )
+                },
+                status_code=409,
+                headers={"Cache-Control": "no-store"},
             )
             await response(scope, receive, send)
             return

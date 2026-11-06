@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     composio_api_key: SecretStr | None = None
     exa_api_key: SecretStr | None = None
     owner_token: SecretStr | None = Field(default=None, repr=False)
+    photon_api_key: SecretStr | None = Field(default=None, repr=False)
+    photon_project_id: str | None = Field(default=None, repr=False)
+    photon_owner_handle: str | None = Field(default=None, repr=False)
+    photon_agent_handle: str | None = Field(default=None, repr=False)
 
     debug: bool = False
     data_dir: Path = Path("data")

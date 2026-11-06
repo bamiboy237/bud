@@ -5,15 +5,16 @@ user types as a message.
 
 import asyncio
 import json
-from uuid import uuid4
 
 import httpx
 
 from bud.config import get_settings
 from bud.core.auth import OwnerAuthError, owner_token
+from bud.core.controls import HELP, approval_text, session_snapshot
+from bud.core.controls import submit as submit_control
 
 
-def render(event: dict, seen_requests: set[str]) -> None:
+def render(event: dict, seen_requests: set[str], *, historical_approval: bool = False) -> None:
     data = event["data"]
     match event["type"]:
         case "user.message":
@@ -58,25 +59,22 @@ def render(event: dict, seen_requests: set[str]) -> None:
         case "tool.result":
             print(f"[result] {data['result'][:200]}", flush=True)
         case "approval.requested":
-            print(f"\n[approval needed] {data['tool']}({data['args']})", flush=True)
-            print("Type /approve or /deny.", flush=True)
+            if historical_approval:
+                print(
+                    f"\n[historical approval; no longer pending] {data['approval_id']}: "
+                    f"{data['tool']}",
+                    flush=True,
+                )
+            else:
+                print(f"\n{approval_text(data)}", flush=True)
         case "approval.granted":
-            print("[approved]", flush=True)
+            print(f"[approved] {data['approval_id']}", flush=True)
         case "approval.denied":
-            print("[denied]", flush=True)
+            print(f"[denied] {data['approval_id']}", flush=True)
         case "run.waiting" | "run.completed":
             print(flush=True)
         case "run.failed":
             print(f"\n[run failed] {data['reason']}", flush=True)
-
-
-async def refresh_pending(client: httpx.AsyncClient, session_id: str, pending: set[str]) -> dict:
-    response = await client.get(f"/sessions/{session_id}")
-    response.raise_for_status()
-    snapshot = response.json()
-    pending.clear()
-    pending.update(approval["approval_id"] for approval in snapshot["pending_approvals"])
-    return snapshot
 
 
 def print_http_error(error: httpx.HTTPStatusError) -> None:
@@ -88,13 +86,14 @@ def print_http_error(error: httpx.HTTPStatusError) -> None:
     print(f"[HTTP {response.status_code}] {detail}", flush=True)
 
 
-async def follow(client: httpx.AsyncClient, session_id: str, pending: set[str]) -> None:
+async def follow(client: httpx.AsyncClient, session_id: str) -> None:
     last_seq = 0
     seen_requests: set[str] = set()
     while True:
         try:
-            snapshot = await refresh_pending(client, session_id, pending)
-            approval_seq = snapshot["last_seq"]
+            state = await session_snapshot(client, session_id)
+            watermark = state["last_seq"]
+            pending = {item["approval_id"] for item in state["pending_approvals"]}
             async with client.stream(
                 "GET",
                 f"/sessions/{session_id}/events",
@@ -108,151 +107,29 @@ async def follow(client: httpx.AsyncClient, session_id: str, pending: set[str]) 
                     if line.startswith("data: "):
                         event = json.loads(line.removeprefix("data: "))
                         last_seq = event["seq"]
-                        render(event, seen_requests)
-                        if event["seq"] <= approval_seq:
-                            continue
-                        if event["type"] == "approval.requested":
-                            pending.add(event["data"]["approval_id"])
-                        elif event["type"] in ("approval.granted", "approval.denied"):
-                            pending.discard(event["data"]["approval_id"])
-                        elif event["type"] == "run.cancelled":
-                            pending.clear()
-                            snapshot = await refresh_pending(client, session_id, pending)
-                            approval_seq = snapshot["last_seq"]
+                        render(
+                            event,
+                            seen_requests,
+                            historical_approval=(
+                                event["type"] == "approval.requested"
+                                and event["seq"] <= watermark
+                                and event["data"]["approval_id"] not in pending
+                            ),
+                        )
         except httpx.HTTPStatusError as error:
             print_http_error(error)
+            if error.response.status_code in (401, 404):
+                return
             await asyncio.sleep(1)
         except httpx.RequestError:
             print("\n[reconnecting]", flush=True)
             await asyncio.sleep(1)
 
 
-async def resolve(
-    client: httpx.AsyncClient, session_id: str, pending: set[str], approved: bool
-) -> None:
-    if not pending:
-        print("[nothing is waiting for approval]")
-    for approval_id in list(pending):
-        response = await client.post(
-            f"/sessions/{session_id}/approvals/{approval_id}", json={"approved": approved}
-        )
-        response.raise_for_status()
-
-
-async def status(client: httpx.AsyncClient, session_id: str, pending: set[str]) -> None:
-    snapshot = await refresh_pending(client, session_id, pending)
-    queue_state = "paused" if snapshot["queue_paused"] else "open"
-    active = "yes" if snapshot["run_active"] else "no"
-    print(f"[status] {snapshot['status']}; queue {queue_state}; run active: {active}")
-    print("[queue]")
-    for message in snapshot["queued_messages"]:
-        preview = " ".join(message["text"].split())
-        if len(preview) > 80:
-            preview = preview[:77] + "..."
-        print(f"  {message['message_id']}: {preview}")
-    if not snapshot["queued_messages"]:
-        print("  empty")
-    print(f"[pending approvals] {', '.join(sorted(pending)) or 'none'}")
-    if snapshot["recent_runs"]:
-        print("[recent runs]")
-        for run in snapshot["recent_runs"]:
-            reason = f"; {run['reason']}" if run.get("reason") else ""
-            print(f"  {run['run_id']}: {run['status']}{reason}")
-
-
-def print_connection_status(state: dict) -> None:
-    for toolkit, value in state["statuses"].items():
-        print(f"[{toolkit}] {value}")
-    if state["restart_required"]:
-        print("[restart required] Stop and restart bud serve, then start a new conversation.")
-    else:
-        print("[connections current] Tool refresh requires a full server process restart.")
-
-
-async def submit(client: httpx.AsyncClient, session_id: str, pending: set[str], text: str) -> None:
-    parts = text.split(maxsplit=2)
-    command = parts[0]
-    path = f"/sessions/{session_id}"
-    match command:
-        case "/connect":
-            if len(parts) != 2 or parts[1] not in ("gmail", "calendar"):
-                print("[usage] /connect gmail|calendar")
-                return
-            response = await client.post(f"/connections/{parts[1]}/connect")
-            response.raise_for_status()
-            # Deliberate UI-only output; never submit the command/link as a message.
-            print(f"[sign in to {parts[1]}] {response.json()['url']}", flush=True)
-            print(
-                "[restart required] After sign-in, /refresh; restart bud serve; start a new chat."
-            )
-            return
-        case "/connections" | "/refresh":
-            if len(parts) != 1:
-                print(f"[usage] {command}")
-                return
-            response = (
-                await client.get("/connections")
-                if command == "/connections"
-                else await client.post("/connections/refresh")
-            )
-            response.raise_for_status()
-            print_connection_status(response.json())
-            return
-        case "/approve" | "/deny" | "/status" | "/pause" | "/resume" | "/stop":
-            if len(parts) != 1:
-                print(f"[usage] {command}")
-                return
-            match command:
-                case "/approve" | "/deny":
-                    await resolve(client, session_id, pending, command == "/approve")
-                    return
-                case "/status":
-                    await status(client, session_id, pending)
-                    return
-                case "/pause" | "/resume":
-                    response = await client.post(f"{path}/queue/{command[1:]}")
-                    label = "queue paused" if command == "/pause" else "queue resumed"
-                case "/stop":
-                    response = await client.post(f"{path}/stop")
-                    response.raise_for_status()
-                    label = (
-                        "stop requested; queue paused; authorized actions may still finish"
-                        if response.json()["stop_requested"]
-                        else "queue paused; no active run to stop"
-                    )
-        case "/cancel":
-            if len(parts) != 2:
-                print("[usage] /cancel <message-id>")
-                return
-            response = await client.delete(f"{path}/queue/{parts[1]}")
-            response.raise_for_status()
-            label = (
-                f"message cancelled: {parts[1]}"
-                if response.json()["cancelled"]
-                else f"message is no longer queued: {parts[1]}"
-            )
-        case "/edit":
-            if len(parts) != 3:
-                print("[usage] /edit <message-id> <replacement text>")
-                return
-            response = await client.patch(f"{path}/queue/{parts[1]}", json={"text": parts[2]})
-            label = f"message edited: {parts[1]}"
-        case _:
-            if command.startswith("/"):
-                print(
-                    "[unknown command] /status /pause /resume /stop /cancel /edit /approve /deny "
-                    "/connect /connections /refresh"
-                )
-                return
-            response = await client.post(
-                f"{path}/messages", json={"text": text, "message_id": uuid4().hex}
-            )
-            response.raise_for_status()
-            if response.json().get("duplicate"):
-                print("[duplicate message]")
-            return
-    response.raise_for_status()
-    print(f"[{label}]")
+async def submit(client: httpx.AsyncClient, session_id: str, text: str) -> None:
+    result = await submit_control(client, session_id, text)
+    if result:
+        print(result, flush=True)
 
 
 def owner_client(base_url: str) -> httpx.AsyncClient:
@@ -289,21 +166,20 @@ async def chat(base_url: str, session_id: str | None) -> None:
             session_id = response.json()["session_id"]
         else:
             # Authenticate before showing state or starting an endless SSE retry loop.
-            await refresh_pending(client, session_id, set())
+            await session_snapshot(client, session_id)
         print(
-            f"session {session_id}\nCtrl-D to leave. /status for state and queue; "
-            "/connect gmail|calendar, /connections or /refresh for account controls."
+            f"session {session_id}\nCtrl-D to leave. {HELP}\n"
+            "Approval commands always require the exact displayed approval ID."
         )
 
-        pending: set[str] = set()
-        follower = asyncio.create_task(follow(client, session_id, pending))
+        follower = asyncio.create_task(follow(client, session_id))
         try:
             while True:
                 text = await asyncio.to_thread(input)
                 if not text.strip():
                     continue
                 try:
-                    await submit(client, session_id, pending, text)
+                    await submit(client, session_id, text)
                 except httpx.HTTPStatusError as error:
                     print_http_error(error)
                 except httpx.RequestError as error:

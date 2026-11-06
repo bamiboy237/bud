@@ -17,6 +17,12 @@ dependencies = [
     "uvicorn>=0.54.0",
 ]
 
+[project.optional-dependencies]
+photon = [
+    "photonhq-api>=0.6.0,<0.7",
+    "python-socketio[asyncio-client]>=5.14,<6",
+]
+
 [project.scripts]
 bud = "bud.cli:main"
 

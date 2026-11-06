@@ -163,6 +163,12 @@ def _main(argv: list[str] | None = None) -> None:
     chat_parser = commands.add_parser("chat", help="open or attach to a session")
     chat_parser.add_argument("session", nargs="?", help="session id to attach to")
     chat_parser.add_argument("--url", default=DEFAULT_URL)
+    photon_parser = commands.add_parser(
+        "photon", help="talk to bud through the owner-only Photon 2.0 iMessage connection"
+    )
+    photon_parser.add_argument("--url", default=DEFAULT_URL)
+    photon_parser.add_argument("--session", help="attach to an existing core conversation")
+    photon_parser.add_argument("--simulate", action="store_true", help="require a simulated core")
 
     args = parser.parse_args(argv)
     if args.command == "ask":
@@ -193,6 +199,17 @@ def _main(argv: list[str] | None = None) -> None:
         uvicorn.run(app, host=HOST, port=PORT)
     elif args.command == "chat":
         asyncio.run(chat(args.url, args.session))
+    elif args.command == "photon":
+        from bud.photon_chat import chat as photon_chat
+        from bud.photon_config import PhotonSetupError
+        from bud.photon_store import TransportError
+
+        try:
+            asyncio.run(
+                photon_chat(get_settings(), args.url, simulate=args.simulate, session=args.session)
+            )
+        except (PhotonSetupError, TransportError) as exc:
+            raise SystemExit(str(exc)) from None
     else:
         parser.print_help()
 

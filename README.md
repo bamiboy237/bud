@@ -66,7 +66,7 @@ uv run bud chat <session-id>  # terminal 3, attaches to the same session
 
 `uv run bud serve` provides public web research and tools for your active connected accounts. It needs model access. Composio and Google connections are optional for public research. See [Connect real accounts](#connect-real-accounts) to add Gmail or Calendar.
 
-Ask bud to check the inbox or move a meeting in `bud chat`. Writes wait for you to answer `/approve` or `/deny`. See what you've spent, inspect the simulated world, or restore it:
+Ask bud to check the inbox or move a meeting in `bud chat`. Each proposed write displays its tool, arguments, and exact approval ID. Answer `/approve <approval-id>` or `/deny <approval-id>` for that action. Bare approval commands never approve a batch; `/status` shows the current proposals. See what you've spent, inspect the simulated world, or restore it:
 
 ```sh
 uv run bud costs
@@ -216,9 +216,55 @@ New-reply verification accepts CRLF/LF normalization, HTML line breaks, and one 
 
 In a fresh conversation, bud can list draft metadata with `GMAIL_LIST_DRAFTS`, then read a selected ID with `GMAIL_GET_DRAFT`. Draft listing has no query filter. Bud must match candidates from returned pages and report incomplete searches. Simulation has separate bounded `list_drafts` and `read_draft` tools. Simulated draft creation now requires approval and records its replay key atomically with the draft.
 
-Every real-account write, including draft creation, waits for `/approve` or `/deny`. Before dispatch, bud saves a claim for that approval in `dispatches.db`. Confirmed draft identifiers are saved there before awaiting read-back, so cancellation does not discard an already observed ID; cancellation itself still propagates. A completed DBOS step receipt skips another execution during recovery. If a write has a claim but no confirmed result, the claim blocks another dispatch under the same approval. This is not a guarantee of exactly-once delivery by Google. Inspect the account before you request a new action or give a new approval. The original action may already have completed.
+Every real-account write, including draft creation, waits for `/approve <approval-id>` or `/deny <approval-id>`. Before dispatch, bud saves a claim for that approval in `dispatches.db`. Confirmed draft identifiers are saved there before awaiting read-back, so cancellation does not discard an already observed ID; cancellation itself still propagates. A completed DBOS step receipt skips another execution during recovery. If a write has a claim but no confirmed result, the claim blocks another dispatch under the same approval. This is not a guarantee of exactly-once delivery by Google. Inspect the account before you request a new action or give a new approval. The original action may already have completed.
 
 With the default `DATA_DIR`, simulated conversations use `data/bud.db`, the durable journal uses `data/runtime.db`, and persistent spend counters use `data/world-spend.db`. Real-account state stays in `data/composio/sessions/<binding-hash>/`, with separate `bud.db`, `runtime.db`, `spend.db`, and `dispatches.db` files. The hash includes the local owner, connection generation, and accepted account mapping. Legacy account-only scope directories are preserved, not automatically resumed. The request cost ledger remains in `data/bud.db` for both modes. Git ignores `data/`.
+
+## iMessage through Photon 2.0
+
+The adapter targets **Beta/2.0**, whose project IDs begin `pho_prj_`. It uses the official `photonhq-api` Python client for sending and a Socket.IO client for versioned incoming events. Stable/Spectrum credentials and packages are not interchangeable with these.
+
+Install the optional SDK:
+
+```sh
+uv sync --extra photon
+```
+
+Supply these privately through your environment or ignored `.env`, never in chat, command arguments, or source:
+
+| Setting | Value |
+| --- | --- |
+| `PHOTON_API_KEY` | Project-scoped `pho_sk_…` key with `project:read` and `project:write` |
+| `PHOTON_PROJECT_ID` | The `pho_prj_…` project |
+| `PHOTON_OWNER_HANDLE` | Exact iMessage send-from email or E.164 phone number |
+| `PHOTON_AGENT_HANDLE` | Different E.164 number Photon assigned to that sender |
+
+For a Mac without an iPhone, use the send-from email shown in Messages → Settings → iMessage. Add that exact identity to your Photon project's shared iMessage assignment. Check plan capacity before assigning a line; no purchase or provisioning is performed by Bud. A shared line requires the human to start the conversation.
+
+Run the core and adapter from the same working directory and `DATA_DIR`, so both use the same owner credential:
+
+```sh
+uv run bud serve                  # terminal 1: connected accounts and public research
+uv run --extra photon bud photon  # terminal 2: owner-only iMessage
+```
+
+Wait for `Photon iMessage ready (accounts)`, then send a fresh message from the configured identity to its assigned number. `ping` returns `Bud connection verified.` without a model call. Other text enters the normal core conversation; replies and concise progress return to the same direct conversation. Groups, unknown senders, agent echoes, attachments, and non-plain-text content are ignored. The adapter does not read your Mac's Messages database or automatically contact other people.
+
+Use `/status`, `/pause`, `/resume`, `/stop`, `/cancel <message-id>`, `/edit <message-id> <text>`, `/approve <approval-id>`, or `/deny <approval-id>` just as in the terminal. Approvals must name the exact pending action; a bare yes or approve is not permission. `/connect gmail|calendar`, `/connections`, and `/refresh` remain owner controls, never model messages. Sign-in links are sent only as immediate UI output, not retained in the transport database.
+
+`/status` includes the core session ID. Attach from `bud chat <session-id>` to view or continue that same history. Alternatively, `bud photon --session <session-id>` selects an existing conversation before the first route is created; it does not replay old replies into a newly linked iMessage chat. Stop the existing adapter before changing its selected session. The adapter retains routing and delivery metadata, not a second model conversation or memory notebook.
+
+For synthetic work, use `bud serve --simulate` and `bud photon --simulate` with a dedicated synthetic `DATA_DIR`; outgoing text is labeled `[Simulation]`. Do not connect an unsuspecting real user to a synthetic core. Terminal-only walkthroughs need just `bud serve --simulate` and `bud chat`, with no Photon credentials.
+
+An authenticated `/runtime` handshake pins the core mode and account scope. The core rejects stale `X-Bud-Scope` headers before processing a request. After an account change, restart the core and adapter; old scopes and approvals are not copied into the new route. An unavailable saved core conversation fails closed instead of silently creating a replacement.
+
+Transport state is under `DATA_DIR/photon/`. Incoming message IDs and effective-payload digests prevent duplicate tasks; ordinary messages also use stable core message IDs. A control whose dispatch was interrupted is not repeated automatically: inspect `/status`. Notifications and their core event cursors are saved together. Final responses are sent as complete text, split into numbered parts when needed, rather than forwarding speculative text deltas.
+
+Every outgoing part has a durable pre-dispatch claim and stable Photon idempotency key. There is one SDK attempt. API acceptance, dispatch, delivery, and uncertainty are distinct states; acceptance alone is not delivery. A timeout or interrupted claimed send is not automatically resent, and remaining parts of an uncertain notification are blocked. Inspect the chat and transport state before requesting another copy. Successful delivery bodies are cleared from transport storage; the authoritative reply remains in core history.
+
+Socket.IO reconnects and resubscribes with the last successfully handled cursor. The first subscription starts live, and replay after that is limited to Photon's retained history. There is no zero-loss or exactly-once guarantee. A stream error, state corruption, or overload stops the adapter rather than skipping unfinished work. Neither this local process nor Cloud Runner development establishes always-on hosting, backup/restore, Android iMessage access, or laptop-closed availability.
+
+Sources: [Photon 2.0 iMessage setup](https://photon.codes/docs/beta/get-started/imessage), [Python client](https://photon.codes/docs/beta/api-client), [event transport](https://photon.codes/docs/beta/message-delivery/websocket), and [retry rules](https://photon.codes/docs/beta/api-client/retries-and-timeouts).
 
 ## Memory
 
