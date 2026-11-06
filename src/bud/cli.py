@@ -162,6 +162,7 @@ def _main(argv: list[str] | None = None) -> None:
     serve_parser.add_argument("--model", help="pin a model ID from `bud models`, without fallback")
     chat_parser = commands.add_parser("chat", help="open or attach to a session")
     chat_parser.add_argument("session", nargs="?", help="session id to attach to")
+    chat_parser.add_argument("--new", action="store_true", help="start a separate conversation")
     chat_parser.add_argument("--url", default=DEFAULT_URL)
     photon_parser = commands.add_parser(
         "photon", help="talk to bud through the owner-only Photon 2.0 iMessage connection"
@@ -198,7 +199,9 @@ def _main(argv: list[str] | None = None) -> None:
         app = create_app(simulate=args.simulate, model_id=args.model)
         uvicorn.run(app, host=HOST, port=PORT)
     elif args.command == "chat":
-        asyncio.run(chat(args.url, args.session))
+        if args.new and args.session:
+            parser.error("Use either a session ID or --new, not both.")
+        asyncio.run(chat(args.url, args.session, new=args.new))
     elif args.command == "photon":
         from bud.photon_chat import chat as photon_chat
         from bud.photon_config import PhotonSetupError

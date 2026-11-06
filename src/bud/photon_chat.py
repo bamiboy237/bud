@@ -18,18 +18,19 @@ from pydantic import ValidationError
 from bud.config import Settings
 from bud.core.client import owner_client
 from bud.core.controls import approval_text, session_snapshot, submit
+from bud.core.events import MessageOrigin
 from bud.photon_config import PhotonConfig, owner_message
 from bud.photon_store import TransportError, TransportStore, digest, fingerprint
 
 API_VERSION = "2026-07-01"
 
 
-def notification(event: dict) -> str | None:
+def notification(event: dict, origin: MessageOrigin) -> str | None:
     """Final output comes from the completed core run, never a partial text stream."""
     data = event["data"]
+    if data.get("origin") != origin.model_dump():
+        return None
     match event["type"]:
-        case "run.started":
-            return "Working on your request."
         case "run.recovered":
             return "Recovering interrupted work; completed actions will not be requested again."
         case "approval.requested":
@@ -101,6 +102,35 @@ class PhotonChat:
     def fail(self, reason: str) -> None:
         self.failure = reason
         self.stopping.set()
+
+    def origin(self, space: str) -> MessageOrigin:
+        return MessageOrigin(channel="imessage", client_id=digest(f"{self.config.project}:{space}"))
+
+    async def resolve_conversation(self) -> None:
+        routes = self.store.routes()
+        if self.session is None:
+            legacy = {route["session"] for route in routes}
+            if len(legacy) > 1:
+                raise TransportError(
+                    "Choose an existing conversation explicitly; none were merged."
+                )
+            response = await self.core.post(
+                "/sessions/primary",
+                json={"session_id": next(iter(legacy))} if legacy else None,
+            )
+            if response.status_code == 409:
+                raise TransportError(
+                    "The saved iMessage conversation differs from the primary conversation. "
+                    "No histories were merged. Attach explicitly to review them."
+                )
+            response.raise_for_status()
+            self.session = response.json()["session_id"]
+            snapshot = await session_snapshot(self.core, self.session)
+            self.session_seq = snapshot["last_seq"]
+        if any(route["session"] != self.session for route in routes):
+            raise TransportError(
+                "The saved channel route belongs to another conversation; it was not rebound."
+            )
 
     async def check_scope(self) -> dict:
         response = await self.core.get("/runtime")
@@ -214,10 +244,12 @@ class PhotonChat:
         else:
             try:
                 result = await submit(
-                    self.core, route["session"], text, message_id=digest("photon:" + message.id)
+                    self.core,
+                    route["session"],
+                    text,
+                    message_id=digest("photon:" + message.id),
+                    origin=self.origin(route["space"]),
                 )
-                if result is None:
-                    result = "Message accepted. Use /status for progress and queued message IDs."
             except httpx.HTTPStatusError as exc:
                 result = (
                     f"Bud declined this request (HTTP {exc.response.status_code}). "
@@ -230,12 +262,13 @@ class PhotonChat:
                 f"\nCore session: {route['session']}\n"
                 f"Transport deliveries needing review: {self.store.uncertain()}"
             )
-        self.enqueue(
-            route,
-            "incoming:" + message.id,
-            result,
-            private_link=text.split(maxsplit=1)[0] == "/connect",
-        )
+        if result:
+            self.enqueue(
+                route,
+                "incoming:" + message.id,
+                result,
+                private_link=text.split(maxsplit=1)[0] == "/connect",
+            )
         self.store.complete(message.id, seq)
 
     async def follow(self, initial: dict) -> None:
@@ -259,7 +292,7 @@ class PhotonChat:
                         # Re-read the latest reply route, not the parent message
                         # captured before a burst of owner follow-ups arrived.
                         route = next(item for item in self.store.routes() if item["space"] == space)
-                        text = notification(event)
+                        text = notification(event, self.origin(space))
                         if text and self.runtime["mode"] == "simulate":
                             text = "[Simulation]\n" + text
                         self.store.project(route, event["seq"], text)
@@ -388,6 +421,7 @@ class PhotonChat:
 
             tasks = []
             try:
+                await self.resolve_conversation()
                 for route in self.store.routes():
                     await self.ensure_session(route)
                 tasks = [asyncio.create_task(self.consume()), asyncio.create_task(self.send())]
@@ -402,6 +436,8 @@ class PhotonChat:
                 stopped = asyncio.create_task(self.stopping.wait())
                 tasks.append(stopped)
                 await asyncio.wait((tasks[-2], stopped), return_when=asyncio.FIRST_COMPLETED)
+            except TransportError as exc:
+                self.fail(str(exc))
             except Exception:
                 self.fail(
                     "Photon connection stopped; inspect access, connectivity and saved state."

@@ -10,7 +10,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-from bud.core.events import Event
+from bud.core.events import Event, MessageOrigin
 
 
 class Turn(BaseModel):
@@ -27,6 +27,7 @@ class PendingApproval(BaseModel):
 class QueuedMessage(BaseModel):
     message_id: str
     text: str
+    origin: MessageOrigin | None = None
 
 
 class RunView(BaseModel):

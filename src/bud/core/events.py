@@ -5,10 +5,11 @@ Every fact the system records is one `Event`, and `EventType` lists the kinds it
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 EventType = Literal[
     "session.created",
+    "session.primary",
     "user.message",
     "message.queued",
     "message.edited",
@@ -40,6 +41,15 @@ EventType = Literal[
 ]
 
 RUN_END_EVENTS = ("run.waiting", "run.completed", "run.failed", "run.cancelled")
+
+
+class MessageOrigin(BaseModel):
+    """Reply routing metadata, not identity or permission to execute an action."""
+
+    channel: Literal["api", "terminal", "web", "imessage"] = "api"
+    client_id: str = Field(
+        default="default", min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"
+    )
 
 
 class Event(BaseModel):

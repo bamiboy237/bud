@@ -10,6 +10,8 @@ from uuid import uuid4
 
 import httpx
 
+from bud.core.events import MessageOrigin
+
 HELP = (
     "/status /pause /resume /stop /cancel <message-id> "
     "/edit <message-id> <text> /approve <approval-id> /deny <approval-id> "
@@ -76,11 +78,13 @@ async def submit(
     text: str,
     *,
     message_id: str | None = None,
+    origin: MessageOrigin | None = None,
 ) -> str | None:
     """Handle a command or enqueue text. Provider adapters supply a stable message ID."""
     if not text.strip():
         return None
     parts = text.split(maxsplit=2)
+    source = (origin or MessageOrigin(channel="terminal", client_id="terminal")).model_dump()
     command = parts[0]
     path = f"/sessions/{session_id}"
     if command in ("/help", "/?"):
@@ -92,7 +96,8 @@ async def submit(
         if parts[1] not in {item["approval_id"] for item in state["pending_approvals"]}:
             return "[not pending] No permission was granted. Use /status for current actions."
         response = await client.post(
-            f"{path}/approvals/{parts[1]}", json={"approved": command == "/approve"}
+            f"{path}/approvals/{parts[1]}",
+            json={"approved": command == "/approve", "origin": source},
         )
         response.raise_for_status()
         label = "approved" if command == "/approve" else "denied"
@@ -154,7 +159,8 @@ async def submit(
     if command.startswith("/"):
         return f"[unknown command] {HELP}"
     response = await client.post(
-        f"{path}/messages", json={"text": text, "message_id": message_id or uuid4().hex}
+        f"{path}/messages",
+        json={"text": text, "message_id": message_id or uuid4().hex, "origin": source},
     )
     response.raise_for_status()
     return "[duplicate message]" if response.json().get("duplicate") else None

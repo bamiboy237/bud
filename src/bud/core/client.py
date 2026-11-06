@@ -158,10 +158,13 @@ def owner_client(base_url: str) -> httpx.AsyncClient:
     )
 
 
-async def chat(base_url: str, session_id: str | None) -> None:
+async def chat(base_url: str, session_id: str | None, *, new: bool = False) -> None:
     async with owner_client(base_url) as client:
+        response = await client.get("/runtime")
+        response.raise_for_status()
+        client.headers["X-Bud-Scope"] = response.json()["scope"]
         if session_id is None:
-            response = await client.post("/sessions")
+            response = await client.post("/sessions" if new else "/sessions/primary")
             response.raise_for_status()
             session_id = response.json()["session_id"]
         else:

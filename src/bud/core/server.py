@@ -23,7 +23,7 @@ from pydantic_ai.toolsets import CombinedToolset, FunctionToolset
 from bud.composio.connection import ConnectionError, Connections
 from bud.config import Settings, get_settings
 from bud.core.auth import OwnerAuthentication, owner_token
-from bud.core.events import Event
+from bud.core.events import Event, MessageOrigin
 from bud.core.hub import Hub
 from bud.core.log import EventLog, QueueFull
 from bud.core.projection import Snapshot, snapshot
@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 class NewMessage(BaseModel):
     text: str = Field(min_length=1, max_length=100_000)
+    origin: MessageOrigin = Field(default_factory=MessageOrigin)
     message_id: str | None = Field(
         default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"
     )
@@ -63,6 +64,7 @@ class EditMessage(BaseModel):
 
 class Decision(BaseModel):
     approved: bool
+    origin: MessageOrigin = Field(default_factory=MessageOrigin)
 
 
 def sse_frame(event: Event) -> str:
@@ -294,6 +296,16 @@ def _create_app(
         if connections is not None and connections.restart_required():
             raise HTTPException(409, "Account binding changed. Restart bud and start a new chat.")
 
+    @app.post("/sessions/primary")
+    def primary_session(request: NewSession | None = None) -> dict[str, str]:
+        require_current_binding()
+        try:
+            session_id = log.primary_session(request.session_id if request else None)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        hub.wake(session_id)
+        return {"session_id": session_id}
+
     @app.post("/sessions", status_code=201)
     def create_session(request: NewSession | None = None) -> dict[str, str]:
         require_current_binding()
@@ -317,7 +329,12 @@ def _create_app(
         require_session(session_id)
         require_current_binding()
         try:
-            event = runner.start(session_id, message.text, message.message_id or uuid4().hex)
+            event = runner.start(
+                session_id,
+                message.text,
+                message.message_id or uuid4().hex,
+                message.origin.model_dump(),
+            )
         except QueueFull as exc:
             raise HTTPException(429, str(exc)) from None
         except ValueError as exc:
@@ -360,7 +377,11 @@ def _create_app(
         if decision.approved:
             require_current_binding()
         try:
-            return {"applied": runner.decide(session_id, approval_id, decision.approved)}
+            return {
+                "applied": runner.decide(
+                    session_id, approval_id, decision.approved, decision.origin.model_dump()
+                )
+            }
         except UnknownApproval:
             raise HTTPException(404, "unknown approval") from None
 

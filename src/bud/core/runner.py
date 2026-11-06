@@ -148,7 +148,12 @@ class Runner(DBOSConfiguredInstance):
             self._drain(session_id)
 
     def _inputs(
-        self, session_id: str, text: str | None, results: DeferredToolResults | None = None
+        self,
+        session_id: str,
+        text: str | None,
+        results: DeferredToolResults | None = None,
+        *,
+        origin: dict | None = None,
     ) -> dict:
         events = self.hub.log.read(session_id)
         conversation = next(
@@ -164,6 +169,7 @@ class Runner(DBOSConfiguredInstance):
             "run_id": uuid4().hex,
             "text": text,
             "trigger": "message" if results is None else "approval",
+            "origin": origin,
             "conversation": conversation,
             "history": json.loads(ModelMessagesTypeAdapter.dump_json(model_history(events)))
             if conversation is None
@@ -173,10 +179,12 @@ class Runner(DBOSConfiguredInstance):
             "version": self.version,
         }
 
-    def start(self, session_id: str, text: str, message_id: str) -> Event | None:
+    def start(
+        self, session_id: str, text: str, message_id: str, origin: dict | None = None
+    ) -> Event | None:
         self._loop = asyncio.get_running_loop()
         self._validate_text(text)
-        event = self.hub.log.accept_message(session_id, text, message_id)
+        event = self.hub.log.accept_message(session_id, text, message_id, origin)
         if event is not None:
             self.hub.wake(session_id)
         self._drain(session_id)
@@ -214,7 +222,11 @@ class Runner(DBOSConfiguredInstance):
         pending = queued_messages(events)
         if queue_paused(events) or not pending:
             return
-        run = self._inputs(session_id, pending[0].text)
+        run = self._inputs(
+            session_id,
+            pending[0].text,
+            origin=pending[0].origin.model_dump() if pending[0].origin else None,
+        )
         run["message_id"] = pending[0].message_id
         if self.hub.log.dispatch_message(session_id, pending[0].message_id, run):
             self.hub.wake(session_id)
@@ -235,14 +247,18 @@ class Runner(DBOSConfiguredInstance):
             self.hub.wake(session_id)
         return {"stop_requested": request is not None, "queue_paused": True}
 
-    def decide(self, session_id: str, approval_id: str, approved: bool) -> bool:
+    def decide(
+        self, session_id: str, approval_id: str, approved: bool, origin: dict | None = None
+    ) -> bool:
         events = self.hub.log.read(session_id)
         if approval_id in decisions(events):
             return False
         if not any(request["approval_id"] == approval_id for request in waiting_batch(events)):
             raise UnknownApproval(approval_id)
         event_type = "approval.granted" if approved else "approval.denied"
-        event = self.hub.publish_once(session_id, event_type, {"approval_id": approval_id})
+        event = self.hub.publish_once(
+            session_id, event_type, {"approval_id": approval_id, "origin": origin}
+        )
         if event is None:
             return False
         self._resume_if_ready(session_id)
@@ -265,7 +281,27 @@ class Runner(DBOSConfiguredInstance):
                 request["call_id"]: {"approval_id": request["approval_id"]} for request in batch
             },
         )
-        run = self._inputs(session_id, None, results)
+        ids = {request["approval_id"] for request in batch}
+        origin = next(
+            (
+                event.data.get("origin")
+                for event in reversed(events)
+                if event.type in ("approval.granted", "approval.denied")
+                and event.data["approval_id"] in ids
+                and event.data.get("origin") is not None
+            ),
+            None,
+        )
+        if origin is None:
+            origin = next(
+                (
+                    event.data.get("origin")
+                    for event in reversed(events)
+                    if event.type == "run.queued" and event.data["run_id"] == batch[0]["run_id"]
+                ),
+                None,
+            )
+        run = self._inputs(session_id, None, results, origin=origin)
         self.hub.publish_once(session_id, "run.queued", run, key=f"{run['run_id']}:queued")
         self._launch(run)
 

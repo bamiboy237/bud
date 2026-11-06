@@ -60,8 +60,9 @@ Run the server with simulated tools and chat with it. This mode needs ChatGPT si
 
 ```sh
 uv run bud serve --simulate   # terminal 1, simulated tools
-uv run bud chat               # terminal 2, prints a session id
+uv run bud chat               # terminal 2, resumes the primary conversation
 uv run bud chat <session-id>  # terminal 3, attaches to the same session
+uv run bud chat --new         # explicitly starts a separate conversation
 ```
 
 `uv run bud serve` provides public web research and tools for your active connected accounts. It needs model access. Composio and Google connections are optional for public research. See [Connect real accounts](#connect-real-accounts) to add Gmail or Calendar.
@@ -87,6 +88,30 @@ The server listens on `127.0.0.1:8420` and requires single-owner bearer authenti
 Run server and chat from the same working directory with the same `DATA_DIR`. Bud automatically creates one owner credential in `DATA_DIR/auth/owner.token` and the local CLI loads it; no token copying or printing is needed. It persists across restarts and account changes. The auth directory must be owned with mode `0700`, and the token file with mode `0600`. Unsafe or corrupt credentials fail closed instead of being replaced automatically.
 
 A separate trusted client can use a strong `OWNER_TOKEN` supplied through secure environment injection. Never put it in URLs, query strings, command arguments, examples, logs, or shared files. The CLI refuses remote plaintext HTTP, credential-bearing URLs, proxies, and redirects. HTTPS still requires an appropriate trusted host; no deployment is established by these access checks.
+
+### One conversation across interfaces
+
+The server owns the conversation; an interface is not a separate agent or memory. `bud chat` and `bud photon` default to one persistent primary session in the current account scope. Leaving, switching interfaces, or restarting does not create a fresh primary. `bud chat --new` and `POST /sessions` still create explicit separate conversations; they do not replace the primary or merge old threads.
+
+An authenticated client discovers or creates the primary with `POST /sessions/primary`. It can then submit to `/sessions/<id>/messages` with a stable message ID and origin metadata, for example:
+
+```json
+{
+  "text": "What time did we choose?",
+  "message_id": "example-message-1",
+  "origin": {"channel": "web", "client_id": "browser-1"}
+}
+```
+
+`web` is an API origin label, not a shipped web frontend. Origin describes where a reply belongs; it is not identity, authority, or a replacement for owner authentication and account-scope checks. Clients should pin `X-Bud-Scope` from the authenticated `/runtime` handshake.
+
+All accepted text joins the selected session's authoritative history, independent of origin. Origin survives queue edits, dispatch, completion and restart. The iMessage adapter sends model replies and approval requests only when their origin matches that exact iMessage route. Web/API/terminal replies are not pushed into Messages, and old unattributed events are not guessed or backfilled there. The terminal remains a full-history viewer; a future web UI can likewise render the canonical history even though the native iMessage transcript contains only messages delivered through it.
+
+An approval decision is still tied to an exact pending action. If it is explicitly answered from another interface, the continued run replies to that decision's interface; permission is not inferred from origin metadata or a context-free yes. Existing strict approval and dispatch-claim rules remain unchanged.
+
+At first upgrade, start the iMessage adapter before opening a new default terminal chat if you want it to adopt its existing conversation as primary. Adoption selects the existing session without copying history. If a different primary already exists, the adapter stops rather than merging histories or silently moving pending approvals. Explicit `--session` attachment remains available for a compatible saved route. Account generations keep separate primaries; context and approvals never follow a changed account binding automatically.
+
+Work performed inside a conversation remains in its tool/action history. This is not yet model-facing search over old threads, routines, or past outgoing email; older-context retrieval is separate work. Keeping history does not guarantee perfect model recall or that all history fits in each request.
 
 ## Durable server and recovery
 
@@ -248,11 +273,11 @@ uv run bud serve                  # terminal 1: connected accounts and public re
 uv run --extra photon bud photon  # terminal 2: owner-only iMessage
 ```
 
-Wait for `Photon iMessage ready (accounts)`, then send a fresh message from the configured identity to its assigned number. `ping` returns `Bud connection verified.` without a model call. Other text enters the normal core conversation; replies and concise progress return to the same direct conversation. Groups, unknown senders, agent echoes, attachments, and non-plain-text content are ignored. The adapter does not read your Mac's Messages database or automatically contact other people.
+Wait for `Photon iMessage ready (accounts)`, then send a fresh message from the configured identity to its assigned number. `ping` returns `Bud connection verified.` without a model call. Other text enters the primary core conversation. A short request gets its answer without automatic accepted/working bubbles; replies for other interfaces are not mirrored into Messages. Groups, unknown senders, agent echoes, attachments, and non-plain-text content are ignored. The adapter does not read your Mac's Messages database or automatically contact other people.
 
 Use `/status`, `/pause`, `/resume`, `/stop`, `/cancel <message-id>`, `/edit <message-id> <text>`, `/approve <approval-id>`, or `/deny <approval-id>` just as in the terminal. Approvals must name the exact pending action; a bare yes or approve is not permission. `/connect gmail|calendar`, `/connections`, and `/refresh` remain owner controls, never model messages. Sign-in links are sent only as immediate UI output, not retained in the transport database.
 
-`/status` includes the core session ID. Attach from `bud chat <session-id>` to view or continue that same history. Alternatively, `bud photon --session <session-id>` selects an existing conversation before the first route is created; it does not replay old replies into a newly linked iMessage chat. Stop the existing adapter before changing its selected session. The adapter retains routing and delivery metadata, not a second model conversation or memory notebook.
+`/status` includes the core session ID. A default `bud chat` uses the same primary, or attach explicitly with `bud chat <session-id>`. Alternatively, `bud photon --session <session-id>` selects an existing conversation before the first route is created; it does not replay old replies into a newly linked iMessage chat. An incompatible saved route is refused rather than rebound. The adapter retains routing and delivery metadata, not a second model conversation or memory notebook.
 
 For synthetic work, use `bud serve --simulate` and `bud photon --simulate` with a dedicated synthetic `DATA_DIR`; outgoing text is labeled `[Simulation]`. Do not connect an unsuspecting real user to a synthetic core. Terminal-only walkthroughs need just `bud serve --simulate` and `bud chat`, with no Photon credentials.
 

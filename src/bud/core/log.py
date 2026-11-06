@@ -80,6 +80,26 @@ class EventLog:
         once: bool = False,
         key: str | None = None,
     ) -> Event | None:
+        if (
+            type
+            in {
+                "run.started",
+                "run.recovered",
+                "run.waiting",
+                "run.completed",
+                "run.failed",
+                "run.cancelled",
+                "approval.requested",
+            }
+            and "origin" not in data
+        ):
+            row = db.execute(
+                """SELECT json_extract(data, '$.origin') FROM events
+                   WHERE session_id=? AND type='run.queued'
+                   AND json_extract(data, '$.run_id')=?""",
+                (session_id, data.get("run_id")),
+            ).fetchone()
+            data = {**data, "origin": json.loads(row[0]) if row and row[0] else None}
         event_id = uuid4().hex
         created_at = datetime.now(UTC).isoformat()
         verb = "INSERT OR IGNORE" if once else "INSERT"
@@ -135,20 +155,59 @@ class EventLog:
                 is not None
             )
 
-    def accept_message(self, session_id: str, text: str, message_id: str) -> Event | None:
+    def primary_session(self, preferred: str | None = None) -> str:
+        """Choose once, transactionally; never guess which old thread to merge."""
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            if db.execute(
-                """SELECT 1 FROM events WHERE session_id = ?
+            row = db.execute(
+                "SELECT session_id FROM events WHERE event_key='owner:primary-session'"
+            ).fetchone()
+            if row:
+                if not db.execute(
+                    "SELECT 1 FROM events WHERE session_id=? AND type='session.created'",
+                    (row[0],),
+                ).fetchone():
+                    raise ValueError("Primary conversation is unavailable; it was not replaced.")
+                if preferred is not None and preferred != row[0]:
+                    raise ValueError(
+                        "The primary conversation is already set. Explicit threads were not merged."
+                    )
+                return row[0]
+            session_id = preferred or uuid4().hex
+            exists = db.execute(
+                "SELECT 1 FROM events WHERE session_id=? AND type='session.created'",
+                (session_id,),
+            ).fetchone()
+            if preferred is not None and not exists:
+                raise ValueError("The requested existing conversation is unavailable.")
+            if not exists:
+                self._insert(db, session_id, "session.created", {})
+            self._insert(db, session_id, "session.primary", {}, key="owner:primary-session")
+            return session_id
+
+    def accept_message(
+        self, session_id: str, text: str, message_id: str, origin: dict | None = None
+    ) -> Event | None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            previous = db.execute(
+                """SELECT data FROM events WHERE session_id = ?
                    AND type IN ('message.queued', 'user.message')
-                   AND json_extract(data, '$.message_id') = ?""",
+                   AND json_extract(data, '$.message_id') = ? ORDER BY seq LIMIT 1""",
                 (session_id, message_id),
-            ).fetchone():
+            ).fetchone()
+            if previous:
+                data = json.loads(previous[0])
+                if data["text"] != text or data.get("origin") != origin:
+                    raise ValueError("Message ID already used with different content or origin")
                 return None
             if len(queued_messages(self._read(db, session_id))) >= 20:
                 raise QueueFull("This conversation already has 20 waiting messages")
             return self._insert(
-                db, session_id, "message.queued", {"message_id": message_id, "text": text}
+                db,
+                session_id,
+                "message.queued",
+                {"message_id": message_id, "text": text, "origin": origin},
             )
 
     def edit_message(self, session_id: str, message_id: str, text: str) -> None:
