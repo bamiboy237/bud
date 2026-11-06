@@ -20,7 +20,9 @@ READ_TOOLS = {
 
 def _action_key(ctx: RunContext[None]) -> str:
     metadata = ctx.tool_call_metadata or {}
-    return metadata.get("approval_id") or ctx.tool_call_id or ""
+    if not ctx.tool_call_approved or not metadata.get("approval_id"):
+        raise WorldError("Writes require an explicit approval.")
+    return metadata["approval_id"]
 
 
 def build_tools(world: World) -> list[Tool]:
@@ -87,8 +89,7 @@ def build_tools(world: World) -> list[Tool]:
         """
 
         def draft() -> Any:
-            if not ctx.tool_call_approved or not (ctx.tool_call_metadata or {}).get("approval_id"):
-                raise WorldError("Saving a draft requires an explicit approval.")
+
             return world.draft_reply(_action_key(ctx), thread_id, body)
 
         return _safely(draft)

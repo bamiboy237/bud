@@ -64,9 +64,14 @@ class World:
             columns = {row["name"] for row in db.execute("PRAGMA table_info(applied_actions)")}
             if "draft_id" not in columns:
                 db.execute("ALTER TABLE applied_actions ADD COLUMN draft_id TEXT")
-            empty = db.execute("SELECT COUNT(*) FROM threads").fetchone()[0] == 0
-        if empty:
-            self.reset()
+            if "send_payload" not in columns:
+                db.execute("ALTER TABLE applied_actions ADD COLUMN send_payload TEXT")
+            empty = all(
+                db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+                for table in (*TABLES, "applied_actions")
+            )
+            if empty:
+                self._reset(db)
 
     def profile(self) -> str:
         info = self.info
@@ -85,41 +90,45 @@ class World:
 
     def reset(self) -> None:
         with self._connect() as db:
-            for table in (*TABLES, "applied_actions"):
-                db.execute(f"DELETE FROM {table}")
-            for thread in self.seed["threads"]:
-                db.execute("INSERT INTO threads VALUES (?, ?)", (thread["id"], thread["subject"]))
-                for index, message in enumerate(thread["messages"], start=1):
-                    is_own = message["sender"] == self.info["email"]
-                    db.execute(
-                        "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            f"{thread['id']}-m{index}",
-                            thread["id"],
-                            "sent" if is_own else "inbox",
-                            message["sender"],
-                            json.dumps(message["to"]),
-                            message["sent_at"],
-                            message["body"],
-                            int(message.get("unread", False)),
-                        ),
-                    )
-            for event in self.seed["events"]:
+            db.execute("BEGIN IMMEDIATE")
+            self._reset(db)
+
+    def _reset(self, db: sqlite3.Connection) -> None:
+        for table in (*TABLES, "applied_actions"):
+            db.execute(f"DELETE FROM {table}")
+        for thread in self.seed["threads"]:
+            db.execute("INSERT INTO threads VALUES (?, ?)", (thread["id"], thread["subject"]))
+            for index, message in enumerate(thread["messages"], start=1):
+                is_own = message["sender"] == self.info["email"]
                 db.execute(
-                    "INSERT INTO events VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        event["id"],
-                        event["title"],
-                        event["start"],
-                        event["end"],
-                        json.dumps(event["attendees"]),
+                        f"{thread['id']}-m{index}",
+                        thread["id"],
+                        "sent" if is_own else "inbox",
+                        message["sender"],
+                        json.dumps(message["to"]),
+                        message["sent_at"],
+                        message["body"],
+                        int(message.get("unread", False)),
                     ),
                 )
-            for contact in self.seed["contacts"]:
-                db.execute(
-                    "INSERT INTO contacts VALUES (?, ?, ?)",
-                    (contact["email"], contact["name"], contact["relationship"]),
-                )
+        for event in self.seed["events"]:
+            db.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?, ?)",
+                (
+                    event["id"],
+                    event["title"],
+                    event["start"],
+                    event["end"],
+                    json.dumps(event["attendees"]),
+                ),
+            )
+        for contact in self.seed["contacts"]:
+            db.execute(
+                "INSERT INTO contacts VALUES (?, ?, ?)",
+                (contact["email"], contact["name"], contact["relationship"]),
+            )
 
     def snapshot(self) -> dict[str, list[dict[str, Any]]]:
         with self._connect() as db:
@@ -263,10 +272,21 @@ class World:
             return self._draft(db, draft_id)
 
     def send_email(self, key: str, to: list[str], subject: str, body: str) -> bool:
-        """Return False when this key already sent, so nothing new goes out."""
+        """Replay only the same known send; other or legacy unknown keys are refused."""
+        if not key.strip():
+            raise WorldError("Sending requires an action key.")
+        payload = json.dumps({"to": to, "subject": subject, "body": body}, sort_keys=True)
         with self._connect() as db:
             if not self._apply_once(db, key):
+                saved = db.execute(
+                    "SELECT send_payload FROM applied_actions WHERE key = ?", (key,)
+                ).fetchone()
+                if saved["send_payload"] != payload:
+                    raise WorldError(
+                        "This action key was already used for a different or unverified write."
+                    )
                 return False
+            db.execute("UPDATE applied_actions SET send_payload = ? WHERE key = ?", (payload, key))
             thread_id = f"t-{uuid4().hex[:8]}"
             db.execute("INSERT INTO threads VALUES (?, ?)", (thread_id, subject))
             db.execute(
