@@ -9,18 +9,19 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import timedelta
-from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, TextIO
 from uuid import uuid4
 
 from dbos import DBOS
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, SecretStr
 from pydantic_ai.toolsets import CombinedToolset, FunctionToolset
 
-from bud.config import get_settings
+from bud.composio.connection import ConnectionError, Connections
+from bud.config import Settings, get_settings
+from bud.core.auth import OwnerAuthentication, owner_token
 from bud.core.events import Event
 from bud.core.hub import Hub
 from bud.core.log import EventLog, QueueFull
@@ -69,7 +70,11 @@ def hold_single_server_lock(path: Path) -> TextIO:
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+        lock.close()
         raise SystemExit(f"Another bud server is already using {path.parent}.") from None
+    except OSError:
+        lock.close()
+        raise
     return lock
 
 
@@ -81,15 +86,38 @@ def workspace_tools(directory: Path) -> FunctionToolset[None]:
 
 def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAPI:
     settings = get_settings()
+    token = owner_token(settings)
+    settings.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # This lock spans all account generations, before any live sessions, tools,
+    # recovery or runners can be constructed. A scoped DB lock alone is too late.
+    live_lock = (
+        None if simulate else hold_single_server_lock(settings.data_dir / "live-server.lock")
+    )
+    try:
+        return _create_app(settings, token, live_lock, simulate=simulate, model_id=model_id)
+    except BaseException:
+        if live_lock is not None:
+            live_lock.close()
+        raise
+
+
+def _create_app(
+    settings: Settings,
+    token: SecretStr,
+    live_lock: TextIO | None,
+    *,
+    simulate: bool,
+    model_id: str | None,
+) -> FastAPI:
+    connections = None
     if not simulate:
-        from bud.composio.connection import Connections
         from bud.composio.tools import PROFILE, READ_TOOLS, build_toolset, policy
 
         connections = Connections(settings)
-        accounts = connections.active_accounts() if settings.composio_api_key else {}
-        # Reconnecting a different account must not resume the old account's approvals.
-        scope = sha256(repr(sorted(accounts.items())).encode()).hexdigest()[:16]
-        session_dir = connections.folder / "sessions" / scope
+        binding = connections.capture_binding()
+        accounts = binding.accounts
+        # Neither old approvals nor memory cross an owner/generation boundary.
+        session_dir = connections.folder / "sessions" / binding.scope
         session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         db_path = session_dir / "bud.db"
         gateway = build_gateway(
@@ -111,6 +139,9 @@ def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAP
             PROFILE
             + "\nConnected apps: "
             + (", ".join(sorted(accounts)) or "none")
+            + "\nUse /connect gmail or /connect calendar for a missing/disconnected app. "
+            "Then /refresh and restart the bud server process; start a new conversation. "
+            "Connection commands are user controls, not model tools."
             + WEB_GUIDANCE
             + WORKSPACE_GUIDANCE,
             memory=build_memory(session_dir / "memory.db", namespace="owner"),
@@ -156,7 +187,7 @@ def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAP
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        lock = hold_single_server_lock(db_path.with_suffix(".lock"))
+        lock = live_lock or hold_single_server_lock(db_path.with_suffix(".lock"))
         cleanup = None
         try:
             hub.bind_loop()
@@ -172,26 +203,78 @@ def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAP
                 }
             )
             DBOS.launch()
+            if connections is not None and connections.restart_required():
+                raise ConnectionError("Account binding changed during startup. Restart bud.")
             await runner.recover()
             cleanup = asyncio.create_task(cleanup_results())
             yield
         finally:
-            if cleanup is not None:
-                cleanup.cancel()
-                await asyncio.gather(cleanup, return_exceptions=True)
-            await runner.stop()
-            await asyncio.to_thread(DBOS.destroy, workflow_completion_timeout_sec=5)
-            gateway.close()
-            lock.close()
+            try:
+                if cleanup is not None:
+                    cleanup.cancel()
+                    await asyncio.gather(cleanup, return_exceptions=True)
+                await runner.stop()
+                await asyncio.to_thread(DBOS.destroy, workflow_completion_timeout_sec=5)
+            finally:
+                try:
+                    gateway.close()
+                finally:
+                    lock.close()
 
     app = FastAPI(title="bud core", lifespan=lifespan)
+    app.add_middleware(OwnerAuthentication, token=token)
+
+    def live_connections() -> Connections:
+        if connections is None:
+            raise HTTPException(409, "Account controls are disabled in --simulate mode.")
+        return connections
+
+    @app.get("/connections")
+    @app.post("/connections/refresh")
+    def connection_status() -> JSONResponse:
+        current = live_connections()
+        try:
+            statuses = current.statuses()
+            restart_required = current.restart_required()
+        except ConnectionError as exc:
+            raise HTTPException(503, str(exc)) from None
+        return JSONResponse(
+            {
+                "statuses": {"gmail": statuses["gmail"], "calendar": statuses["googlecalendar"]},
+                "restart_required": restart_required,
+                "refresh_boundary": "process_restart",
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/connections/{toolkit}/connect")
+    def connect_account(toolkit: str) -> JSONResponse:
+        current = live_connections()
+        name = {"gmail": "gmail", "calendar": "googlecalendar"}.get(toolkit)
+        if name is None:
+            raise HTTPException(400, "Use /connect gmail or /connect calendar.")
+        try:
+            url = current.connect(name)
+        except ConnectionError as exc:
+            raise HTTPException(503, str(exc)) from None
+        # The sign-in link exists only in this immediate authenticated response,
+        # not in session events, model input/history, status metadata or logs.
+        return JSONResponse(
+            {"url": url, "restart_required": True, "refresh_boundary": "process_restart"},
+            headers={"Cache-Control": "no-store"},
+        )
 
     def require_session(session_id: str) -> None:
         if not log.exists(session_id):
             raise HTTPException(404, "unknown session")
 
+    def require_current_binding() -> None:
+        if connections is not None and connections.restart_required():
+            raise HTTPException(409, "Account binding changed. Restart bud and start a new chat.")
+
     @app.post("/sessions", status_code=201)
     def create_session() -> dict[str, str]:
+        require_current_binding()
         session_id = uuid4().hex
         hub.publish(session_id, "session.created")
         return {"session_id": session_id}
@@ -204,6 +287,7 @@ def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAP
     @app.post("/sessions/{session_id}/messages", status_code=202)
     async def post_message(session_id: str, message: NewMessage) -> dict[str, bool]:
         require_session(session_id)
+        require_current_binding()
         try:
             event = runner.start(session_id, message.text, message.message_id or uuid4().hex)
         except QueueFull as exc:
@@ -234,6 +318,7 @@ def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAP
     @app.post("/sessions/{session_id}/queue/resume")
     async def resume_queue(session_id: str) -> dict:
         require_session(session_id)
+        require_current_binding()
         return {"changed": runner.pause_queue(session_id, False), "queue_paused": False}
 
     @app.post("/sessions/{session_id}/stop", status_code=202)
@@ -244,6 +329,8 @@ def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAP
     @app.post("/sessions/{session_id}/approvals/{approval_id}")
     async def decide(session_id: str, approval_id: str, decision: Decision) -> dict[str, bool]:
         require_session(session_id)
+        if decision.approved:
+            require_current_binding()
         try:
             return {"applied": runner.decide(session_id, approval_id, decision.approved)}
         except UnknownApproval:

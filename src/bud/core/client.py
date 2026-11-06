@@ -9,6 +9,9 @@ from uuid import uuid4
 
 import httpx
 
+from bud.config import get_settings
+from bud.core.auth import OwnerAuthError, owner_token
+
 
 def render(event: dict, seen_requests: set[str]) -> None:
     data = event["data"]
@@ -157,11 +160,44 @@ async def status(client: httpx.AsyncClient, session_id: str, pending: set[str]) 
             print(f"  {run['run_id']}: {run['status']}{reason}")
 
 
+def print_connection_status(state: dict) -> None:
+    for toolkit, value in state["statuses"].items():
+        print(f"[{toolkit}] {value}")
+    if state["restart_required"]:
+        print("[restart required] Stop and restart bud serve, then start a new conversation.")
+    else:
+        print("[connections current] Tool refresh requires a full server process restart.")
+
+
 async def submit(client: httpx.AsyncClient, session_id: str, pending: set[str], text: str) -> None:
     parts = text.split(maxsplit=2)
     command = parts[0]
     path = f"/sessions/{session_id}"
     match command:
+        case "/connect":
+            if len(parts) != 2 or parts[1] not in ("gmail", "calendar"):
+                print("[usage] /connect gmail|calendar")
+                return
+            response = await client.post(f"/connections/{parts[1]}/connect")
+            response.raise_for_status()
+            # Deliberate UI-only output; never submit the command/link as a message.
+            print(f"[sign in to {parts[1]}] {response.json()['url']}", flush=True)
+            print(
+                "[restart required] After sign-in, /refresh; restart bud serve; start a new chat."
+            )
+            return
+        case "/connections" | "/refresh":
+            if len(parts) != 1:
+                print(f"[usage] {command}")
+                return
+            response = (
+                await client.get("/connections")
+                if command == "/connections"
+                else await client.post("/connections/refresh")
+            )
+            response.raise_for_status()
+            print_connection_status(response.json())
+            return
         case "/approve" | "/deny" | "/status" | "/pause" | "/resume" | "/stop":
             if len(parts) != 1:
                 print(f"[usage] {command}")
@@ -203,7 +239,10 @@ async def submit(client: httpx.AsyncClient, session_id: str, pending: set[str], 
             label = f"message edited: {parts[1]}"
         case _:
             if command.startswith("/"):
-                print("[unknown command] /status /pause /resume /stop /cancel /edit /approve /deny")
+                print(
+                    "[unknown command] /status /pause /resume /stop /cancel /edit /approve /deny "
+                    "/connect /connections /refresh"
+                )
                 return
             response = await client.post(
                 f"{path}/messages", json={"text": text, "message_id": uuid4().hex}
@@ -216,13 +255,45 @@ async def submit(client: httpx.AsyncClient, session_id: str, pending: set[str], 
     print(f"[{label}]")
 
 
+def owner_client(base_url: str) -> httpx.AsyncClient:
+    """Never send the owner secret through a proxy, redirect, URL or remote plaintext HTTP."""
+    url = httpx.URL(base_url)
+    if (
+        url.scheme not in ("http", "https")
+        or not url.host
+        or url.userinfo
+        or url.query
+        or url.fragment
+        or url.path not in ("", "/")
+        or (url.scheme == "http" and url.host not in ("127.0.0.1", "::1", "localhost"))
+    ):
+        raise OwnerAuthError(
+            "Use a plain server origin: loopback HTTP or trusted HTTPS, "
+            "without credentials, query parameters or a path."
+        )
+    token = owner_token(get_settings())
+    return httpx.AsyncClient(
+        base_url=url,
+        headers={"Authorization": f"Bearer {token.get_secret_value()}"},
+        timeout=10,
+        trust_env=False,
+        follow_redirects=False,
+    )
+
+
 async def chat(base_url: str, session_id: str | None) -> None:
-    async with httpx.AsyncClient(base_url=base_url, timeout=10) as client:
+    async with owner_client(base_url) as client:
         if session_id is None:
             response = await client.post("/sessions")
             response.raise_for_status()
             session_id = response.json()["session_id"]
-        print(f"session {session_id}\nCtrl-D to leave. /status for state and queue.")
+        else:
+            # Authenticate before showing state or starting an endless SSE retry loop.
+            await refresh_pending(client, session_id, set())
+        print(
+            f"session {session_id}\nCtrl-D to leave. /status for state and queue; "
+            "/connect gmail|calendar, /connections or /refresh for account controls."
+        )
 
         pending: set[str] = set()
         follower = asyncio.create_task(follow(client, session_id, pending))

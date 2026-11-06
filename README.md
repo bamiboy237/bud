@@ -2,7 +2,7 @@
 
 bud is a personal AI agent you run yourself. It keeps every conversation in an append-only event log, so multiple clients can follow one session and reconnect after a disconnect. The server uses native DBOS durable execution to recover accepted work after a crash. Model calls go through a gateway that falls back to another provider on failure and records reported usage and cost.
 
-bud is under active development. It can chat, call tools, remember approved facts across sessions, and hold write actions for your approval. By default, bud uses real Gmail and Google Calendar connections through the Composio SDK and MCP (Model Context Protocol). Use `bud serve --simulate` to work with a fictional person's inbox and calendar instead. Live email and event listing, approved email sending, and approval pause/denial have been checked. One harmless unsent Gmail draft and fresh-conversation read-back have also been checked. One separately approved harmless Calendar create/time-only move and fresh-conversation read-back have also been checked, without attendees or a conference link.
+bud is under active development. It can chat, call tools, remember approved facts across sessions, and hold write actions for your approval. By default, bud uses real Gmail and Google Calendar connections through the Composio SDK and MCP (Model Context Protocol). Use `bud serve --simulate` to work with a fictional person's inbox and calendar instead. Live email and event listing, approved email sending, approval pause/denial, one harmless unsent draft, and one approved Calendar create/time-only move have been checked. Each new write waits for its own approval; these focused checks do not establish broad daily-use reliability.
 
 ## Install
 
@@ -80,7 +80,13 @@ Run the eval suite, which spends a few cents on model calls:
 uv run bud eval
 ```
 
-The server listens on `127.0.0.1:8420` and has no authentication, so keep it on your own machine. `--simulate` is the only mode switch. The old `--backend` flag and `BACKEND` setting are no longer used. Missing model access stops normal startup. Without a Composio key, account tools are unavailable but public research still works. Bud exposes account tools only for active connections and never silently switches to simulation.
+The server listens on `127.0.0.1:8420` and requires single-owner bearer authentication on every HTTP endpoint, including events, approvals, and account controls. Keep it on your own machine: authentication does not add TLS, remote hosting, or permission to expose it publicly. `--simulate` is the only mode switch. Missing model access stops normal startup. Account-free public research needs no Composio key; retained account references require the key to verify their binding. Bud never silently switches to simulation.
+
+### Owner access
+
+Run server and chat from the same working directory with the same `DATA_DIR`. Bud automatically creates one owner credential in `DATA_DIR/auth/owner.token` and the local CLI loads it; no token copying or printing is needed. It persists across restarts and account changes. The auth directory must be owned with mode `0700`, and the token file with mode `0600`. Unsafe or corrupt credentials fail closed instead of being replaced automatically.
+
+A separate trusted client can use a strong `OWNER_TOKEN` supplied through secure environment injection. Never put it in URLs, query strings, command arguments, examples, logs, or shared files. The CLI refuses remote plaintext HTTP, credential-bearing URLs, proxies, and redirects. HTTPS still requires an appropriate trusted host; no deployment is established by these access checks.
 
 ## Durable server and recovery
 
@@ -96,7 +102,7 @@ If recovery restarts an unfinished model request, `text.reset` replaces partial 
 
 Recovery refuses queued executions when their saved code version or run configuration differs from the current server. The version includes packaged code and configuration files, plus the DBOS, Pydantic AI, Harness, and Monty versions. Changed work fails before tools run rather than replaying across an upgrade. Interrupted runs from before durable execution have no recoverable inputs or journal and are marked failed.
 
-Earlier live recovery after `SIGKILL` was verified with DeepSeek and synthetic tools. Successful ChatGPT execution under DBOS and recovery of real Google writes have not been verified. The server remains local and unauthenticated. Durable execution does not add scheduling or an always-on deployment.
+Earlier live recovery after `SIGKILL` was verified with DeepSeek and synthetic tools. Successful ChatGPT execution under DBOS and recovery of real Google writes have not been verified. The server remains local with single-owner authentication. Durable execution does not add scheduled routines or an always-on deployment.
 
 ## Queue and Stop controls
 
@@ -183,7 +189,19 @@ uv run bud connections
 
 The connect commands do not wait or poll. `bud connections` reads only connection metadata, not mailbox or calendar data. It shows `gmail` and `googlecalendar` statuses; missing connections show `NOT_CONNECTED`.
 
-Composio manages the hosted OAuth sign-in flow, so you do not need your own Google Cloud console setup. Managed OAuth availability depends on your Composio project. These commands are the current developer setup; in-chat connection links are not implemented yet.
+Composio manages hosted OAuth, so you do not need your own Google Cloud console setup. Managed OAuth availability depends on your project. The CLI commands remain available; account links can also be requested directly in `bud chat`:
+
+```text
+/connect gmail
+/connections
+/refresh
+```
+
+Use `/connect calendar` for Calendar. These are explicit user controls, not model tools. The hosted link appears only in the immediate authenticated response/chat output, not model history, memory, session events, or connection-status output. Simulation refuses account controls without contacting a provider.
+
+After sign-in, `/refresh` verifies metadata and reports whether restart is required. Stop and restart the **server process**, then start a **new conversation**. This is the initial supported tool-refresh boundary, not hot reload: tools and DBOS are never reconstructed in the running process. Reads/Stop/denial remain available after a binding changes, but new messages, positive approvals, queue resume, and account dispatch are fenced until restart.
+
+Each explicit connection attempt retires the previous local generation, even when reconnecting the same remote account ID. Pending and accepted references are separate; only verified ACTIVE references enter a new tool scope. Changing owner, generation, or account mapping creates a new storage scope. Old conversations, memory, approvals, journals, and dispatch claims remain in their original directories; they are never copied into the new scope. A root live-server lock prevents concurrent live processes across generations. Remote status failures block new account dispatch. A check cannot recall a request already in flight, and does not prove continuous remote authorization between observations.
 
 3. Start normal mode and open a chat in another terminal. Only active connections add account tools. Public web research works without either Google connection:
 
@@ -198,9 +216,9 @@ New-reply verification accepts CRLF/LF normalization, HTML line breaks, and one 
 
 In a fresh conversation, bud can list draft metadata with `GMAIL_LIST_DRAFTS`, then read a selected ID with `GMAIL_GET_DRAFT`. Draft listing has no query filter. Bud must match candidates from returned pages and report incomplete searches. Simulation has separate bounded `list_drafts` and `read_draft` tools. Simulated draft creation now requires approval and records its replay key atomically with the draft.
 
-Every real-account write, including draft creation, waits for `/approve` or `/deny`. Before dispatch, bud saves a claim for that approval in `dispatches.db`. Confirmed draft identifiers are persisted before awaiting read-back; cancellation still propagates. A completed DBOS step receipt skips another execution during recovery. If a write has a claim but no confirmed result, the claim blocks another dispatch under the same approval. This is not a guarantee of exactly-once delivery by Google. Inspect the account before you request a new action or give a new approval. The original action may already have completed.
+Every real-account write, including draft creation, waits for `/approve` or `/deny`. Before dispatch, bud saves a claim for that approval in `dispatches.db`. Confirmed draft identifiers are saved there before awaiting read-back, so cancellation does not discard an already observed ID; cancellation itself still propagates. A completed DBOS step receipt skips another execution during recovery. If a write has a claim but no confirmed result, the claim blocks another dispatch under the same approval. This is not a guarantee of exactly-once delivery by Google. Inspect the account before you request a new action or give a new approval. The original action may already have completed.
 
-With the default `DATA_DIR`, simulated conversations use `data/bud.db`, the durable journal uses `data/runtime.db`, and persistent spend counters use `data/world-spend.db`. Real-account state stays in `data/composio/sessions/<account-hash>/`, with separate `bud.db`, `runtime.db`, `spend.db`, and `dispatches.db` files. The request cost ledger remains in `data/bud.db` for both modes. Git ignores `data/`.
+With the default `DATA_DIR`, simulated conversations use `data/bud.db`, the durable journal uses `data/runtime.db`, and persistent spend counters use `data/world-spend.db`. Real-account state stays in `data/composio/sessions/<binding-hash>/`, with separate `bud.db`, `runtime.db`, `spend.db`, and `dispatches.db` files. The hash includes the local owner, connection generation, and accepted account mapping. Legacy account-only scope directories are preserved, not automatically resumed. The request cost ledger remains in `data/bud.db` for both modes. Git ignores `data/`.
 
 ## Memory
 
@@ -214,7 +232,7 @@ bud requests approval for `write_memory`. After you approve, a new session can u
 
 The notebook uses Pydantic AI Harness Memory with SQLite persistence. A bounded main summary enters the model context, and longer notes are read on demand. Search matches text; it is not semantic email or document search. Do not store passwords or API keys in memory.
 
-Real memory stays with its account mapping in `data/composio/sessions/<account-hash>/memory.db`. Simulated memory uses `data/world-memory.db`, and every eval attempt gets a temporary store. `bud world reset` restores the fake inbox and calendar, not the memory notebook. Forgetting a note does not erase old conversation logs.
+Real memory stays with its immutable account binding in `data/composio/sessions/<binding-hash>/memory.db`. Simulated memory uses `data/world-memory.db`, and every eval attempt gets a temporary store. `bud world reset` restores the fake inbox and calendar, not the memory notebook. Forgetting a note does not erase old conversation logs.
 
 Memory content enters the model context, so local storage does not mean local-only processing. Real mode sends it to the selected model provider. Simulation must contain synthetic data only. Save, deny, update, forget, and fresh-session recall after server restarts have been verified in simulation with live model calls.
 

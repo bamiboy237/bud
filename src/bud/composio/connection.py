@@ -1,19 +1,12 @@
 """Hosted sign-in and local account references. OAuth tokens stay with Composio."""
 
-import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from uuid import uuid4
 
 from composio import SESSION_PRESET_DIRECT_TOOLS, Composio
 
+from bud.composio.binding import TOOLKITS, AccountBinding, BindingStore, ConnectionError
 from bud.config import Settings
-
-TOOLKITS = ("gmail", "googlecalendar")
-
-
-class ConnectionError(Exception):
-    """An integration error safe to show in the CLI and session log."""
 
 
 @contextmanager
@@ -33,26 +26,11 @@ class Connections:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.folder = settings.data_dir / "composio"
-        self.folder.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = self.folder / "connections.db"
-        with self._db() as db:
-            db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS owner (id TEXT PRIMARY KEY);
-                CREATE TABLE IF NOT EXISTS accounts (
-                    toolkit TEXT PRIMARY KEY, account_id TEXT NOT NULL
-                );
-                """
-            )
-            db.execute(
-                "INSERT INTO owner SELECT ? WHERE NOT EXISTS (SELECT 1 FROM owner)",
-                (uuid4().hex,),
-            )
-            self.user_id = db.execute("SELECT id FROM owner").fetchone()[0]
-        self.path.chmod(0o600)
-
-    def _db(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path, timeout=5)
+        with safe_errors("Could not read the local owner and account binding."):
+            self.store = BindingStore(self.path)
+            self.user_id = self.store.snapshot()[0].owner
+        self.binding: AccountBinding | None = None
 
     def client(self) -> Composio:
         key = self.settings.composio_api_key
@@ -63,49 +41,111 @@ class Connections:
         )
 
     def accounts(self) -> dict[str, str]:
-        with self._db() as db:
-            return dict(db.execute("SELECT toolkit, account_id FROM accounts"))
+        return self.store.snapshot()[0].accounts
 
     def connect(self, toolkit: str) -> str:
         if toolkit not in TOOLKITS:
-            raise ValueError("Unsupported toolkit")
+            raise ConnectionError("Unsupported toolkit. Use gmail or calendar.")
         with safe_errors("Could not start Composio sign-in. Check your key and connection."):
-            session = self.client().create(
-                user_id=self.user_id,
+            attempt = self.store.begin_connect(toolkit)
+            client = self.client()
+            session = client.create(
+                user_id=attempt.owner,
                 toolkits=[toolkit],
                 session_preset=SESSION_PRESET_DIRECT_TOOLS,
                 manage_connections=False,
             )
             request = session.authorize(toolkit)
             if not request.redirect_url:
-                raise ConnectionError("Composio did not return a sign-in link. Try again.")
-            with self._db() as db:
-                db.execute("INSERT OR REPLACE INTO accounts VALUES (?, ?)", (toolkit, request.id))
+                raise ConnectionError("Composio did not return a sign-in link. Check /connections.")
+            self.store.save_pending(attempt, toolkit, request.id)
             return request.redirect_url
 
     def statuses(self) -> dict[str, str]:
-        return self._statuses(self.accounts())
+        return self.refresh()[1]
 
-    def _statuses(self, accounts: dict[str, str]) -> dict[str, str]:
-        statuses = dict.fromkeys(TOOLKITS, "NOT_CONNECTED")
-        if not accounts:
-            return statuses
-        with safe_errors("Could not check Composio connections. Check your key and network."):
-            client = self.client()
-            for toolkit, account_id in accounts.items():
-                account = client.connected_accounts.get(nanoid=account_id)
-                if account.user_id != self.user_id or account.toolkit.slug != toolkit:
-                    raise ConnectionError(
-                        "Connection owner or toolkit changed. Reconnect the account."
-                    )
-                statuses[toolkit] = "DISABLED" if account.is_disabled else account.status
-        return statuses
+    def _status(
+        self, client: Composio, binding: AccountBinding, toolkit: str, account_id: str
+    ) -> str:
+        account = client.connected_accounts.get(nanoid=account_id)
+        if (
+            account.id != account_id
+            or account.user_id != binding.owner
+            or account.toolkit.slug != toolkit
+        ):
+            raise ConnectionError("Connection owner or toolkit changed. Reconnect the account.")
+        if account.is_disabled:
+            return "DISABLED"
+        # Only return known metadata, never arbitrary provider error text or URLs.
+        known = {"ACTIVE", "INITIATED", "INACTIVE", "FAILED", "EXPIRED", "REVOKED"}
+        return account.status if account.status in known else "UNAVAILABLE"
 
-    def active_accounts(self) -> dict[str, str]:
-        accounts = self.accounts()
-        statuses = self._statuses(accounts)
-        return {
-            toolkit: account_id
-            for toolkit, account_id in accounts.items()
-            if statuses[toolkit] == "ACTIVE"
-        }
+    def refresh(self) -> tuple[AccountBinding, dict[str, str]]:
+        """Verify references, accept completed sign-ins, and fence removed accounts.
+
+        This updates local metadata only. It never replaces a running toolset/DBOS
+        instance; a full process restart is the supported refresh boundary.
+        """
+        with safe_errors("Could not verify connections. No account tools were refreshed."):
+            previous, pending = self.store.snapshot()
+            references = previous.accounts | {k: v for k, v in pending.items() if v is not None}
+            statuses = dict.fromkeys(TOOLKITS, "NOT_CONNECTED")
+            try:
+                if references:
+                    client = self.client()
+                    for toolkit, account_id in references.items():
+                        statuses[toolkit] = self._status(client, previous, toolkit, account_id)
+            except Exception:
+                self.store.retire(previous)
+                raise
+            for toolkit, account_id in pending.items():
+                if account_id is None:
+                    statuses[toolkit] = "CONNECT_REQUESTED"
+            active = {k: v for k, v in references.items() if statuses[k] == "ACTIVE"}
+            remaining = {k: v for k, v in pending.items() if statuses[k] != "ACTIVE"}
+            accepted = self.store.accept_verified(previous, pending, active, remaining)
+            return accepted, statuses
+
+    def capture_binding(self) -> AccountBinding:
+        if self.binding is not None:
+            if self.restart_required():
+                raise ConnectionError("Account binding changed. Restart with a new session.")
+            return self.binding
+        binding = self.refresh()[0]
+        if binding.owner != self.user_id:
+            raise ConnectionError(
+                "Owner changed during startup. Restart with the original owner state."
+            )
+        self.binding = binding
+        return self.binding
+
+    def restart_required(self) -> bool:
+        return self.binding is None or self.store.snapshot()[0] != self.binding
+
+    def assert_current_binding(self, binding: AccountBinding, target_toolkit: str) -> None:
+        """Fence EVERY remote dispatch, including internal verification/read-back calls.
+
+        A remote call already in flight cannot be undone. A failed write must not
+        be retried automatically; inspect its outcome before any replacement action.
+        """
+        with safe_errors("Could not verify the account binding. No new tool call is authorized."):
+            current = self.store.snapshot()[0]
+            if self.binding != binding or binding.owner != self.user_id or current != binding:
+                raise ConnectionError("Account binding changed. Restart bud and use a new session.")
+            account_id = binding.accounts.get(target_toolkit)
+            if target_toolkit not in TOOLKITS or account_id is None:
+                raise ConnectionError("App not connected. Use /connect gmail or /connect calendar.")
+            try:
+                status = self._status(self.client(), binding, target_toolkit, account_id)
+            except Exception:
+                self.store.retire(binding)
+                raise
+            if status != "ACTIVE":
+                self.store.retire(binding, disconnected=target_toolkit)
+                raise ConnectionError(
+                    "Account is not active. Reconnect, restart and use a new session."
+                )
+            if self.store.snapshot()[0] != binding:
+                raise ConnectionError(
+                    "Account changed during verification. Restart with a new session."
+                )

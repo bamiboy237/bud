@@ -11,7 +11,9 @@ from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelAPIError, UserError
 
 from bud import __version__
+from bud.composio.binding import ConnectionError
 from bud.config import get_settings
+from bud.core.auth import OwnerAuthError
 from bud.core.client import chat
 from bud.evals.runner import evaluate
 from bud.gateway import Ledger, NoModelAvailable, build_gateway
@@ -97,7 +99,7 @@ def world(action: str) -> None:
 
 
 def connect(toolkit: str, no_browser: bool) -> None:
-    from bud.composio.connection import ConnectionError, Connections
+    from bud.composio.connection import Connections
 
     try:
         url = Connections(get_settings()).connect(toolkit)
@@ -106,11 +108,14 @@ def connect(toolkit: str, no_browser: bool) -> None:
     print(url)
     if not no_browser:
         webbrowser.open(url)
-    print("Sign in at this URL, then run `bud connections` to check the connection.")
+    print(
+        "Sign in at this URL, then run `bud connections` to check the connection. "
+        "Restart bud serve and start a new chat to load the changed account tools."
+    )
 
 
 def connections() -> None:
-    from bud.composio.connection import ConnectionError, Connections
+    from bud.composio.connection import Connections
 
     try:
         statuses = Connections(get_settings()).statuses()
@@ -118,6 +123,7 @@ def connections() -> None:
         raise SystemExit(str(exc)) from None
     for toolkit in ("gmail", "googlecalendar"):
         print(f"{toolkit}: {statuses.get(toolkit, 'NOT_CONNECTED')}")
+    print("Account tool changes require a full bud serve restart and a new chat.")
 
 
 def _main(argv: list[str] | None = None) -> None:
@@ -194,7 +200,14 @@ def _main(argv: list[str] | None = None) -> None:
 def main(argv: list[str] | None = None) -> None:
     try:
         _main(argv)
-    except (ChatGPTError, NoModelAvailable) as exc:
+    except (ChatGPTError, NoModelAvailable, OwnerAuthError, ConnectionError) as exc:
         raise SystemExit(str(exc)) from None
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 401:
+            raise SystemExit(
+                "Owner authentication failed (HTTP 401). "
+                "Use the server's DATA_DIR or securely supply its matching OWNER_TOKEN."
+            ) from None
+        raise SystemExit(error_summary(exc)) from None
     except (ModelAPIError, UserError, OpenAIError, httpx.HTTPError, OSError, ExceptionGroup) as exc:
         raise SystemExit(error_summary(exc)) from None

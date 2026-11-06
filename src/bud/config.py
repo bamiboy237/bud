@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     muse_api_key: SecretStr | None = None
     composio_api_key: SecretStr | None = None
     exa_api_key: SecretStr | None = None
+    owner_token: SecretStr | None = Field(default=None, repr=False)
 
     debug: bool = False
     data_dir: Path = Path("data")
