@@ -22,10 +22,23 @@ from bud.config import Settings
 from bud.core.controls import approval_text, session_snapshot, submit
 from bud.core.events import MessageOrigin
 from bud.photon_config import PhotonConfig, owner_message
-from bud.photon_store import TransportError, TransportStore, digest, fingerprint
+from bud.photon_signals import PhotonSignals
+from bud.photon_store import TransportError, TransportStore, digest, fingerprint, proposal_hash
 
 API_VERSION = "2026-07-01"
 logger = logging.getLogger(__name__)
+
+
+def reply_intent(text: str) -> bool | str | None:
+    """Explicit words, not model interpretation, determine permission or revision intent."""
+    value = text.strip().casefold().rstrip(".!")
+    if value in ("yes", "yep", "yes please", "approve", "go ahead", "do it", "👍"):
+        return True
+    if value in ("no", "no thanks", "deny", "cancel", "👎"):
+        return False
+    if value.startswith(("actually ", "actually, ", "instead ", "instead, ", "no, ")):
+        return text
+    return None
 
 
 def notification(event: dict, origin: MessageOrigin) -> str | None:
@@ -37,7 +50,7 @@ def notification(event: dict, origin: MessageOrigin) -> str | None:
         case "run.recovered":
             return "Recovering interrupted work; completed actions will not be requested again."
         case "approval.requested":
-            return approval_text(data)
+            return approval_text(data, reply=True)
         case "run.completed":
             for message in reversed(data["messages"]):
                 if message.get("kind") == "response":
@@ -102,6 +115,7 @@ class PhotonChat:
         self.ready = asyncio.Event()
         self.failure: str | None = None
         self.epoch = 0
+        self.signals = PhotonSignals(api, config.project, self.check_scope)
         if not self.store.get("not_before"):
             self.store.set("not_before", datetime.now(UTC).isoformat())
 
@@ -159,14 +173,90 @@ class PhotonChat:
         if route["space"] not in self.followers:
             self.followers[route["space"]] = asyncio.create_task(self.follow(route))
 
-    def enqueue(self, route: dict, identity: str, text: str, *, private_link: bool = False) -> None:
+    def enqueue(
+        self,
+        route: dict,
+        identity: str,
+        text: str,
+        *,
+        private_link: bool = False,
+        reply: bool = False,
+    ) -> None:
         if self.runtime["mode"] == "simulate":
             text = "[Simulation]\n" + text
+        route = {**route, "parent": route["parent"] if reply else ""}
         for key, body in self.store.enqueue(route, identity, text, persist=not private_link):
             if private_link:
                 # OAuth links are immediate UI output only, not durable transport
                 # history. If this process dies, request a new link explicitly.
                 self.ephemeral[key] = body
+
+    async def reply_decision(
+        self, route: dict, parent: str | None, text: str, message_id: str
+    ) -> str | None:
+        """A native reference selects the proposal; words alone never select permission."""
+        intent = reply_intent(text)
+        if intent is None:
+            return None
+        reference = self.store.approval_reference(route["space"], parent)
+        state = await session_snapshot(self.core, route["session"])
+        pending = state["pending_approvals"]
+        if reference is None:
+            if pending:
+                if isinstance(intent, str):
+                    return (
+                        "Please reply directly to the preview with your correction so I know "
+                        "which action to replace. Nothing was changed."
+                    )
+                return (
+                    "Please reply directly to the action preview with yes or no. "
+                    "Nothing was approved. You can also use the exact command in /status."
+                )
+            return None  # An ordinary conversational answer, not approval.
+        proposal = next((p for p in pending if p["approval_id"] == reference["approval_id"]), None)
+        if proposal is None:
+            return "That action is no longer waiting for permission. Nothing was approved."
+        if (
+            not reference["complete"]
+            or reference["session"] != route["session"]
+            or proposal_hash(proposal) != reference["proposal_hash"]
+        ):
+            return (
+                "I couldn't verify the complete preview for that action. Nothing was approved. "
+                "Use /status and its exact approval command."
+            )
+        if isinstance(intent, str):
+            if len(pending) != 1:
+                return (
+                    "Several actions are waiting. Decline the previews you want to replace "
+                    "before sending the correction. Nothing was changed."
+                )
+            response = await self.core.post(
+                f"/sessions/{route['session']}/approvals/{proposal['approval_id']}/revise",
+                json={
+                    "text": intent,
+                    "message_id": message_id,
+                    "origin": self.origin(route["space"]).model_dump(),
+                },
+            )
+            response.raise_for_status()
+            return (
+                "The old action is declined. I'll use your correction and ask again "
+                "before making a change."
+                if response.json()["applied"]
+                else "That correction was already received."
+            )
+        result = await submit(
+            self.core,
+            route["session"],
+            f"/{'approve' if intent else 'deny'} {proposal['approval_id']}",
+            origin=self.origin(route["space"]),
+        )
+        if result and result.startswith("[approved]"):
+            return "Approved once."
+        if result and result.startswith("[denied]"):
+            return "Declined. I won't perform that action."
+        return "That action is no longer waiting for permission. Nothing new was approved."
 
     async def receive(self, event: dict, meta: dict) -> None:
         from photon_api.generated.models import ReceivedImessageMessage
@@ -192,6 +282,7 @@ class PhotonChat:
                 item = event["data"].get("object", {})
                 if isinstance(item, dict) and isinstance(item.get("id"), str):
                     self.store.delivery(item["id"], kind.removeprefix("message."))
+                    self.signals.delivery(item["id"], kind.removeprefix("message."))
             self.store.set("cursor", str(seq))
             return
         if (
@@ -216,13 +307,14 @@ class PhotonChat:
             return
         await self.check_scope()
         text = message.content.text
+        parent = message.parentMessageId if isinstance(message.parentMessageId, str) else None
         effective = {
             "space": message.space.root.id,
             "sender": message.sentBy.root.id,
             "agent": message.receivedBy.root.id,
             "text": text,
         }
-        state = self.store.accept(message.id, fingerprint(effective))
+        state = self.store.accept(message.id, fingerprint(effective), parent=parent)
         if state == "done":
             self.store.complete(message.id, seq)
             return
@@ -237,22 +329,33 @@ class PhotonChat:
         # Explicit session attachment starts at the current end, not a replay of
         # private old replies into a newly linked messaging conversation.
         is_control = text.lstrip().startswith("/")
+        # A replay must never turn an uncertain approval decision into another
+        # decision. Ordinary conversational answers remain idempotent core input.
+        answer = text.strip().casefold().rstrip(".!")
+        reply_control = reply_intent(text) is not None
+        is_control = is_control or reply_control or answer in ("stop", "stop please")
         if text.strip().lower() == "ping":
             result = "Bud connection verified."
         elif state == "dispatching" and is_control:
             result = (
-                "Your earlier control may already have applied. I did not repeat it. "
+                "Your earlier reply may already have been handled. I did not apply it again. "
                 "Use /status to inspect the current state."
             )
         else:
             try:
-                result = await submit(
-                    self.core,
-                    route["session"],
-                    text,
-                    message_id=digest("photon:" + message.id),
-                    origin=self.origin(route["space"]),
+                result = (
+                    await self.reply_decision(route, parent, text, digest("photon:" + message.id))
+                    if reply_control
+                    else None
                 )
+                if result is None:
+                    result = await submit(
+                        self.core,
+                        route["session"],
+                        "/stop" if answer in ("stop", "stop please") else text,
+                        message_id=digest("photon:" + message.id),
+                        origin=self.origin(route["space"]),
+                    )
             except httpx.HTTPStatusError as exc:
                 result = (
                     f"Bud declined this request (HTTP {exc.response.status_code}). "
@@ -271,8 +374,10 @@ class PhotonChat:
                 "incoming:" + message.id,
                 result,
                 private_link=text.split(maxsplit=1)[0] == "/connect",
+                reply=parent is not None,
             )
         self.store.complete(message.id, seq)
+        self.signals.accepted(message.id)
 
     async def follow(self, initial: dict) -> None:
         """Project committed core events into durable, deduplicated notifications."""
@@ -284,7 +389,16 @@ class PhotonChat:
                 async for event in self.events(route["session"], route["core_seq"]):
                     route = next(item for item in self.store.routes() if item["space"] == space)
                     text = notification(event, self.origin(space))
-                    self.store.project(route, event["seq"], text)
+                    if event["data"].get("origin") == self.origin(space).model_dump():
+                        self.signals.observe(event, space, route["agent"])
+                    self.store.project(
+                        {**route, "parent": ""},
+                        event["seq"],
+                        text,
+                        approval=event["data"]
+                        if text and event["type"] == "approval.requested"
+                        else None,
+                    )
             except Exception:
                 self.fail("Core event projection stopped; its cursor was preserved.")
                 return
@@ -317,7 +431,11 @@ class PhotonChat:
                                     "body": {
                                         "spaceId": item["space"],
                                         "senderId": item["agent"],
-                                        "parentMessageId": item["parent"],
+                                        **(
+                                            {"parentMessageId": item["parent"]}
+                                            if item["parent"]
+                                            else {}
+                                        ),
                                         "content": {
                                             "type": "text",
                                             "format": "plain",
@@ -409,7 +527,12 @@ class PhotonChat:
                 await self.resolve_conversation()
                 for route in self.store.routes():
                     await self.ensure_session(route)
-                tasks = [asyncio.create_task(self.consume()), asyncio.create_task(self.send())]
+                tasks = [
+                    asyncio.create_task(self.consume()),
+                    asyncio.create_task(self.send()),
+                    asyncio.create_task(self.signals.mark_read()),
+                    asyncio.create_task(self.signals.refresh_typing()),
+                ]
                 await socket.connect(
                     "https://api.photon.codes",
                     headers={"Authorization": f"Bearer {self.config.key.get_secret_value()}"},

@@ -63,6 +63,33 @@ def queued_messages(events: list[Event]) -> list[QueuedMessage]:
     return list(pending.values())
 
 
+def message_batch(events: list[Event]) -> list[QueuedMessage]:
+    """Coalesce only adjacent iMessage inputs from one route within two seconds."""
+    pending = queued_messages(events)
+    if not pending:
+        return []
+    first = pending[0]
+    if first.origin is None or first.origin.channel != "imessage":
+        return [first]
+    times = {
+        event.data["message_id"]: event.created_at
+        for event in events
+        if event.type == "message.queued"
+    }
+    batch = []
+    length = 0
+    for item in pending:
+        if (
+            item.origin != first.origin
+            or (times[item.message_id] - times[first.message_id]).total_seconds() > 2
+            or length + len(item.text) + 2 > 100_000
+        ):
+            break
+        batch.append(item)
+        length += len(item.text) + 2
+    return batch or [first]
+
+
 def queue_paused(events: list[Event]) -> bool:
     return next(
         (
@@ -185,6 +212,9 @@ def model_history(events: list[Event]) -> list[ModelMessage]:
         match event.type:
             case "user.message":
                 user_text = event.data["text"]
+            case "run.queued":
+                if event.data.get("text") is not None:
+                    user_text = event.data["text"]
             case "tool.call":
                 calls[event.data["call_id"]] = f"{event.data['tool']}({event.data['args']})"
             case "action.decided":

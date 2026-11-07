@@ -34,9 +34,9 @@ from bud.core.hub import Hub
 from bud.core.log import StopRequested
 from bud.core.projection import (
     decisions,
+    message_batch,
     model_history,
     queue_paused,
-    queued_messages,
     runs,
     undecided_approvals,
     waiting_batch,
@@ -80,6 +80,7 @@ class Runner(DBOSConfiguredInstance):
         self._monitors: set[asyncio.Task] = set()
         self._executing: dict[str, asyncio.Task] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._bursts: dict[str, asyncio.TimerHandle] = {}
         self._closing = False
         self._current: ContextVar[dict] = ContextVar("bud_run")
         self.version = replay_version()
@@ -187,8 +188,23 @@ class Runner(DBOSConfiguredInstance):
         event = self.hub.log.accept_message(session_id, text, message_id, origin)
         if event is not None:
             self.hub.wake(session_id)
-        self._drain(session_id)
+        if (
+            event is not None
+            and origin
+            and origin.get("channel") == "imessage"
+            and not self._busy(session_id)
+        ):
+            if session_id not in self._bursts:
+                # A fixed window, not an indefinitely reset timer. Accepted text
+                # is already durable; a restart can drain it without this timer.
+                self._bursts[session_id] = self._loop.call_later(1, self._flush_burst, session_id)
+        else:
+            self._drain(session_id)
         return event
+
+    def _flush_burst(self, session_id: str) -> None:
+        self._bursts.pop(session_id, None)
+        self._drain(session_id)
 
     @staticmethod
     def _validate_text(text: str) -> None:
@@ -213,26 +229,30 @@ class Runner(DBOSConfiguredInstance):
         return changed
 
     def _drain(self, session_id: str) -> None:
-        if self._closing or self._busy(session_id):
+        if self._closing or session_id in self._bursts or self._busy(session_id):
             return
         events = self.hub.log.read(session_id)
         if waiting_batch(events):
             self._resume_if_ready(session_id)
             return
-        pending = queued_messages(events)
+        pending = message_batch(events)
         if queue_paused(events) or not pending:
             return
         run = self._inputs(
             session_id,
-            pending[0].text,
+            "\n\n".join(item.text for item in pending),
             origin=pending[0].origin.model_dump() if pending[0].origin else None,
         )
         run["message_id"] = pending[0].message_id
+        run["message_ids"] = [item.message_id for item in pending]
         if self.hub.log.dispatch_message(session_id, pending[0].message_id, run):
             self.hub.wake(session_id)
             self._launch(run)
 
     async def stop_session(self, session_id: str) -> dict:
+        timer = self._bursts.pop(session_id, None)
+        if timer is not None:
+            timer.cancel()
         request = self.hub.log.request_stop(session_id)
         self.hub.wake(session_id)
         await self.context.discard(session_id)
@@ -263,6 +283,15 @@ class Runner(DBOSConfiguredInstance):
             return False
         self._resume_if_ready(session_id)
         return True
+
+    def revise(
+        self, session_id: str, approval_id: str, text: str, message_id: str, origin: dict
+    ) -> bool:
+        self._validate_text(text)
+        event = self.hub.log.revise_approval(session_id, approval_id, text, message_id, origin)
+        self.hub.wake(session_id)
+        self._drain(session_id)
+        return event is not None
 
     def _resume_if_ready(self, session_id: str) -> None:
         events = self.hub.log.read(session_id)
@@ -372,6 +401,9 @@ class Runner(DBOSConfiguredInstance):
 
     async def stop(self) -> None:
         self._closing = True
+        for timer in self._bursts.values():
+            timer.cancel()
+        self._bursts.clear()
         if not self.durable:
             for task in self._monitors:
                 task.cancel()

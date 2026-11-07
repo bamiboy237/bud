@@ -26,13 +26,37 @@ async def session_snapshot(client: httpx.AsyncClient, session_id: str) -> dict:
     return response.json()
 
 
-def approval_text(approval: dict) -> str:
+def approval_text(approval: dict, *, reply: bool = False) -> str:
+    """Render every supplied argument; presentation never changes the approved payload."""
     identity = approval["approval_id"]
-    return (
-        f"[approval {identity}] {approval['tool']}\n"
-        f"{json.dumps(approval['args'], ensure_ascii=False)}\n"
-        f"/approve {identity}\n/deny {identity}"
-    )
+    titles = {
+        "draft_reply": "Save a reply draft (not send)",
+        "GMAIL_CREATE_EMAIL_DRAFT": "Save an email draft (not send)",
+        "send_email": "Send an email",
+        "GMAIL_SEND_EMAIL": "Send an email",
+        "create_event": "Create a meeting",
+        "GOOGLECALENDAR_CREATE_EVENT": "Create a meeting",
+        "move_event": "Move a meeting",
+        "GOOGLECALENDAR_PATCH_EVENT": "Move a meeting",
+        "workspace_create": "Create a workspace file",
+        "workspace_update": "Update a workspace file",
+    }
+    lines = [f"Permission needed: {titles.get(approval['tool'], approval['tool'])}"]
+    for name, value in approval["args"].items():
+        label = name.replace("_", " ").capitalize()
+        if name in ("body", "message_body", "content") and isinstance(value, str):
+            lines.append(f"{label} (each line quoted):")
+            lines.extend("│ " + line for line in value.split("\n"))
+        else:
+            lines.append(f"{label}: {json.dumps(value, ensure_ascii=False)}")
+    if reply:
+        lines.append(
+            'Reply directly to this preview: "yes" to approve once, "no" to decline. '
+            'To revise the only pending action, reply "Actually, ..." with the correction. '
+            "For a multi-part preview, reply to the last part after all parts arrive."
+        )
+    lines.extend((f"/approve {identity}", f"/deny {identity}"))
+    return "\n".join(lines)
 
 
 def connection_text(state: dict) -> str:

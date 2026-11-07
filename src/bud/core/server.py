@@ -443,6 +443,25 @@ def _create_app(
         except UnknownApproval:
             raise HTTPException(404, "unknown approval") from None
 
+    @app.post("/sessions/{session_id}/approvals/{approval_id}/revise")
+    async def revise(session_id: str, approval_id: str, message: NewMessage) -> dict[str, bool]:
+        require_session(session_id)
+        require_current_binding()
+        try:
+            return {
+                "applied": runner.revise(
+                    session_id,
+                    approval_id,
+                    message.text,
+                    message.message_id or uuid4().hex,
+                    message.origin.model_dump(),
+                )
+            }
+        except QueueFull as exc:
+            raise HTTPException(429, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+
     @app.get("/sessions/{session_id}/events")
     async def stream_events(
         session_id: str,

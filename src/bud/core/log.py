@@ -8,7 +8,13 @@ from typing import Any
 from uuid import uuid4
 
 from bud.core.events import RUN_END_EVENTS, Event, EventType
-from bud.core.projection import queue_paused, queued_messages, runs, undecided_approvals
+from bud.core.projection import (
+    message_batch,
+    queue_paused,
+    queued_messages,
+    runs,
+    undecided_approvals,
+)
 
 
 class QueueFull(Exception):
@@ -89,6 +95,7 @@ class EventLog:
                 "run.completed",
                 "run.failed",
                 "run.cancelled",
+                "run.stop_requested",
                 "approval.requested",
             }
             and "origin" not in data
@@ -190,25 +197,51 @@ class EventLog:
     ) -> Event | None:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            previous = db.execute(
-                """SELECT data FROM events WHERE session_id = ?
+            return self._accept_message(db, session_id, text, message_id, origin)
+
+    def _accept_message(
+        self, db, session_id: str, text: str, message_id: str, origin: dict | None
+    ) -> Event | None:
+        previous = db.execute(
+            """SELECT data FROM events WHERE session_id = ?
                    AND type IN ('message.queued', 'user.message')
                    AND json_extract(data, '$.message_id') = ? ORDER BY seq LIMIT 1""",
-                (session_id, message_id),
-            ).fetchone()
-            if previous:
-                data = json.loads(previous[0])
-                if data["text"] != text or data.get("origin") != origin:
-                    raise ValueError("Message ID already used with different content or origin")
+            (session_id, message_id),
+        ).fetchone()
+        if previous:
+            data = json.loads(previous[0])
+            if data["text"] != text or data.get("origin") != origin:
+                raise ValueError("Message ID already used with different content or origin")
+            return None
+        if len(queued_messages(self._read(db, session_id))) >= 20:
+            raise QueueFull("This conversation already has 20 waiting messages")
+        return self._insert(
+            db,
+            session_id,
+            "message.queued",
+            {"message_id": message_id, "text": text, "origin": origin},
+        )
+
+    def revise_approval(
+        self, session_id: str, approval_id: str, text: str, message_id: str, origin: dict
+    ) -> Event | None:
+        """Retire one pending permission and accept its correction atomically."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            event = self._accept_message(db, session_id, text, message_id, origin)
+            if event is None:
+                # A repeated transport request cannot decline a later proposal.
                 return None
-            if len(queued_messages(self._read(db, session_id))) >= 20:
-                raise QueueFull("This conversation already has 20 waiting messages")
-            return self._insert(
+            pending = undecided_approvals(self._read(db, session_id))
+            if len(pending) != 1 or pending[0]["approval_id"] != approval_id:
+                raise ValueError("The exact action must be the only pending approval to revise.")
+            self._insert(
                 db,
                 session_id,
-                "message.queued",
-                {"message_id": message_id, "text": text, "origin": origin},
+                "approval.denied",
+                {"approval_id": approval_id, "origin": origin},
             )
+            return event
 
     def edit_message(self, session_id: str, message_id: str, text: str) -> None:
         with self._connect() as db:
@@ -253,14 +286,19 @@ class EventLog:
                 )
             ):
                 return False
-            item = pending[0]
-            self._insert(db, session_id, "user.message", item.model_dump(), once=True)
-            self._insert(
-                db,
-                session_id,
-                "message.dispatched",
-                {"message_id": message_id, "run_id": run["run_id"]},
-            )
+            batch = message_batch(events)
+            if run.get("message_ids", [message_id]) != [item.message_id for item in batch]:
+                return False
+            if run["text"] != "\n\n".join(item.text for item in batch):
+                return False
+            for item in batch:
+                self._insert(db, session_id, "user.message", item.model_dump(), once=True)
+                self._insert(
+                    db,
+                    session_id,
+                    "message.dispatched",
+                    {"message_id": item.message_id, "run_id": run["run_id"]},
+                )
             self._insert(db, session_id, "run.queued", run, key=f"{run['run_id']}:queued")
             return True
 

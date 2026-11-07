@@ -66,7 +66,7 @@ class TransportStore:
                 os.close(dbfd)
             with self.connect() as db:
                 version = db.execute("PRAGMA user_version").fetchone()[0]
-                if version not in (0, 1):
+                if version not in (0, 1, 2):
                     raise TransportError(
                         "Unsupported Photon state version; restore compatible state."
                     )
@@ -75,7 +75,7 @@ class TransportStore:
                     for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")
                 }
                 expected = {"state", "routes", "inbox", "outbox"}
-                if (version == 1 or tables) and not expected.issubset(tables):
+                if (version or tables) and not expected.issubset(tables):
                     raise TransportError("Incomplete Photon state; it will not be reset.")
                 if tables:
                     cursor = db.execute("SELECT value FROM state WHERE name='cursor'").fetchone()
@@ -97,6 +97,9 @@ class TransportStore:
                             "delivery_status",
                         },
                     }
+                    if version == 2:
+                        columns["inbox"].add("reply_to")
+                        columns["outbox"].update(("approval_id", "proposal_hash"))
                     for name, required in columns.items():
                         actual = {row[1] for row in db.execute(f"PRAGMA table_info({name})")}
                         if not required.issubset(actual):
@@ -111,25 +114,30 @@ class TransportStore:
                         ).fetchone()
                     ):
                         raise TransportError("Invalid Photon dispatch state; it was not reset.")
-                db.executescript("""
-                    CREATE TABLE IF NOT EXISTS state (name TEXT PRIMARY KEY, value TEXT NOT NULL);
-                    CREATE TABLE IF NOT EXISTS routes (
+                db.execute("BEGIN IMMEDIATE")
+                if not tables:
+                    db.execute("CREATE TABLE state (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                    db.execute("""CREATE TABLE routes (
                         space TEXT PRIMARY KEY, agent TEXT NOT NULL, parent TEXT NOT NULL,
                         session TEXT NOT NULL, core_seq INTEGER NOT NULL DEFAULT 0,
                         ready INTEGER NOT NULL DEFAULT 0
-                    );
-                    CREATE TABLE IF NOT EXISTS inbox (
-                        id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL
-                    );
-                    CREATE TABLE IF NOT EXISTS outbox (
+                    )""")
+                    db.execute("""CREATE TABLE inbox (
+                        id TEXT PRIMARY KEY, digest TEXT NOT NULL, state TEXT NOT NULL,
+                        reply_to TEXT
+                    )""")
+                    db.execute("""CREATE TABLE outbox (
                         id TEXT PRIMARY KEY, group_id TEXT NOT NULL, space TEXT NOT NULL,
                         parent TEXT NOT NULL, body TEXT, state TEXT NOT NULL DEFAULT 'queued',
-                        receipt TEXT, delivery_status TEXT
-                    );
-                    PRAGMA user_version=1;
-                """)
-                if version == 0:
-                    db.execute("INSERT OR IGNORE INTO state VALUES ('cursor','0')")
+                        receipt TEXT, delivery_status TEXT, approval_id TEXT, proposal_hash TEXT
+                    )""")
+                    db.execute("INSERT INTO state VALUES ('cursor','0')")
+                elif version < 2:
+                    # Old previews never acquire permission-bearing reply references.
+                    db.execute("ALTER TABLE inbox ADD COLUMN reply_to TEXT")
+                    db.execute("ALTER TABLE outbox ADD COLUMN approval_id TEXT")
+                    db.execute("ALTER TABLE outbox ADD COLUMN proposal_hash TEXT")
+                db.execute("PRAGMA user_version=2")
                 # A process may have died after submitting the send. Keep its
                 # receipt/claim, do not turn it back into a retryable job.
                 db.execute("UPDATE outbox SET state='unknown',body=NULL WHERE state='sending'")
@@ -194,15 +202,22 @@ class TransportStore:
                 db.execute("UPDATE routes SET parent=? WHERE space=?", (parent, space))
             return dict(db.execute("SELECT * FROM routes WHERE space=?", (space,)).fetchone())
 
-    def accept(self, identity: str, fingerprint: str) -> str:
+    def accept(self, identity: str, fingerprint: str, *, parent: str | None = None) -> str:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM inbox WHERE id=?", (identity,)).fetchone()
             if row is not None:
                 if row["digest"] != fingerprint:
                     raise TransportError("Photon reused a message ID with different content.")
+                if row["reply_to"] is not None and row["reply_to"] != (parent or ""):
+                    raise TransportError(
+                        "Photon reused a message ID with a different reply target."
+                    )
                 return row["state"]
-            db.execute("INSERT INTO inbox VALUES (?,?,'dispatching')", (identity, fingerprint))
+            db.execute(
+                "INSERT INTO inbox(id,digest,state,reply_to) VALUES (?,?,'dispatching',?)",
+                (identity, fingerprint, parent or ""),
+            )
             return "new"
 
     def ready(self, space: str) -> None:
@@ -215,7 +230,9 @@ class TransportStore:
             db.execute("INSERT OR REPLACE INTO state VALUES ('cursor',?)", (str(cursor),))
 
     @staticmethod
-    def _enqueue(db, route: dict, identity: str, text: str, persist: bool) -> list[tuple[str, str]]:
+    def _enqueue(
+        db, route: dict, identity: str, text: str, persist: bool, approval: dict | None = None
+    ) -> list[tuple[str, str]]:
         # Split complete output rather than discarding the tail. Approval command
         # lines follow the full arguments and therefore appear in the final part.
         chunks = [text[i : i + 1800] for i in range(0, len(text), 1800)]
@@ -230,13 +247,20 @@ class TransportStore:
             ).fetchone()
             if row:
                 result.append((key, body))
+                if approval is not None and index == len(chunks) - 1:
+                    db.execute(
+                        "UPDATE outbox SET approval_id=?,proposal_hash=? WHERE id=?",
+                        (approval["approval_id"], proposal_hash(approval), key),
+                    )
         return result
 
     def enqueue(self, route: dict, identity: str, text: str, *, persist: bool = True) -> list:
         with self.connect() as db:
             return self._enqueue(db, route, identity, text, persist)
 
-    def project(self, route: dict, seq: int, text: str | None) -> None:
+    def project(
+        self, route: dict, seq: int, text: str | None, *, approval: dict | None = None
+    ) -> None:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
@@ -245,14 +269,39 @@ class TransportStore:
             if row[0] >= seq:
                 return
             if text:
-                self._enqueue(db, route, f"core:{route['session']}:{seq}", text, True)
+                self._enqueue(db, route, f"core:{route['session']}:{seq}", text, True, approval)
             db.execute("UPDATE routes SET core_seq=? WHERE space=?", (seq, route["space"]))
+
+    def approval_reference(self, space: str, receipt: str | None) -> dict | None:
+        """Only the final, known preview part can identify an action—not arbitrary text."""
+        if not receipt:
+            return None
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT o.*,r.session FROM outbox o JOIN routes r ON o.space=r.space
+                   WHERE o.space=? AND o.receipt=? AND o.approval_id IS NOT NULL""",
+                (space, receipt),
+            ).fetchall()
+            if len(rows) != 1:
+                return None
+            item = dict(rows[0])
+            # A reply proves this final part arrived. Earlier parts still require
+            # delivery evidence, not merely HTTP acceptance.
+            incomplete = db.execute(
+                """SELECT 1 FROM outbox WHERE group_id=? AND
+                   (state != 'accepted' OR delivery_status='failed' OR
+                    (id != ? AND COALESCE(delivery_status,'') != 'delivered')) LIMIT 1""",
+                (item["group_id"], item["id"]),
+            ).fetchone()
+            item["complete"] = incomplete is None
+            return item
 
     @staticmethod
     def _block_partial(db) -> None:
         db.execute(
             """UPDATE outbox SET state='blocked',body=NULL WHERE state='queued'
-               AND group_id IN (SELECT group_id FROM outbox WHERE state='unknown')"""
+               AND group_id IN (SELECT group_id FROM outbox
+                                WHERE state='unknown' OR delivery_status='failed')"""
         )
 
     def claim(self) -> dict | None:
@@ -281,9 +330,14 @@ class TransportStore:
     def uncertain(self) -> int:
         with self.connect() as db:
             return db.execute(
-                "SELECT count(*) FROM outbox WHERE state IN ('sending','unknown','blocked')"
+                """SELECT count(*) FROM outbox WHERE state IN ('sending','unknown','blocked')
+                   OR delivery_status='failed'"""
             ).fetchone()[0]
 
 
 def fingerprint(message: dict) -> str:
     return digest(json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
+
+def proposal_hash(approval: dict) -> str:
+    return fingerprint({key: approval[key] for key in ("approval_id", "tool", "args")})
