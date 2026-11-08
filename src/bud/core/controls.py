@@ -26,7 +26,7 @@ async def session_snapshot(client: httpx.AsyncClient, session_id: str) -> dict:
     return response.json()
 
 
-def approval_text(approval: dict, *, reply: bool = False) -> str:
+def approval_text(approval: dict) -> str:
     """Render every supplied argument; presentation never changes the approved payload."""
     identity = approval["approval_id"]
     titles = {
@@ -49,12 +49,6 @@ def approval_text(approval: dict, *, reply: bool = False) -> str:
             lines.extend("│ " + line for line in value.split("\n"))
         else:
             lines.append(f"{label}: {json.dumps(value, ensure_ascii=False)}")
-    if reply:
-        lines.append(
-            'Reply directly to this preview: "yes" to approve once, "no" to decline. '
-            'To revise the only pending action, reply "Actually, ..." with the correction. '
-            "For a multi-part preview, reply to the last part after all parts arrive."
-        )
     lines.extend((f"/approve {identity}", f"/deny {identity}"))
     return "\n".join(lines)
 

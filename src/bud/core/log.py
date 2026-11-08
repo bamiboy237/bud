@@ -101,12 +101,20 @@ class EventLog:
             and "origin" not in data
         ):
             row = db.execute(
-                """SELECT json_extract(data, '$.origin') FROM events
+                """SELECT json_extract(data, '$.origin'),
+                          COALESCE(json_extract(data, '$.message_ids[#-1]'),
+                                   json_extract(data, '$.message_id')),
+                          json_extract(data, '$.quiet') FROM events
                    WHERE session_id=? AND type='run.queued'
                    AND json_extract(data, '$.run_id')=?""",
                 (session_id, data.get("run_id")),
             ).fetchone()
-            data = {**data, "origin": json.loads(row[0]) if row and row[0] else None}
+            data = {
+                **data,
+                "origin": json.loads(row[0]) if row and row[0] else None,
+                "source_message_id": row[1] if row else None,
+                "quiet": bool(row[2]) if row else False,
+            }
         event_id = uuid4().hex
         created_at = datetime.now(UTC).isoformat()
         verb = "INSERT OR IGNORE" if once else "INSERT"
@@ -197,7 +205,54 @@ class EventLog:
     ) -> Event | None:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            return self._accept_message(db, session_id, text, message_id, origin)
+            event = self._accept_message(db, session_id, text, message_id, origin)
+            if event is not None:
+                self._supersede(db, session_id, message_id, origin)
+            return event
+
+    def _supersede(self, db, session_id: str, message_id: str, origin: dict | None) -> None:
+        # New conversational input makes unapproved proposals stale. Already
+        # granted permissions are not recalled or changed by this operation.
+        for request in undecided_approvals(self._read(db, session_id)):
+            self._insert(
+                db,
+                session_id,
+                "approval.denied",
+                {
+                    "approval_id": request["approval_id"],
+                    "origin": origin,
+                    "revision_message_id": message_id,
+                },
+            )
+
+    def _supersede_updates(self, db, session_id: str, run_id: str) -> bool:
+        events = self._read(db, session_id)
+        started = next(
+            event.seq
+            for event in reversed(events)
+            if event.type == "run.queued" and event.data["run_id"] == run_id
+        )
+        pending = {item.message_id for item in queued_messages(events)}
+        update = next(
+            (
+                event
+                for event in reversed(events)
+                if event.seq > started
+                and event.type == "message.queued"
+                and event.data["message_id"] in pending
+            ),
+            None,
+        )
+        if update is None or not undecided_approvals(events):
+            return False
+        self._supersede(db, session_id, update.data["message_id"], update.data.get("origin"))
+        return True
+
+    def supersede_updates(self, session_id: str) -> bool:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            pending = undecided_approvals(self._read(db, session_id))
+            return bool(pending) and self._supersede_updates(db, session_id, pending[0]["run_id"])
 
     def _accept_message(
         self, db, session_id: str, text: str, message_id: str, origin: dict | None
@@ -239,7 +294,7 @@ class EventLog:
                 db,
                 session_id,
                 "approval.denied",
-                {"approval_id": approval_id, "origin": origin},
+                {"approval_id": approval_id, "origin": origin, "revision_message_id": message_id},
             )
             return event
 
@@ -426,6 +481,8 @@ class EventLog:
                     key=f"{run_id}:approval:{request['call_id']}",
                 )
             terminal = self._insert(db, session_id, kind, data, once=True, key=f"{run_id}:terminal")
+            if terminal is not None and kind == "run.waiting":
+                self._supersede_updates(db, session_id, run_id)
             if (
                 terminal is not None
                 and kind == "run.failed"

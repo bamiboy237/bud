@@ -115,7 +115,7 @@ Work performed inside a conversation remains in its tool/action history. This is
 
 ## Durable server and recovery
 
-`bud serve` uses Pydantic AI's native `DBOSDurability` integration with a local SQLite journal, `runtime.db`, beside the session database. Each session runs one execution at a time. Messages received while bud is busy or waiting for approval enter a persistent queue in arrival order.
+`bud serve` uses Pydantic AI's native `DBOSDurability` integration with a local SQLite journal, `runtime.db`, beside the session database. Each session runs one execution at a time. Messages received while bud is busy enter a persistent queue in arrival order. New conversational input makes unapproved proposals stale rather than freezing the conversation: bud closes those permissions and considers the new request. Corrected writes need fresh approval. Already granted permissions are not recalled by an ordinary follow-up; use Stop when you want active work stopped.
 
 The queue holds up to 20 waiting messages. Waiting messages do not enter the conversation until their turn starts. At dispatch, the server saves the messages and their `run.queued` inputs in one transaction, using the latest completed conversation. iMessage gets a fixed one-second collection window when idle. Adjacent messages from the same iMessage route received within two seconds can become one model turn, with each original message and ID retained separately. Different interfaces, older messages and inputs exceeding the normal text budget are not combined. Restart recovery preserves waiting messages and can drain them without waiting for the in-memory timer. A completed approval batch continues before the next queued message.
 
@@ -245,64 +245,101 @@ Every real-account write, including draft creation, waits for `/approve <approva
 
 With the default `DATA_DIR`, simulated conversations use `data/bud.db`, the durable journal uses `data/runtime.db`, and persistent spend counters use `data/world-spend.db`. Real-account state stays in `data/composio/sessions/<binding-hash>/`, with separate `bud.db`, `runtime.db`, `spend.db`, and `dispatches.db` files. The hash includes the local owner, connection generation, and accepted account mapping. Legacy account-only scope directories are preserved, not automatically resumed. The request cost ledger remains in `data/bud.db` for both modes. Git ignores `data/`.
 
-## iMessage through Photon 2.0
+## iMessage through Photon v2
 
-The adapter targets **Beta/2.0**, whose project IDs begin `pho_prj_`. It uses the official `photonhq-api` Python client for sending and a Socket.IO client for versioned incoming events. Stable/Spectrum credentials and packages are not interchangeable with these.
+Bud uses Photon's official Python v2 client and Socket.IO events. The Python core
+owns the conversation, tools and approvals; Photon carries plain-text messages.
+There is no separate agent, Node runtime or connection to your Mac's Messages database.
 
-Photon's dependencies are included in the normal installation:
-
-```sh
-uv sync
-```
-
-Supply these privately through your environment or ignored `.env`, never in chat, command arguments, or source:
+Use the [Photon v2 dashboard](https://app.beta.photon.codes/), not the separate
+Spectrum dashboard. Register your exact Messages send-from email or phone number
+and use the shared number assigned to that identity. Supply these privately in
+the server's environment or ignored `.env`:
 
 | Setting | Value |
 | --- | --- |
-| `PHOTON_API_KEY` | Project-scoped `pho_sk_…` key with `project:read` and `project:write` |
-| `PHOTON_PROJECT_ID` | The `pho_prj_…` project |
-| `PHOTON_OWNER_HANDLE` | Exact iMessage send-from email or E.164 phone number |
-| `PHOTON_AGENT_HANDLE` | Different E.164 number Photon assigned to that sender |
+| `PHOTON_API_KEY` | Project-scoped v2 key beginning `pho_sk_` |
+| `PHOTON_PROJECT_ID` | v2 project ID beginning `pho_prj_` |
+| `PHOTON_OWNER_HANDLE` | Your exact Messages send-from email or E.164 number |
+| `PHOTON_AGENT_HANDLE` | The different number assigned to that sender in v2 |
 
-For a Mac without an iPhone, use the send-from email shown in Messages → Settings → iMessage. Add that exact identity to your Photon project's shared iMessage assignment. Check plan capacity before assigning a line; no purchase or provisioning is performed by Bud. A shared line requires the human to start the conversation.
+A Mac sending from an Apple-account email can use v2's email-identity assignment;
+an iPhone is not required. Spectrum credentials and assignments are different and
+are not used. Bud does not create assignments, buy plans or provision numbers.
+Partial configuration fails before account recovery.
 
-Start Bud from its checkout with one command:
+The normal command is unchanged:
 
 ```sh
 uv run bud serve
 ```
 
-The server owns both the core and configured iMessage service in one process; there is no second startup command or dependency-selection flag. It uses the same account scope, owner authentication and conversation history. It starts messaging automatically when all four Photon settings are present. With no Photon settings, the core runs without messaging; partial or invalid configuration fails before account recovery.
+There is no separate messaging command or installation extra. Normal dependency
+installation includes the v2 client. The server starts and stops messaging with
+its own lifetime.
 
-Wait for `Photon iMessage ready (accounts)`, then send a fresh message from the configured identity to its assigned number. `ping` returns `Bud connection verified.` without a model call. Other text enters the primary core conversation. A short request gets its answer without automatic accepted/working bubbles; replies for other interfaces are not mirrored into Messages. Groups, unknown senders, agent echoes, attachments, and non-plain-text content are ignored. The service does not read your Mac's Messages database or automatically contact other people.
+Only the configured owner's iMessage direct conversation is accepted. Unknown
+senders, groups, outbound echoes, SMS/RCS and unsupported content do not start
+agent work. Both the human identity and assigned agent number must match the
+configuration; a number from another Photon project is not interchangeable.
 
-Use `/status`, `/pause`, `/resume`, `/stop`, `/cancel <message-id>`, `/edit <message-id> <text>`, `/approve <approval-id>`, or `/deny <approval-id>` just as in the terminal. A standalone `stop` or `stop please` also requests Stop immediately, without waiting for the burst window. `/connect gmail|calendar`, `/connections`, and `/refresh` remain owner controls, never model messages. Sign-in links are sent only as immediate UI output, not retained in the transport database.
+Chat normally: short requests produce one useful response, not accepted/working
+announcements. New input can clarify or revise an unapproved proposal without
+getting stuck behind it. Corrected writes always require fresh permission.
+Conversation and tool history stay in the same primary session used by `bud chat`.
+Other interfaces' answers are not pushed into Messages.
 
-Action previews distinguish drafts from sends and show every supplied argument, with message/file text quoted line by line. Use Messages' **Reply** on the exact preview, then send `yes` (or a plain-text `👍`) to approve it once, or `no` to decline. A context-free yes never selects a pending permission. The server checks the provider reply reference, conversation, current proposal and full argument digest. Stale, unknown, changed or incomplete previews cannot grant permission. For a multi-part preview, reply to the final part; all preceding parts require provider-delivered evidence. Exact-ID commands remain available if Photon does not supply a usable native reference. Existing previews from before this upgrade are not retrospectively made reply-approvable.
+A file preview looks like:
 
-To replace the only pending action, reply directly to its preview with `Actually, ...` or `Instead, ...` and the correction. Declining the old permission and storing the correction happen in one transaction. The corrected action needs a fresh preview and approval; retries cannot revive the old permission. With several actions pending, decline the relevant previews explicitly before revising. Messages arriving during active work wait for the next turn; corrections do not recall or undo a tool operation already dispatched. A later explicit revision is a new request, not permission to retry a denied action automatically.
+```text
+Create notes.txt?
 
-Ordinary replies use normal bubbles, not forced inline threads. A control response to a native quoted reply can stay attached to that reply. Plain-text emoji are supported; they are not native Tapbacks.
+The requested file contents.
 
-Bud uses the installed **Photon Beta** SDK's typing and mark-read endpoints as best-effort UI signals for the verified owner only. Read requests follow durable incoming handling. Typing follows matching active core runs, stops for permission/results/Stop, refreshes at most every eight seconds and stops after 45 seconds for long jobs. Signals do not block real messages and are never task-completion or delivery proof. An unsupported operation or signal failure disables that signal until restart without disabling chat. HTTP 202 means asynchronous acceptance, not visible typing or a visible read receipt; provider support and privacy settings still apply. These hooks require a live check on the assigned line.
+/approve <approval-id>
+/deny <approval-id>
+```
 
-Photon's current Beta iMessage documentation reserves native Tapbacks, message effects, polls and voice notes for **Stable**. Bud does not silently change API versions, credentials or SDKs to enable them. Native Tapbacks/effects are not implemented here.
+Send the exact command shown in the preview. Bare "yes", emoji and native Reply
+do not grant permission: the v2 messages inspected during live use did not expose
+the reply target needed to bind those answers safely. A correction replaces the
+unapproved proposal and requires a fresh command. Stale or already-decided IDs
+cannot authorize another action.
 
-`/status` includes the core session ID. A default `bud chat` uses the same primary, or attach explicitly with `bud chat <session-id>`. An incompatible saved iMessage route is refused rather than rebound. Messaging retains routing and delivery metadata, not a second model conversation or memory notebook.
+Long previews retain the complete details, with decision commands kept together
+after them. Superseded previews are checked before enqueueing and again before
+dispatch. The terminal retains its detailed controls.
 
-For synthetic work, use `bud serve --simulate` with a dedicated synthetic `DATA_DIR`. This always disables the real iMessage connection, even if Photon settings are present. Use `bud chat` for the simulated conversation; no messaging credential is needed.
+Say `stop`, `pause`, `resume` or `status` for conversation controls. Stop acts
+immediately, including during the burst window. It cannot undo already authorized
+work. `/connect gmail|calendar`, `/connections` and `/refresh` remain available;
+sign-in links are immediate owner output, not model input or durable transport text.
 
-The server-owned service uses in-process authenticated HTTP commands and the scope's event hub, not a second server or agent. The core rejects stale `X-Bud-Scope` headers before processing a request. After an account change, restart Bud; old scopes and approvals are not copied into the new route. An unavailable saved conversation fails closed instead of silently creating a replacement.
+Normal results use ordinary text bubbles. Emoji are text, not native Tapbacks.
+Effects, rich cards, typing/read signals and reply-bound permissions are not part
+of this text-only integration.
 
-`GET /runtime` reports `messaging` as `not_configured`, `disabled_in_simulation`, `starting`, `connected`, `reconnecting`, `failed`, or `stopped`. A messaging startup/runtime failure is logged and reported as failed; the authenticated core stays available for status and Stop. There is no application-level restart loop that could retry an uncertain send. Stopping the server stops incoming messaging and its delivery workers before shutting down the core.
+`bud serve --simulate` always disables real messaging, even when credentials are
+present. No messaging provider connection is needed for
+the fictional world. Use it for experiments rather than real-account mutations.
 
-Transport state is under `DATA_DIR/photon/`. Incoming message IDs and effective-payload digests prevent duplicate tasks; ordinary messages also use stable core message IDs. A control whose dispatch was interrupted is not repeated automatically: inspect `/status`. Notifications and their core event cursors are saved together. Final responses are sent as complete text, split into numbered parts when needed, rather than forwarding speculative text deltas.
+Routes, incoming digests, replay cursors and pre-dispatch send claims stay under
+`DATA_DIR/photon/`, scoped to the configured identities and core account binding.
+Returning from Spectrum reuses the original v2 state, not a backup of old core
+databases. Unused Spectrum metadata is left untouched in its separate directory;
+it is never read as v2 state. Pending legacy native-reply previews are retired
+from the transport; `/status` shows current exact commands.
 
-Every outgoing part has a durable pre-dispatch claim and stable Photon idempotency key. There is one SDK attempt. API acceptance, dispatch, delivery, and uncertainty are distinct states; acceptance alone is not delivery. A timeout or interrupted claimed send is not automatically resent, and remaining parts of an uncertain notification are blocked. Inspect the chat and transport state before requesting another copy. Successful delivery bodies are cleared from transport storage; the authoritative reply remains in core history.
+Socket.IO reconnects using the last completed provider cursor. Incoming duplicates
+reuse stable core IDs; uncertain controls and outgoing sends are not repeated.
+Accepted, delivered and unknown are distinct, and the SDK's automatic send retries
+are disabled. Delivery claims survive restart; dispatched bodies are cleared.
+Provider replay retention and uninterrupted service are not guaranteed. The
+authenticated `/runtime` endpoint reports messaging state separately from the core.
 
-Socket.IO reconnects and resubscribes with the last successfully handled cursor. The first subscription starts live, and replay after that is limited to Photon's retained history. There is no zero-loss or exactly-once guarantee. A stream error, state corruption, or overload stops the adapter rather than skipping unfinished work. Neither this local process nor Cloud Runner development establishes always-on hosting, backup/restore, Android iMessage access, or laptop-closed availability.
-
-Sources: [Photon Beta iMessage limits](https://photon.codes/docs/beta/messaging/imessage), [typing](https://photon.codes/docs/beta/api-reference/spaces/set-typing-in-a-space), [read requests](https://photon.codes/docs/beta/api-reference/messages/mark-a-message-as-read), [setup](https://photon.codes/docs/beta/get-started/imessage), [Python client](https://photon.codes/docs/beta/api-client), [event transport](https://photon.codes/docs/beta/message-delivery/websocket), and [retry rules](https://photon.codes/docs/beta/api-client/retries-and-timeouts).
+Sources: [v2 setup](https://photon.codes/docs/beta/get-started/imessage),
+[live events](https://photon.codes/docs/beta/websocket/session),
+and [replay cursors](https://photon.codes/docs/beta/websocket/cursors).
 
 ## Memory
 

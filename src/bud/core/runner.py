@@ -233,6 +233,8 @@ class Runner(DBOSConfiguredInstance):
             return
         events = self.hub.log.read(session_id)
         if waiting_batch(events):
+            if self.hub.log.supersede_updates(session_id):
+                self.hub.wake(session_id)
             self._resume_if_ready(session_id)
             return
         pending = message_batch(events)
@@ -299,11 +301,20 @@ class Runner(DBOSConfiguredInstance):
         if not batch or undecided_approvals(events) or self._busy(session_id):
             return
         decided = decisions(events)
+        revised = {
+            event.data["approval_id"]
+            for event in events
+            if event.type == "approval.denied" and event.data.get("revision_message_id")
+        }
         results = DeferredToolResults(
             approvals={
                 request["call_id"]: ToolApproved()
                 if decided[request["approval_id"]]
-                else ToolDenied("The user denied this action.")
+                else ToolDenied(
+                    "The user sent new input. Stop this proposal; the updated request will follow."
+                    if request["approval_id"] in revised
+                    else "The user denied this action."
+                )
                 for request in batch
             },
             metadata={
@@ -331,6 +342,9 @@ class Runner(DBOSConfiguredInstance):
                 None,
             )
         run = self._inputs(session_id, None, results, origin=origin)
+        run["quiet"] = any(request["approval_id"] in revised for request in batch) and not any(
+            decided[request["approval_id"]] for request in batch
+        )
         self.hub.publish_once(session_id, "run.queued", run, key=f"{run['run_id']}:queued")
         self._launch(run)
 
