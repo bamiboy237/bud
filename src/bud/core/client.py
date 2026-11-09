@@ -18,12 +18,12 @@ from bud.core.projection import reply_text
 def render(
     event: dict,
     seen_requests: set[str],
-    streamed: set[str] | None = None,
+    streamed: dict[str, str] | None = None,
     *,
     historical_approval: bool = False,
 ) -> None:
     data = event["data"]
-    streamed = set() if streamed is None else streamed
+    streamed = {} if streamed is None else streamed
     match event["type"]:
         case "user.message":
             print(f"\nyou: {data['text']}")
@@ -42,6 +42,7 @@ def render(
                 "\n[stop requested; queue paused; authorized actions may still finish]", flush=True
             )
         case "run.cancelled":
+            streamed.pop(data["run_id"], None)
             uncertain = data.get("uncertain_tools", [])
             if uncertain:
                 print(f"\n[stopped; check the outcome of: {', '.join(uncertain)}]", flush=True)
@@ -61,7 +62,8 @@ def render(
                 )
             seen_requests.add(request)
         case "text.delta":
-            streamed.add(data["run_id"])
+            run_id = data["run_id"]
+            streamed[run_id] = streamed.get(run_id, "") + data["text"]
             print(data["text"], end="", flush=True)
         case "tool.call":
             print(f"\n[tool] {data['tool']}({data['args']})", flush=True)
@@ -81,11 +83,17 @@ def render(
         case "approval.denied":
             print(f"[denied] {data['approval_id']}", flush=True)
         case "run.waiting" | "run.completed":
-            # Streamed text is live-only. After a reconnect or for history, print the reply.
-            if data["run_id"] not in streamed:
-                print(reply_text(data.get("messages", [])), end="", flush=True)
+            # Live text can be lost on disconnect or backlog overflow. Reconcile with
+            # the stored reply instead of assuming one received token means all arrived.
+            text = reply_text(data.get("messages", []))
+            printed = streamed.pop(data["run_id"], "")
+            if text.startswith(printed):
+                print(text[len(printed) :], end="", flush=True)
+            elif text:
+                print(f"\n[complete reply]\n{text}", end="", flush=True)
             print(flush=True)
         case "run.failed":
+            streamed.pop(data["run_id"], None)
             print(f"\n[run failed] {data['reason']}", flush=True)
 
 
@@ -101,7 +109,7 @@ def print_http_error(error: httpx.HTTPStatusError) -> None:
 async def follow(client: httpx.AsyncClient, session_id: str) -> None:
     last_seq = 0
     seen_requests: set[str] = set()
-    streamed: set[str] = set()
+    streamed: dict[str, str] = {}
     while True:
         try:
             state = await session_snapshot(client, session_id)

@@ -18,18 +18,18 @@ WAIT_SECONDS = 15
 # A reader that falls this far behind loses live text, never stored events.
 MAX_LIVE_BACKLOG = 2_000
 
-_WAKE = None
-
 
 class _Subscriber:
     def __init__(self) -> None:
-        self.items: deque[tuple[EventType, dict] | None] = deque()
+        self.items: deque[tuple[EventType, dict] | int] = deque()
         self.ready = asyncio.Event()
 
-    def push(self, item: tuple[EventType, dict] | None) -> None:
-        if item is _WAKE:
-            if not self.items or self.items[-1] is not _WAKE:
-                self.items.append(_WAKE)
+    def push(self, item: tuple[EventType, dict] | int) -> None:
+        if isinstance(item, int):
+            if self.items and isinstance(self.items[-1], int):
+                self.items[-1] = max(self.items[-1], item)
+            else:
+                self.items.append(item)
         elif len(self.items) < MAX_LIVE_BACKLOG:
             self.items.append(item)
         self.ready.set()
@@ -45,13 +45,13 @@ class Hub:
         self._loop = asyncio.get_running_loop()
 
     def wake(self, session_id: str) -> None:
-        self._send(session_id, _WAKE)
+        self._send(session_id, self.log.last_seq(session_id))
 
     def broadcast(self, session_id: str, type: EventType, data: dict) -> None:
         """Deliver a live-only event to current readers. It is not written to the log."""
         self._send(session_id, (type, data))
 
-    def _send(self, session_id: str, item: tuple[EventType, dict] | None) -> None:
+    def _send(self, session_id: str, item: tuple[EventType, dict] | int) -> None:
         if self._loop is not None and not self._loop.is_closed():
             self._loop.call_soon_threadsafe(self._deliver, session_id, item)
 
@@ -73,7 +73,7 @@ class Hub:
             self.wake(session_id)
         return event
 
-    def _deliver(self, session_id: str, item: tuple[EventType, dict] | None) -> None:
+    def _deliver(self, session_id: str, item: tuple[EventType, dict] | int) -> None:
         for subscriber in self._subscribers.get(session_id, ()):
             subscriber.push(item)
 
@@ -83,7 +83,7 @@ class Hub:
         yielded event's seq never skips a stored one."""
         self.bind_loop()
         subscriber = _Subscriber()
-        subscriber.push(_WAKE)
+        subscriber.push(self.log.last_seq(session_id))
         self._subscribers[session_id].add(subscriber)
         try:
             while True:
@@ -92,12 +92,15 @@ class Hub:
                     try:
                         await asyncio.wait_for(subscriber.ready.wait(), WAIT_SECONDS)
                     except TimeoutError:
-                        subscriber.push(_WAKE)
+                        subscriber.push(self.log.last_seq(session_id))
                         yield None
                     continue
                 item = subscriber.items.popleft()
-                if item is None:
+                if isinstance(item, int):
                     for event in await asyncio.to_thread(self.log.read, session_id, after):
+                        # A later stored event must not overtake live text already queued.
+                        if event.seq > item:
+                            break
                         after = event.seq
                         yield event
                 else:

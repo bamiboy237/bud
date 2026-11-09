@@ -166,19 +166,28 @@ class EventLog:
         """Read events after `after`. Only reads outside a write transaction may update the
         cache, so rows from a transaction that later rolls back are never remembered."""
         with self._cache_lock:
-            cached = self._cache.get(session_id, [])
+            cached = self._cache.get(session_id)
+            if cached is not None:
+                self._cache.move_to_end(session_id)
         last = cached[-1].seq if cached else 0
         if after > last or (not cached and after > 0):
             return self._fetch(db, session_id, after)
         fresh = self._fetch(db, session_id, last)
         if remember and fresh:
             with self._cache_lock:
-                if self._cache.get(session_id, []) is cached:
-                    self._cache[session_id] = cached + fresh
+                if self._cache.get(session_id) is cached:
+                    self._cache[session_id] = (cached or []) + fresh
                     self._cache.move_to_end(session_id)
                     while len(self._cache) > CACHED_SESSIONS:
                         self._cache.popitem(last=False)
-        return [event for event in cached if event.seq > after] + fresh
+        return [event for event in cached or [] if event.seq > after] + fresh
+
+    def last_seq(self, session_id: str) -> int:
+        """Capture a stored-event boundary without reading the event payloads."""
+        with self._connect() as db:
+            return db.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?", (session_id,)
+            ).fetchone()[0]
 
     @staticmethod
     def _fetch(db: sqlite3.Connection, session_id: str, after: int) -> list[Event]:
