@@ -32,10 +32,9 @@ RULES = {
     "install_skill": "ask",
     "disable_skill": "ask",
 }
-GUIDANCE = """
-Skills provide specialized task workflows. Use `list_skills` to discover available
-capabilities, and `load_capability` to activate only the methods required for the
-current task. Follow loaded skill instructions alongside available tools.
+GUIDANCE = """Discover available task capabilities using `list_skills`.
+Activate relevant methods for the task using `load_capability`.
+Follow instructions in loaded skills alongside available tools.
 """
 
 
@@ -167,7 +166,11 @@ class SkillStore:
             ]
 
     async def find_skills(self, query: str) -> str:
-        """Search the public ecosystem registry for reusable skills using a generic task phrase."""
+        """Search the public ecosystem registry for reusable skills using a generic task phrase.
+
+        Query using general capability descriptions. Omit private messages, personal
+        details, and credentials.
+        """
         if not 2 <= len(query.strip()) <= 200 or query.startswith("-"):
             raise SkillError("Use a search phrase between 2 and 200 characters.")
         return (await self.installer.run(["find", query], self.root))[:16_000]
@@ -217,7 +220,11 @@ class SkillStore:
     def install_skill(
         self, ctx: RunContext, preview_id: str, source: str, name: str, version: str
     ) -> dict:
-        """Install an exact inspected skill version. Requires user approval."""
+        """Install an exact inspected skill package previously fetched with prepare_skill.
+
+        Requires user approval. The installed version becomes active on subsequent tasks
+        while the current task retains its active methods.
+        """
         approval = (ctx.tool_call_metadata or {}).get("approval_id")
         if not ctx.tool_call_approved or not approval:
             raise SkillError("Skill installation requires an exact approved proposal.")
