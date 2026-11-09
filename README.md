@@ -6,7 +6,7 @@ bud is under active development. It can chat, call tools, remember approved fact
 
 ## Install
 
-You need [uv](https://docs.astral.sh/uv/) and either ChatGPT plan sign-in or a model-provider API key.
+You need [uv](https://docs.astral.sh/uv/) and ChatGPT plan sign-in, a model-provider API key, or a configured local model endpoint.
 
 ```sh
 git clone https://github.com/bamiboy237/bud.git
@@ -39,6 +39,105 @@ uv run bud serve --simulate --model deepseek:deepseek-flash
 DeepSeek remains available for simulated work. Real-account mode permits ChatGPT, OpenAI API, and Meta. `--simulate` selects tools, not inference. `--tier` selects the API tier; the default ChatGPT model serves both tiers after sign-in.
 
 `bud costs` shows subscription token usage separately from metered API dollars. The ChatGPT subscription fee is not allocated to individual requests. The server's [spend and execution limits](#spend-and-execution-limits) apply separately from the provider's subscription allowance.
+
+### Custom model routes
+
+Set `MODELS_FILE` to a TOML registry to replace the bundled API registry. Each
+entry describes a route; entries in a tier are tried in order. For example,
+save this as `data/models.toml`, replacing the model name with the ID served
+by your endpoint:
+
+```toml
+[[models]]
+provider = "local"
+name = "your-tool-capable-model"
+tier = "fast"
+billing = "local"
+base_url = "http://127.0.0.1:11434/v1"
+protocol = "chat"
+supports_tools = true
+context_window = 32768
+max_tokens = 4096
+```
+
+Then configure `.env`:
+
+```dotenv
+MODELS_FILE=data/models.toml
+DEFAULT_MODEL=local:your-tool-capable-model
+MODEL_FALLBACK=false
+```
+
+Start normally with `uv run bud serve`, or use `uv run bud serve --simulate`
+for fictional tools. The endpoint must already be running. Its capabilities
+are declared by the operator, not inferred from the model's name. The core
+refuses a route declared without tool support before executing a task.
+`protocol` is `chat` or `responses`; use the protocol your server implements.
+`context_window`, `max_tokens` and `reasoning_effort` are optional. Native
+provider profiles handle their supported protocol behavior.
+
+For a custom metered API, use a distinct provider name, HTTPS, `billing = "api"`
+and explicit `input`, `output` and `cached` prices per million tokens.
+Set its secret separately through `MODEL_API_KEYS`, a JSON object mapping
+provider names to keys, in `.env` or secure environment injection. Endpoint
+URLs cannot contain credentials or query strings. Custom endpoints never
+inherit `OPENAI_API_KEY`. A custom endpoint can use real-account tools only
+when its registry entry explicitly sets `allow_accounts = true`.
+
+`DEFAULT_MODEL` pins the default just like `--model`; neither falls back.
+Otherwise `MODEL_FALLBACK` controls the tier's availability fallback, enabled
+by default for compatibility. A local route never falls through to a different
+endpoint. Local billing records token usage and zero metered API dollars,
+not hardware or electricity costs. Subscription usage remains separate.
+`uv run bud models --cached` shows saved/configured routes without refreshing
+ChatGPT credentials, so it can be used while the server owns their lease.
+
+## Task skills
+
+Bud includes research, attention-briefing, meeting-preparation, message-writing
+and document-writing methods. The model first sees short descriptions, then
+loads relevant instructions with Pydantic's `load_capability` tool. Ask for
+the work normally; there is no separate startup command.
+
+Each task records its offered skill names and SHA-256 content versions in
+`run.started`. Tool events show which methods were loaded. Approval
+continuations retain the original versions, even after a method is disabled
+or updated. A modified or missing saved package stops that task instead of
+silently substituting instructions.
+
+Writing methods use saved preferences and approved examples. Corrections apply
+to the current draft; ask Bud to remember a preference to propose its existing
+approved-memory update. You can inspect, change or forget those preferences.
+The methods are general and work with the available sources and document tools.
+They do not add Slack, binary document conversion or a shell by themselves.
+
+### Find and install a skill
+
+Ask Bud to find a skill for a task. `find_skills` searches skills.sh;
+`prepare_skill` fetches a selected public GitHub skill at an exact commit and
+shows its instructions, source, version and supporting files.
+`read_prepared_skill` lets Bud inspect those files before recommending it.
+`install_skill` then waits for the normal exact user approval. It activates
+only that prepared version. Updating requires another preview and approval.
+`list_skills` shows installed versions; `disable_skill` removes a method from
+future task catalogs while retaining it for existing tasks.
+
+On first use, discovery/preview downloads a checksum-pinned Node 22.20 runtime
+under the scope's private `skills/tooling` directory and runs the released
+`skills@1.7.6` CLI. Its dependency tree is installed with the packaged npm lock
+file and integrity hashes. No global Node or coding-agent installation is changed.
+The subprocess gets an isolated home, no owner API keys or Git credentials,
+telemetry disabled, and npm install scripts disabled. These operations need
+network access and currently support macOS/Linux x64 and arm64.
+
+Imported methods cannot replace bundled methods. Packages are limited to
+64 files, 64 KiB per file and 512 KiB total; links and special files are
+refused. Catalog descriptions are limited to 1,024 characters and instruction
+bodies to 32 KiB. Manual-only skills are not supported. Names and versions are
+validated, and source files are hashed before
+activation and use. Instructions and supporting files are retained in the
+private account/world scope. Scripts can be inspected but are not executed.
+Skill instructions never grant tool permissions.
 
 Credentials live in `data/chatgpt/credentials.json`, with owner-only directory and file permissions. The installation ID and client registration survive logout. Only one bud process can use these credentials at a time because refresh tokens rotate. Stop a ChatGPT server before another ChatGPT command, including `bud models`, login, or logout.
 
@@ -149,6 +248,13 @@ Session snapshots include `status`, `queue_paused`, `queued_messages`, and `rece
 ## Spend and execution limits
 
 The server uses a spend brake of **$0.50 per run** and **$5 per UTC day**, shared across sessions in the same account or simulated-world spend database. Spend counters persist across restarts. Each execution has a limit of **25 model requests** and **20 tool calls**. An approval continuation is a new execution with fresh per-run limits. The runner offsets the saved conversation's cumulative usage to enforce these request and tool limits per execution, not across the whole conversation. Recovery of the same execution keeps its run ID.
+
+Code Mode's nested reads count toward the tool limit, as does `run_code`
+itself. Bud supplies the remaining budget before every model request. With
+three or fewer tool calls left, or one model request left, it disables further
+tools and asks the model to deliver verified findings and identify unfinished
+work or missing evidence. A partial answer is not confirmation that an
+unfinished action succeeded. The hard execution limits remain enforced.
 
 The spend brake checks recorded usage before the next model request. A request that crosses the dollar limit can finish and take spend above the threshold. Provider usage that bud never receives remains unknown, not proof of zero cost. These are metered API spend limits, not a guaranteed provider bill ceiling. ChatGPT subscription responses add no API dollars, but request and tool limits still apply.
 

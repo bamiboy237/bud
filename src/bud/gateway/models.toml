@@ -33,11 +33,11 @@ cache_write = 2.50
 
 [[models]]
 provider = "deepseek"
-name = "deepseek-v4-pro"
+name = "deepseek-flash"
 tier = "frontier"
-input = 1.32
-output = 3.96
-cached = 0.044
+input = 0.30
+output = 1.20
+cached = 0.006
 
 [[models]]
 provider = "meta"

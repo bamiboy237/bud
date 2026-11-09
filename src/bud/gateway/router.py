@@ -15,6 +15,7 @@ from pydantic_ai.exceptions import (
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
+from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.deepseek import DeepSeekProvider
 from pydantic_ai.providers.meta import MetaProvider
 from pydantic_ai.providers.openai import OpenAIProvider
@@ -33,6 +34,30 @@ ModelFactory = Callable[[ModelSpec], Model | None]
 
 class NoModelAvailable(Exception):
     pass
+
+
+class EndpointProvider(OpenAIProvider):
+    @staticmethod
+    def model_profile(model_name: str) -> OpenAIModelProfile:
+        """A custom endpoint's capabilities come from its configuration, not its model name.
+
+        Leading system messages are merged into one: strict servers (llama.cpp,
+        some vLLM setups) reject any system message that is not the first message.
+        """
+        return OpenAIModelProfile(
+            openai_chat_supports_multiple_system_messages=False,
+            context_window=None,
+            supports_tools=False,
+            supported_native_tools=frozenset(),
+            supports_json_schema_output=False,
+            supports_json_object_output=False,
+            supports_image_input=False,
+            supports_document_input=False,
+            supports_audio_file_input=False,
+            openai_supports_strict_tool_definition=False,
+            tool_deferral_mode="none",
+            tool_addition_mode="with_definitions",
+        )
 
 
 def should_fall_back(exc: Exception, *, subscription: bool = False) -> bool:
@@ -54,34 +79,52 @@ def provider_model_factory(settings: Settings, chatgpt: ChatGPTStore) -> ModelFa
     providers = {}
 
     def build(spec: ModelSpec) -> Model | None:
-        if spec.provider not in providers:
-            if spec.provider == "openai-chatgpt":
+        key = (spec.provider, spec.base_url)
+        if key not in providers:
+            if spec.base_url:
+                secret = settings.model_api_keys.get(spec.provider)
+                if spec.billing == "api" and secret is None:
+                    return None
+                providers[key] = EndpointProvider(
+                    base_url=spec.base_url,
+                    api_key=secret.get_secret_value() if secret else "local-no-key",
+                )
+            elif spec.provider == "openai-chatgpt":
                 if not chatgpt.connected:
                     return None
                 chatgpt.acquire()
-                providers[spec.provider] = OpenAIChatGPTProvider(credential_source=chatgpt)
+                providers[key] = OpenAIChatGPTProvider(credential_source=chatgpt)
             elif spec.provider == "deepseek":
                 if not settings.deepseek_api_key:
                     return None
-                providers[spec.provider] = DeepSeekProvider(
+                providers[key] = DeepSeekProvider(
                     api_key=settings.deepseek_api_key.get_secret_value()
                 )
             elif spec.provider == "openai":
                 if not settings.openai_api_key:
                     return None
-                providers[spec.provider] = OpenAIProvider(
-                    api_key=settings.openai_api_key.get_secret_value()
-                )
+                providers[key] = OpenAIProvider(api_key=settings.openai_api_key.get_secret_value())
             elif spec.provider == "meta":
                 if not settings.muse_api_key:
                     return None
-                providers[spec.provider] = MetaProvider(
-                    api_key=settings.muse_api_key.get_secret_value()
-                )
+                providers[key] = MetaProvider(api_key=settings.muse_api_key.get_secret_value())
             else:
                 raise ValueError(f"unknown provider in registry: {spec.provider}")
-        model_type = OpenAIChatModel if spec.provider == "deepseek" else OpenAIResponsesModel
-        return model_type(spec.name, provider=providers[spec.provider], settings=model_settings)
+        protocol = spec.protocol or ("chat" if spec.provider == "deepseek" else "responses")
+        model_type = OpenAIChatModel if protocol == "chat" else OpenAIResponsesModel
+        options = dict(model_settings)
+        if spec.max_tokens is not None:
+            options["max_tokens"] = spec.max_tokens
+        if spec.reasoning_effort is not None:
+            options["openai_reasoning_effort"] = spec.reasoning_effort
+        profile = None
+        if spec.supports_tools is not None or spec.context_window is not None:
+            profile = profile or {}
+            if spec.supports_tools is not None:
+                profile["supports_tools"] = spec.supports_tools
+            if spec.context_window is not None:
+                profile["context_window"] = spec.context_window
+        return model_type(spec.name, provider=providers[key], settings=options, profile=profile)
 
     return build
 
@@ -97,31 +140,48 @@ class Gateway:
         *,
         selected_model: str | None = None,
         chatgpt: ChatGPTStore | None = None,
+        fallback: bool = True,
     ) -> None:
         self.registry = registry
         self.ledger = ledger
         self.build_model = build_model
         self.selected_model = selected_model
         self.chatgpt = chatgpt
+        self.fallback = fallback
 
     def close(self) -> None:
         if self.chatgpt is not None:
             self.chatgpt.close()
 
-    def model(self, tier: Tier, session_id: str | None = None) -> Model:
+    def model(
+        self, tier: Tier, session_id: str | None = None, *, require_tools: bool = False
+    ) -> Model:
         if self.selected_model:
             specs = [spec for spec in self.registry.models if spec.id == self.selected_model][:1]
         else:
             specs = self.registry.tier(tier)
         chain: list[TrackedModel] = []
         for spec in specs:
+            if (
+                chain
+                and (spec.billing == "local" or chain[0].spec.billing == "local")
+                and spec.base_url != chain[0].spec.base_url
+            ):
+                break
             model = self.build_model(spec)
             if model is not None:
+                if require_tools and not model.profile.get("supports_tools", True):
+                    raise NoModelAvailable(
+                        f"{spec.id} does not support tools. Select a tool-capable model."
+                    )
                 chain.append(TrackedModel(model, spec, self.ledger, session_id))
+                if not self.fallback or self.selected_model:
+                    break
         if not chain:
             target = self.selected_model or f"tier {tier!r}"
             raise NoModelAvailable(
-                f"No model credentials for {target}. Run `bud login chatgpt` or set an API key."
+                f"No configured model for {target}. Check MODELS_FILE, model keys or "
+                "run `bud login chatgpt`."
             )
         if len(chain) == 1:
             return chain[0]

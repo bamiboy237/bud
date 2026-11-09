@@ -10,9 +10,11 @@ from pydantic_ai.tools import ToolDefinition
 from pydantic_ai_harness import CodeMode
 
 inside_code_mode: ContextVar[bool] = ContextVar("bud_inside_code_mode", default=False)
+CODE_TOOL_CALL_LIMIT = 12
 
 CODE_GUIDANCE = """
 Use run_code to filter, join, group, and calculate over read-only tool results.
+The listed sandbox functions are callable only inside run_code, not as standalone tools.
 Fetch data through the listed sandbox functions and return only the answer and source identifiers.
 Do not print or return an entire dataset when a small result answers the question.
 load_tool_result(handle=...) loads a saved result inside the sandbox, decoding JSON when possible.
@@ -47,7 +49,7 @@ def build_code_mode(read_tools: set[str]) -> ReadOnlyCodeMode:
         id="bud_read_only_code",
         tools=sorted(read_tools),
         max_retries=2,
-        max_tool_calls=12,
+        max_tool_calls=CODE_TOOL_CALL_LIMIT,
         resource_limits={
             "max_duration_secs": 10,
             "max_memory": 128 * 1024 * 1024,

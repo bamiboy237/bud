@@ -264,7 +264,7 @@ dependencies = [
     { name = "httpx" },
     { name = "photonhq-api" },
     { name = "pydantic" },
-    { name = "pydantic-ai-harness" },
+    { name = "pydantic-ai-harness", extra = ["skills"] },
     { name = "pydantic-ai-slim", extra = ["dbos", "mcp", "openai"] },
     { name = "pydantic-monty" },
     { name = "pydantic-settings" },
@@ -284,7 +284,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "photonhq-api", specifier = ">=0.6.0,<0.7" },
     { name = "pydantic", specifier = ">=2.14.1" },
-    { name = "pydantic-ai-harness", specifier = ">=0.61.0" },
+    { name = "pydantic-ai-harness", extras = ["skills"], specifier = ">=0.61.0" },
     { name = "pydantic-ai-slim", extras = ["dbos", "mcp", "openai"], specifier = ">=2.61.0" },
     { name = "pydantic-monty", specifier = ">=1.0.0,<2" },
     { name = "pydantic-settings", specifier = ">=2.16.1" },
@@ -1717,6 +1717,11 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/97/01/522cf4b0327bd7562560915407ee7d7f18e9dd29fae26ae954d85f6e7f7b/pydantic_ai_harness-0.61.0.tar.gz", hash = "sha256:895cd29712ca029430bdca67075c1c83662373b142c23db5fe68d15aefa1bb67", size = 1272746, upload-time = "2026-10-24T03:55:34.142Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ff/56/2870665ebfdb89594cd04072e17be5280adb25264f6faa4d5e6abf7552d3/pydantic_ai_harness-0.61.0-py3-none-any.whl", hash = "sha256:110b2ff92f914a24ea1b7f9cd1f5c1ded146c671430400e88cd999e5021ffca3", size = 1567129, upload-time = "2026-10-24T03:55:22.691Z" },
+]
+
+[package.optional-dependencies]
+skills = [
+    { name = "pyyaml" },
 ]
 
 [[package]]

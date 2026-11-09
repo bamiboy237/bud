@@ -51,6 +51,7 @@ class TrackedModel(WrapperModel):
         except BaseException as exc:
             self._record_failure(exc, started)
             raise
+        response.metadata = (response.metadata or {}) | {"bud_model_id": self.spec.id}
         self._record_usage(response.usage, started)
         return response
 
@@ -67,6 +68,7 @@ class TrackedModel(WrapperModel):
             async with super().request_stream(
                 messages, model_settings, model_request_parameters, run_context
             ) as stream:
+                stream.metadata = (stream.metadata or {}) | {"bud_model_id": self.spec.id}
                 yield stream
         except BaseException as exc:
             self._record_failure(exc, started)
