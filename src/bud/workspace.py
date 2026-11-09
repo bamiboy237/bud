@@ -178,7 +178,7 @@ def _safe(call) -> dict[str, Any]:
 
 
 def build_tools(root: Path, dispatch_path: Path) -> list[Tool]:
-    """Build five tools; provision root/ledger parent first. Never creates directories.
+    """Build five tools; provision root/ledger parent first. Directory creation is omitted.
 
     dispatch_path is a trusted persistent file, not a model-controlled argument.
     All results are bounded. List/search scan at most 500 entries in one directory;
@@ -406,7 +406,7 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool]:
     def workspace_create(
         ctx: RunContext[None], path: str, content: str
     ) -> dict[str, Any] | ToolReturn:
-        """Create a new text file after approval. Never overwrite an existing path."""
+        """Create a new text file after approval. Rejects paths that already exist."""
         return write(ctx, path, content, None)
 
     def workspace_update(

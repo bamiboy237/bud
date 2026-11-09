@@ -145,8 +145,8 @@ def build_tools(world: World) -> list[Tool]:
     ) -> Any:
         """Create an approved synthetic event, then use read_event to verify it.
 
-        Check list_events first. Never guess an unclear date, person, timezone, or
-        DST fold; ask the user. Bookings must fit the fictional seed's weekday
+        Check list_events first. Clarify ambiguous dates, attendees, timezones, or
+        DST folds with the user. Bookings must fit the fictional seed's weekday
         09:00–17:00 America/Chicago hours and cannot overlap any event, including
         Focus Blocks. Returns applied and the saved event; a replay has applied=false
         and returns current state without writing again.
@@ -174,7 +174,7 @@ def build_tools(world: World) -> list[Tool]:
         Focus Blocks cannot be moved, and no booking may overlap another event or
         fall outside the fictional seed's weekday 09:00–17:00 America/Chicago hours.
         Returns applied and the saved event. A replay returns current state with
-        applied=false, never moves again. Use read_event after approval to verify.
+        applied=false without moving again. Use read_event after approval to verify.
 
         Args:
             event_id: The event id from list_events.

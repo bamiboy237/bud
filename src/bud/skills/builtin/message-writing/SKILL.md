@@ -18,7 +18,7 @@ When the person edits the draft, distinguish a style correction from a changed f
 one-off instruction. Apply it immediately to the current draft. If they ask you to learn,
 remember or use that style in future, read the existing writing profile and propose a
 concise memory update through the approved memory tools. Retain examples only with that
-request. Never learn the quoted sender's voice as the person's own.
+request. Learn writing voice exclusively from the person's own messages, separating quoted sender text.
 
 Use the relevant saved profile on later drafts. Help the person inspect, revise or
 forget it when asked. Preference updates do not rewrite the reusable skill.

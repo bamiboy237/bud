@@ -16,6 +16,8 @@ build/
 .ruff_cache/
 .coverage
 htmlcov/
+live_audit_test.py
+run_live_audit.py
 
 # Local data: personal data stays on this machine
 *.sqlite
