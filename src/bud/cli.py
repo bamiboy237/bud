@@ -21,7 +21,7 @@ from bud.evals.runner import evaluate
 from bud.gateway import Ledger, NoModelAvailable, build_gateway
 from bud.gateway.chatgpt import ChatGPTError, ChatGPTStore, login, refresh_models
 from bud.gateway.errors import error_summary
-from bud.gateway.registry import ModelConfigurationError, load_registry
+from bud.gateway.registry import ModelConfigurationError, Tier, load_registry
 from bud.photon_config import PhotonSetupError
 from bud.world.store import World
 
@@ -30,7 +30,7 @@ PORT = 8420
 DEFAULT_URL = f"http://{HOST}:{PORT}"
 
 
-async def ask(prompt: str, tier: str, model_id: str | None) -> None:
+async def ask(prompt: str, tier: Tier, model_id: str | None) -> None:
     gateway = build_gateway(model_id=model_id)
     try:
         agent = Agent(gateway.model(tier))

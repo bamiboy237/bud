@@ -12,10 +12,18 @@ from bud.config import get_settings
 from bud.core.auth import OwnerAuthError, owner_token
 from bud.core.controls import HELP, approval_text, session_snapshot
 from bud.core.controls import submit as submit_control
+from bud.core.projection import reply_text
 
 
-def render(event: dict, seen_requests: set[str], *, historical_approval: bool = False) -> None:
+def render(
+    event: dict,
+    seen_requests: set[str],
+    streamed: set[str] | None = None,
+    *,
+    historical_approval: bool = False,
+) -> None:
     data = event["data"]
+    streamed = set() if streamed is None else streamed
     match event["type"]:
         case "user.message":
             print(f"\nyou: {data['text']}")
@@ -53,6 +61,7 @@ def render(event: dict, seen_requests: set[str], *, historical_approval: bool = 
                 )
             seen_requests.add(request)
         case "text.delta":
+            streamed.add(data["run_id"])
             print(data["text"], end="", flush=True)
         case "tool.call":
             print(f"\n[tool] {data['tool']}({data['args']})", flush=True)
@@ -72,6 +81,9 @@ def render(event: dict, seen_requests: set[str], *, historical_approval: bool = 
         case "approval.denied":
             print(f"[denied] {data['approval_id']}", flush=True)
         case "run.waiting" | "run.completed":
+            # Streamed text is live-only. After a reconnect or for history, print the reply.
+            if data["run_id"] not in streamed:
+                print(reply_text(data.get("messages", [])), end="", flush=True)
             print(flush=True)
         case "run.failed":
             print(f"\n[run failed] {data['reason']}", flush=True)
@@ -89,6 +101,7 @@ def print_http_error(error: httpx.HTTPStatusError) -> None:
 async def follow(client: httpx.AsyncClient, session_id: str) -> None:
     last_seq = 0
     seen_requests: set[str] = set()
+    streamed: set[str] = set()
     while True:
         try:
             state = await session_snapshot(client, session_id)
@@ -110,6 +123,7 @@ async def follow(client: httpx.AsyncClient, session_id: str) -> None:
                         render(
                             event,
                             seen_requests,
+                            streamed,
                             historical_approval=(
                                 event["type"] == "approval.requested"
                                 and event["seq"] <= watermark
@@ -170,6 +184,7 @@ async def chat(base_url: str, session_id: str | None, *, new: bool = False) -> N
         else:
             # Authenticate before showing state or starting an endless SSE retry loop.
             await session_snapshot(client, session_id)
+        assert session_id is not None
         print(
             f"session {session_id}\nCtrl-D to leave. {HELP}\n"
             "Approval commands always require the exact displayed approval ID."

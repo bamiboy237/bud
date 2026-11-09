@@ -1,31 +1,59 @@
 """In-process hub between the event log and its readers.
 Writers publish through the hub, which appends to the log and wakes the readers subscribed
-to that session.
+to that session. Streaming text is broadcast live and never stored: the finished reply is
+already saved in the run's terminal event.
 """
 
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+from uuid import uuid4
 
 from bud.core.events import Event, EventType
 from bud.core.log import EventLog
 
 # Poll the log after a missed wake-up; delivery still depends on a successful log read.
 WAIT_SECONDS = 15
+# A reader that falls this far behind loses live text, never stored events.
+MAX_LIVE_BACKLOG = 2_000
+
+_WAKE = None
+
+
+class _Subscriber:
+    def __init__(self) -> None:
+        self.items: deque[tuple[EventType, dict] | None] = deque()
+        self.ready = asyncio.Event()
+
+    def push(self, item: tuple[EventType, dict] | None) -> None:
+        if item is _WAKE:
+            if not self.items or self.items[-1] is not _WAKE:
+                self.items.append(_WAKE)
+        elif len(self.items) < MAX_LIVE_BACKLOG:
+            self.items.append(item)
+        self.ready.set()
 
 
 class Hub:
     def __init__(self, log: EventLog) -> None:
         self.log = log
-        self._waiters: dict[str, set[asyncio.Event]] = defaultdict(set)
+        self._subscribers: dict[str, set[_Subscriber]] = defaultdict(set)
         self._loop: asyncio.AbstractEventLoop | None = None
 
     def bind_loop(self) -> None:
         self._loop = asyncio.get_running_loop()
 
     def wake(self, session_id: str) -> None:
+        self._send(session_id, _WAKE)
+
+    def broadcast(self, session_id: str, type: EventType, data: dict) -> None:
+        """Deliver a live-only event to current readers. It is not written to the log."""
+        self._send(session_id, (type, data))
+
+    def _send(self, session_id: str, item: tuple[EventType, dict] | None) -> None:
         if self._loop is not None and not self._loop.is_closed():
-            self._loop.call_soon_threadsafe(self._wake, session_id)
+            self._loop.call_soon_threadsafe(self._deliver, session_id, item)
 
     def publish(self, session_id: str, type: EventType, data: dict | None = None) -> Event:
         event = self.log.append(session_id, type, data)
@@ -45,28 +73,45 @@ class Hub:
             self.wake(session_id)
         return event
 
-    def _wake(self, session_id: str) -> None:
-        for waiter in self._waiters.get(session_id, ()):
-            waiter.set()
+    def _deliver(self, session_id: str, item: tuple[EventType, dict] | None) -> None:
+        for subscriber in self._subscribers.get(session_id, ()):
+            subscriber.push(item)
 
     async def subscribe(self, session_id: str, after: int = 0) -> AsyncIterator[Event | None]:
+        """Yield stored events after `after` in order, live events as they arrive, and None
+        as a keep-alive. A live event carries the last stored seq, so resuming from any
+        yielded event's seq never skips a stored one."""
         self.bind_loop()
-        waiter = asyncio.Event()
-        self._waiters[session_id].add(waiter)
+        subscriber = _Subscriber()
+        subscriber.push(_WAKE)
+        self._subscribers[session_id].add(subscriber)
         try:
             while True:
-                waiter.clear()
-                events = self.log.read(session_id, after)
-                for event in events:
-                    after = event.seq
-                    yield event
-                if events:
+                if not subscriber.items:
+                    subscriber.ready.clear()
+                    try:
+                        await asyncio.wait_for(subscriber.ready.wait(), WAIT_SECONDS)
+                    except TimeoutError:
+                        subscriber.push(_WAKE)
+                        yield None
                     continue
-                try:
-                    await asyncio.wait_for(waiter.wait(), WAIT_SECONDS)
-                except TimeoutError:
-                    yield None
+                item = subscriber.items.popleft()
+                if item is None:
+                    for event in await asyncio.to_thread(self.log.read, session_id, after):
+                        after = event.seq
+                        yield event
+                else:
+                    type, data = item
+                    yield Event(
+                        id=uuid4().hex,
+                        session_id=session_id,
+                        seq=after,
+                        type=type,
+                        data=data,
+                        created_at=datetime.now(UTC),
+                        live=True,
+                    )
         finally:
-            self._waiters[session_id].discard(waiter)
-            if not self._waiters[session_id]:
-                del self._waiters[session_id]
+            self._subscribers[session_id].discard(subscriber)
+            if not self._subscribers[session_id]:
+                del self._subscribers[session_id]

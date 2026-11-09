@@ -1,8 +1,9 @@
 """Fold session events into conversation, approval, queue, and run views."""
 
+from contextlib import suppress
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
@@ -110,7 +111,9 @@ def queue_paused(events: list[Event]) -> bool:
     )
 
 
-def runs(events: list[Event]) -> list[RunView]:
+def runs(events: list[Event], *, summaries: bool = False) -> list[RunView]:
+    """Fold run status. `summaries` adds loaded skills and saved files. That is display
+    data, so locking paths leave it off and a malformed summary never blocks a run."""
     states: dict[str, RunView] = {}
     offered: dict[str, dict[str, str]] = {}
     loads: dict[tuple[str, str], str] = {}
@@ -131,35 +134,71 @@ def runs(events: list[Event]) -> list[RunView]:
                 continue
             if event.type == "run.cancelled" and event.data.get("uncertain_tools"):
                 status = "needs_review"
-            view = states.setdefault(run_id, RunView(run_id=run_id, status=status))
+            view = states.get(run_id)
+            if view is None:
+                view = states[run_id] = RunView(run_id=run_id, status=status)
+                if summaries and event.data.get("trigger") == "approval" and len(states) > 1:
+                    # An approved action executes in a new run that continues the previous
+                    # run's work, so it inherits the methods that run had loaded.
+                    previous = list(states.values())[-2]
+                    view.loaded_skills = dict(previous.loaded_skills)
             view.status = status
             view.reason = event.data.get("reason")
+        if not summaries:
+            continue
         run_id = event.data.get("run_id")
+        if not isinstance(run_id, str):
+            continue
         if event.type == "run.started":
-            offered[run_id] = event.data.get("skills", {})
-        elif event.type == "tool.call" and event.data["tool"] == "load_capability":
-            loads[run_id, event.data["call_id"]] = event.data["args"].get("id")
+            offered[run_id] = event.data.get("skills") or {}
+        elif event.type == "tool.call" and event.data.get("tool") == "load_capability":
+            name = (event.data.get("args") or {}).get("id")
+            if isinstance(name, str):
+                loads[run_id, event.data["call_id"]] = name
         elif event.type == "tool.result":
             name = loads.pop((run_id, event.data["call_id"]), None)
             view = states.get(run_id)
             if view is None or event.data.get("outcome") != "success":
                 continue
-            if name in offered.get(run_id, {}):
+            if name is not None and name in offered.get(run_id, {}):
                 view.loaded_skills[name] = offered[run_id][name]
-            if event.data.get("artifact") is not None:
-                view.artifacts.append(SavedArtifact.model_validate(event.data["artifact"]))
+            artifact = event.data.get("artifact")
+            if artifact is not None:
+                with suppress(ValidationError):
+                    view.artifacts.append(SavedArtifact.model_validate(artifact))
     return list(states.values())
+
+
+def reply_text(messages: list[dict]) -> str:
+    return "".join(
+        part.get("content", "")
+        for message in messages
+        if message.get("kind") == "response"
+        for part in message.get("parts", [])
+        if part.get("part_kind") == "text"
+    )
 
 
 def snapshot(session_id: str, events: list[Event]) -> Snapshot:
     transcript: list[Turn] = []
     blocks: dict[str, str] = {}
+    replies: list[str] = []
     for event in events:
         match event.type:
             case "user.message":
                 transcript.append(Turn(role="user", text=event.data["text"]))
-                blocks = {}
+                blocks, replies = {}, []
+            case "run.waiting" | "run.completed":
+                text = reply_text(event.data.get("messages", []))
+                if not text:
+                    continue
+                replies.append(text)
+                if not transcript or transcript[-1].role != "assistant":
+                    transcript.append(Turn(role="assistant", text=""))
+                # The finished reply replaces any text a legacy log stored piece by piece.
+                transcript[-1].text = "\n\n".join(replies)
             case "text.reset" | "text.delta":
+                # Logs written before text became live-only stored each streamed piece.
                 if not transcript or transcript[-1].role != "assistant":
                     transcript.append(Turn(role="assistant", text=""))
                 block = event.data.get("block", "legacy")
@@ -171,7 +210,7 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
                 else:
                     blocks[block] = blocks.get(block, "") + event.data["text"]
                 transcript[-1].text = "".join(blocks.values())
-    recent = runs(events)
+    recent = runs(events, summaries=True)
     state = recent[-1].status if recent else "idle"
     paused = queue_paused(events)
     active = state in ("queued", "running", "stopping")
