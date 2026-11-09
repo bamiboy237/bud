@@ -2,17 +2,20 @@
 
 > A personal AI teammate you run yourself. Fast, durable, and safe.
 
-Bud is an open-source, local-first personal AI assistant. It integrates directly with your real-world tools—Gmail, Google Calendar, web search, and local files—while keeping you firmly in control through exact, human-in-the-loop write approvals.
+Bud is an open-source, local-first personal AI assistant. It connects to Gmail,
+Google Calendar, web search, and a private local workspace. You approve each
+proposed write before it runs.
 
 ---
 
 ## Highlights
 
-* **Crash-Resilient Durability:** Built on DBOS and SQLite event logs. If your server or laptop restarts mid-task, Bud recovers its execution state and resumes.
-* **Human-in-the-Loop Safety:** Read operations run automatically; state-modifying actions (sending emails, editing files, updating calendar events) pause for explicit user approval.
-* **Real-World Connections:** Native integrations with Gmail and Google Calendar via Composio, web research via Exa, and a private local workspace.
-* **Progressive Skills:** Capabilities and workflows load on-demand just-in-time, preventing system prompt bloat and keeping token consumption minimal.
-* **Full Simulation Mode:** Develop and test with a completely sandboxed synthetic persona and database—zero API keys or live accounts required.
+* **Crash recovery:** DBOS and SQLite retain execution state across restarts.
+* **Write approvals:** Reads run automatically. Changes pause for your exact approval.
+* **Connected tools:** Gmail and Google Calendar use Composio; public web research uses Exa.
+* **Progressive skills:** Bud loads task instructions when it needs them.
+* **Simulation mode:** Experiment with synthetic accounts and files using your model access.
+* **Independent jobs:** Keep chatting while jobs work or wait for approval.
 
 ---
 
@@ -28,62 +31,73 @@ cd bud
 uv sync
 ```
 
-### 2. Connect a Model
+### 2. Connect a model
 
-Sign in with your ChatGPT subscription (no API key needed), or bring your own API keys:
+Sign in with your ChatGPT subscription:
 
 ```bash
-# Option A: Sign in with ChatGPT subscription
 uv run bud login chatgpt
-
-# Option B: Or provide API keys in .env
-echo "OPENAI_API_KEY=your-key" >> .env
-# (Optional: DEEPSEEK_API_KEY, MUSE_API_KEY, EXA_API_KEY, COMPOSIO_API_KEY)
 ```
 
-### 3. Start Chatting
+Or set `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, or `MUSE_API_KEY` privately in your
+environment or ignored `.env` file. Simulation also needs model access.
 
-Launch the background daemon and interactive terminal client:
+### 3. Start chatting
+
+Start the server and interactive terminal client in separate terminals:
 
 ```bash
-# Terminal 1: Start the server (using safe simulation mode)
+# Terminal 1: Use synthetic accounts and files
 uv run bud serve --simulate
 
-# Terminal 2: Attach the interactive client
-uv run bud client
+# Terminal 2: Resume the primary conversation
+uv run bud chat
 ```
 
 Or ask a one-off question directly:
+
 ```bash
 uv run bud ask "What are the core principles of event sourcing?"
 ```
 
+### Jobs and approvals
+
+Quick questions stay in the chat. Longer work runs as a separate job with its
+own history and approvals. Ask another question while a job waits, or name the
+job to revise it.
+
+Each proposal shows exact `/approve <reference>` and `/deny <reference>`
+commands. A correction replaces the affected job's proposal with a fresh
+reference. `/status` shows jobs and pending proposals. `/stop` stops the
+conversation and its open jobs.
+
+See [Jobs in the conversation](docs/jobs.md) for an example and API details.
+
 ---
 
-## CLI Reference
+## CLI reference
 
 | Command | Description |
 | :--- | :--- |
-| `bud serve` | Start the persistent Bud server daemon |
-| `bud serve --simulate` | Start server in safe simulation mode with synthetic data |
-| `bud client` | Connect the interactive terminal chat interface |
-| `bud ask "<prompt>"` | Send a single prompt through the gateway and print output |
-| `bud models` | List available models, active routes, and fallbacks |
+| `bud serve` | Start the persistent Bud server |
+| `bud serve --simulate` | Start with synthetic accounts and files |
+| `bud chat` | Open the interactive terminal conversation |
+| `bud ask "<prompt>"` | Send one prompt through the model gateway |
+| `bud models` | List available models |
 | `bud costs` | Inspect subscription token usage and metered API spend |
-| `bud eval` | Run regression, safety, and tool-use evaluation benchmarks |
-| `bud connect <app>` | Connect an external service (`gmail`, `calendar`) via Composio |
+| `bud eval` | Run evaluations against the simulated world |
+| `bud connect <app>` | Connect Gmail or Calendar through Composio |
 
 ---
 
-## Architecture & Deep Dives
+## Guides
 
-To keep the root documentation focused, deep technical guides live in [`docs/`](docs/):
-
-* **[Architecture & Durability](docs/architecture.md):** Append-only event streams, DBOS crash recovery, and state projection.
-* **[Connecting Real Accounts](docs/accounts.md):** Setting up live Gmail and Google Calendar integrations via Composio MCP.
-* **[iMessage Integration](docs/photon.md):** Bridging Bud to Apple Messages via Photon v2.
-* **[Skills & Tool Extensibility](docs/skills.md):** Writing, testing, and progressively loading custom task skills.
-* **[Security & Policy Model](docs/security.md):** Approval claims, memory boundaries, and workspace sandboxing.
+* [Architecture and durability](docs/architecture.md)
+* [Jobs in the conversation](docs/jobs.md)
+* [Connect real accounts](docs/accounts.md)
+* [iMessage through Photon v2](docs/photon.md)
+* [Skills and tool extensibility](docs/skills.md)
+* [Security and approvals](docs/security.md)
 
 ---
 

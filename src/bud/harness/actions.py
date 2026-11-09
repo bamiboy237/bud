@@ -5,7 +5,7 @@ Tools may also enforce their own safety checks.
 
 import tomllib
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import resources
 from pathlib import Path
 from typing import Any, Literal
@@ -44,6 +44,25 @@ def load_policy(path: Path | None = None) -> Policy:
 class ActionGateway(WrapperToolset[None]):
     policy: Policy = field(kw_only=True)
     record: RecordDecision = field(kw_only=True)
+
+    async def get_tools(self, ctx: RunContext[None]) -> dict[str, ToolsetTool[None]]:
+        tools = await super().get_tools(ctx)
+        return {
+            name: replace(
+                tool,
+                tool_def=replace(
+                    tool.tool_def,
+                    description=(
+                        "Submit this change for approval. "
+                        "The system asks the user before execution. "
+                        + (tool.tool_def.description or "")
+                    ),
+                ),
+            )
+            if self.policy.decide(name) == "ask"
+            else tool
+            for name, tool in tools.items()
+        }
 
     async def call_tool(
         self,

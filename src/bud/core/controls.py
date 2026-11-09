@@ -28,7 +28,7 @@ async def session_snapshot(client: httpx.AsyncClient, session_id: str) -> dict:
 
 def approval_text(approval: dict) -> str:
     """Render every supplied argument; presentation never changes the approved payload."""
-    identity = approval["approval_id"]
+    identity = approval.get("reference") or approval["approval_id"]
     titles = {
         "draft_reply": "Save a reply draft (not send)",
         "GMAIL_CREATE_EMAIL_DRAFT": "Save an email draft (not send)",
@@ -41,7 +41,8 @@ def approval_text(approval: dict) -> str:
         "workspace_create": "Create a workspace file",
         "workspace_update": "Update a workspace file",
     }
-    lines = [f"Permission needed: {titles.get(approval['tool'], approval['tool'])}"]
+    task = f"Task {approval['reference']}: " if approval.get("reference") else ""
+    lines = [f"{task}Permission needed: {titles.get(approval['tool'], approval['tool'])}"]
     for name, value in approval["args"].items():
         label = name.replace("_", " ").capitalize()
         if name in ("body", "message_body", "content") and isinstance(value, str):
@@ -79,6 +80,12 @@ def status_text(state: dict) -> str:
     lines.extend(approval_text(approval) for approval in state["pending_approvals"])
     if not state["pending_approvals"]:
         lines.append("  none")
+    if state.get("tasks"):
+        lines.append("[jobs]")
+        lines.extend(
+            f"  Task {task['task_id']}: {task['title']} ({task['status']})"
+            for task in state["tasks"]
+        )
     if state["recent_runs"]:
         lines.append("[recent runs]")
         for run in state["recent_runs"]:
@@ -111,7 +118,13 @@ async def submit(
         if len(parts) != 2 or not IDENTIFIER.fullmatch(parts[1]):
             return f"[usage] {command} <approval-id>; use /status to see each exact action."
         state = await session_snapshot(client, session_id)
-        if parts[1] not in {item["approval_id"] for item in state["pending_approvals"]}:
+        references = {
+            identity
+            for item in state["pending_approvals"]
+            for identity in (item["approval_id"], item.get("reference"))
+            if identity is not None
+        }
+        if parts[1] not in references:
             return "[not pending] No permission was granted. Use /status for current actions."
         response = await client.post(
             f"{path}/approvals/{parts[1]}",

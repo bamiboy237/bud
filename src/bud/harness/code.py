@@ -13,15 +13,10 @@ inside_code_mode: ContextVar[bool] = ContextVar("bud_inside_code_mode", default=
 CODE_TOOL_CALL_LIMIT = 12
 
 CODE_GUIDANCE = """
-Use run_code to filter, join, group, and calculate over read-only tool results.
-The listed sandbox functions are callable only inside run_code, not as standalone tools.
-Fetch data through the listed sandbox functions and return only the answer and source identifiers.
-Do not print or return an entire dataset when a small result answers the question.
-load_tool_result(handle=...) loads a saved result inside the sandbox, decoding JSON when possible.
-Sends, drafts, calendar changes, and memory changes are not sandbox functions.
-Use their normal tools.
-The sandbox has no host files, environment, network, or arbitrary third-party Python packages.
-Variables can be reused within this run, but do not assume they exist in another run.
+Use `run_code` to process, calculate, and transform read-only tool outputs in an isolated sandbox.
+Load stored tool payloads with `load_tool_result(handle=...)` and return targeted results.
+State-modifying actions (such as sending messages, scheduling, or file edits) use their
+dedicated external tools.
 """
 
 

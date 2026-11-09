@@ -69,7 +69,7 @@ def render(
             print(f"\n[tool] {data['tool']}({data['args']})", flush=True)
         case "tool.result":
             print(f"[result] {data['result'][:200]}", flush=True)
-        case "approval.requested":
+        case "approval.requested" | "task.approval":
             if historical_approval:
                 print(
                     f"\n[historical approval; no longer pending] {data['approval_id']}: "
@@ -95,6 +95,8 @@ def render(
         case "run.failed":
             streamed.pop(data["run_id"], None)
             print(f"\n[run failed] {data['reason']}", flush=True)
+        case "task.completed" | "task.failed" | "task.cancelled":
+            print(f"\nTask {data['task_id']}: {data['text']}", flush=True)
 
 
 def print_http_error(error: httpx.HTTPStatusError) -> None:
@@ -133,7 +135,7 @@ async def follow(client: httpx.AsyncClient, session_id: str) -> None:
                             seen_requests,
                             streamed,
                             historical_approval=(
-                                event["type"] == "approval.requested"
+                                event["type"] in ("approval.requested", "task.approval")
                                 and event["seq"] <= watermark
                                 and event["data"]["approval_id"] not in pending
                             ),
