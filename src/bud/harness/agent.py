@@ -9,7 +9,7 @@ from pathlib import Path
 
 from pydantic_ai import Agent, DeferredToolRequests, RunContext, Tool
 from pydantic_ai.capabilities import AbstractCapability, Capability
-from pydantic_ai.messages import InstructionPart, ModelResponse
+from pydantic_ai.messages import ModelRequest, ModelResponse, UserPromptPart
 from pydantic_ai.models import Model, ModelRequestContext
 from pydantic_ai.toolsets import AbstractToolset, CombinedToolset, FunctionToolset
 from pydantic_ai.usage import UsageLimits
@@ -189,16 +189,14 @@ class ExecutionBudget(AbstractCapability[None]):
                 " Tools are now disabled. Deliver the verified result and identify any "
                 "unfinished work or missing evidence; do not claim an action succeeded."
             )
-        parameters = request_context.model_request_parameters
+        # A per-request note, not an instruction part: it must not change the system
+        # prefix, or strict endpoints reject the request and provider prompt caching
+        # misses on every turn. request_context.messages is request-owned, so this
+        # note reaches only the current model request.
+        budget_note = ModelRequest(parts=[UserPromptPart(content=guidance)])
         return replace(
             request_context,
-            model_request_parameters=replace(
-                parameters,
-                instruction_parts=[
-                    *(parameters.instruction_parts or []),
-                    InstructionPart(guidance, dynamic=True, name="execution_budget"),
-                ],
-            ),
+            messages=[*request_context.messages, budget_note],
             model_settings=(
                 (request_context.model_settings or {}) | {"tool_choice": "none"}
                 if finish

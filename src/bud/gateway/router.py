@@ -39,8 +39,13 @@ class NoModelAvailable(Exception):
 class EndpointProvider(OpenAIProvider):
     @staticmethod
     def model_profile(model_name: str) -> OpenAIModelProfile:
-        """A custom endpoint's capabilities come from its configuration, not its model name."""
+        """A custom endpoint's capabilities come from its configuration, not its model name.
+
+        Leading system messages are merged into one: strict servers (llama.cpp,
+        some vLLM setups) reject any system message that is not the first message.
+        """
         return OpenAIModelProfile(
+            openai_chat_supports_multiple_system_messages=False,
             context_window=None,
             supports_tools=False,
             supported_native_tools=frozenset(),
