@@ -33,35 +33,9 @@ RULES = {
     "disable_skill": "ask",
 }
 GUIDANCE = """
-Use the skill catalog to find a method for substantial research, briefings, meeting
-preparation, writing and document work. Load relevant methods with load_capability.
-Skills guide the work; use the actual available tools and saved preferences.
-For a goal with several kinds of work, combine the methods needed for each part.
-Load a method before using it, not the whole library. A research question that
-needs a saved deliverable can use research for the evidence and document-writing
-for the artifact; a meeting follow-up can use meeting-preparation and message-writing.
-These are examples, not fixed workflows. Simple requests need no extra methods.
-Work from the requested result and available tools. Gather independent sources
-together where useful, then use the findings in the next step instead of starting
-over. Keep important claims tied to source identifiers and carry those references
-and material evidence gaps into the deliverable, not only the chat reply.
-Before proposing a write, check the result against the person's constraints and
-latest corrections. A missing tool or unresolved source conflict must not become
-an invented result. Use a supported output or ask for a decision that blocks progress.
-For a correction, read the saved artifact and the relevant retained sources, then
-revise that same artifact. Preserve unaffected content and source references.
-Each changed write needs its own approval; an earlier approval does not cover a revision.
-Finish by naming the confirmed artifact or giving the requested answer, with any
-unfinished work stated plainly. Loading methods or drafting a proposal is not completion.
-Interpret relative dates in a source against that source's timestamp. An old
-"by Friday" does not move to this week's Friday when you read it later.
-For an additional skill, find_skills searches the ecosystem using a generic task
-description, never private messages, personal details or credentials. prepare_skill fetches
-a specific public source for inspection. Read its instructions and requirements;
-recommend it only when it fits. install_skill proposes the exact prepared version
-for user approval. Never run installation commands or skill scripts through another
-tool. An update needs a new prepared version and approval. New versions are offered
-on the next task; the current task keeps its original methods.
+Skills provide specialized task workflows. Use `list_skills` to discover available
+capabilities, and `load_capability` to activate only the methods required for the
+current task. Follow loaded skill instructions alongside available tools.
 """
 
 
@@ -183,7 +157,7 @@ class SkillStore:
         return directory
 
     def list_skills(self) -> list[dict]:
-        """List installed methods, versions, sources and whether they are enabled."""
+        """List installed skills, active versions, sources, and enabled status."""
         with self.connect() as db:
             return [
                 dict(zip(("name", "version", "source", "enabled"), row, strict=True))
@@ -193,7 +167,7 @@ class SkillStore:
             ]
 
     async def find_skills(self, query: str) -> str:
-        """Search skills.sh for reusable methods; this does not install them."""
+        """Search the public ecosystem registry for reusable skills using a generic task phrase."""
         if not 2 <= len(query.strip()) <= 200 or query.startswith("-"):
             raise SkillError("Use a search phrase between 2 and 200 characters.")
         return (await self.installer.run(["find", query], self.root))[:16_000]
@@ -243,7 +217,7 @@ class SkillStore:
     def install_skill(
         self, ctx: RunContext, preview_id: str, source: str, name: str, version: str
     ) -> dict:
-        """Install this exact prepared skill version after user approval."""
+        """Install an exact inspected skill version. Requires user approval."""
         approval = (ctx.tool_call_metadata or {}).get("approval_id")
         if not ctx.tool_call_approved or not approval:
             raise SkillError("Skill installation requires an exact approved proposal.")
@@ -280,7 +254,7 @@ class SkillStore:
         return {"installed": True, "name": name, "version": version, "applied": True}
 
     def disable_skill(self, ctx: RunContext, name: str, version: str) -> dict:
-        """Disable an exact installed version after approval, retaining versions for old tasks."""
+        """Disable an installed skill version. Requires user approval."""
         approval = (ctx.tool_call_metadata or {}).get("approval_id")
         if not ctx.tool_call_approved or not approval:
             raise SkillError("Disabling a skill requires approval.")
@@ -303,7 +277,7 @@ class SkillStore:
         return {"disabled": name, "applied": True}
 
     def read_skill_reference(self, ctx: RunContext, name: str, path: str) -> str:
-        """Read a UTF-8 reference from a skill loaded in this task."""
+        """Read a UTF-8 reference document from a skill loaded in the active task."""
         versions = (ctx.metadata or {}).get("bud_skills", {})
         version = versions.get(name)
         if name not in ctx.loaded_capability_ids or version is None:
