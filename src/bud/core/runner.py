@@ -3,7 +3,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterable
-from contextvars import ContextVar
+from contextvars import Context, ContextVar
 from dataclasses import replace
 from hashlib import sha256
 from typing import cast
@@ -38,15 +38,18 @@ from bud.core.events import RUN_END_EVENTS, Event, EventType
 from bud.core.hub import Hub
 from bud.core.log import StopRequested
 from bud.core.projection import (
+    Snapshot,
     decisions,
     message_batch,
     model_history,
     queue_paused,
     runs,
+    snapshot,
     undecided_approvals,
     waiting_batch,
 )
 from bud.core.runtime import replay_version
+from bud.core.tasks import CONTROL_TOOLS, FINISHED, TaskFlow, WorkItems
 from bud.gateway import Gateway
 from bud.gateway.errors import error_summary
 from bud.gateway.registry import Tier
@@ -80,6 +83,7 @@ class Runner(DBOSConfiguredInstance):
         tier: Tier = "fast",
         *,
         durable: bool = False,
+        jobs: bool = False,
     ) -> None:
         self.hub = hub
         self.gateway = gateway
@@ -93,6 +97,9 @@ class Runner(DBOSConfiguredInstance):
         self._bursts: dict[str, asyncio.TimerHandle] = {}
         self._closing = False
         self._current: ContextVar[dict] = ContextVar("bud_run")
+        self.work_items = WorkItems(hub) if jobs else None
+        if jobs:
+            harness.policy.tools.update(dict.fromkeys(CONTROL_TOOLS, "allow"))
         self.version = replay_version()
         self.fingerprint = sha256(
             (
@@ -101,6 +108,7 @@ class Runner(DBOSConfiguredInstance):
                 + json.dumps(harness.policy.tools, sort_keys=True)
                 + str(gateway.selected_model)
                 + str(gateway.fallback)
+                + str(jobs)
                 + tier
                 + str(harness.results.retention.total_seconds())
             ).encode()
@@ -126,7 +134,43 @@ class Runner(DBOSConfiguredInstance):
             self._record_decision,
             context=self.context,
             durability=durability,
+            capabilities=(
+                TaskFlow(
+                    store=self.work_items,
+                    policy=harness.policy,
+                    kick=self._kick,
+                    stop=self._stop_task,
+                ),
+            )
+            if self.work_items is not None
+            else (),
         )
+
+    def snapshot(self, session_id: str) -> Snapshot:
+        state = snapshot(session_id, self.hub.log.read(session_id))
+        if self.work_items is not None and self.work_items.for_session(session_id) is None:
+            state.tasks = self.work_items.views(session_id)
+            state.pending_approvals.extend(
+                approval for task in state.tasks for approval in task.pending_approvals
+            )
+        return state
+
+    def _kick(self, session_id: str) -> None:
+        self.hub.wake(session_id)
+        if self._loop is not None and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._drain, session_id, context=Context())
+
+    async def _stop_task(self, session_id: str) -> dict:
+        if self._loop is asyncio.get_running_loop():
+            return await self.stop_session(session_id)
+        assert self._loop is not None
+        return await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(self.stop_session(session_id), self._loop)
+        )
+
+    def _publish_task(self, session_id: str) -> None:
+        if self.work_items is not None:
+            self.work_items.publish(session_id)
 
     async def recover(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -158,6 +202,9 @@ class Runner(DBOSConfiguredInstance):
             self.hub.log.sessions_with_decisions() + self.hub.log.queue_sessions()
         ):
             self._drain(session_id)
+        if self.work_items is not None:
+            for item in self.work_items.items():
+                self.work_items.publish(item.session_id)
 
     def _inputs(
         self,
@@ -172,6 +219,21 @@ class Runner(DBOSConfiguredInstance):
         saved = last is not None and bool(
             last.data.get("conversation_saved") or last.data.get("conversation")
         )
+        item = self.work_items.for_session(session_id) if self.work_items is not None else None
+        skills = self.harness.skills.snapshot()
+        if item is not None:
+            skills = (
+                item.skills
+                if item.skills is not None
+                else next(
+                    (
+                        event.data["skills"]
+                        for event in events
+                        if event.type == "run.queued" and "skills" in event.data
+                    ),
+                    skills,
+                )
+            )
         # Inputs name the saved snapshot or a log position instead of copying history, so
         # each queued run stays small. Both references are immutable once written.
         return {
@@ -180,10 +242,11 @@ class Runner(DBOSConfiguredInstance):
             "text": text,
             "trigger": "message" if results is None else "approval",
             "origin": origin,
+            "task_id": item.task_id if item is not None else None,
             "conversation_run": last.data["run_id"] if saved and last is not None else None,
             "history_seq": None if saved else (events[-1].seq if events else 0),
             "results": RESULTS.dump_json(results).decode() if results is not None else None,
-            "skills": self.harness.skills.snapshot(),
+            "skills": skills,
             "config": self.fingerprint,
             "version": self.version,
         }
@@ -267,6 +330,12 @@ class Runner(DBOSConfiguredInstance):
             timer.cancel()
         request = self.hub.log.request_stop(session_id)
         self.hub.wake(session_id)
+        child_stopped = False
+        if self.work_items is not None:
+            for item in self.work_items.items(session_id):
+                if self.work_items.view(item).status not in FINISHED:
+                    result = await self.stop_session(item.session_id)
+                    child_stopped |= result["stop_requested"]
         await self.context.discard(session_id)
         if request is not None:
             run_id = request["run_id"]
@@ -277,11 +346,16 @@ class Runner(DBOSConfiguredInstance):
             if run_id not in self._executing:
                 self.hub.log.acknowledge_stop(session_id, run_id)
             self.hub.wake(session_id)
-        return {"stop_requested": request is not None, "queue_paused": True}
+        self._publish_task(session_id)
+        return {"stop_requested": request is not None or child_stopped, "queue_paused": True}
 
     def decide(
         self, session_id: str, approval_id: str, approved: bool, origin: dict | None = None
     ) -> bool:
+        if self.work_items is not None:
+            target = self.work_items.resolve(session_id, approval_id)
+            if target is not None:
+                return self.decide(target[0], target[1], approved, origin)
         events = self.hub.log.read(session_id)
         if approval_id in decisions(events):
             return False
@@ -299,6 +373,10 @@ class Runner(DBOSConfiguredInstance):
     def revise(
         self, session_id: str, approval_id: str, text: str, message_id: str, origin: dict
     ) -> bool:
+        if self.work_items is not None:
+            target = self.work_items.resolve(session_id, approval_id)
+            if target is not None:
+                return self.revise(target[0], target[1], text, message_id, origin)
         self._validate_text(text)
         event = self.hub.log.revise_approval(session_id, approval_id, text, message_id, origin)
         self.hub.wake(session_id)
@@ -426,6 +504,7 @@ class Runner(DBOSConfiguredInstance):
             )
             self.hub.wake(session_id)
         if not task.cancelled():
+            self._publish_task(session_id)
             self._drain(session_id)
 
     async def stop(self) -> None:
@@ -496,7 +575,15 @@ class Runner(DBOSConfiguredInstance):
                 else None,
                 run_id=run["run_id"],
                 conversation_id=run["session_id"] if conversation is None else None,
-                metadata={"bud_skills": run.get("skills", {})},
+                metadata={
+                    "bud_skills": run.get("skills", {}),
+                    "bud_session_id": run["session_id"],
+                    "bud_task_id": run.get("task_id"),
+                    "bud_origin": run.get("origin"),
+                    "bud_revision_pending": bool(run.get("quiet")),
+                    "bud_inline_approval": run.get("task_id") is None
+                    and run["trigger"] == "approval",
+                },
                 usage_limits=limits,
                 event_stream_handler=None if self.durable else self._stream,
             )
@@ -552,6 +639,7 @@ class Runner(DBOSConfiguredInstance):
             if self.hub.log.stop_requested(run["run_id"]):
                 self.hub.log.acknowledge_stop(run["session_id"], run["run_id"])
                 self.hub.wake(run["session_id"])
+                self._publish_task(run["session_id"])
                 if self._loop is not None and not self._loop.is_closed():
                     self._loop.call_soon_threadsafe(self._drain, run["session_id"])
             self._executing.pop(run["run_id"], None)
@@ -585,6 +673,7 @@ class Runner(DBOSConfiguredInstance):
     def _finish(self, run: dict, type: EventType, data: dict, approvals: list[dict]) -> None:
         self.hub.log.finish_run(run["session_id"], run["run_id"], type, data, approvals)
         self.hub.wake(run["session_id"])
+        self._publish_task(run["session_id"])
 
     def _record_context(self, event: dict) -> None:
         session_id = event["session_id"]

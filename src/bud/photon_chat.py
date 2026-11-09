@@ -46,8 +46,10 @@ def notification(event: dict, origin: MessageOrigin) -> str | None:
     if data.get("origin") != origin.model_dump():
         return None
     match event["type"]:
-        case "approval.requested":
+        case "approval.requested" | "task.approval":
             return action_preview(data)
+        case "task.completed" | "task.failed" | "task.cancelled":
+            return f"Task {data['task_id']}: {data['text']}"
         case "run.completed":
             if data.get("quiet"):
                 return None
@@ -298,7 +300,11 @@ class PhotonChat:
             async for event in self.events(route["session"], route["core_seq"]):
                 data = event["data"]
                 body = notification(event, self.origin(route["space"]))
-                approval = data if body and event["type"] == "approval.requested" else None
+                approval = (
+                    data
+                    if body and event["type"] in ("approval.requested", "task.approval")
+                    else None
+                )
                 if approval:
                     snapshot = await session_snapshot(self.core, route["session"])
                     if not any(

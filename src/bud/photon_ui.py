@@ -27,6 +27,8 @@ def action_preview(approval: dict, *, decision: bool = True) -> str:
         "workspace_update": f"Replace the contents of {target}?",
     }
     title = titles.get(tool, tool.replace("_", " ").capitalize() + "?")
+    if approval.get("reference"):
+        title = f"Task {approval['reference']}: {title}"
     details = []
     for key, value in args.items():
         # Preconditions prevent races; they do not describe a user-visible change.
@@ -55,7 +57,7 @@ def action_preview(approval: dict, *, decision: bool = True) -> str:
     if details:
         parts.append("\n".join(details))
     if decision:
-        identity = approval["approval_id"]
+        identity = approval.get("reference") or approval["approval_id"]
         parts.append(f"/approve {identity}\n/deny {identity}")
     return "\n\n".join(parts)
 
@@ -75,4 +77,14 @@ def status_text(state: dict) -> str:
         )
     if state["run_active"]:
         return "I'm on it." + (f" There are {count} more requests waiting." if count else "")
+    jobs = [
+        task
+        for task in state.get("tasks", [])
+        if task["status"] not in {"completed", "failed", "cancelled"}
+    ]
+    if jobs:
+        return "\n".join(
+            f"Task {task['task_id']}: {task['title']} ({task['status'].replace('_', ' ')})"
+            for task in jobs
+        )
     return "All caught up."

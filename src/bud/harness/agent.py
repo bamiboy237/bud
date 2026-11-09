@@ -129,10 +129,12 @@ class Harness:
         *,
         context: BackgroundCompaction,
         durability: AbstractCapability | None = None,
+        capabilities: tuple[AbstractCapability[None], ...] = (),
     ) -> Agent[None, str | DeferredToolRequests]:
         return Agent(
             model,
             name="bud",
+            deps_type=type(None),
             instructions=self.system_prompt,
             toolsets=[self.toolset],
             output_type=[str, DeferredToolRequests],
@@ -153,6 +155,7 @@ class Harness:
                 ),
                 *([self.memory] if self.memory is not None else []),
                 *([durability] if durability is not None else []),
+                *capabilities,
             ],
         )
 

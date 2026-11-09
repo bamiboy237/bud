@@ -18,6 +18,7 @@ from dbos import DBOS
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
+from pydantic_ai import ModelRetry
 from pydantic_ai.toolsets import CombinedToolset, FunctionToolset
 
 from bud.composio.connection import ConnectionError, Connections
@@ -26,7 +27,7 @@ from bud.core.auth import OwnerAuthentication, owner_token
 from bud.core.events import Event, MessageOrigin
 from bud.core.hub import Hub
 from bud.core.log import EventLog, QueueFull
-from bud.core.projection import Snapshot, snapshot
+from bud.core.projection import Snapshot
 from bud.core.runner import Runner, UnknownApproval
 from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
@@ -203,7 +204,7 @@ def _create_app(
     gateway.model("fast", require_tools=True)
     log = EventLog(db_path)
     hub = Hub(log)
-    runner = Runner(hub, gateway, harness, durable=True)
+    runner = Runner(hub, gateway, harness, durable=True, jobs=True)
 
     async def cleanup_results() -> None:
         while True:
@@ -384,7 +385,21 @@ def _create_app(
     @app.get("/sessions/{session_id}")
     def get_session(session_id: str) -> Snapshot:
         require_session(session_id)
-        return snapshot(session_id, log.read(session_id))
+        return runner.snapshot(session_id)
+
+    @app.get("/sessions/{session_id}/tasks/{task_id}")
+    def get_task(session_id: str, task_id: int) -> dict:
+        require_session(session_id)
+        assert runner.work_items is not None
+        try:
+            item = runner.work_items.get(session_id, task_id)
+        except ModelRetry:
+            raise HTTPException(404, "unknown task") from None
+        return {
+            "brief": item.brief.model_dump(),
+            "task": runner.work_items.view(item).model_dump(),
+            "conversation": runner.snapshot(item.session_id).model_dump(),
+        }
 
     @app.post("/sessions/{session_id}/messages", status_code=202)
     async def post_message(session_id: str, message: NewMessage) -> dict[str, bool]:

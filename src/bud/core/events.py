@@ -38,6 +38,11 @@ EventType = Literal[
     "run.failed",
     "run.stop_requested",
     "run.cancelled",
+    "task.created",
+    "task.approval",
+    "task.completed",
+    "task.failed",
+    "task.cancelled",
 ]
 
 RUN_END_EVENTS = ("run.waiting", "run.completed", "run.failed", "run.cancelled")

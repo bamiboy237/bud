@@ -18,12 +18,15 @@ from bud.limits import MAX_MESSAGE_CHARS
 class Turn(BaseModel):
     role: str
     text: str
+    task_id: int | None = None
 
 
 class PendingApproval(BaseModel):
     approval_id: str
     tool: str
     args: dict[str, Any]
+    task_id: int | None = None
+    reference: str | None = None
 
 
 class QueuedMessage(BaseModel):
@@ -46,6 +49,16 @@ class RunView(BaseModel):
     artifacts: list[SavedArtifact] = Field(default_factory=list)
 
 
+class TaskView(BaseModel):
+    task_id: int
+    session_id: str
+    title: str
+    status: str
+    pending_approvals: list[PendingApproval]
+    artifacts: list[SavedArtifact]
+    result: str | None = None
+
+
 class Snapshot(BaseModel):
     session_id: str
     last_seq: int
@@ -56,6 +69,7 @@ class Snapshot(BaseModel):
     queue_paused: bool = False
     queued_messages: list[QueuedMessage] = Field(default_factory=list)
     recent_runs: list[RunView] = Field(default_factory=list)
+    tasks: list[TaskView] = Field(default_factory=list)
 
 
 def queued_messages(events: list[Event]) -> list[QueuedMessage]:
@@ -182,25 +196,35 @@ def reply_text(messages: list[dict]) -> str:
 def snapshot(session_id: str, events: list[Event]) -> Snapshot:
     transcript: list[Turn] = []
     blocks: dict[str, str] = {}
-    replies: list[str] = []
+    run_turns: dict[str, Turn] = {}
     for event in events:
         match event.type:
             case "user.message":
                 transcript.append(Turn(role="user", text=event.data["text"]))
-                blocks, replies = {}, []
+                blocks = {}
             case "run.waiting" | "run.completed":
                 text = reply_text(event.data.get("messages", []))
                 if not text:
                     continue
-                replies.append(text)
-                if not transcript or transcript[-1].role != "assistant":
-                    transcript.append(Turn(role="assistant", text=""))
-                # The finished reply replaces any text a legacy log stored piece by piece.
-                transcript[-1].text = "\n\n".join(replies)
+                run_id = event.data["run_id"]
+                if run_id not in run_turns:
+                    run_turns[run_id] = Turn(role="assistant", text="")
+                    transcript.append(run_turns[run_id])
+                run_turns[run_id].text = text
+            case "task.completed" | "task.failed" | "task.cancelled":
+                transcript.append(
+                    Turn(
+                        role="assistant",
+                        text=f"Task {event.data['task_id']}: {event.data['text']}",
+                        task_id=event.data["task_id"],
+                    )
+                )
             case "text.reset" | "text.delta":
                 # Logs written before text became live-only stored each streamed piece.
-                if not transcript or transcript[-1].role != "assistant":
-                    transcript.append(Turn(role="assistant", text=""))
+                run_id = event.data["run_id"]
+                if run_id not in run_turns:
+                    run_turns[run_id] = Turn(role="assistant", text="")
+                    transcript.append(run_turns[run_id])
                 block = event.data.get("block", "legacy")
                 if event.type == "text.reset":
                     request = event.data["request"] + ":"
@@ -209,7 +233,7 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
                     }
                 else:
                     blocks[block] = blocks.get(block, "") + event.data["text"]
-                transcript[-1].text = "".join(blocks.values())
+                run_turns[run_id].text = "".join(blocks.values())
     recent = runs(events, summaries=True)
     state = recent[-1].status if recent else "idle"
     paused = queue_paused(events)
