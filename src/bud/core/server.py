@@ -32,6 +32,7 @@ from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
 from bud.harness.memory import build_memory
+from bud.limits import MAX_MESSAGE_CHARS
 from bud.photon_config import PhotonConfig
 from bud.web import GUIDANCE as WEB_GUIDANCE
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
@@ -48,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 
 class NewMessage(BaseModel):
-    text: str = Field(min_length=1, max_length=100_000)
+    text: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
     origin: MessageOrigin = Field(default_factory=MessageOrigin)
     message_id: str | None = Field(
         default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"
@@ -60,7 +61,7 @@ class NewSession(BaseModel):
 
 
 class EditMessage(BaseModel):
-    text: str = Field(min_length=1, max_length=100_000)
+    text: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
 
 
 class Decision(BaseModel):
@@ -69,7 +70,9 @@ class Decision(BaseModel):
 
 
 def sse_frame(event: Event) -> str:
-    return f"id: {event.seq}\nevent: {event.type}\ndata: {event.model_dump_json()}\n\n"
+    # Live text has no stored position; only stored events move the reconnect cursor.
+    cursor = "" if event.live else f"id: {event.seq}\n"
+    return f"{cursor}event: {event.type}\ndata: {event.model_dump_json()}\n\n"
 
 
 def hold_single_server_lock(path: Path) -> TextIO:
@@ -118,6 +121,7 @@ def _create_app(
     model_id: str | None,
 ) -> FastAPI:
     connections = None
+    binding = None
     photon = None
     if not simulate and any(
         (
@@ -278,7 +282,7 @@ def _create_app(
 
     scope_id = (
         binding.scope
-        if connections is not None
+        if binding is not None
         else hashlib.sha256(str(db_path.resolve()).encode()).hexdigest()
     )
     app = FastAPI(title="bud core", lifespan=lifespan)
@@ -290,7 +294,7 @@ def _create_app(
         if not log.exists(session_id):
             raise RuntimeError("Saved iMessage conversation is unavailable.")
         async for event in hub.subscribe(session_id, after=after):
-            if event is not None:
+            if event is not None and not event.live:
                 yield event.model_dump(mode="json")
 
     @app.get("/runtime")

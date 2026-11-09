@@ -6,11 +6,13 @@ from collections.abc import AsyncIterable
 from contextvars import ContextVar
 from dataclasses import replace
 from hashlib import sha256
+from typing import cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from dbos import DBOS, DBOSConfiguredInstance, SetWorkflowID
 from pydantic import TypeAdapter
 from pydantic_ai import (
+    Conversation,
     ConversationTypeAdapter,
     DeferredToolRequests,
     DeferredToolResults,
@@ -22,14 +24,17 @@ from pydantic_ai.durable_exec.dbos import DBOSDurability
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
-    ModelMessagesTypeAdapter,
+    ModelMessage,
     PartDeltaEvent,
     PartStartEvent,
+    RetryPromptPart,
     TextPart,
     TextPartDelta,
+    ToolReturnPart,
 )
+from pydantic_ai.usage import UsageLimits
 
-from bud.core.events import Event
+from bud.core.events import RUN_END_EVENTS, Event, EventType
 from bud.core.hub import Hub
 from bud.core.log import StopRequested
 from bud.core.projection import (
@@ -46,8 +51,13 @@ from bud.gateway import Gateway
 from bud.gateway.errors import error_summary
 from bud.gateway.registry import Tier
 from bud.gateway.tracked import request_session
-from bud.harness.agent import RUN_LIMITS, Harness
+from bud.harness.agent import Harness
 from bud.harness.context import BackgroundCompaction
+from bud.limits import (
+    MAX_MESSAGE_CHARS,
+    MAX_MODEL_REQUESTS_PER_RUN,
+    MAX_TOOL_CALLS_PER_RUN,
+)
 
 RESULTS = TypeAdapter(DeferredToolResults)
 
@@ -158,24 +168,20 @@ class Runner(DBOSConfiguredInstance):
         origin: dict | None = None,
     ) -> dict:
         events = self.hub.log.read(session_id)
-        conversation = next(
-            (
-                event.data.get("conversation")
-                for event in reversed(events)
-                if event.type in ("run.waiting", "run.completed", "run.failed", "run.cancelled")
-            ),
-            None,
+        last = next((event for event in reversed(events) if event.type in RUN_END_EVENTS), None)
+        saved = last is not None and bool(
+            last.data.get("conversation_saved") or last.data.get("conversation")
         )
+        # Inputs name the saved snapshot or a log position instead of copying history, so
+        # each queued run stays small. Both references are immutable once written.
         return {
             "session_id": session_id,
             "run_id": uuid4().hex,
             "text": text,
             "trigger": "message" if results is None else "approval",
             "origin": origin,
-            "conversation": conversation,
-            "history": json.loads(ModelMessagesTypeAdapter.dump_json(model_history(events)))
-            if conversation is None
-            else None,
+            "conversation_run": last.data["run_id"] if saved and last is not None else None,
+            "history_seq": None if saved else (events[-1].seq if events else 0),
             "results": RESULTS.dump_json(results).decode() if results is not None else None,
             "skills": self.harness.skills.snapshot(),
             "config": self.fingerprint,
@@ -210,8 +216,10 @@ class Runner(DBOSConfiguredInstance):
 
     @staticmethod
     def _validate_text(text: str) -> None:
-        if not text.strip() or len(text) > 100_000:
-            raise ValueError("Message must contain text and be at most 100,000 characters")
+        if not text.strip() or len(text) > MAX_MESSAGE_CHARS:
+            raise ValueError(
+                f"Message must contain text and be at most {MAX_MESSAGE_CHARS:,} characters"
+            )
 
     def edit_message(self, session_id: str, message_id: str, text: str) -> None:
         self._validate_text(text)
@@ -447,7 +455,9 @@ class Runner(DBOSConfiguredInstance):
     async def _execute(self, run: dict) -> None:
         token = self._current.set(run)
         session_token = request_session.set(run["session_id"])
-        self._executing[run["run_id"]] = asyncio.current_task()
+        task = asyncio.current_task()
+        assert task is not None
+        self._executing[run["run_id"]] = task
         try:
             if self.hub.log.stop_requested(run["run_id"]):
                 return
@@ -464,26 +474,23 @@ class Runner(DBOSConfiguredInstance):
                 return
             await self._step("bud.started", self._started, run)
 
-            conversation = (
-                ConversationTypeAdapter.validate_json(run["conversation"])
-                if run["conversation"]
-                else None
-            )
+            conversation, history = self._history(run)
             if conversation is not None and conversation.conversation_id != run["session_id"]:
                 raise RecoveryRefused("Conversation does not belong to this session.")
-            limits = RUN_LIMITS
+            limits = UsageLimits(
+                request_limit=MAX_MODEL_REQUESTS_PER_RUN,
+                tool_calls_limit=MAX_TOOL_CALLS_PER_RUN,
+            )
             if conversation is not None:
                 limits = replace(
-                    RUN_LIMITS,
-                    request_limit=conversation.usage.requests + RUN_LIMITS.request_limit,
-                    tool_calls_limit=conversation.usage.tool_calls + RUN_LIMITS.tool_calls_limit,
+                    limits,
+                    request_limit=conversation.usage.requests + MAX_MODEL_REQUESTS_PER_RUN,
+                    tool_calls_limit=conversation.usage.tool_calls + MAX_TOOL_CALLS_PER_RUN,
                 )
             result = await self.agent.run(
                 run["text"],
                 conversation=conversation,
-                message_history=ModelMessagesTypeAdapter.validate_python(run["history"])
-                if run["history"]
-                else None,
+                message_history=history or None,
                 deferred_tool_results=RESULTS.validate_json(run["results"])
                 if run["results"]
                 else None,
@@ -551,6 +558,17 @@ class Runner(DBOSConfiguredInstance):
             request_session.reset(session_token)
             self._current.reset(token)
 
+    def _history(self, run: dict) -> tuple[Conversation | None, list[ModelMessage]]:
+        if run.get("conversation_run"):
+            saved = self.hub.log.conversation(run["session_id"], run["conversation_run"])
+            if saved is None:
+                raise RecoveryRefused("The saved conversation for this run is unavailable.")
+            return ConversationTypeAdapter.validate_json(saved), []
+        if run.get("history_seq") is None:
+            return None, []
+        events = self.hub.log.read(run["session_id"])
+        return None, model_history([event for event in events if event.seq <= run["history_seq"]])
+
     def _started(self, run: dict) -> None:
         self.hub.publish_once(
             run["session_id"],
@@ -564,7 +582,7 @@ class Runner(DBOSConfiguredInstance):
             key=f"{run['run_id']}:started",
         )
 
-    def _finish(self, run: dict, type: str, data: dict, approvals: list[dict]) -> None:
+    def _finish(self, run: dict, type: EventType, data: dict, approvals: list[dict]) -> None:
         self.hub.log.finish_run(run["session_id"], run["run_id"], type, data, approvals)
         self.hub.wake(run["session_id"])
 
@@ -572,7 +590,7 @@ class Runner(DBOSConfiguredInstance):
         session_id = event["session_id"]
         self.hub.publish_once(
             session_id,
-            f"context.{event['stage']}",
+            cast(EventType, f"context.{event['stage']}"),
             event,
             key=f"context:{event['id']}:{event['stage']}",
         )
@@ -590,22 +608,23 @@ class Runner(DBOSConfiguredInstance):
             request = f"{run['run_id']}:{ctx.run_step}"
             match event:
                 case PartStartEvent(index=index, part=part):
+                    # Streamed text is live-only; run.completed stores the finished reply.
                     if request not in seen:
-                        self.hub.publish(
+                        self.hub.broadcast(
                             run["session_id"], "text.reset", {**data, "request": request}
                         )
                         seen.add(request)
                     if isinstance(part, TextPart) and part.content:
-                        self.hub.publish(
+                        self.hub.broadcast(
                             run["session_id"],
                             "text.delta",
                             {**data, "block": f"{request}:{index}", "text": part.content},
                         )
                 case PartDeltaEvent(index=index, delta=TextPartDelta(content_delta=text)) if text:
-                    self.hub.publish(
+                    self.hub.broadcast(
                         run["session_id"],
                         "text.delta",
-                        {**data, "block": f"{run['run_id']}:{ctx.run_step}:{index}", "text": text},
+                        {**data, "block": f"{request}:{index}", "text": text},
                     )
                 case FunctionToolCallEvent(part=part):
                     self.hub.publish_once(
@@ -620,13 +639,34 @@ class Runner(DBOSConfiguredInstance):
                         key=f"{run['run_id']}:call:{part.tool_call_id}",
                     )
                 case FunctionToolResultEvent() as result:
+                    part = result.part
+                    outcome = part.outcome if isinstance(part, ToolReturnPart) else "retried"
+                    artifact = _artifact(part) if outcome == "success" else None
                     self.hub.publish_once(
                         run["session_id"],
                         "tool.result",
                         {
                             **data,
                             "call_id": result.tool_call_id,
-                            "result": str(result.part.content),
+                            "tool": part.tool_name,
+                            "outcome": outcome,
+                            "result": str(part.content),
+                            **({"artifact": artifact} if artifact else {}),
                         },
                         key=f"{run['run_id']}:result:{result.tool_call_id}",
                     )
+
+
+def _artifact(part: ToolReturnPart | RetryPromptPart) -> dict[str, str] | None:
+    """A tool marks a saved deliverable in its return metadata; the model never sees it."""
+    metadata = getattr(part, "metadata", None)
+    artifact = metadata.get("artifact") if isinstance(metadata, dict) else None
+    if not isinstance(artifact, dict):
+        return None
+    fields: dict[str, str] = {}
+    for key in ("path", "revision", "operation"):
+        value = artifact.get(key)
+        if not isinstance(value, str):
+            return None
+        fields[key] = value
+    return fields

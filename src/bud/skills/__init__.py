@@ -36,6 +36,23 @@ GUIDANCE = """
 Use the skill catalog to find a method for substantial research, briefings, meeting
 preparation, writing and document work. Load relevant methods with load_capability.
 Skills guide the work; use the actual available tools and saved preferences.
+For a goal with several kinds of work, combine the methods needed for each part.
+Load a method before using it, not the whole library. A research question that
+needs a saved deliverable can use research for the evidence and document-writing
+for the artifact; a meeting follow-up can use meeting-preparation and message-writing.
+These are examples, not fixed workflows. Simple requests need no extra methods.
+Work from the requested result and available tools. Gather independent sources
+together where useful, then use the findings in the next step instead of starting
+over. Keep important claims tied to source identifiers and carry those references
+and material evidence gaps into the deliverable, not only the chat reply.
+Before proposing a write, check the result against the person's constraints and
+latest corrections. A missing tool or unresolved source conflict must not become
+an invented result. Use a supported output or ask for a decision that blocks progress.
+For a correction, read the saved artifact and the relevant retained sources, then
+revise that same artifact. Preserve unaffected content and source references.
+Each changed write needs its own approval; an earlier approval does not cover a revision.
+Finish by naming the confirmed artifact or giving the requested answer, with any
+unfinished work stated plainly. Loading methods or drafting a proposal is not completion.
 Interpret relative dates in a source against that source's timestamp. An old
 "by Friday" does not move to this week's Friday when you read it later.
 For an additional skill, find_skills searches the ecosystem using a generic task

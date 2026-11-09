@@ -1,6 +1,6 @@
 # bud
 
-bud is a personal AI agent you run yourself. It keeps every conversation in an append-only event log, so multiple clients can follow one session and reconnect after a disconnect. The server uses native DBOS durable execution to recover accepted work after a crash. Model calls go through a gateway that falls back to another provider on failure and records reported usage and cost.
+bud is a personal AI agent you run yourself. It keeps every conversation in an append-only event log, so multiple clients can follow one session and reconnect after a disconnect. Reply text streams live to connected clients and is not stored piece by piece; the finished reply is saved when the run ends. The server uses native DBOS durable execution to recover accepted work after a crash. Model calls go through a gateway that falls back to another provider on failure and records reported usage and cost.
 
 bud is under active development. It can chat, call tools, remember approved facts across sessions, and hold write actions for your approval. By default, bud uses real Gmail and Google Calendar connections through the Composio SDK and MCP (Model Context Protocol). Use `bud serve --simulate` to work with a fictional person's inbox and calendar instead. Live email and event listing, approved email sending, approval pause/denial, one harmless unsent draft, and one approved Calendar create/time-only move have been checked. Each new write waits for its own approval; these focused checks do not establish broad daily-use reliability.
 
@@ -104,6 +104,20 @@ Each task records its offered skill names and SHA-256 content versions in
 continuations retain the original versions, even after a method is disabled
 or updated. A modified or missing saved package stops that task instead of
 silently substituting instructions.
+
+For a multi-part goal, Bud can combine methods within the same agent loop:
+research can supply evidence for a document, or meeting preparation can supply
+context for a message. It uses the methods relevant to the request rather than
+a fixed workflow. Findings and source references carry into the deliverable;
+corrections revise the retained artifact with a fresh approval.
+
+Session snapshots expose `recent_runs[].loaded_skills`, mapping methods
+successfully loaded in that execution to their pinned versions, and
+`recent_runs[].artifacts`, listing confirmed workspace saves with path,
+revision and operation. Proposed, denied and refused writes are not saved
+artifacts. Methods loaded earlier can remain available through the native
+conversation history without another load call. Older run records have empty
+summary fields; their original tool events remain available.
 
 Writing methods use saved preferences and approved examples. Corrections apply
 to the current draft; ask Bud to remember a preference to propose its existing

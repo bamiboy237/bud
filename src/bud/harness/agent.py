@@ -23,6 +23,7 @@ from bud.harness.context import BackgroundCompaction
 from bud.harness.memory import MEMORY_RULES
 from bud.harness.results import SqliteResultStore, build_output_limits
 from bud.harness.spend import SqliteSpendStore
+from bud.limits import MAX_MODEL_REQUESTS_PER_RUN, MAX_TOOL_CALLS_PER_RUN
 from bud.skills import GUIDANCE as SKILL_GUIDANCE
 from bud.skills import RULES as SKILL_RULES
 from bud.skills import SkillMethods, SkillStore
@@ -31,7 +32,10 @@ MAX_USD_PER_RUN = Decimal("0.50")
 
 MAX_USD_PER_DAY = Decimal("5.00")
 
-RUN_LIMITS = UsageLimits(request_limit=25, tool_calls_limit=20)
+RUN_LIMITS = UsageLimits(
+    request_limit=MAX_MODEL_REQUESTS_PER_RUN,
+    tool_calls_limit=MAX_TOOL_CALLS_PER_RUN,
+)
 
 
 def load_system_prompt() -> str:
