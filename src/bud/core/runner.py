@@ -27,7 +27,9 @@ from pydantic_ai.messages import (
     PartStartEvent,
     TextPart,
     TextPartDelta,
+    ToolReturnPart,
 )
+from pydantic_ai.usage import UsageLimits
 
 from bud.core.events import Event
 from bud.core.hub import Hub
@@ -46,8 +48,13 @@ from bud.gateway import Gateway
 from bud.gateway.errors import error_summary
 from bud.gateway.registry import Tier
 from bud.gateway.tracked import request_session
-from bud.harness.agent import RUN_LIMITS, Harness
+from bud.harness.agent import Harness
 from bud.harness.context import BackgroundCompaction
+from bud.limits import (
+    MAX_MESSAGE_CHARS,
+    MAX_MODEL_REQUESTS_PER_RUN,
+    MAX_TOOL_CALLS_PER_RUN,
+)
 
 RESULTS = TypeAdapter(DeferredToolResults)
 
@@ -210,8 +217,10 @@ class Runner(DBOSConfiguredInstance):
 
     @staticmethod
     def _validate_text(text: str) -> None:
-        if not text.strip() or len(text) > 100_000:
-            raise ValueError("Message must contain text and be at most 100,000 characters")
+        if not text.strip() or len(text) > MAX_MESSAGE_CHARS:
+            raise ValueError(
+                f"Message must contain text and be at most {MAX_MESSAGE_CHARS:,} characters"
+            )
 
     def edit_message(self, session_id: str, message_id: str, text: str) -> None:
         self._validate_text(text)
@@ -471,12 +480,16 @@ class Runner(DBOSConfiguredInstance):
             )
             if conversation is not None and conversation.conversation_id != run["session_id"]:
                 raise RecoveryRefused("Conversation does not belong to this session.")
-            limits = RUN_LIMITS
+            limits = UsageLimits(
+                request_limit=MAX_MODEL_REQUESTS_PER_RUN,
+                tool_calls_limit=MAX_TOOL_CALLS_PER_RUN,
+            )
             if conversation is not None:
                 limits = replace(
-                    RUN_LIMITS,
-                    request_limit=conversation.usage.requests + RUN_LIMITS.request_limit,
-                    tool_calls_limit=conversation.usage.tool_calls + RUN_LIMITS.tool_calls_limit,
+                    limits,
+                    request_limit=conversation.usage.requests + MAX_MODEL_REQUESTS_PER_RUN,
+                    tool_calls_limit=conversation.usage.tool_calls
+                    + MAX_TOOL_CALLS_PER_RUN,
                 )
             result = await self.agent.run(
                 run["text"],
@@ -620,13 +633,30 @@ class Runner(DBOSConfiguredInstance):
                         key=f"{run['run_id']}:call:{part.tool_call_id}",
                     )
                 case FunctionToolResultEvent() as result:
+                    part = result.part
+                    outcome = part.outcome if isinstance(part, ToolReturnPart) else "retried"
+                    artifact = {}
+                    if (
+                        outcome == "success"
+                        and part.tool_name in {"workspace_create", "workspace_update"}
+                        and isinstance(part.content, dict)
+                        and part.content.get("ok") is True
+                    ):
+                        artifact = {
+                            "artifact": {
+                                key: part.content[key] for key in ("path", "revision", "operation")
+                            }
+                        }
                     self.hub.publish_once(
                         run["session_id"],
                         "tool.result",
                         {
                             **data,
                             "call_id": result.tool_call_id,
-                            "result": str(result.part.content),
+                            "tool": part.tool_name,
+                            "outcome": outcome,
+                            "result": str(part.content),
+                            **artifact,
                         },
                         key=f"{run['run_id']}:result:{result.tool_call_id}",
                     )

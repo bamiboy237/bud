@@ -32,6 +32,7 @@ from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
 from bud.harness.memory import build_memory
+from bud.limits import MAX_MESSAGE_CHARS
 from bud.photon_config import PhotonConfig
 from bud.web import GUIDANCE as WEB_GUIDANCE
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
@@ -48,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 
 class NewMessage(BaseModel):
-    text: str = Field(min_length=1, max_length=100_000)
+    text: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
     origin: MessageOrigin = Field(default_factory=MessageOrigin)
     message_id: str | None = Field(
         default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"
@@ -60,7 +61,7 @@ class NewSession(BaseModel):
 
 
 class EditMessage(BaseModel):
-    text: str = Field(min_length=1, max_length=100_000)
+    text: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
 
 
 class Decision(BaseModel):

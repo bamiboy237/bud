@@ -15,6 +15,7 @@ from bud.core.projection import (
     runs,
     undecided_approvals,
 )
+from bud.limits import MAX_QUEUED_MESSAGES
 
 
 class QueueFull(Exception):
@@ -268,8 +269,10 @@ class EventLog:
             if data["text"] != text or data.get("origin") != origin:
                 raise ValueError("Message ID already used with different content or origin")
             return None
-        if len(queued_messages(self._read(db, session_id))) >= 20:
-            raise QueueFull("This conversation already has 20 waiting messages")
+        if len(queued_messages(self._read(db, session_id))) >= MAX_QUEUED_MESSAGES:
+            raise QueueFull(
+                f"This conversation already has {MAX_QUEUED_MESSAGES} waiting messages"
+            )
         return self._insert(
             db,
             session_id,

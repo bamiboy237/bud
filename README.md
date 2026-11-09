@@ -105,6 +105,20 @@ continuations retain the original versions, even after a method is disabled
 or updated. A modified or missing saved package stops that task instead of
 silently substituting instructions.
 
+For a multi-part goal, Bud can combine methods within the same agent loop:
+research can supply evidence for a document, or meeting preparation can supply
+context for a message. It uses the methods relevant to the request rather than
+a fixed workflow. Findings and source references carry into the deliverable;
+corrections revise the retained artifact with a fresh approval.
+
+Session snapshots expose `recent_runs[].loaded_skills`, mapping methods
+successfully loaded in that execution to their pinned versions, and
+`recent_runs[].artifacts`, listing confirmed workspace saves with path,
+revision and operation. Proposed, denied and refused writes are not saved
+artifacts. Methods loaded earlier can remain available through the native
+conversation history without another load call. Older run records have empty
+summary fields; their original tool events remain available.
+
 Writing methods use saved preferences and approved examples. Corrections apply
 to the current draft; ask Bud to remember a preference to propose its existing
 approved-memory update. You can inspect, change or forget those preferences.

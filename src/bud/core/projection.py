@@ -11,6 +11,7 @@ from pydantic_ai.messages import (
 )
 
 from bud.core.events import Event, MessageOrigin
+from bud.limits import MAX_MESSAGE_CHARS
 
 
 class Turn(BaseModel):
@@ -30,10 +31,18 @@ class QueuedMessage(BaseModel):
     origin: MessageOrigin | None = None
 
 
+class SavedArtifact(BaseModel):
+    path: str
+    revision: str
+    operation: str
+
+
 class RunView(BaseModel):
     run_id: str
     status: str
     reason: str | None = None
+    loaded_skills: dict[str, str] = Field(default_factory=dict)
+    artifacts: list[SavedArtifact] = Field(default_factory=list)
 
 
 class Snapshot(BaseModel):
@@ -82,7 +91,7 @@ def message_batch(events: list[Event]) -> list[QueuedMessage]:
         if (
             item.origin != first.origin
             or (times[item.message_id] - times[first.message_id]).total_seconds() > 2
-            or length + len(item.text) + 2 > 100_000
+            or length + len(item.text) + 2 > MAX_MESSAGE_CHARS
         ):
             break
         batch.append(item)
@@ -103,6 +112,8 @@ def queue_paused(events: list[Event]) -> bool:
 
 def runs(events: list[Event]) -> list[RunView]:
     states: dict[str, RunView] = {}
+    offered: dict[str, dict[str, str]] = {}
+    loads: dict[tuple[str, str], str] = {}
     names = {
         "run.queued": "queued",
         "run.started": "running",
@@ -120,7 +131,23 @@ def runs(events: list[Event]) -> list[RunView]:
                 continue
             if event.type == "run.cancelled" and event.data.get("uncertain_tools"):
                 status = "needs_review"
-            states[run_id] = RunView(run_id=run_id, status=status, reason=event.data.get("reason"))
+            view = states.setdefault(run_id, RunView(run_id=run_id, status=status))
+            view.status = status
+            view.reason = event.data.get("reason")
+        run_id = event.data.get("run_id")
+        if event.type == "run.started":
+            offered[run_id] = event.data.get("skills", {})
+        elif event.type == "tool.call" and event.data["tool"] == "load_capability":
+            loads[run_id, event.data["call_id"]] = event.data["args"].get("id")
+        elif event.type == "tool.result":
+            name = loads.pop((run_id, event.data["call_id"]), None)
+            view = states.get(run_id)
+            if view is None or event.data.get("outcome") != "success":
+                continue
+            if name in offered.get(run_id, {}):
+                view.loaded_skills[name] = offered[run_id][name]
+            if event.data.get("artifact") is not None:
+                view.artifacts.append(SavedArtifact.model_validate(event.data["artifact"]))
     return list(states.values())
 
 
