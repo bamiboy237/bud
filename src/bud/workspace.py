@@ -8,7 +8,9 @@ and hard links are refused. This is not a content-secret detector: only put mate
 approved for the agent in root. Visible text can itself contain private information.
 
 Claims are fsynced BEFORE writing. A crash can consume approval without saving;
-recovery requires inspection and fresh approval, never automatic redispatch.
+recovery requires inspection and fresh approval, never automatic redispatch. A
+replay of the same claim reports success only if the file already holds the
+approved bytes, so a save that finished before a crash is still recorded.
 Claims must not be deleted/rolled back while approvals can replay. flock serializes
 this module's writers, including across processes. External editors do not honor
 that lock: revision checks detect prior edits, not a hostile edit in the final
@@ -27,7 +29,7 @@ from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-from pydantic_ai import RunContext, Tool
+from pydantic_ai import RunContext, Tool, ToolReturn
 
 READ_TOOLS = {"workspace_list", "workspace_read", "workspace_search"}
 WRITE_TOOLS = {"workspace_create", "workspace_update"}
@@ -144,6 +146,30 @@ def _identity(info: os.stat_result) -> tuple:
 
 def _revision(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _saved(path: str, data: bytes, expected_revision: str | None) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "path": path,
+        "revision": _revision(data),
+        "operation": "created" if expected_revision is None else "updated",
+    }
+
+
+def _confirm(
+    root: Path, path: str, data: bytes, expected_revision: str | None
+) -> dict[str, Any] | None:
+    """Report a replayed save as done only when the file holds exactly the approved bytes."""
+    try:
+        parts = _parts(path)
+        with _parent(root, parts[:-1]) as fd:
+            current, _ = _read(fd, parts[-1])
+    except (OSError, _Refused, UnicodeError, ValueError):
+        return None
+    if current != data:
+        return None
+    return {**_saved(path, data, expected_revision), "replayed": True}
 
 
 def _safe(call) -> dict[str, Any]:
@@ -271,7 +297,7 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool]:
 
     def write(
         ctx: RunContext[None], path: str, content: str, expected_revision: str | None
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | ToolReturn:
         def run():
             metadata = ctx.tool_call_metadata
             approval = metadata.get("approval_id") if isinstance(metadata, dict) else None
@@ -313,6 +339,10 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool]:
                             ):
                                 raise _Refused("Invalid dispatch ledger; inspect claim storage.")
                             if record["claim"] == claim:
+                                if record["request"] == fingerprint:
+                                    saved = _confirm(root, path, data, expected_revision)
+                                    if saved is not None:
+                                        return saved
                                 return {
                                     "ok": False,
                                     "error": "Approval already consumed; inspect "
@@ -366,24 +396,26 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool]:
                         finally:
                             with suppress(FileNotFoundError):
                                 os.unlink(temporary, dir_fd=fd)
-                    return {
-                        "ok": True,
-                        "path": path,
-                        "revision": _revision(data),
-                        "operation": "created" if previous is None else "updated",
-                    }
+                    return _saved(path, data, expected_revision)
                 finally:
                     os.close(ledger)
 
-        return _safe(run)
+        result = _safe(run)
+        if result.get("ok") is not True:
+            return result
+        # The runner reads saved files from metadata; the model only sees the result.
+        artifact = {key: result[key] for key in ("path", "revision", "operation")}
+        return ToolReturn(result, metadata={"artifact": artifact})
 
-    def workspace_create(ctx: RunContext[None], path: str, content: str) -> dict[str, Any]:
+    def workspace_create(
+        ctx: RunContext[None], path: str, content: str
+    ) -> dict[str, Any] | ToolReturn:
         """Create a new text file after approval. Never overwrite an existing path."""
         return write(ctx, path, content, None)
 
     def workspace_update(
         ctx: RunContext[None], path: str, content: str, expected_revision: str
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | ToolReturn:
         """Replace a text file after approval, only if its SHA-256 revision still matches."""
         return write(ctx, path, content, expected_revision)
 

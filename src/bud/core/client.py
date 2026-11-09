@@ -12,10 +12,18 @@ from bud.config import get_settings
 from bud.core.auth import OwnerAuthError, owner_token
 from bud.core.controls import HELP, approval_text, session_snapshot
 from bud.core.controls import submit as submit_control
+from bud.core.projection import reply_text
 
 
-def render(event: dict, seen_requests: set[str], *, historical_approval: bool = False) -> None:
+def render(
+    event: dict,
+    seen_requests: set[str],
+    streamed: dict[str, str] | None = None,
+    *,
+    historical_approval: bool = False,
+) -> None:
     data = event["data"]
+    streamed = {} if streamed is None else streamed
     match event["type"]:
         case "user.message":
             print(f"\nyou: {data['text']}")
@@ -34,6 +42,7 @@ def render(event: dict, seen_requests: set[str], *, historical_approval: bool = 
                 "\n[stop requested; queue paused; authorized actions may still finish]", flush=True
             )
         case "run.cancelled":
+            streamed.pop(data["run_id"], None)
             uncertain = data.get("uncertain_tools", [])
             if uncertain:
                 print(f"\n[stopped; check the outcome of: {', '.join(uncertain)}]", flush=True)
@@ -53,6 +62,8 @@ def render(event: dict, seen_requests: set[str], *, historical_approval: bool = 
                 )
             seen_requests.add(request)
         case "text.delta":
+            run_id = data["run_id"]
+            streamed[run_id] = streamed.get(run_id, "") + data["text"]
             print(data["text"], end="", flush=True)
         case "tool.call":
             print(f"\n[tool] {data['tool']}({data['args']})", flush=True)
@@ -72,8 +83,17 @@ def render(event: dict, seen_requests: set[str], *, historical_approval: bool = 
         case "approval.denied":
             print(f"[denied] {data['approval_id']}", flush=True)
         case "run.waiting" | "run.completed":
+            # Live text can be lost on disconnect or backlog overflow. Reconcile with
+            # the stored reply instead of assuming one received token means all arrived.
+            text = reply_text(data.get("messages", []))
+            printed = streamed.pop(data["run_id"], "")
+            if text.startswith(printed):
+                print(text[len(printed) :], end="", flush=True)
+            elif text:
+                print(f"\n[complete reply]\n{text}", end="", flush=True)
             print(flush=True)
         case "run.failed":
+            streamed.pop(data["run_id"], None)
             print(f"\n[run failed] {data['reason']}", flush=True)
 
 
@@ -89,6 +109,7 @@ def print_http_error(error: httpx.HTTPStatusError) -> None:
 async def follow(client: httpx.AsyncClient, session_id: str) -> None:
     last_seq = 0
     seen_requests: set[str] = set()
+    streamed: dict[str, str] = {}
     while True:
         try:
             state = await session_snapshot(client, session_id)
@@ -110,6 +131,7 @@ async def follow(client: httpx.AsyncClient, session_id: str) -> None:
                         render(
                             event,
                             seen_requests,
+                            streamed,
                             historical_approval=(
                                 event["type"] == "approval.requested"
                                 and event["seq"] <= watermark
@@ -170,6 +192,7 @@ async def chat(base_url: str, session_id: str | None, *, new: bool = False) -> N
         else:
             # Authenticate before showing state or starting an endless SSE retry loop.
             await session_snapshot(client, session_id)
+        assert session_id is not None
         print(
             f"session {session_id}\nCtrl-D to leave. {HELP}\n"
             "Approval commands always require the exact displayed approval ID."

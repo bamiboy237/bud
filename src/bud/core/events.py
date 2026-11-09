@@ -59,3 +59,5 @@ class Event(BaseModel):
     type: EventType
     data: dict[str, Any]
     created_at: datetime
+    # Live events (streamed text) reach open readers only and are never stored.
+    live: bool = False

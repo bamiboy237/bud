@@ -2,6 +2,8 @@
 
 import json
 import sqlite3
+import threading
+from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -42,12 +44,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_decision_per_approval
 CREATE UNIQUE INDEX IF NOT EXISTS one_event_per_client_message
     ON events (session_id, json_extract(data, '$.message_id'))
     WHERE type = 'user.message';
+-- The latest conversation snapshots, kept out of the append-only log so that each
+-- turn does not store every earlier turn again.
+CREATE TABLE IF NOT EXISTS conversations (
+    run_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS conversations_by_session ON conversations (session_id);
 """
+# Recovery replays one run, which needs its predecessor's snapshot; keep a spare.
+KEEP_CONVERSATIONS = 2
+CACHED_SESSIONS = 32
 
 
 class EventLog:
     def __init__(self, path: Path) -> None:
         self.path = path
+        # Committed events per session. The log is append-only and seq is unique, so a
+        # cached prefix plus a fetch of later rows equals a full read.
+        self._cache: OrderedDict[str, list[Event]] = OrderedDict()
+        self._cache_lock = threading.Lock()
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
@@ -117,7 +134,7 @@ class EventLog:
                 "quiet": bool(row[2]) if row else False,
             }
         event_id = uuid4().hex
-        created_at = datetime.now(UTC).isoformat()
+        created_at = datetime.now(UTC)
         verb = "INSERT OR IGNORE" if once else "INSERT"
         row = db.execute(
             f"""
@@ -126,7 +143,7 @@ class EventLog:
             FROM events WHERE session_id = ?
             RETURNING seq
             """,
-            (event_id, session_id, type, json.dumps(data), created_at, key, session_id),
+            (event_id, session_id, type, json.dumps(data), created_at.isoformat(), key, session_id),
         ).fetchone()
         if row is None:
             return None
@@ -141,10 +158,39 @@ class EventLog:
 
     def read(self, session_id: str, after: int = 0) -> list[Event]:
         with self._connect() as db:
-            return self._read(db, session_id, after)
+            return self._read(db, session_id, after, remember=True)
+
+    def _read(
+        self, db: sqlite3.Connection, session_id: str, after: int = 0, *, remember: bool = False
+    ) -> list[Event]:
+        """Read events after `after`. Only reads outside a write transaction may update the
+        cache, so rows from a transaction that later rolls back are never remembered."""
+        with self._cache_lock:
+            cached = self._cache.get(session_id)
+            if cached is not None:
+                self._cache.move_to_end(session_id)
+        last = cached[-1].seq if cached else 0
+        if after > last or (not cached and after > 0):
+            return self._fetch(db, session_id, after)
+        fresh = self._fetch(db, session_id, last)
+        if remember and fresh:
+            with self._cache_lock:
+                if self._cache.get(session_id) is cached:
+                    self._cache[session_id] = (cached or []) + fresh
+                    self._cache.move_to_end(session_id)
+                    while len(self._cache) > CACHED_SESSIONS:
+                        self._cache.popitem(last=False)
+        return [event for event in cached or [] if event.seq > after] + fresh
+
+    def last_seq(self, session_id: str) -> int:
+        """Capture a stored-event boundary without reading the event payloads."""
+        with self._connect() as db:
+            return db.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?", (session_id,)
+            ).fetchone()[0]
 
     @staticmethod
-    def _read(db: sqlite3.Connection, session_id: str, after: int = 0) -> list[Event]:
+    def _fetch(db: sqlite3.Connection, session_id: str, after: int) -> list[Event]:
         rows = db.execute(
             "SELECT id, session_id, seq, type, data, created_at FROM events "
             "WHERE session_id = ? AND seq > ? ORDER BY seq",
@@ -161,6 +207,22 @@ class EventLog:
             )
             for row in rows
         ]
+
+    def conversation(self, session_id: str, run_id: str) -> str | None:
+        """The conversation snapshot saved when `run_id` ended, if it is still kept."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT data FROM conversations WHERE run_id = ? AND session_id = ?",
+                (run_id, session_id),
+            ).fetchone()
+            if row is None:
+                # Logs written before the conversations table kept snapshots inline.
+                row = db.execute(
+                    "SELECT json_extract(data, '$.conversation') FROM events "
+                    "WHERE session_id = ? AND event_key = ?",
+                    (session_id, f"{run_id}:terminal"),
+                ).fetchone()
+        return row[0] if row and row[0] else None
 
     def exists(self, session_id: str) -> bool:
         with self._connect() as db:
@@ -270,9 +332,7 @@ class EventLog:
                 raise ValueError("Message ID already used with different content or origin")
             return None
         if len(queued_messages(self._read(db, session_id))) >= MAX_QUEUED_MESSAGES:
-            raise QueueFull(
-                f"This conversation already has {MAX_QUEUED_MESSAGES} waiting messages"
-            )
+            raise QueueFull(f"This conversation already has {MAX_QUEUED_MESSAGES} waiting messages")
         return self._insert(
             db,
             session_id,
@@ -483,7 +543,23 @@ class EventLog:
                     once=True,
                     key=f"{run_id}:approval:{request['call_id']}",
                 )
+            conversation = data.get("conversation")
+            if conversation is not None:
+                data = {key: value for key, value in data.items() if key != "conversation"}
+                data["conversation_saved"] = True
             terminal = self._insert(db, session_id, kind, data, once=True, key=f"{run_id}:terminal")
+            if terminal is not None and conversation is not None:
+                db.execute(
+                    "INSERT OR REPLACE INTO conversations (run_id, session_id, data) "
+                    "VALUES (?, ?, ?)",
+                    (run_id, session_id, conversation),
+                )
+                db.execute(
+                    """DELETE FROM conversations WHERE session_id = ? AND rowid NOT IN (
+                        SELECT rowid FROM conversations WHERE session_id = ?
+                        ORDER BY rowid DESC LIMIT ?)""",
+                    (session_id, session_id, KEEP_CONVERSATIONS),
+                )
             if terminal is not None and kind == "run.waiting":
                 self._supersede_updates(db, session_id, run_id)
             if (

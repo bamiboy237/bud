@@ -28,6 +28,11 @@ data/
 .vscode/
 .idea/
 
+# Local agent tooling
+.agents/
+.claude/
+skills-lock.json
+
 # Private course material and working notes
 AGENTS.md
 CLAUDE.md
