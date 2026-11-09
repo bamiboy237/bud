@@ -7,8 +7,10 @@ import webbrowser
 import httpx
 import uvicorn
 from openai import OpenAIError
+from pydantic import ValidationError
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelAPIError, UserError
+from pydantic_settings.exceptions import SettingsError
 
 from bud import __version__
 from bud.composio.binding import ConnectionError
@@ -19,7 +21,7 @@ from bud.evals.runner import evaluate
 from bud.gateway import Ledger, NoModelAvailable, build_gateway
 from bud.gateway.chatgpt import ChatGPTError, ChatGPTStore, login, refresh_models
 from bud.gateway.errors import error_summary
-from bud.gateway.registry import load_registry
+from bud.gateway.registry import ModelConfigurationError, load_registry
 from bud.photon_config import PhotonSetupError
 from bud.world.store import World
 
@@ -37,12 +39,13 @@ async def ask(prompt: str, tier: str, model_id: str | None) -> None:
         gateway.close()
 
 
-async def models() -> None:
+async def models(*, cached: bool = False) -> None:
     settings = get_settings()
     store = ChatGPTStore(settings.data_dir)
     print(f"{'Model ID':<48} {'Billing':<14} Status")
     if store.connected:
-        for model in await refresh_models(store):
+        catalog = store.state().get("models", []) if cached else await refresh_models(store)
+        for model in catalog:
             selected = model["slug"] == store.state().get("selected_model")
             print(
                 f"{'openai-chatgpt:' + model['slug']:<48} {'subscription':<14} "
@@ -56,10 +59,23 @@ async def models() -> None:
         "meta": settings.muse_api_key,
     }
     seen = set()
-    for spec in load_registry().models:
+    for spec in load_registry(settings.models_file).models:
         if spec.id not in seen:
-            print(f"{spec.id:<48} {'API':<14} {'key set' if keys[spec.provider] else 'no key'}")
+            ready = (
+                spec.billing == "local"
+                or settings.model_api_keys.get(spec.provider)
+                or keys.get(spec.provider)
+            )
+            print(
+                f"{spec.id:<48} {spec.billing:<14} {'configured' if ready else 'no key'} "
+                f"tools={spec.supports_tools if spec.supports_tools is not None else 'native'}"
+            )
             seen.add(spec.id)
+    print(
+        f"Fallback: {'enabled' if settings.model_fallback else 'disabled'}; "
+        f"default: {settings.default_model or 'automatic'}. "
+        "Pinned models never fall back; local routes stay on their configured endpoint."
+    )
 
 
 def costs() -> None:
@@ -72,7 +88,13 @@ def costs() -> None:
         f"{'Input':>9} {'Output':>9} {'USD':>10} {'Unpriced':>8}"
     )
     for row in rows:
-        usd = f"{row.cost_usd:.6f}" if row.billing == "api" else "plan"
+        usd = (
+            f"{row.cost_usd:.6f}"
+            if row.billing == "api"
+            else "local"
+            if row.billing == "local"
+            else "plan"
+        )
         print(
             f"{row.day:<11} {row.model:<38} {row.billing:<12} {row.requests:>5} {row.failed:>6} "
             f"{row.input_tokens:>9} {row.output_tokens:>9} {usd:>10} "
@@ -141,7 +163,14 @@ def _main(argv: list[str] | None = None) -> None:
     login_parser.add_argument("--no-browser", action="store_true", help="print a sign-in link")
     logout_parser = commands.add_parser("logout", help="remove local model-provider credentials")
     logout_parser.add_argument("provider", choices=["chatgpt"])
-    commands.add_parser("models", help="list model IDs and refresh the ChatGPT account catalog")
+    models_parser = commands.add_parser(
+        "models", help="list model IDs and refresh the ChatGPT account catalog"
+    )
+    models_parser.add_argument(
+        "--cached",
+        action="store_true",
+        help="use the saved ChatGPT catalog without acquiring its credential lease",
+    )
     commands.add_parser("costs", help="print spend by day and model")
     world_parser = commands.add_parser("world", help="inspect or reset the simulated world")
     world_parser.add_argument("action", choices=["show", "reset"])
@@ -176,7 +205,7 @@ def _main(argv: list[str] | None = None) -> None:
         ChatGPTStore(get_settings().data_dir).logout()
         print("Local ChatGPT credentials removed.")
     elif args.command == "models":
-        asyncio.run(models())
+        asyncio.run(models(cached=args.cached))
     elif args.command == "costs":
         costs()
     elif args.command == "world":
@@ -205,12 +234,17 @@ def _main(argv: list[str] | None = None) -> None:
 def main(argv: list[str] | None = None) -> None:
     try:
         _main(argv)
+    except (ValidationError, SettingsError):
+        raise SystemExit(
+            "Invalid settings. Check your environment and .env configuration."
+        ) from None
     except (
         ChatGPTError,
         NoModelAvailable,
         OwnerAuthError,
         ConnectionError,
         PhotonSetupError,
+        ModelConfigurationError,
     ) as exc:
         raise SystemExit(str(exc)) from None
     except httpx.HTTPStatusError as exc:

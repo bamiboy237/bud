@@ -196,7 +196,7 @@ def _create_app(
             read_tools=WORLD_READ_TOOLS | WORKSPACE_READ_TOOLS,
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
         )
-    gateway.model("fast")
+    gateway.model("fast", require_tools=True)
     log = EventLog(db_path)
     hub = Hub(log)
     runner = Runner(hub, gateway, harness, durable=True)

@@ -90,6 +90,7 @@ class Runner(DBOSConfiguredInstance):
                 + gateway.registry.model_dump_json()
                 + json.dumps(harness.policy.tools, sort_keys=True)
                 + str(gateway.selected_model)
+                + str(gateway.fallback)
                 + tier
                 + str(harness.results.retention.total_seconds())
             ).encode()
@@ -111,7 +112,7 @@ class Runner(DBOSConfiguredInstance):
             spend_for_run=harness.spend_for_run, record=self._record_context
         )
         self.agent = harness.agent(
-            gateway.model(tier),
+            gateway.model(tier, require_tools=True),
             self._record_decision,
             context=self.context,
             durability=durability,
@@ -176,6 +177,7 @@ class Runner(DBOSConfiguredInstance):
             if conversation is None
             else None,
             "results": RESULTS.dump_json(results).decode() if results is not None else None,
+            "skills": self.harness.skills.snapshot(),
             "config": self.fingerprint,
             "version": self.version,
         }
@@ -342,6 +344,11 @@ class Runner(DBOSConfiguredInstance):
                 None,
             )
         run = self._inputs(session_id, None, results, origin=origin)
+        run["skills"] = next(
+            event.data.get("skills", {})
+            for event in reversed(events)
+            if event.type == "run.queued" and event.data["run_id"] == batch[0]["run_id"]
+        )
         run["quiet"] = any(request["approval_id"] in revised for request in batch) and not any(
             decided[request["approval_id"]] for request in batch
         )
@@ -482,6 +489,7 @@ class Runner(DBOSConfiguredInstance):
                 else None,
                 run_id=run["run_id"],
                 conversation_id=run["session_id"] if conversation is None else None,
+                metadata={"bud_skills": run.get("skills", {})},
                 usage_limits=limits,
                 event_stream_handler=None if self.durable else self._stream,
             )
@@ -551,6 +559,7 @@ class Runner(DBOSConfiguredInstance):
                 "run_id": run["run_id"],
                 "trigger": run["trigger"],
                 "prompt": self.harness.prompt_version,
+                "skills": run.get("skills", {}),
             },
             key=f"{run['run_id']}:started",
         )

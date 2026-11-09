@@ -88,7 +88,7 @@ class GuardTools(AbstractCapability[None]):
         args: ValidatedToolArgs,
     ) -> ValidatedToolArgs:
         # CodeMode creates run_code outside this wrapper; its nested reads still use it.
-        if call.tool_name == "run_code":
+        if call.tool_name in {"run_code", "load_capability"}:
             if self.policy.decide(call.tool_name) != "allow":
                 raise UserError("Code Mode is not allowed by the action policy")
             self.record(

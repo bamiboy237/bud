@@ -12,7 +12,7 @@ def replay_version() -> str:
     root = Path(__file__).resolve().parents[1]
     digest = sha256()
     for path in sorted(root.rglob("*")):
-        if path.is_file() and path.suffix in {".py", ".toml", ".md"}:
+        if path.is_file() and path.suffix in {".py", ".toml", ".md", ".json"}:
             digest.update(path.relative_to(root).as_posix().encode())
             digest.update(path.read_bytes())
     for package in ("dbos", "pydantic-ai-slim", "pydantic-ai-harness", "pydantic-monty"):

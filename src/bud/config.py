@@ -23,6 +23,10 @@ class Settings(BaseSettings):
 
     debug: bool = False
     data_dir: Path = Path("data")
+    models_file: Path | None = None
+    default_model: str | None = None
+    model_fallback: bool = True
+    model_api_keys: dict[str, SecretStr] = Field(default_factory=dict, repr=False)
     tool_result_retention_hours: float = Field(default=24, gt=0, allow_inf_nan=False)
 
     model_config = SettingsConfigDict(
