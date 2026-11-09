@@ -180,7 +180,7 @@ uv run bud chat --new         # explicitly starts a separate conversation
 
 `uv run bud serve` provides public web research and tools for your active connected accounts. It needs model access. Composio and Google connections are optional for public research. See [Connect real accounts](#connect-real-accounts) to add Gmail or Calendar.
 
-Ask bud to check the inbox or move a meeting in `bud chat`. Each proposed write displays its tool, arguments, and exact approval ID. Answer `/approve <approval-id>` or `/deny <approval-id>` for that action. Bare approval commands never approve a batch; `/status` shows the current proposals. See what you've spent, inspect the simulated world, or restore it:
+Ask bud to check the inbox or move a meeting in `bud chat`. Each proposed write displays its tool, arguments, and exact approval reference. Answer `/approve <reference>` or `/deny <reference>` for that action. `/status` shows current jobs and proposals. See what you've spent, inspect the simulated world, or restore it:
 
 ```sh
 uv run bud costs
@@ -220,15 +220,62 @@ An authenticated client discovers or creates the primary with `POST /sessions/pr
 
 All accepted text joins the selected session's authoritative history, independent of origin. Origin survives queue edits, dispatch, completion and restart. The iMessage adapter sends model replies and approval requests only when their origin matches that exact iMessage route. Web/API/terminal replies are not pushed into Messages, and old unattributed events are not guessed or backfilled there. The terminal remains a full-history viewer; a future web UI can likewise render the canonical history even though the native iMessage transcript contains only messages delivered through it.
 
-An approval decision is still tied to an exact pending action. If it is explicitly answered from another interface, the continued run replies to that decision's interface; permission is not inferred from origin metadata or a context-free yes. Existing strict approval and dispatch-claim rules remain unchanged.
+An approval decision is tied to an exact pending action and can be answered from another owner interface. Job results return to the interface where the job was requested. Existing non-job approval continuations reply to the decision's interface. Permission is not inferred from origin metadata or a context-free yes.
 
 During server startup, configured iMessage adopts its existing conversation as primary when none is set, before accepting external clients. Adoption selects the existing session without copying history. If a different primary already exists, messaging reports failure rather than merging histories or silently moving pending approvals; the authenticated core remains available for inspection. Account generations keep separate primaries; context and approvals never follow a changed account binding automatically.
 
 Work performed inside a conversation remains in its tool/action history. This is not yet model-facing search over old threads, routines, or past outgoing email; older-context retrieval is separate work. Keeping history does not guarantee perfect model recall or that all history fits in each request.
 
+### Jobs in the conversation
+
+Quick questions stay in the chat. Work that takes time, produces a deliverable
+or changes data runs as a separate job. Bud gives it a short brief containing
+the goal, relevant inputs and expected result. Each job uses its own session,
+working history and approvals with the same model, tools and approval policy.
+The offered skill versions stay pinned to the job, including later corrections.
+
+Keep chatting while a job waits. For example:
+
+```text
+you: Create checkpoint-note.txt containing Cedar first draft.
+bud: Task 1 is preparing the note.
+Task 1-A: Create checkpoint-note.txt?
+/approve 1-A
+/deny 1-A
+
+you: What is 2 + 2?
+bud: 4
+
+you: For task 1, use Cedar revised draft. instead.
+Task 1-B: Create checkpoint-note.txt?
+/approve 1-B
+/deny 1-B
+```
+
+The unrelated question leaves `1-A` pending. The correction retires `1-A`
+and creates `1-B`. Each reference identifies one exact proposal; the task
+number alone is not an approval. Original full approval IDs remain supported.
+The conversation, job, pending decision and saved results survive a process
+restart. A completed job posts its result back to the conversation.
+
+Name the job for a correction or follow-up. Bud asks which one when several
+jobs could fit the request. Ask it to inspect or stop a named job. `/stop`
+also stops the current conversation's open jobs.
+
+Session snapshots include `tasks` and aggregate pending job approvals.
+Each proposal adds `task_id` and `reference` to its existing exact ID, tool
+and arguments. `GET /sessions/{session_id}/tasks/{task_id}` returns the brief,
+current job view and working conversation. Supporting details remain stored;
+this feature adds no automatic history deletion or conversation forking.
+
+The job admission limit is four open jobs in the account or simulated-world
+scope. Reopening a finished job uses the same limit. Child jobs use the normal
+action tools; the conversation uses read and job-control tools. Job creation
+and updates are replay-safe. A correction retires approvals only in that job.
+
 ## Durable server and recovery
 
-`bud serve` uses Pydantic AI's native `DBOSDurability` integration with a local SQLite journal, `runtime.db`, beside the session database. Each session runs one execution at a time. Messages received while bud is busy enter a persistent queue in arrival order. New conversational input makes unapproved proposals stale rather than freezing the conversation: bud closes those permissions and considers the new request. Corrected writes need fresh approval. Already granted permissions are not recalled by an ordinary follow-up; use Stop when you want active work stopped.
+`bud serve` uses Pydantic AI's native `DBOSDurability` integration with a local SQLite journal, `runtime.db`, beside the session database. Each session runs one execution at a time. The conversation and its jobs use separate sessions, so a waiting job does not block a quick question. Messages enter their recipient's persistent queue in arrival order. New input to a job retires that job's unapproved proposals; ordinary conversation leaves them intact. Corrected writes need fresh approval. Already granted permissions are not recalled by an ordinary follow-up; use Stop when you want active work stopped.
 
 The queue holds up to 20 waiting messages. Waiting messages do not enter the conversation until their turn starts. At dispatch, the server saves the messages and their `run.queued` inputs in one transaction, using the latest completed conversation. iMessage gets a fixed one-second collection window when idle. Adjacent messages from the same iMessage route received within two seconds can become one model turn, with each original message and ID retained separately. Different interfaces, older messages and inputs exceeding the normal text budget are not combined. Restart recovery preserves waiting messages and can drain them without waiting for the in-memory timer. A completed approval batch continues before the next queued message.
 
@@ -240,7 +287,7 @@ If recovery restarts an unfinished model request, `text.reset` replaces partial 
 
 Recovery refuses queued executions when their saved code version or run configuration differs from the current server. The version includes packaged code and configuration files, plus the DBOS, Pydantic AI, Harness, and Monty versions. Changed work fails before tools run rather than replaying across an upgrade. Interrupted runs from before durable execution have no recoverable inputs or journal and are marked failed.
 
-Earlier live recovery after `SIGKILL` was verified with DeepSeek and synthetic tools. Successful ChatGPT execution under DBOS and recovery of real Google writes have not been verified. The server remains local with single-owner authentication. Durable execution does not add scheduled routines or an always-on deployment.
+Earlier live recovery after `SIGKILL` was verified with DeepSeek and synthetic tools. ChatGPT file-save and pending-approval restart workflows have also been verified with synthetic tools. Recovery of real Google writes remains unverified. The server remains local with single-owner authentication. Durable execution does not add scheduled routines or an always-on deployment.
 
 ## Queue and Stop controls
 
@@ -248,16 +295,16 @@ Use these commands in `bud chat`:
 
 | Command                     | Result                                                                          |
 | --------------------------- | ------------------------------------------------------------------------------- |
-| `/status`                   | Show the current state, queued message IDs, approvals, and recent runs.         |
+| `/status`                   | Show current jobs, queued message IDs, approvals, and recent runs.               |
 | `/pause`                    | Hold waiting messages. The current run continues.                               |
 | `/resume`                   | Allow queued messages to run. This does not restart a stopped run.              |
 | `/edit <message-id> <text>` | Replace a message that is still waiting.                                        |
 | `/cancel <message-id>`      | Remove a message that is still waiting.                                         |
-| `/stop`                     | Pause the queue, close pending approvals, and request Stop for the current run. |
+| `/stop`                     | Pause the queue and request Stop for the conversation and its open jobs.         |
 
 Stop prevents new tool permissions. A tool authorized before Stop may still finish, even if its network request starts later. Stop does not undo an action. The state remains `stopping` until the execution exits. If an approved tool has no recorded result, the run becomes `needs_review` and the queue stays paused. Check the external result before retrying the action. After a failed run, the queue also pauses instead of starting all remaining messages.
 
-Session snapshots include `status`, `queue_paused`, `queued_messages`, and `recent_runs`. HTTP clients can edit or cancel `/sessions/{id}/queue/{message_id}`, post to `/sessions/{id}/queue/pause` or `/sessions/{id}/queue/resume`, and post to `/sessions/{id}/stop`. Stop returns HTTP 202. Message submissions return HTTP 429 when the waiting queue is full. Supply a stable `message_id` to deduplicate delivery retries. New IDs accept 1 to 128 ASCII letters, digits, hyphens, or underscores. Omit the ID to generate one.
+Session snapshots include `status`, `queue_paused`, `queued_messages`, `recent_runs` and `tasks`. HTTP clients can edit or cancel `/sessions/{id}/queue/{message_id}`, post to `/sessions/{id}/queue/pause` or `/sessions/{id}/queue/resume`, and post to `/sessions/{id}/stop`. Stop returns HTTP 202. Message submissions return HTTP 429 when the waiting queue is full. Supply a stable `message_id` to deduplicate delivery retries. New IDs accept 1 to 128 ASCII letters, digits, hyphens, or underscores. Omit the ID to generate one.
 
 ## Spend and execution limits
 
