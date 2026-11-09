@@ -178,7 +178,7 @@ def _safe(call) -> dict[str, Any]:
 
 
 def build_tools(root: Path, dispatch_path: Path) -> list[Tool]:
-    """Build five tools; provision root/ledger parent first. Never creates directories.
+    """Build five tools; provision root/ledger parent first. Directory creation is omitted.
 
     dispatch_path is a trusted persistent file, not a model-controlled argument.
     All results are bounded. List/search scan at most 500 entries in one directory;
