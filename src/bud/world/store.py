@@ -7,6 +7,8 @@ The simulated clock uses the seed's `now`; generated IDs are not fixed.
 import json
 import sqlite3
 import tomllib
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from datetime import datetime, time
 from importlib import resources
 from pathlib import Path
@@ -103,10 +105,12 @@ class World:
             "A denied draft must not be saved or sent."
         )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         db = sqlite3.connect(self.path, timeout=5)
         db.row_factory = sqlite3.Row
-        return db
+        with closing(db), db:
+            yield db
 
     def reset(self) -> None:
         with self._connect() as db:

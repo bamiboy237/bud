@@ -5,6 +5,8 @@ Ledger write errors are logged, so the ledger may not contain every request.
 
 import logging
 import sqlite3
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,6 +29,8 @@ CREATE TABLE IF NOT EXISTS model_requests (
     cost_usd REAL,
     error TEXT
 );
+CREATE INDEX IF NOT EXISTS model_requests_by_session ON model_requests(session_id);
+CREATE INDEX IF NOT EXISTS model_requests_by_created ON model_requests(created_at);
 """
 
 
@@ -73,8 +77,10 @@ class Ledger:
                     "ALTER TABLE model_requests ADD COLUMN billing TEXT NOT NULL DEFAULT 'api'"
                 )
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path, timeout=5)
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(self.path, timeout=5)) as db, db:
+            yield db
 
     def record(self, entry: LedgerEntry) -> None:
         """Log SQLite errors without failing the model request."""

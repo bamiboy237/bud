@@ -2,6 +2,8 @@
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -78,8 +80,10 @@ class BindingStore:
             db.execute("PRAGMA user_version = 1")
         path.chmod(0o600)
 
-    def _db(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path, timeout=5)
+    @contextmanager
+    def _db(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(self.path, timeout=5)) as db, db:
+            yield db
 
     @staticmethod
     def _read(db: sqlite3.Connection) -> tuple[AccountBinding, dict[str, str | None]]:
