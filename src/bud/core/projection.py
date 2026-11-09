@@ -340,7 +340,7 @@ def _failure_note(
     note = (
         f"[bud system note] An earlier run stopped before finishing. Reason: {reason}.\n"
         f"The user had said: {user_text}\n"
-        f"Tools that already executed in this attempt:\n{ran}\n"
+        f"Tools that already executed in this attempt; do not re-execute them:\n{ran}\n"
         f"Tools granted permission without a confirmed result. Outcomes remain unverified; "
         f"report them as unknown without re-executing:\n{unsure}"
     )
