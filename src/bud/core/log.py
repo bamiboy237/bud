@@ -4,6 +4,8 @@ import json
 import sqlite3
 import threading
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -52,6 +54,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS conversations_by_session ON conversations (session_id);
+CREATE INDEX IF NOT EXISTS events_by_type_session ON events (type, session_id);
 """
 # Recovery replays one run, which needs its predecessor's snapshot; keep a spare.
 KEEP_CONVERSATIONS = 2
@@ -74,8 +77,10 @@ class EventLog:
                 db.execute("ALTER TABLE events ADD COLUMN event_key TEXT")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS event_key_once ON events(event_key)")
 
-    def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path, timeout=5)
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(self.path, timeout=5)) as db, db:
+            yield db
 
     def append(self, session_id: str, type: EventType, data: dict[str, Any] | None = None) -> Event:
         with self._connect() as db:

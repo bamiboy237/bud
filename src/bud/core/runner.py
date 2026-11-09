@@ -341,8 +341,11 @@ class Runner(DBOSConfiguredInstance):
             run_id = request["run_id"]
             if self.durable:
                 await DBOS.cancel_workflow_async(run_id)
-            elif session_id in self.tasks:
+            if session_id in self.tasks:
                 self.tasks[session_id].cancel()
+            executing = self._executing.get(run_id)
+            if executing is not None:
+                executing.cancel()
             if run_id not in self._executing:
                 self.hub.log.acknowledge_stop(session_id, run_id)
             self.hub.wake(session_id)
