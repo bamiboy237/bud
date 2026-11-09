@@ -77,7 +77,15 @@ class Connections:
         if account.is_disabled:
             return "DISABLED"
         # Only return known metadata, never arbitrary provider error text or URLs.
-        known = {"ACTIVE", "INITIATED", "INACTIVE", "FAILED", "EXPIRED", "REVOKED"}
+        known = {
+            "ACTIVE",
+            "INITIATED",
+            "INITIALIZING",
+            "INACTIVE",
+            "FAILED",
+            "EXPIRED",
+            "REVOKED",
+        }
         return account.status if account.status in known else "UNAVAILABLE"
 
     def refresh(self) -> tuple[AccountBinding, dict[str, str]]:

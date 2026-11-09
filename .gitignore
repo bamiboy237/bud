@@ -42,3 +42,7 @@ COURSE.md
 PROGRESS.md
 modules/
 notes/
+
+# Stress test reproduction scripts
+comprehensive_live_test.py
+run_live_test.py
