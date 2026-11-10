@@ -5,6 +5,7 @@ user types as a message.
 
 import asyncio
 import json
+import sys
 from uuid import uuid4
 
 import httpx
@@ -12,7 +13,7 @@ from rich.prompt import Prompt
 
 from bud.config import get_settings
 from bud.core.auth import OwnerAuthError, owner_token
-from bud.core.controls import HELP, approval_text, session_snapshot
+from bud.core.controls import approval_text, session_snapshot
 from bud.core.controls import submit as submit_control
 from bud.core.projection import reply_text
 
@@ -197,43 +198,135 @@ async def select_model(client: httpx.AsyncClient) -> str | None:
     return Prompt.ask("[bold]Select a model[/bold]", choices=choices, default=default)
 
 
-async def chat(base_url: str, session_id: str | None, *, new: bool = False) -> None:
+MAX_STDIN_BYTES = 10 * 1024 * 1024  # 10MB
+
+
+async def headless_chat(base_url: str, session_id: str | None, *, new: bool = False) -> None:
+    """Headless streaming client when stdin or stdout is non-interactive / piped."""
+    from bud.tui.terminal import strip_ansi
+
+    # Read piped stdin if stdin is not a tty
+    piped_input: str | None = None
+    if not sys.stdin.isatty():
+        raw = sys.stdin.read(MAX_STDIN_BYTES + 1)
+        if len(raw.encode("utf-8")) > MAX_STDIN_BYTES:
+            raise SystemExit("Error: Piped input exceeds 10MB limit.")
+        piped_input = raw.strip()
+
     async with owner_client(base_url) as client:
         response = await client.get("/runtime")
         response.raise_for_status()
         client.headers["X-Bud-Scope"] = response.json()["scope"]
+
         if session_id is None:
-            model = await select_model(client)
+            models_res = await client.get("/models")
+            models_res.raise_for_status()
+            models_list = models_res.json()
+            model = None
+            if models_list:
+                configured = [m["id"] for m in models_list if m.get("configured")]
+                model = next(
+                    (
+                        m["id"]
+                        for m in models_list
+                        if m.get("tier") == "fast" and m.get("configured")
+                    ),
+                    configured[0] if configured else models_list[0]["id"],
+                )
             if new:
-                response = await client.post(
+                res = await client.post(
                     "/sessions", json={"session_id": uuid4().hex, "model": model}
                 )
             else:
-                response = await client.post("/sessions/primary", json={"model": model})
-            response.raise_for_status()
-            session_id = response.json()["session_id"]
+                res = await client.post("/sessions/primary", json={"model": model})
+            res.raise_for_status()
+            session_id = res.json()["session_id"]
         else:
-            # Authenticate before showing state or starting an endless SSE retry loop.
             await session_snapshot(client, session_id)
-        assert session_id is not None
-        print(
-            f"session {session_id}\nCtrl-D to leave. {HELP}\n"
-            "Approval commands always require the exact displayed approval ID."
-        )
 
-        follower = asyncio.create_task(follow(client, session_id))
-        try:
-            while True:
-                text = await asyncio.to_thread(input)
-                if not text.strip():
-                    continue
-                try:
-                    await submit(client, session_id, text)
-                except httpx.HTTPStatusError as error:
-                    print_http_error(error)
-                except httpx.RequestError as error:
-                    print(f"[request failed] {error}")
-        except EOFError:
-            pass
-        finally:
-            follower.cancel()
+        assert session_id is not None
+
+        if piped_input:
+            # One-shot execution of piped input
+            source = {"channel": "terminal", "client_id": "headless"}
+            await client.post(
+                f"/sessions/{session_id}/messages",
+                json={"text": piped_input, "message_id": uuid4().hex, "origin": source},
+            )
+
+            # Follow events until run ends or approval required
+            last_seq = 0
+            state = await session_snapshot(client, session_id)
+            watermark = state["last_seq"]
+            pending = {item["approval_id"] for item in state["pending_approvals"]}
+
+            async with client.stream(
+                "GET",
+                f"/sessions/{session_id}/events",
+                headers={"Last-Event-ID": str(last_seq)},
+                timeout=httpx.Timeout(5.0, read=None),
+            ) as sse_res:
+                sse_res.raise_for_status()
+                async for line in sse_res.aiter_lines():
+                    if line.startswith("data: "):
+                        event = json.loads(line.removeprefix("data: "))
+                        last_seq = event.get("seq", last_seq)
+                        etype = event.get("type", "")
+                        data = event.get("data", {})
+
+                        if etype in ("approval.requested", "task.approval"):
+                            app_id = data.get("approval_id")
+                            if not (event.get("seq", 0) <= watermark and app_id not in pending):
+                                sys.stderr.write(
+                                    f"\nError: Action requires approval ({data.get('tool')}) "
+                                    f"which is not supported in non-interactive mode.\n"
+                                )
+                                sys.stderr.flush()
+                                raise SystemExit(1)
+
+                        elif etype == "text.delta":
+                            chunk = strip_ansi(data.get("text", ""))
+                            sys.stdout.write(chunk)
+                            sys.stdout.flush()
+
+                        elif etype in ("run.completed", "run.waiting"):
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
+                            return
+
+                        elif etype == "run.failed":
+                            sys.stderr.write(f"\nRun failed: {data.get('reason')}\n")
+                            sys.stderr.flush()
+                            raise SystemExit(1)
+
+                        elif etype == "run.cancelled":
+                            sys.stderr.write("\nRun cancelled.\n")
+                            sys.stderr.flush()
+                            raise SystemExit(1)
+        else:
+            # stdin is a tty, but stdout is piped
+            follower = asyncio.create_task(follow(client, session_id))
+            try:
+                while True:
+                    text = await asyncio.to_thread(input)
+                    if not text.strip():
+                        continue
+                    try:
+                        await submit(client, session_id, text)
+                    except httpx.HTTPStatusError as error:
+                        print_http_error(error)
+                    except httpx.RequestError as error:
+                        print(f"[request failed] {error}")
+            except EOFError:
+                pass
+            finally:
+                follower.cancel()
+
+
+async def chat(base_url: str, session_id: str | None, *, new: bool = False) -> None:
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        from bud.tui.app import run_tui
+
+        await run_tui(base_url, session_id, new=new)
+    else:
+        await headless_chat(base_url, session_id, new=new)
