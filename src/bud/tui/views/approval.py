@@ -80,7 +80,11 @@ class ApprovalView(View):
                 for sub_k, sub_v in v.items():
                     if not isinstance(sub_v, (dict, list)):
                         flat_args.append((f"{k} {sub_k}", str(sub_v)))
-            elif not isinstance(v, list):
+            elif isinstance(v, list):
+                clean_items = [str(x) for x in v if not isinstance(x, (dict, list))]
+                if clean_items:
+                    flat_args.append((k, ", ".join(clean_items)))
+            else:
                 flat_args.append((k, str(v)))
 
         for key_name, val_raw in flat_args:

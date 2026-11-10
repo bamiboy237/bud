@@ -90,10 +90,14 @@ async def handle_slash_command(
         )
 
     if command == "/border":
-        if len(parts) > 1 and parts[1].lower() in ("rounded", "square"):
-            style = parts[1].lower()
-            store.set_border_style(style)
-            return f"[border] Switched border style to: {style}"
+        if len(parts) > 1:
+            raw = parts[1].lower().strip()
+            if raw in ("round", "rounded"):
+                store.set_border_style("rounded")
+                return "[border] Switched border style to: rounded"
+            if raw in ("sq", "square"):
+                store.set_border_style("square")
+                return "[border] Switched border style to: square"
         return (
             f"[border] Current: {store.border_style} (usage: /border rounded | /border square)"
         )

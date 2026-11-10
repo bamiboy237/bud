@@ -19,6 +19,7 @@ def get_code_theme_for_theme(theme_name: str) -> str:
         "gruvbox": "gruvbox-dark",
         "catppuccin": "one-dark",
         "tokyo-night": "material",
+        "groknight": "one-dark",
         "default": "one-dark",
     }
     return mapping.get(theme_name, "one-dark")
@@ -88,15 +89,15 @@ class MessageView(View):
         if self.role == "you":
             prefix = theme.format_primary("you ›", bold=True) if theme else "\x1b[1myou ›\x1b[0m"
             user_lines = current_text.splitlines() or [""]
-            res = [f"{prefix} {user_lines[0]}"]
-            indent = "      "
+            res = [f"  {prefix} {user_lines[0]}"]
+            indent = "        "
             for uline in user_lines[1:]:
                 res.append(f"{indent}{uline}")
             return res
 
         # Assistant role: parse markdown using rich
         prefix = theme.format_accent("bud ›", bold=True) if theme else "\x1b[1mbud ›\x1b[0m"
-        content_width = max(20, width - 2)
+        content_width = max(20, width - 8)
 
         try:
             buf = StringIO()
@@ -119,16 +120,17 @@ class MessageView(View):
         if not rendered_lines:
             rendered_lines = [""]
 
-        # Attach prefix to the first line
+        # Attach prefix to the first line, indented by 2 spaces
         first_line = rendered_lines[0]
-        if first_line.strip():
-            rendered_lines[0] = f"{prefix} {first_line}"
-        else:
-            rendered_lines[0] = prefix
+        formatted_first = f"  {prefix} {first_line}" if first_line.strip() else f"  {prefix}"
+
+        res_lines: list[str] = [formatted_first]
+        for line in rendered_lines[1:]:
+            res_lines.append(f"  {line}" if line.strip() else "")
 
         # If streaming, append a subtle pulsing indicator to the last line
         if self._is_streaming:
             cursor = theme.format_accent(" ▋") if theme else " ▋"
-            rendered_lines[-1] = rendered_lines[-1] + cursor
+            res_lines[-1] = res_lines[-1] + cursor
 
-        return rendered_lines
+        return res_lines

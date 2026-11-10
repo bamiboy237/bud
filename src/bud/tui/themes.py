@@ -202,14 +202,34 @@ THEMES: dict[str, Theme] = {
         bg="#1a1b26",
         fg="#c0caf5",
     ),
+    "groknight": Theme(
+        name="groknight",
+        display_name="GrokNight",
+        primary="#e1e1e1",
+        secondary="#7aa2f7",
+        accent="#c084fc",
+        success="#9ece6a",
+        warning="#e0af68",
+        error="#f7768e",
+        info="#7dcfff",
+        muted="#6b7280",
+        dim="#4b5563",
+        border="#2d3139",
+        bg="#141416",
+        fg="#e1e1e1",
+    ),
 }
 
-DEFAULT_THEME_NAME = "default"
+DEFAULT_THEME_NAME = "groknight"
 
 
 def get_theme(name: str) -> Theme:
     """Retrieve theme by name (case-insensitive) or return default theme."""
     key = name.strip().lower()
+    if key in ("grok", "grok-night", "groknight"):
+        return THEMES["groknight"]
+    if key in ("zinc", "monochrome"):
+        return THEMES["default"]
     return THEMES.get(key, THEMES[DEFAULT_THEME_NAME])
 
 

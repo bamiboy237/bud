@@ -139,8 +139,12 @@ class StateStore:
     def set_border_style(self, style: str) -> bool:
         """Switch border style between 'rounded' and 'square'."""
         cleaned = style.strip().lower()
-        if cleaned in ("rounded", "square"):
-            self.border_style = cleaned
+        if cleaned in ("rounded", "round"):
+            self.border_style = "rounded"
+            self.notify()
+            return True
+        if cleaned in ("square", "sq"):
+            self.border_style = "square"
             self.notify()
             return True
         return False

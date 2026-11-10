@@ -32,10 +32,16 @@ class TestThemes(unittest.TestCase):
     def test_themes_exist(self) -> None:
         names = list_theme_names()
         self.assertIn("default", names)
+        self.assertIn("groknight", names)
         self.assertIn("nord", names)
         self.assertIn("catppuccin", names)
         self.assertIn("gruvbox", names)
         self.assertIn("tokyo-night", names)
+
+    def test_grok_theme_alias(self) -> None:
+        theme = get_theme("grok")
+        self.assertEqual(theme.name, "groknight")
+        self.assertEqual(theme.display_name, "GrokNight")
 
     def test_theme_colors(self) -> None:
         nord = get_theme("nord")
@@ -285,6 +291,21 @@ class TestApprovalView(unittest.TestCase):
         self.assertIn("└", sq_plain)
         self.assertNotIn("╭", sq_plain)
 
+    def test_approval_list_args(self) -> None:
+        """Verify list arguments like multiple recipients are formatted cleanly."""
+        store = StateStore("sess_test")
+        approval = ApprovalState(
+            approval_id="app_list",
+            tool="send_email",
+            args={"recipients": ["alice@example.com", "bob@example.com"]},
+            reference="ref_2",
+        )
+        view = ApprovalView(approval, store)
+        lines = view.render(80)
+        plain = strip_ansi("\n".join(lines))
+        self.assertIn("alice@example.com, bob@example.com", plain)
+        self.assertNotIn("[alice", plain)
+
     def test_friendly_action_title_disambiguation(self) -> None:
         """Verify integrations and actions are mapped to executive titles."""
         t1 = friendly_action_title("COMPOSIO_GITHUB_CREATE_ISSUE", {"title": "Fix login bug"})
@@ -395,6 +416,18 @@ class TestStateStore(unittest.TestCase):
         )
         self.assertEqual(store.status, "idle")
         self.assertGreater(notifications, 4)
+
+    def test_border_style_toggle(self) -> None:
+        store = StateStore("sess_test")
+        self.assertTrue(store.set_border_style("square"))
+        self.assertEqual(store.border_style, "square")
+        self.assertTrue(store.set_border_style("round"))
+        self.assertEqual(store.border_style, "rounded")
+        self.assertTrue(store.set_border_style("sq"))
+        self.assertEqual(store.border_style, "square")
+        self.assertTrue(store.set_border_style("rounded"))
+        self.assertEqual(store.border_style, "rounded")
+        self.assertFalse(store.set_border_style("invalid"))
 
     def test_history_recall(self) -> None:
         store = StateStore("sess_test")
