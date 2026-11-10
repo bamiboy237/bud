@@ -79,12 +79,25 @@ class FooterView(View):
 
         left = f"  {f' {dot} '.join(items)}"
 
-        # Spacing to right-aligned hint
-        total_w = visible_width(left) + visible_width(hint) + 4
-        if total_w <= width:
-            pad = max(1, width - visible_width(left) - visible_width(hint) - 2)
-            line = f"{left}{' ' * pad}{hint}  "
+        # Spacing to right-aligned hint (keep 2-col safety margin from right edge)
+        # to prevent terminal emulator automatic wrap onto the next line
+        target_w = max(20, width - 2)
+        total_needed = visible_width(left) + visible_width(hint) + 2
+
+        if total_needed <= target_w:
+            pad = max(1, target_w - visible_width(left) - visible_width(hint))
+            line = f"{left}{' ' * pad}{hint}"
         else:
-            line = truncate_visible(left, width)
+            # Try condensed hint if space is tight at standard 80 columns
+            condensed = (
+                theme.format_dim("Tab tools · /help")
+                if self.store.mode == InputMode.PROMPT
+                else theme.format_dim("↑/↓ · Enter")
+            )
+            if visible_width(left) + visible_width(condensed) + 2 <= target_w:
+                pad = max(1, target_w - visible_width(left) - visible_width(condensed))
+                line = f"{left}{' ' * pad}{condensed}"
+            else:
+                line = truncate_visible(left, target_w)
 
         return [line]

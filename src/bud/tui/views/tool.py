@@ -7,6 +7,8 @@ in favor of natural language summaries and clean text disclosures.
 
 from __future__ import annotations
 
+import ast
+import contextlib
 import json
 from typing import Any
 
@@ -85,50 +87,121 @@ def humanize_tool_action(tool: str, args: dict[str, Any], status: str) -> str:
     return f"{name}…" if status == "running" else name
 
 
+_IGNORE_METADATA_KEYS = {
+    "ok",
+    "truncated",
+    "revision",
+    "next_offset",
+    "scanned_files",
+    "skipped_files",
+    "status_code",
+}
+
+
+def _format_list_result(data: list[Any]) -> list[str]:
+    lines: list[str] = []
+    for item in data:
+        if isinstance(item, dict):
+            name = item.get("name") or item.get("path") or item.get("title") or ""
+            size = item.get("size")
+            if name:
+                size_str = f" · {size // 1024} KB" if isinstance(size, int) else ""
+                lines.append(f"  • {name}{size_str}")
+            else:
+                valid_items = [
+                    f"{k.replace('_', ' ').capitalize()}: {v}"
+                    for k, v in item.items()
+                    if not isinstance(v, (dict, list)) and k not in _IGNORE_METADATA_KEYS
+                ]
+                if valid_items:
+                    lines.append(f"  • {', '.join(valid_items)}")
+        else:
+            lines.append(f"  • {item}")
+    return lines
+
+
+def _format_dict_result(data: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+
+    # Check for nested collections like entries, matches, items, files, results
+    for coll_key in ("entries", "matches", "items", "files", "results", "data"):
+        val = data.get(coll_key)
+        if isinstance(val, list):
+            for item in val:
+                if isinstance(item, dict):
+                    path = item.get("path") or item.get("name") or item.get("title") or ""
+                    line_num = item.get("line")
+                    snippet = item.get("text") or item.get("snippet") or ""
+                    size = item.get("size")
+                    if path and line_num is not None and snippet:
+                        lines.append(f"  • {path}:{line_num}: {snippet.strip()[:60]}")
+                    elif path:
+                        size_str = f" · {size // 1024} KB" if isinstance(size, int) else ""
+                        lines.append(f"  • {path}{size_str}")
+                    else:
+                        valid_items = [
+                            f"{k.replace('_', ' ').capitalize()}: {v}"
+                            for k, v in item.items()
+                            if not isinstance(v, (dict, list)) and k not in _IGNORE_METADATA_KEYS
+                        ]
+                        if valid_items:
+                            lines.append(f"  • {', '.join(valid_items)}")
+                else:
+                    lines.append(f"  • {item}")
+            if lines:
+                return lines
+
+    # Check for text/content preview (e.g. workspace_read)
+    for text_key in ("text", "content", "body"):
+        val = data.get(text_key)
+        if isinstance(val, str) and val.strip():
+            text_lines = val.strip().splitlines()
+            for tline in text_lines[:12]:
+                lines.append(f"  {tline}")
+            if len(text_lines) > 12:
+                lines.append(f"  … ({len(text_lines) - 12} more lines)")
+            return lines
+
+    # Generic key-values
+    for k, v in data.items():
+        if k in _IGNORE_METADATA_KEYS or isinstance(v, (dict, list)):
+            continue
+        label = k.replace("_", " ").capitalize()
+        val_str = str(v).replace("{", "").replace("}", "")
+        lines.append(f"  {label}: {val_str}")
+
+    return lines
+
+
 def format_clean_result(raw_result: str) -> list[str]:
     """Parse tool output and format it into clean text without curly braces or JSON brackets."""
     text = raw_result.strip()
     if not text:
         return []
 
-    # Attempt to parse as structured JSON
+    # Attempt to parse as structured JSON or Python literal dict/list
+    data: Any = None
     try:
         data = json.loads(text)
-        if isinstance(data, list):
-            lines: list[str] = []
-            for item in data:
-                if isinstance(item, dict):
-                    name = item.get("name") or item.get("path") or item.get("title") or ""
-                    size = item.get("size")
-                    if name:
-                        size_str = f" · {size // 1024} KB" if isinstance(size, int) else ""
-                        lines.append(f"  • {name}{size_str}")
-                    else:
-                        valid_items = [
-                            f"{k}: {v}"
-                            for k, v in item.items()
-                            if not str(v).startswith(("{", "["))
-                        ]
-                        lines.append(f"  • {', '.join(valid_items)}")
-                else:
-                    lines.append(f"  • {item}")
-            return lines
-        elif isinstance(data, dict):
-            lines = []
-            for k, v in data.items():
-                if isinstance(v, (dict, list)):
-                    continue
-                label = k.replace("_", " ").capitalize()
-                lines.append(f"  {label}: {v}")
-            return lines
     except Exception:
-        pass
+        with contextlib.suppress(Exception):
+            data = ast.literal_eval(text)
+
+    if isinstance(data, list):
+        return _format_list_result(data)
+    elif isinstance(data, dict):
+        return _format_dict_result(data)
 
     # Plain text output: clean up code or raw lines
     clean_lines: list[str] = []
     for line in text.splitlines():
         trimmed = line.strip()
         if trimmed in ("{", "}", "[", "]", "{},", "[]"):
+            continue
+        if trimmed.startswith("{") and trimmed.endswith("}"):
+            inner = trimmed[1:-1].strip()
+            if inner:
+                clean_lines.append(f"  {inner}")
             continue
         clean_lines.append(f"  {line}")
     return clean_lines
@@ -177,11 +250,18 @@ class ToolView(View):
 
             # Formatted human parameters
             if t.args:
+                flat_args: list[tuple[str, str]] = []
                 for k, v in t.args.items():
-                    if isinstance(v, (dict, list)):
-                        continue
-                    label = k.replace("_", " ").capitalize()
-                    val_str = str(v)
+                    if isinstance(v, dict):
+                        for sub_k, sub_v in v.items():
+                            if not isinstance(sub_v, (dict, list)):
+                                flat_args.append((f"{k} {sub_k}", str(sub_v)))
+                    elif not isinstance(v, list):
+                        flat_args.append((k, str(v)))
+
+                for key_name, val in flat_args:
+                    label = key_name.replace("_", " ").capitalize()
+                    val_str = val.replace("{", "").replace("}", "")
                     arg_line = f"    {dim_pipe} {label}: {val_str}"
                     lines.append(truncate_visible(arg_line, width))
 

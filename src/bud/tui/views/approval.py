@@ -24,6 +24,18 @@ def friendly_action_title(tool: str, args: dict[str, Any]) -> str:
     if "event" in t or "calendar" in t:
         title = args.get("title") or args.get("summary") or ""
         return f"Schedule meeting: \"{title}\"" if title else "Schedule meeting"
+    if "issue" in t:
+        title = args.get("title") or ""
+        return f"Create issue: \"{title}\"" if title else "Create GitHub issue"
+    if "pull_request" in t or "pr" in t:
+        title = args.get("title") or ""
+        return f"Create pull request: \"{title}\"" if title else "Create pull request"
+    if "slack" in t or "channel" in args:
+        target = args.get("channel") or args.get("to") or ""
+        return f"Send Slack message to {target}" if target else "Send Slack message"
+    if "delete" in t or "remove" in t:
+        target = args.get("path") or args.get("title") or ""
+        return f"Delete {target}" if target else "Delete item"
     if "create" in t:
         path = args.get("path") or ""
         return f"Create file: {path}" if path else "Create file"
@@ -32,8 +44,10 @@ def friendly_action_title(tool: str, args: dict[str, Any]) -> str:
         return f"Update file: {path}" if path else "Update file"
 
     cleaned = (
-        tool.replace("GOOGLECALENDAR_", "")
+        tool.replace("COMPOSIO_", "")
+        .replace("GOOGLECALENDAR_", "")
         .replace("GMAIL_", "")
+        .replace("WORKSPACE_", "")
         .replace("_", " ")
         .capitalize()
     )
@@ -61,14 +75,22 @@ class ApprovalView(View):
         dim_pipe = theme.format_dim("│")
 
         # Arguments in human readable layout
+        flat_args: list[tuple[str, str]] = []
         for k, v in appr.args.items():
-            if isinstance(v, (dict, list)):
-                continue
-            key_label = k.replace("_", " ").capitalize()
-            if k in ("body", "message", "message_body", "content"):
+            if isinstance(v, dict):
+                for sub_k, sub_v in v.items():
+                    if not isinstance(sub_v, (dict, list)):
+                        flat_args.append((f"{k} {sub_k}", str(sub_v)))
+            elif not isinstance(v, list):
+                flat_args.append((k, str(v)))
+
+        for key_name, val_raw in flat_args:
+            key_label = key_name.replace("_", " ").capitalize()
+            val_clean = val_raw.replace("{", "").replace("}", "")
+            if key_name.lower() in ("body", "message", "message_body", "content"):
                 label_line = f"    {dim_pipe} {theme.format_dim(key_label + ':')}"
                 lines.append(truncate_visible(label_line, width))
-                body_lines = str(v).splitlines()
+                body_lines = val_clean.splitlines()
                 for bline in body_lines[:6]:
                     content_line = f"    {dim_pipe}   {theme.format_secondary(bline)}"
                     lines.append(truncate_visible(content_line, width))
@@ -79,7 +101,7 @@ class ApprovalView(View):
             else:
                 arg_text = (
                     f"    {dim_pipe} {theme.format_dim(key_label + ':')} "
-                    f"{theme.format_primary(str(v))}"
+                    f"{theme.format_primary(val_clean)}"
                 )
                 lines.append(truncate_visible(arg_text, width))
 

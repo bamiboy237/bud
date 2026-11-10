@@ -21,7 +21,7 @@ from bud.tui.themes import (
     hex_to_rgb,
     list_theme_names,
 )
-from bud.tui.views.approval import ApprovalView
+from bud.tui.views.approval import ApprovalView, friendly_action_title
 from bud.tui.views.footer import FooterView
 from bud.tui.views.message import MessageView
 from bud.tui.views.question import QuestionView
@@ -176,6 +176,47 @@ class TestToolView(unittest.TestCase):
         self.assertNotIn("{", plain_e)
         self.assertNotIn("}", plain_e)
 
+    def test_tool_python_repr_entries_parsing(self) -> None:
+        """Verify python-repr dict outputs from runner.py strip braces and surface entries."""
+        tool = ToolState(
+            call_id="call_list",
+            tool_name="workspace_list",
+            args={"prefix": "data/"},
+            status="completed",
+            result=(
+                "{'ok': True, 'entries': [{'path': 'data/bud.db', 'kind': 'file'}], "
+                "'truncated': False}"
+            ),
+            expanded=True,
+        )
+        widget = ToolView(tool)
+        lines = widget.render(80)
+        plain = strip_ansi("\n".join(lines))
+        self.assertIn("data/bud.db", plain)
+        self.assertNotIn("{", plain)
+        self.assertNotIn("}", plain)
+        self.assertNotIn("Ok: True", plain)
+
+    def test_tool_python_repr_text_parsing(self) -> None:
+        """Verify workspace_read text preview surfaces content without internal hashes/flags."""
+        tool = ToolState(
+            call_id="call_read",
+            tool_name="workspace_read",
+            args={"path": "src/bud/config.py"},
+            status="completed",
+            result="{'ok': True, 'text': 'import sys\\nimport os', 'revision': 'hash123'}",
+            expanded=True,
+        )
+        widget = ToolView(tool)
+        lines = widget.render(80)
+        plain = strip_ansi("\n".join(lines))
+        self.assertIn("import sys", plain)
+        self.assertIn("import os", plain)
+        self.assertNotIn("{", plain)
+        self.assertNotIn("}", plain)
+        self.assertNotIn("hash123", plain)
+        self.assertNotIn("Ok: True", plain)
+
 
 class TestApprovalView(unittest.TestCase):
     def test_approval_card_render(self) -> None:
@@ -200,6 +241,17 @@ class TestApprovalView(unittest.TestCase):
         self.assertNotIn("╰", plain)
         self.assertNotIn("{", plain)
         self.assertNotIn("}", plain)
+
+    def test_friendly_action_title_disambiguation(self) -> None:
+        """Verify integrations and actions are mapped to executive titles."""
+        t1 = friendly_action_title("COMPOSIO_GITHUB_CREATE_ISSUE", {"title": "Fix login bug"})
+        self.assertEqual(t1, 'Create issue: "Fix login bug"')
+
+        t2 = friendly_action_title("COMPOSIO_SLACK_SEND_MESSAGE", {"channel": "#general"})
+        self.assertEqual(t2, "Send Slack message to #general")
+
+        t3 = friendly_action_title("workspace_delete", {"path": "data/temp.db"})
+        self.assertEqual(t3, "Delete data/temp.db")
 
 
 class TestQuestionView(unittest.TestCase):
