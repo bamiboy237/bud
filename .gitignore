@@ -46,3 +46,7 @@ notes/
 # Stress test reproduction scripts
 comprehensive_live_test.py
 run_live_test.py
+
+# Worktrees
+.worktrees/
+worktrees/

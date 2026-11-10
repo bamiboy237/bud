@@ -67,11 +67,14 @@ class ApprovalView(View):
         appr = self.approval
         border_style: BoxStyle = getattr(self.store, "border_style", "rounded")
 
-        # Action title
+        # Action title; the task reference rides as a dim body row, not chrome.
         title = friendly_action_title(appr.tool, appr.args)
         card_title = f"Action Required: {title}"
 
         body_lines: list[str] = []
+        ref = appr.reference or appr.task_id
+        if ref:
+            body_lines.append(theme.format_dim(f"task {ref}"))
 
         # Flatten arguments into readable label-value pairs
         flat_args: list[tuple[str, str]] = []
@@ -104,16 +107,7 @@ class ApprovalView(View):
                     f"{theme.format_dim(key_label + ':')} {theme.format_primary(val_clean)}"
                 )
 
-        # Shortcuts line inside the card
-        key_y = theme.format_success("[y] Approve", bold=True)
-        key_n = theme.format_error("[n] Deny", bold=True)
-        key_esc = theme.format_muted("[esc] Cancel")
-        action_line = f"{key_y}   {key_n}   {key_esc}"
-
-        if body_lines:
-            body_lines.append("")
-        body_lines.append(action_line)
-
+        # Key hints live in the footer; the card carries content only.
         return render_box(
             title=card_title,
             body_lines=body_lines,

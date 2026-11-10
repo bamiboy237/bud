@@ -22,7 +22,7 @@ from bud.core.projection import reply_text
 def render(
     event: dict,
     seen_requests: set[str],
-    streamed: dict[str, str] | None = None,
+    streamed: dict[str, list[str]] | None = None,
     *,
     historical_approval: bool = False,
 ) -> None:
@@ -31,8 +31,6 @@ def render(
     match event["type"]:
         case "user.message":
             print(f"\nyou: {data['text']}")
-        case "message.queued":
-            print(f"\n[queued] {data['message_id']}: {data['text']}", flush=True)
         case "message.edited":
             print(f"\n[edited] {data['message_id']}: {data['text']}", flush=True)
         case "message.cancelled":
@@ -67,8 +65,8 @@ def render(
             seen_requests.add(request)
         case "text.delta":
             run_id = data["run_id"]
-            streamed[run_id] = streamed.get(run_id, "") + data["text"]
-            print(data["text"], end="", flush=True)
+            streamed.setdefault(run_id, []).append(data["text"])
+            print(data["text"], end="", flush="\n" in data["text"])
         case "tool.call":
             print(f"\n[tool] {data['tool']}({data['args']})", flush=True)
         case "tool.result":
@@ -90,7 +88,7 @@ def render(
             # Live text can be lost on disconnect or backlog overflow. Reconcile with
             # the stored reply instead of assuming one received token means all arrived.
             text = reply_text(data.get("messages", []))
-            printed = streamed.pop(data["run_id"], "")
+            printed = "".join(streamed.pop(data["run_id"], []))
             if text.startswith(printed):
                 print(text[len(printed) :], end="", flush=True)
             elif text:
@@ -115,7 +113,7 @@ def print_http_error(error: httpx.HTTPStatusError) -> None:
 async def follow(client: httpx.AsyncClient, session_id: str) -> None:
     last_seq = 0
     seen_requests: set[str] = set()
-    streamed: dict[str, str] = {}
+    streamed: dict[str, list[str]] = {}
     while True:
         try:
             state = await session_snapshot(client, session_id)

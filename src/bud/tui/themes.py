@@ -28,12 +28,6 @@ def fg_rgb(hex_code: str) -> str:
     return f"\x1b[38;2;{r};{g};{b}m"
 
 
-def bg_rgb(hex_code: str) -> str:
-    """Generate 24-bit TrueColor background ANSI escape sequence."""
-    r, g, b = hex_to_rgb(hex_code)
-    return f"\x1b[48;2;{r};{g};{b}m"
-
-
 RESET = "\x1b[0m"
 BOLD = "\x1b[1m"
 DIM = "\x1b[2m"
@@ -101,22 +95,8 @@ class Theme:
         """Generate prompt-toolkit Style object mapped to this theme."""
         return Style.from_dict(
             {
-                "prompt": f"fg:{self.primary} bold",
                 "prompt.symbol": f"fg:{self.accent} bold",
-                "input": f"fg:{self.fg}",
-                "footer": f"fg:{self.muted}",
-                "footer.model": f"fg:{self.primary}",
-                "footer.tokens": f"fg:{self.muted}",
-                "footer.latency": f"fg:{self.muted}",
-                "footer.hint": f"fg:{self.dim}",
-                "status.idle": f"fg:{self.muted}",
-                "status.active": f"fg:{self.accent}",
-                "status.waiting": f"fg:{self.secondary}",
-                "choice.selected": f"fg:{self.accent} bold",
-                "choice.unselected": f"fg:{self.muted}",
                 "card.border": f"fg:{self.border}",
-                "card.title": f"fg:{self.primary} bold",
-                "key.trap": f"fg:{self.accent} bold",
             }
         )
 

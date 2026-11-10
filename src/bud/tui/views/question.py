@@ -18,7 +18,6 @@ class QuestionView(View):
     def __init__(self, store: StateStore) -> None:
         super().__init__()
         self.store: StateStore = store
-        self.store.subscribe(self.mark_dirty)
 
     def _render(self, width: int) -> list[str]:
         theme = self.store.theme
@@ -39,12 +38,11 @@ class QuestionView(View):
                 choice_str = theme.format_muted(choice)
                 body_lines.append(f"  {choice_str}")
 
-        hint = "↑/↓ navigate · Enter select · Esc cancel"
+        # Key hints live in the footer; the card carries content only.
         return render_box(
             title=title,
             body_lines=body_lines,
             width=width,
             theme=theme,
             style=border_style,
-            footer_text=hint,
         )

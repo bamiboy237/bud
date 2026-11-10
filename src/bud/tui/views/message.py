@@ -1,8 +1,7 @@
-"""Streaming markdown rendering with token buffering (30-50ms debounce) & syntax highlighting."""
+"""Streaming markdown rendering with syntax highlighting."""
 
 from __future__ import annotations
 
-import time
 from io import StringIO
 
 from rich.console import Console
@@ -68,47 +67,24 @@ class MessageView(View):
         self.role: str = role
         self.store: StateStore | None = store
         self._text: str = text
-        self._token_buffer: list[str] = []
-        self._last_flush_time: float = 0.0
         self._is_streaming: bool = False
-        self._debounce_interval: float = 0.04  # 40ms debounce window (25fps cap)
 
     @property
     def text(self) -> str:
-        if self._token_buffer:
-            return self._text + "".join(self._token_buffer)
         return self._text
 
     def set_text(self, text: str) -> None:
         self._text = text
-        self._token_buffer.clear()
         self.mark_dirty()
 
     def start_streaming(self) -> None:
         self._is_streaming = True
-        self._token_buffer.clear()
-        self._last_flush_time = time.time()
         self.mark_dirty()
-
-    def push_token(self, token: str) -> bool:
-        """Push a token into the debounce buffer. Returns True if a flush occurred."""
-        self._token_buffer.append(token)
-        now = time.time()
-        if now - self._last_flush_time >= self._debounce_interval:
-            self._text += "".join(self._token_buffer)
-            self._token_buffer.clear()
-            self._last_flush_time = now
-            self.mark_dirty()
-            return True
-        return False
 
     def finish_streaming(self, final_text: str | None = None) -> None:
         self._is_streaming = False
         if final_text is not None:
             self._text = final_text
-        elif self._token_buffer:
-            self._text += "".join(self._token_buffer)
-        self._token_buffer.clear()
         self.mark_dirty()
 
     def _render(self, width: int) -> list[str]:
