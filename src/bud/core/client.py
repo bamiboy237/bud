@@ -5,9 +5,11 @@ user types as a message.
 
 import asyncio
 import json
+import sys
 from uuid import uuid4
 
 import httpx
+from rich.console import Console
 from rich.prompt import Prompt
 
 from bud.config import get_settings
@@ -184,17 +186,69 @@ def owner_client(base_url: str) -> httpx.AsyncClient:
     )
 
 
+def _read_key() -> str:
+    """Read one keypress in raw mode; arrow keys come back as escape sequences.
+    A lone ESC is returned as-is: the follow-up bytes are awaited with a short
+    timeout so a bare ESC keypress cannot block forever."""
+    import os
+    import select
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        # Read everything through the unbuffered fd: sys.stdin.read would pull the
+        # whole escape sequence into its buffer and starve the select/os.read below.
+        ch = os.read(fd, 1).decode(errors="replace")
+        if ch == "\x1b":
+            seq = ""
+            while select.select([fd], [], [], 0.05)[0]:
+                seq += os.read(fd, 1).decode(errors="replace")
+            ch += seq
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return ch
+
+
+def pick_model(models: list[dict]) -> str | None:
+    """Interactive dropdown: arrows move, Enter selects, q/ESC aborts. Falls back to a
+    typed prompt when the terminal is not interactive."""
+    if not models:
+        return None
+    configured = [m for m in models if m["configured"]]
+    options = configured or models
+    console = Console()
+    if not (sys.stdin.isatty() and console.is_terminal):
+        choices = [m["id"] for m in options]
+        default = next((m["id"] for m in options if m["tier"] == "fast"), choices[0])
+        return Prompt.ask("[bold]Select a model[/bold]", choices=choices, default=default)
+    index = next((i for i, m in enumerate(options) if m["tier"] == "fast"), 0)
+    while True:
+        console.clear()
+        console.print("[bold]Select a model[/bold]  (up/down + Enter, q/ESC to quit)\n")
+        for i, m in enumerate(options):
+            style = "reverse" if i == index else ""
+            console.print(f"  {m['id']:<42} {m['tier']:<9} {m['billing']}", style=style)
+        key = _read_key()
+        if key in ("\x1b[A", "\x1bOA"):
+            index = (index - 1) % len(options)
+        elif key in ("\x1b[B", "\x1bOB"):
+            index = (index + 1) % len(options)
+        elif key in ("\r", "\n"):
+            console.clear()
+            return options[index]["id"]
+        elif key in ("q", "\x03", "\x1b"):
+            console.clear()
+            return None
+
+
 async def select_model(client: httpx.AsyncClient) -> str | None:
     """First-screen provider picker: configured models first, fast tier as default."""
     response = await client.get("/models")
     response.raise_for_status()
-    models = response.json()
-    if not models:
-        return None
-    configured = [m["id"] for m in models if m["configured"]]
-    choices = configured or [m["id"] for m in models]
-    default = next((m["id"] for m in models if m["tier"] == "fast" and m["configured"]), choices[0])
-    return Prompt.ask("[bold]Select a model[/bold]", choices=choices, default=default)
+    return await asyncio.to_thread(pick_model, response.json())
 
 
 async def chat(base_url: str, session_id: str | None, *, new: bool = False) -> None:
@@ -204,6 +258,9 @@ async def chat(base_url: str, session_id: str | None, *, new: bool = False) -> N
         client.headers["X-Bud-Scope"] = response.json()["scope"]
         if session_id is None:
             model = await select_model(client)
+            if model is None:
+                print("No model selected; not starting a session.")
+                return
             if new:
                 response = await client.post(
                     "/sessions", json={"session_id": uuid4().hex, "model": model}
