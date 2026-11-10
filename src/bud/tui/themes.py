@@ -218,14 +218,140 @@ THEMES: dict[str, Theme] = {
         bg="#141416",
         fg="#e1e1e1",
     ),
+    "aura": Theme(
+        name="aura",
+        display_name="OpenCode Aura",
+        primary="#a277ff",
+        secondary="#82e2ff",
+        accent="#a277ff",
+        success="#61ffca",
+        warning="#ffca85",
+        error="#ff6767",
+        info="#82e2ff",
+        muted="#6d6a7e",
+        dim="#4d4a5e",
+        border="#252433",
+        bg="#15141b",
+        fg="#edecee",
+    ),
+    "opencode": Theme(
+        name="opencode",
+        display_name="OpenCode Dark",
+        primary="#fab283",
+        secondary="#edb2f1",
+        accent="#fab283",
+        success="#6bd586",
+        warning="#fcd53a",
+        error="#fc533a",
+        info="#a2bcff",
+        muted="#8f8f8f",
+        dim="#5c5c5c",
+        border="#3a3a3a",
+        bg="#1f1f1f",
+        fg="#f1ece8",
+    ),
+    "vesper": Theme(
+        name="vesper",
+        display_name="OpenCode Vesper",
+        primary="#ffc799",
+        secondary="#99ffe4",
+        accent="#ff8080",
+        success="#99ffe4",
+        warning="#ffc799",
+        error="#ff8080",
+        info="#a0b0d0",
+        muted="#707070",
+        dim="#404040",
+        border="#242424",
+        bg="#101010",
+        fg="#ffffff",
+    ),
+    "kanagawa": Theme(
+        name="kanagawa",
+        display_name="OpenCode Kanagawa",
+        primary="#7e9cd8",
+        secondary="#98bb6c",
+        accent="#d27e99",
+        success="#98bb6c",
+        warning="#d7a657",
+        error="#c34043",
+        info="#7fb4ca",
+        muted="#727169",
+        dim="#49473e",
+        border="#2d2f3f",
+        bg="#1f1f28",
+        fg="#dcd7ba",
+    ),
+    "rosepine": Theme(
+        name="rosepine",
+        display_name="OpenCode Rosé Pine",
+        primary="#ebbcba",
+        secondary="#9ccfd8",
+        accent="#c4a7e7",
+        success="#31748f",
+        warning="#f6c177",
+        error="#eb6f92",
+        info="#9ccfd8",
+        muted="#6e6a86",
+        dim="#524f67",
+        border="#26233a",
+        bg="#191724",
+        fg="#e0def4",
+    ),
+    "carbonfox": Theme(
+        name="carbonfox",
+        display_name="OpenCode Carbonfox",
+        primary="#33b1ff",
+        secondary="#78a9ff",
+        accent="#ff8389",
+        success="#42be65",
+        warning="#f1c21b",
+        error="#ee5396",
+        info="#33b1ff",
+        muted="#6e6e6e",
+        dim="#393939",
+        border="#282828",
+        bg="#161616",
+        fg="#f2f4f8",
+    ),
+    "everforest": Theme(
+        name="everforest",
+        display_name="OpenCode Everforest",
+        primary="#a7c080",
+        secondary="#7fbbb3",
+        accent="#d699b6",
+        success="#a7c080",
+        warning="#dbbc7f",
+        error="#e67e80",
+        info="#83c092",
+        muted="#7a8478",
+        dim="#4f585e",
+        border="#3a444a",
+        bg="#2d353b",
+        fg="#d3c6aa",
+    ),
 }
 
-DEFAULT_THEME_NAME = "groknight"
+DEFAULT_THEME_NAME = "aura"
 
 
 def get_theme(name: str) -> Theme:
     """Retrieve theme by name (case-insensitive) or return default theme."""
     key = name.strip().lower()
+    if key in ("aura", "opencode-aura", "opencode_aura"):
+        return THEMES["aura"]
+    if key in ("opencode", "oc", "oc2", "oc-2", "opencode-dark"):
+        return THEMES["opencode"]
+    if key in ("vesper", "opencode-vesper"):
+        return THEMES["vesper"]
+    if key in ("kanagawa", "opencode-kanagawa"):
+        return THEMES["kanagawa"]
+    if key in ("rosepine", "rose-pine", "rose_pine"):
+        return THEMES["rosepine"]
+    if key in ("carbonfox", "carbon"):
+        return THEMES["carbonfox"]
+    if key in ("everforest", "forest"):
+        return THEMES["everforest"]
     if key in ("grok", "grok-night", "groknight"):
         return THEMES["groknight"]
     if key in ("zinc", "monochrome"):

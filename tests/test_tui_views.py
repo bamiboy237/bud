@@ -32,6 +32,13 @@ class TestThemes(unittest.TestCase):
     def test_themes_exist(self) -> None:
         names = list_theme_names()
         self.assertIn("default", names)
+        self.assertIn("aura", names)
+        self.assertIn("opencode", names)
+        self.assertIn("vesper", names)
+        self.assertIn("kanagawa", names)
+        self.assertIn("rosepine", names)
+        self.assertIn("carbonfox", names)
+        self.assertIn("everforest", names)
         self.assertIn("groknight", names)
         self.assertIn("nord", names)
         self.assertIn("catppuccin", names)
@@ -42,6 +49,19 @@ class TestThemes(unittest.TestCase):
         theme = get_theme("grok")
         self.assertEqual(theme.name, "groknight")
         self.assertEqual(theme.display_name, "GrokNight")
+
+    def test_opencode_theme_aliases(self) -> None:
+        aura = get_theme("opencode-aura")
+        self.assertEqual(aura.name, "aura")
+        self.assertEqual(aura.display_name, "OpenCode Aura")
+
+        oc = get_theme("oc")
+        self.assertEqual(oc.name, "opencode")
+        self.assertEqual(oc.display_name, "OpenCode Dark")
+
+        vesper = get_theme("vesper")
+        self.assertEqual(vesper.name, "vesper")
+        self.assertEqual(vesper.display_name, "OpenCode Vesper")
 
     def test_theme_colors(self) -> None:
         nord = get_theme("nord")

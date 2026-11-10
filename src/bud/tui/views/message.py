@@ -20,6 +20,13 @@ def get_code_theme_for_theme(theme_name: str) -> str:
         "catppuccin": "one-dark",
         "tokyo-night": "material",
         "groknight": "one-dark",
+        "aura": "one-dark",
+        "opencode": "one-dark",
+        "vesper": "monokai",
+        "kanagawa": "material",
+        "rosepine": "one-dark",
+        "carbonfox": "one-dark",
+        "everforest": "gruvbox-dark",
         "default": "one-dark",
     }
     return mapping.get(theme_name, "one-dark")
