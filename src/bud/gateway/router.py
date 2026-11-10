@@ -108,9 +108,18 @@ def provider_model_factory(settings: Settings, chatgpt: ChatGPTStore) -> ModelFa
                 if not settings.muse_api_key:
                     return None
                 providers[key] = MetaProvider(api_key=settings.muse_api_key.get_secret_value())
+            elif spec.provider == "mistral":
+                if not settings.mistral_api_key:
+                    return None
+                providers[key] = EndpointProvider(
+                    base_url="https://api.mistral.ai/v1",
+                    api_key=settings.mistral_api_key.get_secret_value(),
+                )
             else:
                 raise ValueError(f"unknown provider in registry: {spec.provider}")
-        protocol = spec.protocol or ("chat" if spec.provider == "deepseek" else "responses")
+        protocol = spec.protocol or (
+            "chat" if spec.provider in {"deepseek", "mistral"} else "responses"
+        )
         model_type = OpenAIChatModel if protocol == "chat" else OpenAIResponsesModel
         options = dict(model_settings)
         if spec.max_tokens is not None:

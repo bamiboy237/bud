@@ -77,6 +77,7 @@ class ModelSpec(BaseModel):
             "openai",
             "deepseek",
             "meta",
+            "mistral",
         }:
             raise ValueError("Custom providers require an endpoint.")
         if self.base_url and self.provider in {"openai", "deepseek", "meta"}:

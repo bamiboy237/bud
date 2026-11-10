@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     deepseek_api_key: SecretStr | None = None
     openai_api_key: SecretStr | None = None
     muse_api_key: SecretStr | None = None
+    mistral_api_key: SecretStr | None = None
     composio_api_key: SecretStr | None = None
     exa_api_key: SecretStr | None = None
     owner_token: SecretStr | None = Field(default=None, repr=False)

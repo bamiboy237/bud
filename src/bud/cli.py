@@ -57,6 +57,7 @@ async def models(*, cached: bool = False) -> None:
         "deepseek": settings.deepseek_api_key,
         "openai": settings.openai_api_key,
         "meta": settings.muse_api_key,
+        "mistral": settings.mistral_api_key,
     }
     seen = set()
     for spec in load_registry(settings.models_file).models:

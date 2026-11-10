@@ -4,6 +4,23 @@
 #   https://api-docs.deepseek.com/quick_start/pricing
 # Meta prices checked 2026-11-03: https://dev.meta.ai/models/muse-wonder
 # DeepSeek prices are peak rates; off-peak is half, so ledger costs for DeepSeek are an upper bound.
+# Mistral prices approximate — verify at https://docs.mistral.ai/pricing
+
+[[models]]
+provider = "mistral"
+name = "mistral-large-latest"
+tier = "fast"
+input = 2.00
+output = 8.00
+cached = 0.20
+
+[[models]]
+provider = "mistral"
+name = "mistral-small-latest"
+tier = "fast"
+input = 0.20
+output = 0.60
+cached = 0.02
 
 [[models]]
 provider = "deepseek"
