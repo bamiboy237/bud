@@ -51,9 +51,7 @@ class FooterView(View):
         # Tokens
         tot_tokens = self.store.input_tokens + self.store.output_tokens
         token_str = (
-            theme.format_dim(f"{format_token_count(tot_tokens)} tokens")
-            if tot_tokens > 0
-            else ""
+            theme.format_dim(f"{format_token_count(tot_tokens)} tokens") if tot_tokens > 0 else ""
         )
 
         # Latency

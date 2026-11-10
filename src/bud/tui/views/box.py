@@ -16,25 +16,28 @@ from bud.tui.themes import Theme
 BoxStyle = Literal["rounded", "square"]
 
 
+ROUNDED_GLYPHS: dict[str, str] = {
+    "tl": "╭",
+    "tr": "╮",
+    "bl": "╰",
+    "br": "╯",
+    "h": "─",
+    "v": "│",
+}
+
+SQUARE_GLYPHS: dict[str, str] = {
+    "tl": "┌",
+    "tr": "┐",
+    "bl": "└",
+    "br": "┘",
+    "h": "─",
+    "v": "│",
+}
+
+
 def get_box_glyphs(style: BoxStyle) -> dict[str, str]:
     """Return corner and border glyphs for the requested box style."""
-    if style == "square":
-        return {
-            "tl": "┌",
-            "tr": "┐",
-            "bl": "└",
-            "br": "┘",
-            "h": "─",
-            "v": "│",
-        }
-    return {
-        "tl": "╭",
-        "tr": "╮",
-        "bl": "╰",
-        "br": "╯",
-        "h": "─",
-        "v": "│",
-    }
+    return SQUARE_GLYPHS if style == "square" else ROUNDED_GLYPHS
 
 
 def render_box(

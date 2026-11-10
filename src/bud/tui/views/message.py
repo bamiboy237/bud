@@ -32,6 +32,34 @@ def get_code_theme_for_theme(theme_name: str) -> str:
     return mapping.get(theme_name, "one-dark")
 
 
+_SHARED_CONSOLE: Console | None = None
+
+
+def _render_markdown(text: str, width: int, theme_name: str) -> list[str]:
+    """Parse and render markdown lines reusing a shared Rich Console."""
+    global _SHARED_CONSOLE
+    buf = StringIO()
+    if _SHARED_CONSOLE is None:
+        _SHARED_CONSOLE = Console(
+            file=buf,
+            force_terminal=True,
+            color_system="truecolor",
+            width=width,
+            highlight=True,
+        )
+    else:
+        _SHARED_CONSOLE.file = buf
+        _SHARED_CONSOLE.width = width
+
+    try:
+        pygments_theme = get_code_theme_for_theme(theme_name)
+        md = Markdown(text, code_theme=pygments_theme)
+        _SHARED_CONSOLE.print(md)
+        return [line.rstrip() for line in buf.getvalue().splitlines()]
+    finally:
+        _SHARED_CONSOLE.file = StringIO()
+
+
 class MessageView(View):
     """Renders a single message with markdown formatting and syntax highlighting."""
 
@@ -105,21 +133,10 @@ class MessageView(View):
         # Assistant role: parse markdown using rich
         prefix = theme.format_accent("bud ›", bold=True) if theme else "\x1b[1mbud ›\x1b[0m"
         content_width = max(20, width - 8)
+        theme_name = theme.name if theme else "default"
 
         try:
-            buf = StringIO()
-            console = Console(
-                file=buf,
-                force_terminal=True,
-                color_system="truecolor",
-                width=content_width,
-                highlight=True,
-            )
-            theme_name = theme.name if theme else "default"
-            pygments_theme = get_code_theme_for_theme(theme_name)
-            md = Markdown(current_text, code_theme=pygments_theme)
-            console.print(md)
-            rendered_lines = [line.rstrip() for line in buf.getvalue().splitlines()]
+            rendered_lines = _render_markdown(current_text, content_width, theme_name)
         except Exception:
             # Fallback to plain wrapped text if markdown parsing fails
             rendered_lines = current_text.splitlines()

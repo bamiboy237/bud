@@ -23,13 +23,13 @@ def friendly_action_title(tool: str, args: dict[str, Any]) -> str:
         return f"Send email to {recipient}" if recipient else "Send email"
     if "event" in t or "calendar" in t:
         title = args.get("title") or args.get("summary") or ""
-        return f"Schedule meeting: \"{title}\"" if title else "Schedule meeting"
+        return f'Schedule meeting: "{title}"' if title else "Schedule meeting"
     if "issue" in t:
         title = args.get("title") or ""
-        return f"Create issue: \"{title}\"" if title else "Create GitHub issue"
+        return f'Create issue: "{title}"' if title else "Create GitHub issue"
     if "pull_request" in t or "pr" in t:
         title = args.get("title") or ""
-        return f"Create pull request: \"{title}\"" if title else "Create pull request"
+        return f'Create pull request: "{title}"' if title else "Create pull request"
     if "slack" in t or "channel" in args:
         target = args.get("channel") or args.get("to") or ""
         return f"Send Slack message to {target}" if target else "Send Slack message"

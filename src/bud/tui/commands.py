@@ -3,7 +3,7 @@
 Supported commands:
   /help               Show command and hotkey guide
   /model [model_id]   Switch model (interactive menu if no model specified)
-  /theme [theme_name] Switch visual theme (default, nord, catppuccin, gruvbox, tokyo-night)
+  /theme [theme_name] Switch palette (aura, opencode, vesper, kanagawa, rosepine, etc.)
   /cost               Display session tokens and cost summary
   /connect <app>      Connect gmail or calendar via Composio
   /clear              Clear screen history
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 HELP_TEXT = """\
 [Commands]
   /model [id]          Switch model (opens choice selector if omitted)
-  /theme [name]        Switch palette (default, nord, catppuccin, gruvbox, tokyo-night)
+  /theme [name]        Switch palette (aura, opencode, vesper, kanagawa, rosepine, etc.)
   /border [round|sq]   Switch border styling (rounded, square)
   /cost                Print token spend and request ledger
   /connect <gmail|cal> Connect account through Composio
@@ -98,9 +98,7 @@ async def handle_slash_command(
             if raw in ("sq", "square"):
                 store.set_border_style("square")
                 return "[border] Switched border style to: square"
-        return (
-            f"[border] Current: {store.border_style} (usage: /border rounded | /border square)"
-        )
+        return f"[border] Current: {store.border_style} (usage: /border rounded | /border square)"
 
     if command == "/cost":
         ledger_path = get_settings().data_dir / "bud.db"
@@ -152,7 +150,7 @@ async def handle_slash_command(
                 else:
                     app.commit_scrollback("[model] Selection cancelled.")
 
-            asyncio.create_task(_await_model_selection())
+            app.spawn_task(_await_model_selection())
             return None
         except Exception as exc:
             return f"[model] Failed to retrieve models: {exc}"

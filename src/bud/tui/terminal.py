@@ -37,12 +37,18 @@ ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 def strip_ansi(text: str) -> str:
     """Remove ANSI escape codes from text."""
+    if "\x1b" not in text:
+        return text
     return ANSI_ESCAPE_RE.sub("", text)
 
 
 def visible_width(text: str) -> int:
     """Calculate the visible terminal column width of text, accounting for wide characters."""
-    clean = strip_ansi(text)
+    if not text:
+        return 0
+    clean = text if "\x1b" not in text else ANSI_ESCAPE_RE.sub("", text)
+    if clean.isascii():
+        return len(clean)
     w = wcwidth.wcswidth(clean)
     return w if w >= 0 else len(clean)
 

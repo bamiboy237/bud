@@ -297,6 +297,7 @@ class StateStore:
                 self.turn_start_time = time.time()
                 self.first_token_time = None
                 self.streaming_text = ""
+                self.tools.clear()
                 self.notify()
                 return None
 

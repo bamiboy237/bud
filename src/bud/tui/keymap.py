@@ -10,7 +10,6 @@ Bindings adhere to:
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING
 
 from prompt_toolkit.filters import Condition
@@ -36,12 +35,12 @@ def build_key_bindings(store: StateStore, app: TUIApp) -> KeyBindings:
     @kb.add("y", filter=is_approval)
     @kb.add("Y", filter=is_approval)
     def _approve(event: KeyPressEvent) -> None:
-        asyncio.create_task(app.handle_approval_decision(approved=True))
+        app.spawn_task(app.handle_approval_decision(approved=True))
 
     @kb.add("n", filter=is_approval)
     @kb.add("N", filter=is_approval)
     def _deny(event: KeyPressEvent) -> None:
-        asyncio.create_task(app.handle_approval_decision(approved=False))
+        app.spawn_task(app.handle_approval_decision(approved=False))
 
     @kb.add("escape", filter=is_approval)
     def _cancel_approval(event: KeyPressEvent) -> None:
@@ -92,7 +91,7 @@ def build_key_bindings(store: StateStore, app: TUIApp) -> KeyBindings:
     @kb.add("escape", filter=is_prompt)
     def _interrupt_run(event: KeyPressEvent) -> None:
         if store.active_run_id or store.status in ("thinking", "streaming"):
-            asyncio.create_task(app.stop_run())
+            app.spawn_task(app.stop_run())
 
     @kb.add("c-c", filter=is_prompt)
     def _ctrl_c(event: KeyPressEvent) -> None:
@@ -100,7 +99,7 @@ def build_key_bindings(store: StateStore, app: TUIApp) -> KeyBindings:
         if buf.text:
             buf.text = ""
         elif store.active_run_id or store.status in ("thinking", "streaming"):
-            asyncio.create_task(app.stop_run())
+            app.spawn_task(app.stop_run())
 
     @kb.add("c-d", filter=is_prompt)
     def _ctrl_d(event: KeyPressEvent) -> None:

@@ -64,8 +64,8 @@ def humanize_tool_action(tool: str, args: dict[str, Any], status: str) -> str:
         if "web" in t:
             q = args.get("query") or args.get("q") or ""
             if status == "running":
-                return f"Searching web for \"{q}\""
-            return f"Searched web for \"{q}\""
+                return f'Searching web for "{q}"'
+            return f'Searched web for "{q}"'
         return f"Searching {target}" if status == "running" else f"Searched {target}"
 
     if "create" in t or "write" in t or "update" in t:
@@ -82,8 +82,8 @@ def humanize_tool_action(tool: str, args: dict[str, Any], status: str) -> str:
     if "event" in t or "calendar" in t:
         title = args.get("title") or args.get("summary") or ""
         if status == "running":
-            return f"Scheduling \"{title}\"" if title else "Scheduling event"
-        return f"Scheduled \"{title}\"" if title else "Scheduled event"
+            return f'Scheduling "{title}"' if title else "Scheduling event"
+        return f'Scheduled "{title}"' if title else "Scheduled event"
 
     name = humanize_tool_name(tool)
     return f"{name}…" if status == "running" else name
@@ -241,7 +241,7 @@ def build_activity_summary(tools: list[ToolState], theme: Theme | None = None) -
             q = t.args.get("query") or t.args.get("q") or t.args.get("pattern") or ""
             target = t.args.get("prefix") or t.args.get("path") or ""
             if "web" in name_lower:
-                summary = f"Searched web for \"{q}\"" if q else "Searched the web"
+                summary = f'Searched web for "{q}"' if q else "Searched the web"
             elif q and target:
                 summary = f"Searched for '{q}' in {target}"
             elif q:
@@ -280,7 +280,7 @@ def build_activity_summary(tools: list[ToolState], theme: Theme | None = None) -
             lines.append(theme.format_primary(desc) if theme else desc)
         elif "event" in name_lower or "calendar" in name_lower:
             title = t.args.get("title") or t.args.get("summary") or ""
-            desc = f"Scheduled \"{title}\"" if title else "Scheduled calendar event"
+            desc = f'Scheduled "{title}"' if title else "Scheduled calendar event"
             lines.append(theme.format_primary(desc) if theme else desc)
         elif "slack" in name_lower:
             ch = t.args.get("channel") or ""
@@ -308,9 +308,7 @@ class ToolView(View):
             status_hint = theme.format_accent("· running") if theme else "· running"
         elif t.status == "completed":
             dur = (
-                f"{int(t.duration_ms)}ms"
-                if t.duration_ms is not None and t.duration_ms > 0
-                else ""
+                f"{int(t.duration_ms)}ms" if t.duration_ms is not None and t.duration_ms > 0 else ""
             )
             raw_done = f"· done {dur}".strip()
             status_hint = theme.format_dim(raw_done) if theme else raw_done
@@ -383,8 +381,7 @@ class ToolsContainerView(View):
         if not summary_lines:
             # Fallback if specific groupings produced nothing
             summary_lines = [
-                humanize_tool_action(t.tool_name, t.args, "completed")
-                for t in tools_list
+                humanize_tool_action(t.tool_name, t.args, "completed") for t in tools_list
             ]
 
         return render_box(

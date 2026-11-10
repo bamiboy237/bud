@@ -73,9 +73,26 @@ class TUIApp:
         # Background tasks
         self._event_task: asyncio.Task[None] | None = None
         self._running: bool = False
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+
+        # Dynamic layout cache
+        self._dynamic_dirty: bool = True
+        self._cached_dynamic_cols: int = 0
+        self._cached_dynamic_content: FormattedText | ANSI = FormattedText([])
+        self._cached_dynamic_height: int = 0
+
+    def spawn_task(self, coro: Any) -> asyncio.Task[Any]:
+        """Spawn a background task with strong reference tracking to prevent GC drops."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     def _on_state_change(self) -> None:
         """Called whenever reactive StateStore updates."""
+        # Invalidate dynamic content cache
+        self._dynamic_dirty = True
+
         # Sync streaming text
         if self.store.status in ("thinking", "streaming") or self.store.streaming_text:
             if not self.streaming_view._is_streaming:
@@ -97,6 +114,10 @@ class TUIApp:
     def _render_dynamic_content(self) -> FormattedText | ANSI:
         """Render the dynamic content window based on the active mode and status."""
         cols, _ = get_terminal_size()
+        if not self._dynamic_dirty and self._cached_dynamic_cols == cols:
+            return self._cached_dynamic_content
+
+        self._cached_dynamic_cols = cols
         lines: list[str] = []
 
         if self.store.mode == InputMode.APPROVAL:
@@ -120,8 +141,14 @@ class TUIApp:
                     lines.extend(stream_lines)
 
         if not lines:
-            return FormattedText([])
-        return ANSI("\n".join(lines))
+            self._cached_dynamic_content = FormattedText([])
+            self._cached_dynamic_height = 0
+        else:
+            self._cached_dynamic_content = ANSI("\n".join(lines))
+            self._cached_dynamic_height = len(lines)
+
+        self._dynamic_dirty = False
+        return self._cached_dynamic_content
 
     def _render_footer(self) -> ANSI:
         """Render the one-line footer."""
@@ -149,12 +176,9 @@ class TUIApp:
         )
 
         def get_dynamic_height() -> Dimension:
-            # Measure dynamic lines count
-            content = self._render_dynamic_content()
-            raw_text = (
-                content.value if isinstance(content, ANSI) else "".join(t[1] for t in content)
-            )
-            line_count = len(raw_text.splitlines()) if raw_text else 0
+            # Reuses cached height from _render_dynamic_content to eliminate duplicate rendering
+            self._render_dynamic_content()
+            line_count = self._cached_dynamic_height
             if line_count == 0:
                 return Dimension(min=0, max=0, preferred=0)
             return Dimension(min=1, max=line_count, preferred=line_count)
@@ -283,10 +307,9 @@ class TUIApp:
 
     def commit_scrollback(self, lines: str | list[str]) -> None:
         """Commit finalized text lines permanently into native terminal scrollback."""
-        if isinstance(lines, str):
-            lines = lines.splitlines()
-        for line in lines:
-            print_formatted_text(ANSI(line))
+        text = "\n".join(lines) if isinstance(lines, list) else lines
+        if text:
+            print_formatted_text(ANSI(text))
 
     def clear_screen(self) -> None:
         """Clear screen scrollback."""
@@ -303,7 +326,7 @@ class TUIApp:
 
         # Reset buffer immediately
         buffer.text = ""
-        asyncio.create_task(self._process_user_input(text))
+        self.spawn_task(self._process_user_input(text))
         return True
 
     async def _process_user_input(self, text: str) -> None:
@@ -430,7 +453,12 @@ class TUIApp:
                                 self.commit_scrollback(committed)
 
                             # If run finished, commit tools and assistant reply to scrollback
-                            if raw_event.get("type") in ("run.completed", "run.waiting"):
+                            if raw_event.get("type") in (
+                                "run.completed",
+                                "run.waiting",
+                                "run.failed",
+                                "run.cancelled",
+                            ):
                                 from bud.core.projection import reply_text
 
                                 cols, _ = get_terminal_size()
@@ -514,6 +542,10 @@ class TUIApp:
                 await self.pt_app.run_async()
         finally:
             self._running = False
+            for task in list(self._background_tasks):
+                task.cancel()
+            if self._background_tasks:
+                await asyncio.gather(*self._background_tasks, return_exceptions=True)
             if self._event_task:
                 self._event_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

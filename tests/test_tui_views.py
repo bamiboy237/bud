@@ -449,6 +449,18 @@ class TestStateStore(unittest.TestCase):
         self.assertEqual(store.border_style, "rounded")
         self.assertFalse(store.set_border_style("invalid"))
 
+    def test_run_started_clears_stale_tools(self) -> None:
+        """Verify that starting a new run clears any stale tool executions."""
+        store = StateStore("sess_test")
+        store.tools["old_call"] = ToolState(
+            "old_call", "workspace_read", {"path": "old.py"}, "completed"
+        )
+        self.assertIn("old_call", store.tools)
+
+        store.handle_event({"type": "run.started", "data": {"run_id": "r_new"}})
+        self.assertEqual(len(store.tools), 0)
+        self.assertEqual(store.status, "thinking")
+
     def test_history_recall(self) -> None:
         store = StateStore("sess_test")
         store.add_prompt_history("prompt 1")
