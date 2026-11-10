@@ -23,6 +23,9 @@ class InputMode(StrEnum):
     QUESTION = "QUESTION"
 
 
+BoxStyle = Literal["rounded", "square", "left"]
+
+
 @dataclass
 class ToolState:
     call_id: str
@@ -98,8 +101,8 @@ class StateStore:
         self.theme_name: str = DEFAULT_THEME_NAME
         self.theme: Theme = get_theme(DEFAULT_THEME_NAME)
 
-        # Border style: "rounded" (╭─, ╰─) or "square" (┌─, └─)
-        self.border_style: str = "rounded"
+        # Border style: "rounded" (╭─, ╰─), "square" (┌─, └─), or "left" (│)
+        self.border_style: BoxStyle = "rounded"
 
         # Prompt input history
         self.prompt_history: list[str] = []
@@ -137,7 +140,7 @@ class StateStore:
         return True
 
     def set_border_style(self, style: str) -> bool:
-        """Switch border style between 'rounded' and 'square'."""
+        """Switch border style between 'rounded', 'square', or 'left'."""
         cleaned = style.strip().lower()
         if cleaned in ("rounded", "round"):
             self.border_style = "rounded"
@@ -145,6 +148,10 @@ class StateStore:
             return True
         if cleaned in ("square", "sq"):
             self.border_style = "square"
+            self.notify()
+            return True
+        if cleaned == "left":
+            self.border_style = "left"
             self.notify()
             return True
         return False
