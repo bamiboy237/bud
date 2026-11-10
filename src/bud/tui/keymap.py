@@ -102,6 +102,11 @@ def build_key_bindings(store: StateStore, app: TUIApp) -> KeyBindings:
         elif store.active_run_id or store.status in ("thinking", "streaming"):
             asyncio.create_task(app.stop_run())
 
+    @kb.add("c-d", filter=is_prompt)
+    def _ctrl_d(event: KeyPressEvent) -> None:
+        if not event.current_buffer.text:
+            event.app.exit()
+
     @kb.add("c-l", filter=is_prompt)
     def _clear_screen(event: KeyPressEvent) -> None:
         app.clear_screen()

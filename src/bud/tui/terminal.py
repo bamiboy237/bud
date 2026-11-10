@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 import shutil
 import sys
-from typing import TextIO
+from typing import Any, TextIO
 
 import wcwidth
 from prompt_toolkit.cursor_shapes import CursorShape
@@ -210,6 +210,9 @@ class SynchronizedOutput(Output):
     def __init__(self, output: Output) -> None:
         self._output: Output = output
 
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._output, name)
+
     def fileno(self) -> int:
         return self._output.fileno()
 
@@ -229,6 +232,14 @@ class SynchronizedOutput(Output):
         self._output.clear_title()
 
     def flush(self) -> None:
+        buf = getattr(self._output, "_buffer", None)
+        if isinstance(buf, list):
+            if not buf:
+                return
+            buf.insert(0, SYNC_START)
+            buf.append(SYNC_END)
+            self._output.flush()
+            return
         try:
             self._output.write_raw(SYNC_START)
             self._output.flush()

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -16,6 +17,7 @@ from prompt_toolkit.layout import HSplit, Layout, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.output import create_output
+from prompt_toolkit.patch_stdout import patch_stdout
 
 from bud.core.controls import session_snapshot
 from bud.tui.commands import handle_slash_command
@@ -26,7 +28,7 @@ from bud.tui.views.approval import ApprovalView
 from bud.tui.views.footer import FooterView
 from bud.tui.views.message import MessageView
 from bud.tui.views.question import QuestionView
-from bud.tui.views.tool import ToolsContainerView
+from bud.tui.views.tool import ToolsContainerView, ToolView
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +42,14 @@ class TUIApp:
         session_id: str,
         model_id: str = "default",
         scope: str = "",
+        input: Any = None,
+        output: Any = None,
     ) -> None:
         self.client: httpx.AsyncClient = client
         self.session_id: str = session_id
         self.store: StateStore = StateStore(session_id, model_id=model_id, scope=scope)
+        self._custom_input: Any = input
+        self._custom_output: Any = output
 
         # Views
         self.streaming_view: MessageView = MessageView("bud", "", self.store)
@@ -51,9 +57,9 @@ class TUIApp:
         self.question_view: QuestionView = QuestionView(self.store)
         self.footer_view: FooterView = FooterView(self.store)
 
-        # Input buffer
+        # Input buffer: multiline enabled for \+Enter and Alt+Enter continuations
         self.input_buffer: Buffer = Buffer(
-            multiline=False,
+            multiline=True,
             accept_handler=self._on_prompt_accept,
         )
 
@@ -122,11 +128,13 @@ class TUIApp:
         lines = self.footer_view.render(cols)
         return ANSI(lines[0] if lines else "")
 
-    def _get_prompt_prefix(self) -> FormattedText:
+    def _get_prompt_prefix(self, line_no: int = 0) -> FormattedText:
         """Return the prompt symbol prefix."""
         if self.store.mode != InputMode.PROMPT:
             return FormattedText([])
-        return FormattedText([("class:prompt", "you › ")])
+        if line_no == 0:
+            return FormattedText([("class:prompt", "you › ")])
+        return FormattedText([("class:prompt", "    · ")])
 
     def _build_pt_app(self) -> Application:
         """Assemble the prompt-toolkit inline Application with SynchronizedOutput."""
@@ -166,13 +174,15 @@ class TUIApp:
         def get_input_height() -> Dimension:
             if self.store.mode != InputMode.PROMPT:
                 return Dimension(min=0, max=0, preferred=0)
-            return Dimension(min=1, max=1, preferred=1)
+            line_count = len(self.input_buffer.document.lines)
+            h = max(1, min(line_count, 8))
+            return Dimension(min=1, max=h, preferred=h)
 
         input_window = Window(
             content=input_control,
             height=get_input_height,
             dont_extend_height=True,
-            get_line_prefix=lambda line_no, wrap_count: self._get_prompt_prefix(),
+            get_line_prefix=lambda line_no, wrap_count: self._get_prompt_prefix(line_no),
         )
 
         # Footer window
@@ -199,24 +209,30 @@ class TUIApp:
         )
 
         # Use synchronized output to avoid tearing
-        raw_output = create_output()
+        raw_output = self._custom_output or create_output()
         sync_output = SynchronizedOutput(raw_output)
 
-        return Application(
-            layout=root_layout,
-            key_bindings=kb,
-            style=self.store.theme.to_prompt_toolkit_style(),
-            output=sync_output,
-            full_screen=False,
-            refresh_interval=0.05,  # 50ms refresh for smooth spinners and streaming
-        )
+        app_kwargs: dict[str, Any] = {
+            "layout": root_layout,
+            "key_bindings": kb,
+            "style": self.store.theme.to_prompt_toolkit_style(),
+            "output": sync_output,
+            "full_screen": False,
+            "refresh_interval": 0.05,  # 50ms refresh for smooth spinners and streaming
+        }
+        if self._custom_input is not None:
+            app_kwargs["input"] = self._custom_input
+
+        app = Application(**app_kwargs)
+        app.timeoutlen = 0.1  # Fast escape key resolution (100ms) for snappy Esc response
+        return app
 
     def commit_scrollback(self, lines: str | list[str]) -> None:
         """Commit finalized text lines permanently into native terminal scrollback."""
         if isinstance(lines, str):
             lines = lines.splitlines()
         for line in lines:
-            print_formatted_text(ANSI(line), output=self.pt_app.output)
+            print_formatted_text(ANSI(line))
 
     def clear_screen(self) -> None:
         """Clear screen scrollback."""
@@ -275,7 +291,7 @@ class TUIApp:
         if not approval:
             return
 
-        app_id = approval.reference or approval.approval_id
+        app_id = approval.approval_id
         source = {"channel": "terminal", "client_id": "terminal"}
 
         try:
@@ -291,6 +307,13 @@ class TUIApp:
                 else self.store.theme.format_error(f"[{label}]", bold=True)
             )
             self.commit_scrollback(f"{tag} {app_id} ({approval.tool})")
+            # Clear pending approval immediately in local state
+            self.store.pending_approvals = [
+                a for a in self.store.pending_approvals if a.approval_id != app_id
+            ]
+            if not self.store.pending_approvals and self.store.mode == InputMode.APPROVAL:
+                self.store.set_mode(InputMode.PROMPT)
+            self.store.notify()
         except Exception as exc:
             self.commit_scrollback(f"{self.store.theme.format_error('[Approval Failed]')} {exc}")
 
@@ -351,20 +374,34 @@ class TUIApp:
                             if committed:
                                 self.commit_scrollback(committed)
 
-                            # If run finished, commit the completed assistant reply to scrollback
+                            # If run finished, commit tools and assistant reply to scrollback
                             if raw_event.get("type") in ("run.completed", "run.waiting"):
                                 from bud.core.projection import reply_text
+
+                                cols, _ = get_terminal_size()
+
+                                # Commit any completed tool widgets to scrollback before clearing
+                                if self.store.tools:
+                                    for tool_state in self.store.tools.values():
+                                        tool_view = ToolView(tool_state, self.store)
+                                        self.commit_scrollback(tool_view.render(cols))
+                                    self.store.tools.clear()
 
                                 full_reply = reply_text(
                                     raw_event.get("data", {}).get("messages", [])
                                 )
+                                if (
+                                    not full_reply
+                                    and self.store.turns
+                                    and self.store.turns[-1].role == "bud"
+                                ):
+                                    full_reply = self.store.turns[-1].text
+
                                 if full_reply:
                                     reply_view = MessageView("bud", full_reply, self.store)
-                                    cols, _ = get_terminal_size()
                                     self.commit_scrollback(reply_view.render(cols))
 
-                                # Clear tool disclosures and streaming view
-                                self.store.tools.clear()
+                                # Clear streaming view
                                 self.streaming_view.set_text("")
                                 self.pt_app.invalidate()
 
@@ -418,7 +455,8 @@ class TUIApp:
         self._event_task = asyncio.create_task(self._sse_reader())
 
         try:
-            await self.pt_app.run_async()
+            with patch_stdout():
+                await self.pt_app.run_async()
         finally:
             self._running = False
             if self._event_task:

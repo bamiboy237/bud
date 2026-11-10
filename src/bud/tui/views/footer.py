@@ -59,8 +59,10 @@ class FooterView(View):
             hint = theme.format_warning("[y] approve • [n] deny • [Esc] cancel")
         elif self.store.mode == InputMode.QUESTION:
             hint = theme.format_accent("↑/↓ navigate • Enter select • Esc cancel")
+        elif self.store.pending_approvals:
+            hint = theme.format_warning("⚠ approval pending • /status • /help")
         else:
-            hint = theme.format_dim("Tab tools • Esc stop • /help")
+            hint = theme.format_dim("Tab tools • Esc stop • /help • Ctrl-D exit")
 
         # Combine segments
         left_parts = [status_badge, model_str]

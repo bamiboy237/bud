@@ -2,7 +2,7 @@
 
 Uses pseudo-terminals (openpty) to simulate real user terminal sessions,
 keystrokes, mode transitions, tool disclosure toggles, single-key approvals,
-menu choices, Esc interruptions mid-run, and SIGWINCH window resizing.
+menu choices, Esc interruptions mid-run, SIGWINCH window resizing, and clean exits.
 """
 
 from __future__ import annotations
@@ -16,12 +16,18 @@ import pty
 import select
 import struct
 import termios
+import threading
 import time
 import unittest
+from collections.abc import Callable
 from typing import Any
+
+from prompt_toolkit.input import create_input
+from prompt_toolkit.output.vt100 import Vt100_Output
 
 from bud.tui.app import TUIApp
 from bud.tui.state import InputMode
+from bud.tui.terminal import SYNC_END, SYNC_START
 
 
 class MockAsyncClient:
@@ -130,19 +136,30 @@ class MockAsyncClient:
 
         return StreamContext()
 
-    def push_event(self, event_type: str, data: dict[str, Any], seq: int = 1) -> None:
+    def push_event(self, event_type: str, data: dict[str, Any], seq: int = 20) -> None:
         payload = json.dumps({"type": event_type, "data": data, "seq": seq})
         self._events_queue.put_nowait(f"data: {payload}")
 
 
-class PTYHarness:
-    """Manages pseudo-terminal creation, input feeding, and output capture."""
+class RealPTYHarness:
+    """Manages pseudo-terminal creation, background output draining, and input injection."""
 
     def __init__(self, cols: int = 80, rows: int = 24) -> None:
         self.cols: int = cols
         self.rows: int = rows
         self.master_fd, self.slave_fd = pty.openpty()
         self.resize(rows, cols)
+
+        self.slave_in = os.fdopen(self.slave_fd, "r", encoding="utf-8")
+        self.slave_out = os.fdopen(os.dup(self.slave_fd), "w", encoding="utf-8")
+
+        self.pt_input = create_input(always_prefer_tty=True, stdin=self.slave_in)
+        self.pt_output = Vt100_Output.from_pty(self.slave_out)
+
+        self._captured: list[bytes] = []
+        self._running: bool = True
+        self._reader_thread = threading.Thread(target=self._drain_loop, daemon=True)
+        self._reader_thread.start()
 
     def resize(self, rows: int, cols: int) -> None:
         self.rows = rows
@@ -154,230 +171,442 @@ class PTYHarness:
         raw = data.encode("utf-8") if isinstance(data, str) else data
         os.write(self.master_fd, raw)
 
-    def read_available(self, timeout: float = 0.5) -> bytes:
-        chunks: list[bytes] = []
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+    def _drain_loop(self) -> None:
+        """Continuously drain master_fd to prevent PTY buffer saturation."""
+        while self._running:
             r, _, _ = select.select([self.master_fd], [], [], 0.05)
             if self.master_fd in r:
                 try:
-                    data = os.read(self.master_fd, 4096)
-                    if data:
-                        chunks.append(data)
+                    chunk = os.read(self.master_fd, 8192)
+                    if chunk:
+                        self._captured.append(chunk)
                 except OSError:
                     break
-            elif chunks:
-                break
-        return b"".join(chunks)
+
+    def get_output(self) -> bytes:
+        return b"".join(self._captured)
 
     def close(self) -> None:
-        with contextlib.suppress(OSError):
+        self._running = False
+        self._reader_thread.join(timeout=0.5)
+        with contextlib.suppress(Exception):
+            self.pt_input.close()
+        with contextlib.suppress(Exception):
+            self.slave_in.close()
+        with contextlib.suppress(Exception):
+            self.slave_out.close()
+        with contextlib.suppress(Exception):
             os.close(self.master_fd)
-        with contextlib.suppress(OSError):
-            os.close(self.slave_fd)
+
+
+async def wait_for(
+    predicate: Callable[[], bool],
+    timeout: float = 1.5,
+    interval: float = 0.02,
+) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return False
 
 
 class TestTUIPTYDriver(unittest.TestCase):
-    """End-to-end tests exercising the TUI through real PTY file descriptors."""
+    """End-to-end tests exercising the TUI through real PTY file descriptors and keystrokes."""
 
     def setUp(self) -> None:
-        self.harness = PTYHarness(cols=80, rows=24)
+        self.harness = RealPTYHarness(cols=80, rows=24)
 
     def tearDown(self) -> None:
         self.harness.close()
 
     def test_pty_prompt_submission(self) -> None:
-        """Test typing a prompt and pressing Enter inside the PTY."""
+        """Test typing a prompt and pressing Enter inside the real PTY."""
         client = MockAsyncClient()
-        app = TUIApp(client, "sess_pty_1")  # type: ignore
+        app = TUIApp(
+            client,
+            "sess_pty_prompt",
+            input=self.harness.pt_input,
+            output=self.harness.pt_output,
+        )
 
-        # Run within an asyncio loop hooked to the PTY
-        async def _run_test() -> None:
-            # Commit a simulated prompt through app
-            await app._process_user_input("hello bud from pty")
-            self.assertEqual(len(client.posted_messages), 1)
-            self.assertEqual(client.posted_messages[0]["text"], "hello bud from pty")
-            self.assertIn("hello bud from pty", app.store.prompt_history)
+        async def _run() -> None:
+            task = asyncio.create_task(app.run())
+            await asyncio.sleep(0.05)
 
-        asyncio.run(_run_test())
+            try:
+                # Type prompt and Enter through PTY master
+                self.harness.write_input("hello bud from real pty\r")
+                ok = await wait_for(lambda: len(client.posted_messages) > 0)
+                self.assertTrue(ok)
+                self.assertEqual(client.posted_messages[0]["text"], "hello bud from real pty")
+                self.assertIn("hello bud from real pty", app.store.prompt_history)
+
+                # Exit via Ctrl-D
+                self.harness.write_input("\x04")
+                await wait_for(lambda: not app.pt_app.is_running)
+            finally:
+                client._events_queue.put_nowait("__STOP__")
+                if app.pt_app.is_running:
+                    app.pt_app.exit()
+                await task
+
+        asyncio.run(_run())
 
     def test_pty_multiline_prompt_continuation(self) -> None:
-        """Test multiline continuation with backslash+Enter."""
+        """Test multiline continuation with backslash+Enter through the PTY."""
         client = MockAsyncClient()
-        app = TUIApp(client, "sess_pty_2")  # type: ignore
+        app = TUIApp(
+            client,
+            "sess_pty_multi",
+            input=self.harness.pt_input,
+            output=self.harness.pt_output,
+        )
 
-        # Set buffer text with trailing backslash
-        app.input_buffer.text = "first line\\"
-        kb = app.pt_app.key_bindings
-        self.assertIsNotNone(kb)
+        async def _run() -> None:
+            task = asyncio.create_task(app.run())
+            await asyncio.sleep(0.05)
 
-        # Trigger newline replacement
-        if app.input_buffer.text.endswith("\\"):
-            app.input_buffer.text = app.input_buffer.text[:-1] + "\n"
-        app.input_buffer.text += "second line"
+            try:
+                # Type line 1 with backslash then Enter
+                self.harness.write_input("line 1\\\r")
+                await wait_for(lambda: "\n" in app.input_buffer.text)
+                self.assertEqual(app.input_buffer.text, "line 1\n")
 
-        self.assertEqual(app.input_buffer.text, "first line\nsecond line")
+                # Type line 2 and submit with Enter
+                self.harness.write_input("line 2\r")
+                ok = await wait_for(lambda: len(client.posted_messages) > 0)
+                self.assertTrue(ok)
+                self.assertEqual(client.posted_messages[0]["text"], "line 1\nline 2")
+
+                # Exit via Ctrl-D
+                self.harness.write_input("\x04")
+                await wait_for(lambda: not app.pt_app.is_running)
+            finally:
+                client._events_queue.put_nowait("__STOP__")
+                if app.pt_app.is_running:
+                    app.pt_app.exit()
+                await task
+
+        asyncio.run(_run())
 
     def test_pty_tool_disclosure_toggle(self) -> None:
-        """Test pressing Tab to expand and collapse tool disclosure widgets."""
+        """Test pressing Tab to expand and collapse tool disclosure widgets through PTY."""
         client = MockAsyncClient()
-        app = TUIApp(client, "sess_pty_3")  # type: ignore
-
-        # Inject tool call
-        app.store.handle_event(
-            {
-                "type": "tool.call",
-                "data": {
-                    "call_id": "call_99",
-                    "tool": "workspace_create",
-                    "args": {"path": "main.py"},
-                },
-            }
+        app = TUIApp(
+            client,
+            "sess_pty_tools",
+            input=self.harness.pt_input,
+            output=self.harness.pt_output,
         )
-        self.assertFalse(app.store.tools["call_99"].expanded)
 
-        # Simulate Tab toggle
-        app.store.toggle_tool_disclosure()
-        self.assertTrue(app.store.tools["call_99"].expanded)
+        async def _run() -> None:
+            task = asyncio.create_task(app.run())
+            await asyncio.sleep(0.05)
 
-        # Collapse again
-        app.store.toggle_tool_disclosure()
-        self.assertFalse(app.store.tools["call_99"].expanded)
+            try:
+                # Dispatch tool call via SSE
+                client.push_event(
+                    "tool.call",
+                    {"call_id": "c1", "tool": "workspace_create", "args": {"path": "app.py"}},
+                )
+                await wait_for(lambda: "c1" in app.store.tools)
+                self.assertFalse(app.store.tools["c1"].expanded)
+
+                # Press Tab to expand
+                self.harness.write_input("\t")
+                await wait_for(lambda: app.store.tools["c1"].expanded)
+                self.assertTrue(app.store.tools["c1"].expanded)
+
+                # Press Tab to collapse
+                self.harness.write_input("\t")
+                await wait_for(lambda: not app.store.tools["c1"].expanded)
+                self.assertFalse(app.store.tools["c1"].expanded)
+
+                # Exit via Ctrl-D
+                self.harness.write_input("\x04")
+                await wait_for(lambda: not app.pt_app.is_running)
+            finally:
+                client._events_queue.put_nowait("__STOP__")
+                if app.pt_app.is_running:
+                    app.pt_app.exit()
+                await task
+
+        asyncio.run(_run())
 
     def test_pty_single_key_approval_trap(self) -> None:
-        """Test 1-key approval traps: [y] approves, [n] denies, [Esc] cancels."""
+        """Test 1-key approval traps: [y] approves, [n] denies, [Esc] cancels through PTY."""
         client = MockAsyncClient()
-        app = TUIApp(client, "sess_pty_4")  # type: ignore
-
-        # 1. Approval requested
-        app.store.handle_event(
-            {
-                "type": "approval.requested",
-                "data": {
-                    "approval_id": "app_pty_1",
-                    "tool": "send_email",
-                    "args": {"to": "alice@example.com"},
-                },
-            }
+        app = TUIApp(
+            client,
+            "sess_pty_appr",
+            input=self.harness.pt_input,
+            output=self.harness.pt_output,
         )
-        self.assertEqual(app.store.mode, InputMode.APPROVAL)
-        self.assertIsNotNone(app.store.current_approval())
 
-        # 2. Press 'y' to approve
-        async def _test_approve() -> None:
-            await app.handle_approval_decision(approved=True)
-            self.assertEqual(len(client.approved_actions), 1)
-            self.assertTrue(client.approved_actions[0]["approved"])
+        async def _run() -> None:
+            task = asyncio.create_task(app.run())
+            await asyncio.sleep(0.05)
 
-        asyncio.run(_test_approve())
+            try:
+                # 1. Approval requested
+                client.push_event(
+                    "approval.requested",
+                    {
+                        "approval_id": "app_pty_1",
+                        "tool": "send_email",
+                        "args": {"to": "alice@example.com"},
+                    },
+                    seq=21,
+                )
+                await wait_for(lambda: app.store.mode == InputMode.APPROVAL)
+                self.assertEqual(app.store.mode, InputMode.APPROVAL)
 
-        # 3. Simulate another approval and press 'n' to deny
-        app.store.handle_event(
-            {
-                "type": "approval.requested",
-                "data": {
-                    "approval_id": "app_pty_2",
-                    "tool": "create_event",
-                    "args": {"title": "Team Sync"},
-                },
-            }
-        )
-        self.assertEqual(app.store.mode, InputMode.APPROVAL)
+                # Press 'y' through PTY
+                self.harness.write_input("y")
+                ok = await wait_for(lambda: len(client.approved_actions) == 1)
+                self.assertTrue(ok)
+                self.assertTrue(client.approved_actions[0]["approved"])
+                self.assertEqual(app.store.mode, InputMode.PROMPT)
 
-        async def _test_deny() -> None:
-            await app.handle_approval_decision(approved=False)
-            self.assertEqual(len(client.approved_actions), 2)
-            self.assertFalse(client.approved_actions[1]["approved"])
+                # 2. Denial requested
+                client.push_event(
+                    "approval.requested",
+                    {"approval_id": "app_pty_2", "tool": "create_event", "args": {"title": "Sync"}},
+                    seq=22,
+                )
+                await wait_for(lambda: app.store.mode == InputMode.APPROVAL)
+                self.assertEqual(app.store.mode, InputMode.APPROVAL)
 
-        asyncio.run(_test_deny())
+                # Press 'n' through PTY
+                self.harness.write_input("n")
+                ok2 = await wait_for(lambda: len(client.approved_actions) == 2)
+                self.assertTrue(ok2)
+                self.assertFalse(client.approved_actions[1]["approved"])
+                self.assertEqual(app.store.mode, InputMode.PROMPT)
 
-        # 4. Esc dismisses approval back to PROMPT
-        app.handle_approval_cancel()
-        self.assertEqual(app.store.mode, InputMode.PROMPT)
+                # 3. Cancel with Esc
+                client.push_event(
+                    "approval.requested",
+                    {"approval_id": "app_pty_3", "tool": "workspace_update", "args": {}},
+                    seq=23,
+                )
+                await wait_for(lambda: app.store.mode == InputMode.APPROVAL)
+                self.harness.write_input("\x1b")
+                await wait_for(lambda: app.store.mode == InputMode.PROMPT)
+                self.assertEqual(app.store.mode, InputMode.PROMPT)
+
+                # Exit via Ctrl-D
+                self.harness.write_input("\x04")
+                await wait_for(lambda: not app.pt_app.is_running)
+            finally:
+                client._events_queue.put_nowait("__STOP__")
+                if app.pt_app.is_running:
+                    app.pt_app.exit()
+                await task
+
+        asyncio.run(_run())
 
     def test_pty_question_mode_choice_selection(self) -> None:
-        """Test QUESTION mode navigation: arrows navigate, Enter confirms, Esc cancels."""
+        """Test QUESTION mode navigation: arrows navigate, Enter confirms through PTY."""
         client = MockAsyncClient()
-        app = TUIApp(client, "sess_pty_5")  # type: ignore
+        app = TUIApp(
+            client,
+            "sess_pty_q",
+            input=self.harness.pt_input,
+            output=self.harness.pt_output,
+        )
 
-        loop = asyncio.new_event_loop()
-        future: asyncio.Future[str | None] = loop.create_future()
-        app.store.start_question("Select model:", ["openai:gpt-4o", "mistral:large"], future=future)
+        async def _run() -> None:
+            task = asyncio.create_task(app.run())
+            await asyncio.sleep(0.05)
 
-        self.assertEqual(app.store.mode, InputMode.QUESTION)
-        self.assertEqual(app.store.question_selected_index, 0)
+            try:
+                loop = asyncio.get_running_loop()
+                future: asyncio.Future[str | None] = loop.create_future()
+                app.store.start_question(
+                    "Select a model:",
+                    ["gpt-4o", "mistral-large", "deepseek-chat"],
+                    future=future,
+                )
 
-        # Move Down
-        app.store.select_next_choice()
-        self.assertEqual(app.store.question_selected_index, 1)
+                await wait_for(lambda: app.store.mode == InputMode.QUESTION)
+                self.assertEqual(app.store.question_selected_index, 0)
 
-        # Move Up
-        app.store.select_prev_choice()
-        self.assertEqual(app.store.question_selected_index, 0)
+                # Down arrow (\x1b[B)
+                self.harness.write_input("\x1b[B")
+                await wait_for(lambda: app.store.question_selected_index == 1)
+                self.assertEqual(app.store.question_selected_index, 1)
 
-        # Confirm choice
-        confirmed = app.store.confirm_question()
-        self.assertEqual(confirmed, "openai:gpt-4o")
-        self.assertEqual(app.store.mode, InputMode.PROMPT)
-        self.assertEqual(future.result(), "openai:gpt-4o")
-        loop.close()
+                # Up arrow (\x1b[A)
+                self.harness.write_input("\x1b[A")
+                await wait_for(lambda: app.store.question_selected_index == 0)
+                self.assertEqual(app.store.question_selected_index, 0)
+
+                # Down arrow again
+                self.harness.write_input("\x1b[B")
+                await wait_for(lambda: app.store.question_selected_index == 1)
+
+                # Enter to select mistral-large
+                self.harness.write_input("\r")
+                await wait_for(lambda: future.done())
+                self.assertEqual(future.result(), "mistral-large")
+                self.assertEqual(app.store.mode, InputMode.PROMPT)
+
+                # Exit via Ctrl-D
+                self.harness.write_input("\x04")
+                await wait_for(lambda: not app.pt_app.is_running)
+            finally:
+                client._events_queue.put_nowait("__STOP__")
+                if app.pt_app.is_running:
+                    app.pt_app.exit()
+                await task
+
+        asyncio.run(_run())
 
     def test_pty_esc_interrupt_run(self) -> None:
-        """Test pressing Esc mid-run interrupts active execution."""
+        """Test pressing Esc mid-run interrupts active execution through PTY."""
         client = MockAsyncClient()
-        app = TUIApp(client, "sess_pty_6")  # type: ignore
-
-        app.store.handle_event(
-            {
-                "type": "run.started",
-                "data": {"run_id": "run_int_1"},
-            }
+        app = TUIApp(
+            client,
+            "sess_pty_stop",
+            input=self.harness.pt_input,
+            output=self.harness.pt_output,
         )
-        self.assertEqual(app.store.active_run_id, "run_int_1")
 
-        async def _test_interrupt() -> None:
-            await app.stop_run()
-            self.assertEqual(client.stopped_runs, 1)
+        async def _run() -> None:
+            task = asyncio.create_task(app.run())
+            await asyncio.sleep(0.05)
 
-        asyncio.run(_test_interrupt())
+            try:
+                client.push_event("run.started", {"run_id": "run_stop_1"}, seq=21)
+                await wait_for(lambda: app.store.active_run_id == "run_stop_1")
+                self.assertEqual(app.store.active_run_id, "run_stop_1")
+
+                # Press Esc
+                self.harness.write_input("\x1b")
+                ok = await wait_for(lambda: client.stopped_runs > 0)
+                self.assertTrue(ok)
+                self.assertGreaterEqual(client.stopped_runs, 1)
+
+                # Exit via Ctrl-D
+                self.harness.write_input("\x04")
+                await wait_for(lambda: not app.pt_app.is_running)
+            finally:
+                client._events_queue.put_nowait("__STOP__")
+                if app.pt_app.is_running:
+                    app.pt_app.exit()
+                await task
+
+        asyncio.run(_run())
 
     def test_pty_sigwinch_resize(self) -> None:
-        """Test resizing the terminal with SIGWINCH dynamically."""
-        self.harness.resize(40, 120)
-        res = fcntl.ioctl(self.harness.slave_fd, termios.TIOCGWINSZ, b"\x00" * 8)
-        rows, cols = struct.unpack("HHHH", res)[:2]
-        self.assertEqual(rows, 40)
-        self.assertEqual(cols, 120)
+        """Test resizing the terminal with SIGWINCH dynamically through PTY."""
+        client = MockAsyncClient()
+        app = TUIApp(
+            client,
+            "sess_pty_resize",
+            input=self.harness.pt_input,
+            output=self.harness.pt_output,
+        )
 
-        # Small resize (narrow)
-        self.harness.resize(20, 50)
-        res2 = fcntl.ioctl(self.harness.slave_fd, termios.TIOCGWINSZ, b"\x00" * 8)
-        rows2, cols2 = struct.unpack("HHHH", res2)[:2]
-        self.assertEqual(rows2, 20)
-        self.assertEqual(cols2, 50)
+        async def _run() -> None:
+            task = asyncio.create_task(app.run())
+            await asyncio.sleep(0.05)
+
+            try:
+                # Resize to wide/tall
+                self.harness.resize(40, 120)
+                app.pt_app.invalidate()
+                await asyncio.sleep(0.05)
+                self.assertEqual(self.harness.pt_output.get_size().columns, 120)
+                self.assertEqual(self.harness.pt_output.get_size().rows, 40)
+
+                # Resize to narrow
+                self.harness.resize(20, 50)
+                app.pt_app.invalidate()
+                await asyncio.sleep(0.05)
+                self.assertEqual(self.harness.pt_output.get_size().columns, 50)
+                self.assertEqual(self.harness.pt_output.get_size().rows, 20)
+
+                # Exit via Ctrl-D
+                self.harness.write_input("\x04")
+                await wait_for(lambda: not app.pt_app.is_running)
+            finally:
+                client._events_queue.put_nowait("__STOP__")
+                if app.pt_app.is_running:
+                    app.pt_app.exit()
+                await task
+
+        asyncio.run(_run())
 
     def test_pty_slash_commands(self) -> None:
-        """Test slash command dispatching (/theme, /help, /cost)."""
+        """Test slash commands (/theme, /exit) typed through real PTY."""
         client = MockAsyncClient()
-        app = TUIApp(client, "sess_pty_7")  # type: ignore
+        app = TUIApp(
+            client,
+            "sess_pty_cmds",
+            input=self.harness.pt_input,
+            output=self.harness.pt_output,
+        )
 
-        async def _test_commands() -> None:
-            # /theme nord
-            await app._process_user_input("/theme nord")
-            self.assertEqual(app.store.theme_name, "nord")
+        async def _run() -> None:
+            task = asyncio.create_task(app.run())
+            await asyncio.sleep(0.05)
 
-            # /theme tokyo-night
-            await app._process_user_input("/theme tokyo-night")
-            self.assertEqual(app.store.theme_name, "tokyo-night")
+            try:
+                # Switch theme to nord
+                self.harness.write_input("/theme nord\r")
+                await wait_for(lambda: app.store.theme_name == "nord")
+                self.assertEqual(app.store.theme_name, "nord")
 
-            # /help
-            from bud.tui.commands import handle_slash_command
+                # Switch theme to tokyo-night
+                self.harness.write_input("/theme tokyo-night\r")
+                await wait_for(lambda: app.store.theme_name == "tokyo-night")
+                self.assertEqual(app.store.theme_name, "tokyo-night")
 
-            help_out = await handle_slash_command(client, app.store, app, "/help")  # type: ignore
-            self.assertIn("[Commands]", help_out or "")
-            self.assertIn("[Hotkeys]", help_out or "")
+                # Exit via /exit command
+                self.harness.write_input("/exit\r")
+                await wait_for(lambda: not app.pt_app.is_running)
+                self.assertFalse(app.pt_app.is_running)
+            finally:
+                client._events_queue.put_nowait("__STOP__")
+                if app.pt_app.is_running:
+                    app.pt_app.exit()
+                await task
 
-        asyncio.run(_test_commands())
+        asyncio.run(_run())
+
+    def test_synchronized_output_decset2026(self) -> None:
+        """Verify that DECSET 2026 synchronized output start and end sequences enclose frames."""
+        client = MockAsyncClient()
+        app = TUIApp(
+            client,
+            "sess_pty_sync",
+            input=self.harness.pt_input,
+            output=self.harness.pt_output,
+        )
+
+        async def _run() -> None:
+            task = asyncio.create_task(app.run())
+            await asyncio.sleep(0.05)
+
+            try:
+                self.harness.write_input("test frame\r")
+                await wait_for(lambda: len(client.posted_messages) > 0)
+                self.harness.write_input("\x04")
+                await wait_for(lambda: not app.pt_app.is_running)
+            finally:
+                client._events_queue.put_nowait("__STOP__")
+                if app.pt_app.is_running:
+                    app.pt_app.exit()
+                await task
+
+        asyncio.run(_run())
+        captured = self.harness.get_output()
+        self.assertIn(SYNC_START.encode("utf-8"), captured)
+        self.assertIn(SYNC_END.encode("utf-8"), captured)
 
     def test_headless_piped_streaming(self) -> None:
         """Test headless mode streams plain text without ANSI codes when piped."""
@@ -408,7 +637,6 @@ class TestTUIPTYDriver(unittest.TestCase):
             asyncio.run(headless_chat("http://127.0.0.1:8420", "sess_head_1"))
 
         output = fake_stdout.getvalue()
-        # Ensure ANSI codes stripped
         self.assertNotIn("\x1b[32m", output)
         self.assertIn("Hello world", output)
 
@@ -423,7 +651,6 @@ class TestTUIPTYDriver(unittest.TestCase):
         fake_stdin = io.StringIO("do send email")
         fake_stderr = io.StringIO()
 
-        # Feed an approval event
         client.push_event(
             "approval.requested",
             {"approval_id": "app_head_fail", "tool": "send_email", "args": {}},

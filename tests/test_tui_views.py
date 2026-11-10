@@ -10,6 +10,7 @@ from bud.tui.terminal import (
     SYNC_END,
     SYNC_START,
     DifferentialRenderer,
+    SynchronizedOutput,
     strip_ansi,
     truncate_visible,
     visible_width,
@@ -93,6 +94,26 @@ class TestTerminal(unittest.TestCase):
         committed_output = stream.getvalue()
         self.assertIn("Committed line\n", committed_output)
         self.assertEqual(renderer.prev_lines, [])
+
+    def test_synchronized_output_encloses_frame(self) -> None:
+        from prompt_toolkit.output.vt100 import Vt100_Output
+
+        stream = io.StringIO()
+        raw = Vt100_Output(stream, lambda: (80, 24))
+        sync = SynchronizedOutput(raw)
+
+        raw.write("FRAME_CONTENT")
+        sync.flush()
+
+        val = stream.getvalue()
+        self.assertTrue(val.startswith(SYNC_START))
+        self.assertTrue(val.endswith(SYNC_END))
+        self.assertIn("FRAME_CONTENT", val)
+        # Empty flush should produce no output
+        stream.seek(0)
+        stream.truncate(0)
+        sync.flush()
+        self.assertEqual(stream.getvalue(), "")
 
 
 class TestMessageView(unittest.TestCase):

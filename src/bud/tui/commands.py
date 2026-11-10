@@ -42,6 +42,7 @@ HELP_TEXT = """\
   /stop                Interrupt current run
   /cancel <msg_id>     Cancel queued message
   /edit <id> <text>    Edit queued message
+  /exit, /quit         Exit the terminal application
   /help                Show this command guide
 
 [Hotkeys]
@@ -51,6 +52,7 @@ HELP_TEXT = """\
   Esc + ↑              Recall previous prompt from history
   Tab                  Toggle expand/collapse on tool disclosure cards
   Ctrl+C               Clear buffer or stop active run
+  Ctrl+D               Exit application (when input buffer is empty)
   Ctrl+L               Clear screen
   [y] / [n]            Single-key 1-touch approval / denial (when approval active)
   ↑ / ↓                Navigate choices (when menu active)"""
@@ -68,6 +70,10 @@ async def handle_slash_command(
 
     if command in ("/help", "/?"):
         return HELP_TEXT
+
+    if command in ("/exit", "/quit", "/q"):
+        app.pt_app.exit()
+        return None
 
     if command == "/clear":
         return "__CLEAR__"

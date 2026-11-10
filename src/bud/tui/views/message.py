@@ -75,8 +75,12 @@ class MessageView(View):
         # Format user vs assistant
         if self.role == "you":
             prefix = theme.format_primary("you ›", bold=True) if theme else "\x1b[1;36myou ›\x1b[0m"
-            # Render user text as simple wrapped lines
-            return [f"{prefix} {current_text}"]
+            user_lines = current_text.splitlines() or [""]
+            res = [f"{prefix} {user_lines[0]}"]
+            indent = "      "
+            for uline in user_lines[1:]:
+                res.append(f"{indent}{uline}")
+            return res
 
         # Assistant role: parse markdown using rich
         prefix = theme.format_accent("bud ›", bold=True) if theme else "\x1b[1;35mbud ›\x1b[0m"
