@@ -5,8 +5,10 @@ user types as a message.
 
 import asyncio
 import json
+from uuid import uuid4
 
 import httpx
+from rich.prompt import Prompt
 
 from bud.config import get_settings
 from bud.core.auth import OwnerAuthError, owner_token
@@ -182,13 +184,32 @@ def owner_client(base_url: str) -> httpx.AsyncClient:
     )
 
 
+async def select_model(client: httpx.AsyncClient) -> str | None:
+    """First-screen provider picker: configured models first, fast tier as default."""
+    response = await client.get("/models")
+    response.raise_for_status()
+    models = response.json()
+    if not models:
+        return None
+    configured = [m["id"] for m in models if m["configured"]]
+    choices = configured or [m["id"] for m in models]
+    default = next((m["id"] for m in models if m["tier"] == "fast" and m["configured"]), choices[0])
+    return Prompt.ask("[bold]Select a model[/bold]", choices=choices, default=default)
+
+
 async def chat(base_url: str, session_id: str | None, *, new: bool = False) -> None:
     async with owner_client(base_url) as client:
         response = await client.get("/runtime")
         response.raise_for_status()
         client.headers["X-Bud-Scope"] = response.json()["scope"]
         if session_id is None:
-            response = await client.post("/sessions" if new else "/sessions/primary")
+            model = await select_model(client)
+            if new:
+                response = await client.post(
+                    "/sessions", json={"session_id": uuid4().hex, "model": model}
+                )
+            else:
+                response = await client.post("/sessions/primary", json={"model": model})
             response.raise_for_status()
             session_id = response.json()["session_id"]
         else:

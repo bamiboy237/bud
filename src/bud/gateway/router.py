@@ -163,10 +163,16 @@ class Gateway:
             self.chatgpt.close()
 
     def model(
-        self, tier: Tier, session_id: str | None = None, *, require_tools: bool = False
+        self,
+        tier: Tier,
+        session_id: str | None = None,
+        *,
+        require_tools: bool = False,
+        selected: str | None = None,
     ) -> Model:
-        if self.selected_model:
-            specs = [spec for spec in self.registry.models if spec.id == self.selected_model][:1]
+        target = selected or self.selected_model
+        if target:
+            specs = [spec for spec in self.registry.models if spec.id == target][:1]
         else:
             specs = self.registry.tier(tier)
         chain: list[TrackedModel] = []
@@ -184,10 +190,10 @@ class Gateway:
                         f"{spec.id} does not support tools. Select a tool-capable model."
                     )
                 chain.append(TrackedModel(model, spec, self.ledger, session_id))
-                if not self.fallback or self.selected_model:
+                if not self.fallback or target:
                     break
         if not chain:
-            target = self.selected_model or f"tier {tier!r}"
+            target = target or f"tier {tier!r}"
             raise NoModelAvailable(
                 f"No configured model for {target}. Check MODELS_FILE, model keys or "
                 "run `bud login chatgpt`."

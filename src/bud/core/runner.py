@@ -88,7 +88,7 @@ class Runner(DBOSConfiguredInstance):
         self.hub = hub
         self.gateway = gateway
         self.harness = harness
-        self.tier = tier
+        self.tier: Tier = tier
         self.durable = durable
         self.tasks: dict[str, asyncio.Task] = {}
         self._monitors: set[asyncio.Task] = set()
@@ -97,6 +97,7 @@ class Runner(DBOSConfiguredInstance):
         self._bursts: dict[str, asyncio.TimerHandle] = {}
         self._closing = False
         self._current: ContextVar[dict] = ContextVar("bud_run")
+        self.session_models: dict[str, str] = {}
         self.work_items = WorkItems(hub) if jobs else None
         if jobs:
             harness.policy.tools.update(dict.fromkeys(CONTROL_TOOLS, "allow"))
@@ -276,6 +277,14 @@ class Runner(DBOSConfiguredInstance):
     def _flush_burst(self, session_id: str) -> None:
         self._bursts.pop(session_id, None)
         self._drain(session_id)
+
+    def set_model(self, session_id: str, model_id: str | None) -> None:
+        if model_id is None:
+            self.session_models.pop(session_id, None)
+            return
+        if not any(spec.id == model_id for spec in self.gateway.registry.models):
+            raise ValueError(f"Unknown model: {model_id}.")
+        self.session_models[session_id] = model_id
 
     @staticmethod
     def _validate_text(text: str) -> None:
@@ -569,8 +578,19 @@ class Runner(DBOSConfiguredInstance):
                     request_limit=conversation.usage.requests + MAX_MODEL_REQUESTS_PER_RUN,
                     tool_calls_limit=conversation.usage.tool_calls + MAX_TOOL_CALLS_PER_RUN,
                 )
+            model_override = self.session_models.get(run["session_id"])
             result = await self.agent.run(
                 run["text"],
+                model=(
+                    self.gateway.model(
+                        self.tier,
+                        session_id=run["session_id"],
+                        require_tools=True,
+                        selected=model_override,
+                    )
+                    if model_override
+                    else None
+                ),
                 conversation=conversation,
                 message_history=history or None,
                 deferred_tool_results=RESULTS.validate_json(run["results"])

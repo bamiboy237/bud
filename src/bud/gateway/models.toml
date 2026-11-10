@@ -10,6 +10,7 @@
 provider = "mistral"
 name = "mistral-large-latest"
 tier = "fast"
+supports_tools = true
 input = 2.00
 output = 8.00
 cached = 0.20
@@ -18,6 +19,7 @@ cached = 0.20
 provider = "mistral"
 name = "mistral-small-latest"
 tier = "fast"
+supports_tools = true
 input = 0.20
 output = 0.60
 cached = 0.02

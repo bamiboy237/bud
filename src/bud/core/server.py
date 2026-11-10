@@ -58,7 +58,8 @@ class NewMessage(BaseModel):
 
 
 class NewSession(BaseModel):
-    session_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    session_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+    model: str | None = None
 
 
 class EditMessage(BaseModel):
@@ -152,7 +153,9 @@ def _create_app(
         session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         db_path = session_dir / "bud.db"
         gateway = build_gateway(
-            settings, providers={"openai-chatgpt", "openai", "meta"}, model_id=model_id
+            settings,
+            providers={"openai-chatgpt", "openai", "meta", "mistral"},
+            model_id=model_id,
         )
         tools_policy = policy()
         tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS | WORKSPACE_READ_TOOLS, "allow"))
@@ -359,6 +362,43 @@ def _create_app(
         if connections is not None and connections.restart_required():
             raise HTTPException(409, "Account binding changed. Restart bud and start a new chat.")
 
+    @app.get("/models")
+    def list_models() -> list[dict]:
+        keys = {
+            "deepseek": settings.deepseek_api_key,
+            "openai": settings.openai_api_key,
+            "meta": settings.muse_api_key,
+            "mistral": settings.mistral_api_key,
+        }
+        out: list[dict] = []
+        seen: set[str] = set()
+        for spec in gateway.registry.models:
+            if spec.id in seen:
+                continue
+            seen.add(spec.id)
+            ready = (
+                spec.billing != "api"
+                or settings.model_api_keys.get(spec.provider) is not None
+                or keys.get(spec.provider) is not None
+            )
+            out.append(
+                {
+                    "id": spec.id,
+                    "tier": spec.tier,
+                    "billing": spec.billing,
+                    "configured": bool(ready),
+                }
+            )
+        return out
+
+    def _apply_model(session_id: str, request: NewSession | None) -> None:
+        if request is None or request.model is None:
+            return
+        try:
+            runner.set_model(session_id, request.model)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
     @app.post("/sessions/primary")
     def primary_session(request: NewSession | None = None) -> dict[str, str]:
         require_current_binding()
@@ -366,13 +406,14 @@ def _create_app(
             session_id = log.primary_session(request.session_id if request else None)
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from None
+        _apply_model(session_id, request)
         hub.wake(session_id)
         return {"session_id": session_id}
 
     @app.post("/sessions", status_code=201)
     def create_session(request: NewSession | None = None) -> dict[str, str]:
         require_current_binding()
-        session_id = request.session_id if request else uuid4().hex
+        session_id = (request.session_id if request else None) or uuid4().hex
         # A transport persists its chosen ID before this request. A lost HTTP
         # response must not create a second conversation on retry.
         if (
@@ -380,6 +421,7 @@ def _create_app(
             is not None
         ):
             hub.wake(session_id)
+        _apply_model(session_id, request)
         return {"session_id": session_id}
 
     @app.get("/sessions/{session_id}")
