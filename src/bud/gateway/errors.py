@@ -9,10 +9,14 @@ from bud.gateway.chatgpt import ChatGPTError
 from bud.skills.installer import SkillError
 
 
+class NoModelAvailable(Exception):
+    """A requested model has no configured key, provider, or tool support."""
+
+
 def error_summary(exc: BaseException) -> str:
     if isinstance(exc, BaseExceptionGroup):
         return "; ".join(error_summary(error) for error in exc.exceptions)[:500]
-    if isinstance(exc, (ChatGPTError, AccountConnectionError, SkillError)):
+    if isinstance(exc, (ChatGPTError, AccountConnectionError, SkillError, NoModelAvailable)):
         return str(exc)
     fields = [type(exc).__name__]
     status = getattr(exc, "status_code", None)

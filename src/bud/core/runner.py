@@ -32,6 +32,7 @@ from pydantic_ai.messages import (
     TextPartDelta,
     ToolReturnPart,
 )
+from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
 
 from bud.core.events import RUN_END_EVENTS, Event, EventType
@@ -53,7 +54,8 @@ from bud.core.tasks import CONTROL_TOOLS, FINISHED, TaskFlow, WorkItems
 from bud.gateway import Gateway
 from bud.gateway.errors import error_summary
 from bud.gateway.registry import Tier
-from bud.gateway.tracked import request_session
+from bud.gateway.router import NoModelAvailable
+from bud.gateway.tracked import TrackedModel, request_session
 from bud.harness.agent import Harness
 from bud.harness.context import BackgroundCompaction
 from bud.limits import (
@@ -116,9 +118,22 @@ class Runner(DBOSConfiguredInstance):
         ).hexdigest()
         if durable:
             super().__init__("core")
+        # A Model instance cannot cross the DBOS step boundary, so durable runners
+        # register every buildable registry model up front — ledger-tracked, like
+        # the agent's default — and agent.run() receives the registered key, not an
+        # instance. Built only for durable runners: building also acquires the
+        # cross-process ChatGPT lock, which non-durable runners must not take.
+        runtime_models: dict[str, Model] = {}
+        if durable:
+            for spec in self.gateway.registry.models:
+                built = self.gateway.build_model(spec)
+                if built is not None:
+                    runtime_models[spec.id] = TrackedModel(built, spec, self.gateway.ledger)
+        self.runtime_model_ids = frozenset(runtime_models)
         durability = (
             DBOSDurability(
                 name="bud",
+                models=runtime_models,
                 event_stream_handler=self._stream,
                 parallel_execution_mode="sequential",
                 model_step_config={"retries_allowed": False},
@@ -579,10 +594,24 @@ class Runner(DBOSConfiguredInstance):
                     tool_calls_limit=conversation.usage.tool_calls + MAX_TOOL_CALLS_PER_RUN,
                 )
             model_override = self.session_models.get(run["session_id"])
+            if (
+                model_override is not None
+                and self.durable
+                and model_override not in self.runtime_model_ids
+            ):
+                # Fail fast with bud's own error instead of pydantic-ai's
+                # infer_model fallback, which would use a different credential path.
+                raise NoModelAvailable(
+                    f"No configured model for {model_override}. Check its API key in .env "
+                    "or `bud login chatgpt`, then pick again."
+                )
             result = await self.agent.run(
                 run["text"],
                 model=(
-                    self.gateway.model(
+                    # Durable runs resolve pre-registered keys; local runs take the instance.
+                    model_override
+                    if self.durable
+                    else self.gateway.model(
                         self.tier,
                         session_id=run["session_id"],
                         require_tools=True,

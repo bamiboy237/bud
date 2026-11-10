@@ -24,16 +24,13 @@ from pydantic_ai.settings import ModelSettings
 
 from bud.config import Settings
 from bud.gateway.chatgpt import ChatGPTStore
+from bud.gateway.errors import NoModelAvailable
 from bud.gateway.ledger import Ledger
 from bud.gateway.registry import ModelSpec, Registry, Tier
 from bud.gateway.tracked import TrackedModel
 
 REQUEST_TIMEOUT_SECONDS = 120
 ModelFactory = Callable[[ModelSpec], Model | None]
-
-
-class NoModelAvailable(Exception):
-    pass
 
 
 class EndpointProvider(OpenAIProvider):
