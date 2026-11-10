@@ -1,9 +1,9 @@
 """1-key interactive approval card for Bud TUI.
 
-Provides an executive clean action card with natural typography, inspired by
-Grok Bot and Town AI.
-Eliminates all ASCII rounded borders (╭─, ╰─), warning emojis (⚠), raw tool
-identifiers (GMAIL_SEND_EMAIL), and JSON curly braces ({}).
+Provides an executive clean action card with natural typography and hairline containment,
+inspired by OpenCode, Grok Bot, and Town AI.
+Eliminates raw developer plumbing (GMAIL_SEND_EMAIL, {} curly braces, warning emojis)
+in favor of structured human-readable fields framed in subtle hairline borders.
 """
 
 from __future__ import annotations
@@ -11,8 +11,8 @@ from __future__ import annotations
 from typing import Any
 
 from bud.tui.state import ApprovalState, StateStore
-from bud.tui.terminal import truncate_visible
 from bud.tui.views.base import View
+from bud.tui.views.box import BoxStyle, render_box
 
 
 def friendly_action_title(tool: str, args: dict[str, Any]) -> str:
@@ -55,7 +55,7 @@ def friendly_action_title(tool: str, args: dict[str, Any]) -> str:
 
 
 class ApprovalView(View):
-    """Renders a clean executive approval card without ASCII boxes or curly braces."""
+    """Renders a clean executive approval card inside hairline borders."""
 
     def __init__(self, approval: ApprovalState, store: StateStore) -> None:
         super().__init__()
@@ -65,16 +65,15 @@ class ApprovalView(View):
     def _render(self, width: int) -> list[str]:
         theme = self.store.theme
         appr = self.approval
+        border_style: BoxStyle = getattr(self.store, "border_style", "rounded")
 
-        # Title
+        # Action title
         title = friendly_action_title(appr.tool, appr.args)
-        header_text = f"Action Required: {title}"
-        header_line = f"  {theme.format_primary(header_text, bold=True)}"
+        card_title = f"Action Required: {title}"
 
-        lines = ["", truncate_visible(header_line, width)]
-        dim_pipe = theme.format_dim("│")
+        body_lines: list[str] = []
 
-        # Arguments in human readable layout
+        # Flatten arguments into readable label-value pairs
         flat_args: list[tuple[str, str]] = []
         for k, v in appr.args.items():
             if isinstance(v, dict):
@@ -88,30 +87,33 @@ class ApprovalView(View):
             key_label = key_name.replace("_", " ").capitalize()
             val_clean = val_raw.replace("{", "").replace("}", "")
             if key_name.lower() in ("body", "message", "message_body", "content"):
-                label_line = f"    {dim_pipe} {theme.format_dim(key_label + ':')}"
-                lines.append(truncate_visible(label_line, width))
-                body_lines = val_clean.splitlines()
-                for bline in body_lines[:6]:
-                    content_line = f"    {dim_pipe}   {theme.format_secondary(bline)}"
-                    lines.append(truncate_visible(content_line, width))
-                if len(body_lines) > 6:
-                    more_text = f"… ({len(body_lines) - 6} more lines)"
-                    more_line = f"    {dim_pipe}   {theme.format_dim(more_text)}"
-                    lines.append(truncate_visible(more_line, width))
+                body_lines.append(f"{theme.format_dim(key_label + ':')}")
+                content_lines = val_clean.splitlines()
+                for bline in content_lines[:6]:
+                    body_lines.append(f"  {theme.format_secondary(bline)}")
+                if len(content_lines) > 6:
+                    body_lines.append(
+                        f"  {theme.format_dim(f'… ({len(content_lines) - 6} more lines)')}"
+                    )
             else:
-                arg_text = (
-                    f"    {dim_pipe} {theme.format_dim(key_label + ':')} "
-                    f"{theme.format_primary(val_clean)}"
+                body_lines.append(
+                    f"{theme.format_dim(key_label + ':')} {theme.format_primary(val_clean)}"
                 )
-                lines.append(truncate_visible(arg_text, width))
 
-        # Bottom action shortcuts
+        # Shortcuts line inside the card
         key_y = theme.format_success("[y] Approve", bold=True)
         key_n = theme.format_error("[n] Deny", bold=True)
         key_esc = theme.format_muted("[esc] Cancel")
-        action_line = f"    {key_y}   {key_n}   {key_esc}"
-        lines.append("")
-        lines.append(truncate_visible(action_line, width))
-        lines.append("")
+        action_line = f"{key_y}   {key_n}   {key_esc}"
 
-        return lines
+        if body_lines:
+            body_lines.append("")
+        body_lines.append(action_line)
+
+        return render_box(
+            title=card_title,
+            body_lines=body_lines,
+            width=width,
+            theme=theme,
+            style=border_style,
+        )

@@ -217,6 +217,39 @@ class TestToolView(unittest.TestCase):
         self.assertNotIn("hash123", plain)
         self.assertNotIn("Ok: True", plain)
 
+    def test_tools_container_activity_summary(self) -> None:
+        """Verify ToolsContainerView groups completed operations into a Workspace Activity card."""
+        from bud.tui.views.tool import ToolsContainerView
+
+        store = StateStore("sess_tools")
+        t1 = ToolState(
+            "c1", "workspace_read", {"path": "packages/console/routes.tsx"}, status="completed"
+        )
+        t2 = ToolState(
+            "c2", "workspace_read", {"path": "packages/console/header.tsx"}, status="completed"
+        )
+        t3 = ToolState(
+            "c3",
+            "workspace_list",
+            {"pattern": "*.tsx", "prefix": "packages/console"},
+            status="completed",
+        )
+
+        store.tools = {"c1": t1, "c2": t2, "c3": t3}
+        container = ToolsContainerView(store)
+
+        lines = container.render(80)
+        plain = strip_ansi("\n".join(lines))
+
+        self.assertIn("Workspace Activity", plain)
+        self.assertIn("Checked 2 workspace files", plain)
+        self.assertIn("routes.tsx", plain)
+        self.assertIn("header.tsx", plain)
+        self.assertIn("Searched for '*.tsx' in packages/console", plain)
+        # Ensure framed in subtle box
+        self.assertIn("╭", plain)
+        self.assertIn("╰", plain)
+
 
 class TestApprovalView(unittest.TestCase):
     def test_approval_card_render(self) -> None:
@@ -227,6 +260,8 @@ class TestApprovalView(unittest.TestCase):
             args={"to": "alice@example.com", "subject": "Test", "body": "Line 1\nLine 2"},
             reference="ref_1",
         )
+        # Rounded borders (default)
+        store.border_style = "rounded"
         view = ApprovalView(approval, store)
         lines = view.render(80)
         plain = strip_ansi("\n".join(lines))
@@ -236,11 +271,19 @@ class TestApprovalView(unittest.TestCase):
         self.assertIn("[y] Approve", plain)
         self.assertIn("[n] Deny", plain)
         self.assertIn("[esc] Cancel", plain)
-        # Ensure zero ASCII rounded borders and zero curly braces
-        self.assertNotIn("╭", plain)
-        self.assertNotIn("╰", plain)
+        self.assertIn("╭", plain)
+        self.assertIn("╰", plain)
         self.assertNotIn("{", plain)
         self.assertNotIn("}", plain)
+
+        # Square borders
+        store.border_style = "square"
+        view.mark_dirty()
+        sq_lines = view.render(80)
+        sq_plain = strip_ansi("\n".join(sq_lines))
+        self.assertIn("┌", sq_plain)
+        self.assertIn("└", sq_plain)
+        self.assertNotIn("╭", sq_plain)
 
     def test_friendly_action_title_disambiguation(self) -> None:
         """Verify integrations and actions are mapped to executive titles."""

@@ -98,6 +98,9 @@ class StateStore:
         self.theme_name: str = DEFAULT_THEME_NAME
         self.theme: Theme = get_theme(DEFAULT_THEME_NAME)
 
+        # Border style: "rounded" (╭─, ╰─) or "square" (┌─, └─)
+        self.border_style: str = "rounded"
+
         # Prompt input history
         self.prompt_history: list[str] = []
         self.history_index: int = -1
@@ -132,6 +135,15 @@ class StateStore:
         self.theme = new_theme
         self.notify()
         return True
+
+    def set_border_style(self, style: str) -> bool:
+        """Switch border style between 'rounded' and 'square'."""
+        cleaned = style.strip().lower()
+        if cleaned in ("rounded", "square"):
+            self.border_style = cleaned
+            self.notify()
+            return True
+        return False
 
     def set_model(self, model_id: str) -> None:
         self.model_id = model_id

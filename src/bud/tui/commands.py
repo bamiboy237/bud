@@ -34,6 +34,7 @@ HELP_TEXT = """\
 [Commands]
   /model [id]          Switch model (opens choice selector if omitted)
   /theme [name]        Switch palette (default, nord, catppuccin, gruvbox, tokyo-night)
+  /border [round|sq]   Switch border styling (rounded, square)
   /cost                Print token spend and request ledger
   /connect <gmail|cal> Connect account through Composio
   /clear               Clear screen scrollback
@@ -86,6 +87,15 @@ async def handle_slash_command(
         names = ", ".join(list_theme_names())
         return (
             f"[themes] Available: {names}\nCurrent: {store.theme.display_name} ({store.theme.name})"
+        )
+
+    if command == "/border":
+        if len(parts) > 1 and parts[1].lower() in ("rounded", "square"):
+            style = parts[1].lower()
+            store.set_border_style(style)
+            return f"[border] Switched border style to: {style}"
+        return (
+            f"[border] Current: {store.border_style} (usage: /border rounded | /border square)"
         )
 
     if command == "/cost":

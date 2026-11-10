@@ -1,8 +1,9 @@
-"""Collapsible tool disclosure widgets for Bud TUI.
+"""Collapsible tool disclosure widgets and Workspace Activity cards for Bud TUI.
 
-Provides calm, human-readable action cards inspired by Grok Bot and Town AI.
-Eliminates all raw JSON brackets, curly braces, and internal function names
-in favor of natural language summaries and clean text disclosures.
+Provides calm, human-readable activity cards inspired by OpenCode, Grok Bot, and Town AI.
+Eliminates mechanical 'Read this, do that' micro-logs in favor of:
+1. Streaming transient progress while tools run (e.g. '› Checking workspace files…').
+2. Consolidated Workspace Activity summary cards when settled, enclosed in hairline borders.
 """
 
 from __future__ import annotations
@@ -10,11 +11,14 @@ from __future__ import annotations
 import ast
 import contextlib
 import json
+import os
 from typing import Any
 
 from bud.tui.state import StateStore, ToolState
 from bud.tui.terminal import truncate_visible
+from bud.tui.themes import Theme
 from bud.tui.views.base import View
+from bud.tui.views.box import BoxStyle, render_box
 
 
 def humanize_tool_name(tool: str) -> str:
@@ -23,7 +27,7 @@ def humanize_tool_name(tool: str) -> str:
     mapping: dict[str, str] = {
         "workspace_read": "Read file",
         "workspace_list": "Searched workspace files",
-        "workspace_create": "Created file",
+        "workspace_create": "Saved file",
         "workspace_update": "Updated file",
         "draft_reply": "Drafted email reply",
         "send_email": "Sent email",
@@ -37,7 +41,6 @@ def humanize_tool_name(tool: str) -> str:
         return mapping[tool]
     if cleaned in mapping:
         return mapping[cleaned]
-    # Fallback: clean snake_case to Title Case
     words = [w.capitalize() for w in cleaned.split("_") if w]
     return " ".join(words) if words else tool
 
@@ -82,7 +85,6 @@ def humanize_tool_action(tool: str, args: dict[str, Any], status: str) -> str:
             return f"Scheduling \"{title}\"" if title else "Scheduling event"
         return f"Scheduled \"{title}\"" if title else "Scheduled event"
 
-    # Default fallback
     name = humanize_tool_name(tool)
     return f"{name}…" if status == "running" else name
 
@@ -179,7 +181,6 @@ def format_clean_result(raw_result: str) -> list[str]:
     if not text:
         return []
 
-    # Attempt to parse as structured JSON or Python literal dict/list
     data: Any = None
     try:
         data = json.loads(text)
@@ -192,7 +193,6 @@ def format_clean_result(raw_result: str) -> list[str]:
     elif isinstance(data, dict):
         return _format_dict_result(data)
 
-    # Plain text output: clean up code or raw lines
     clean_lines: list[str] = []
     for line in text.splitlines():
         trimmed = line.strip()
@@ -207,8 +207,91 @@ def format_clean_result(raw_result: str) -> list[str]:
     return clean_lines
 
 
+def build_activity_summary(tools: list[ToolState], theme: Theme | None = None) -> list[str]:
+    """Consolidate multiple completed tool operations into a concise human outcome summary."""
+    lines: list[str] = []
+
+    # 1. Group read operations
+    reads: list[str] = []
+    for t in tools:
+        if "read" in t.tool_name.lower() and "path" in t.args:
+            reads.append(str(t.args["path"]))
+
+    if len(reads) == 1:
+        f_text = f"Checked file: {reads[0]}"
+        prefix = theme.format_primary(f_text) if theme else f_text
+        lines.append(prefix)
+    elif len(reads) > 1:
+        # Determine common directory
+        common_dir = os.path.dirname(os.path.commonprefix(reads))
+        dir_suffix = f" in {common_dir}" if common_dir else ""
+        header = f"Checked {len(reads)} workspace files{dir_suffix}:"
+        lines.append(theme.format_primary(header) if theme else header)
+        for p in reads[:5]:
+            display_p = p.removeprefix(common_dir).lstrip("/") if common_dir else p
+            lines.append(f"  • {theme.format_secondary(display_p) if theme else display_p}")
+        if len(reads) > 5:
+            more_text = f"  … ({len(reads) - 5} more files)"
+            lines.append(theme.format_dim(more_text) if theme else more_text)
+
+    # 2. Group searches and listings
+    for t in tools:
+        name_lower = t.tool_name.lower()
+        if ("list" in name_lower or "search" in name_lower) and "read" not in name_lower:
+            q = t.args.get("query") or t.args.get("q") or t.args.get("pattern") or ""
+            target = t.args.get("prefix") or t.args.get("path") or ""
+            if "web" in name_lower:
+                summary = f"Searched web for \"{q}\"" if q else "Searched the web"
+            elif q and target:
+                summary = f"Searched for '{q}' in {target}"
+            elif q:
+                summary = f"Searched for '{q}'"
+            elif target:
+                summary = f"Listed files in {target}"
+            else:
+                summary = "Searched workspace files"
+
+            # Check result count if available
+            count_str = ""
+            if t.result:
+                parsed = format_clean_result(t.result)
+                bullet_count = sum(1 for line in parsed if line.strip().startswith("•"))
+                if bullet_count > 0:
+                    count_str = f" ({bullet_count} matches)"
+
+            line_text = f"{summary}{count_str}"
+            lines.append(theme.format_secondary(line_text) if theme else line_text)
+
+    # 3. Saves / Writes / Updates
+    for t in tools:
+        name_lower = t.tool_name.lower()
+        if "create" in name_lower or "write" in name_lower or "update" in name_lower:
+            path = t.args.get("path") or t.args.get("filename") or ""
+            action = "Updated" if "update" in name_lower else "Saved"
+            desc = f"{action} {path}" if path else f"{action} file"
+            lines.append(theme.format_success(desc) if theme else desc)
+
+    # 4. External communications (Email, Slack, Calendar)
+    for t in tools:
+        name_lower = t.tool_name.lower()
+        if "email" in name_lower or "draft" in name_lower:
+            recipient = t.args.get("to") or t.args.get("recipient") or ""
+            desc = f"Drafted email to {recipient}" if recipient else "Prepared email draft"
+            lines.append(theme.format_primary(desc) if theme else desc)
+        elif "event" in name_lower or "calendar" in name_lower:
+            title = t.args.get("title") or t.args.get("summary") or ""
+            desc = f"Scheduled \"{title}\"" if title else "Scheduled calendar event"
+            lines.append(theme.format_primary(desc) if theme else desc)
+        elif "slack" in name_lower:
+            ch = t.args.get("channel") or ""
+            desc = f"Sent Slack message to {ch}" if ch else "Sent Slack message"
+            lines.append(theme.format_primary(desc) if theme else desc)
+
+    return lines
+
+
 class ToolView(View):
-    """Renders a collapsible disclosure widget for a single tool execution."""
+    """Renders a single tool execution widget with clean text disclosure."""
 
     def __init__(self, tool: ToolState, store: StateStore | None = None) -> None:
         super().__init__()
@@ -219,10 +302,8 @@ class ToolView(View):
         theme = self.store.theme if self.store else None
         t = self.tool
 
-        # Headline
         action_text = humanize_tool_action(t.tool_name, t.args, t.status)
 
-        # Status indicator
         if t.status == "running":
             status_hint = theme.format_accent("· running") if theme else "· running"
         elif t.status == "completed":
@@ -242,30 +323,19 @@ class ToolView(View):
         tab_hint = theme.format_dim("(Tab)") if theme and not t.expanded else "(Tab)"
 
         collapsed_line = f"  {arrow_str} {title_str} {status_hint} {tab_hint}"
-        truncated = truncate_visible(collapsed_line, width)
-        lines = [truncated]
+        lines = [truncate_visible(collapsed_line, width)]
 
         if t.expanded:
             dim_pipe = theme.format_dim("│") if theme else "│"
-
-            # Formatted human parameters
             if t.args:
-                flat_args: list[tuple[str, str]] = []
                 for k, v in t.args.items():
-                    if isinstance(v, dict):
-                        for sub_k, sub_v in v.items():
-                            if not isinstance(sub_v, (dict, list)):
-                                flat_args.append((f"{k} {sub_k}", str(sub_v)))
-                    elif not isinstance(v, list):
-                        flat_args.append((k, str(v)))
-
-                for key_name, val in flat_args:
-                    label = key_name.replace("_", " ").capitalize()
-                    val_str = val.replace("{", "").replace("}", "")
+                    if isinstance(v, (dict, list)):
+                        continue
+                    label = k.replace("_", " ").capitalize()
+                    val_str = str(v).replace("{", "").replace("}", "")
                     arg_line = f"    {dim_pipe} {label}: {val_str}"
                     lines.append(truncate_visible(arg_line, width))
 
-            # Formatted clean result lines
             if t.result is not None:
                 clean_results = format_clean_result(t.result)
                 for rline in clean_results[:12]:
@@ -278,7 +348,11 @@ class ToolView(View):
 
 
 class ToolsContainerView(View):
-    """Renders all currently active or recently finished tool disclosure widgets."""
+    """Renders tool operations.
+
+    When running: displays a transient streaming progress line.
+    When completed: renders a framed Workspace Activity card with unified outcome summaries.
+    """
 
     def __init__(self, store: StateStore) -> None:
         super().__init__()
@@ -288,8 +362,35 @@ class ToolsContainerView(View):
     def _render(self, width: int) -> list[str]:
         if not self.store.tools:
             return []
-        lines: list[str] = []
-        for tool_state in self.store.tools.values():
-            widget = ToolView(tool_state, self.store)
-            lines.extend(widget.render(width))
-        return lines
+
+        tools_list = list(self.store.tools.values())
+        theme = self.store.theme
+        border_style: BoxStyle = getattr(self.store, "border_style", "rounded")
+
+        # 1. If any tool is running, display transient streaming line
+        running_tools = [t for t in tools_list if t.status == "running"]
+        if running_tools:
+            active = running_tools[-1]
+            active_text = humanize_tool_action(active.tool_name, active.args, "running")
+            arrow = theme.format_accent("›")
+            action_styled = theme.format_secondary(active_text)
+            hint = theme.format_accent("…")
+            line = f"  {arrow} {action_styled}{hint}"
+            return [truncate_visible(line, width)]
+
+        # 2. If tools are completed, consolidate into a framed Workspace Activity card
+        summary_lines = build_activity_summary(tools_list, theme)
+        if not summary_lines:
+            # Fallback if specific groupings produced nothing
+            summary_lines = [
+                humanize_tool_action(t.tool_name, t.args, "completed")
+                for t in tools_list
+            ]
+
+        return render_box(
+            title="Workspace Activity",
+            body_lines=summary_lines,
+            width=width,
+            theme=theme,
+            style=border_style,
+        )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 from typing import Any
@@ -13,7 +14,7 @@ import httpx
 from prompt_toolkit import Application, print_formatted_text
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.formatted_text import ANSI, FormattedText
-from prompt_toolkit.layout import HSplit, Layout, Window
+from prompt_toolkit.layout import DynamicContainer, HSplit, Layout, VSplit, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.output import create_output
@@ -28,7 +29,7 @@ from bud.tui.views.approval import ApprovalView, friendly_action_title
 from bud.tui.views.footer import FooterView
 from bud.tui.views.message import MessageView
 from bud.tui.views.question import QuestionView
-from bud.tui.views.tool import ToolsContainerView, ToolView
+from bud.tui.views.tool import ToolsContainerView
 
 logger = logging.getLogger(__name__)
 
@@ -133,8 +134,8 @@ class TUIApp:
         if self.store.mode != InputMode.PROMPT:
             return FormattedText([])
         if line_no == 0:
-            return FormattedText([("class:prompt", "you › ")])
-        return FormattedText([("class:prompt", "    · ")])
+            return FormattedText([("class:prompt.symbol", "› ")])
+        return FormattedText([("class:prompt.symbol", "· ")])
 
     def _build_pt_app(self) -> Application:
         """Assemble the prompt-toolkit inline Application with SynchronizedOutput."""
@@ -185,6 +186,59 @@ class TUIApp:
             get_line_prefix=lambda line_no, wrap_count: self._get_prompt_prefix(line_no),
         )
 
+        def _render_framed_composer() -> Any:
+            if self.store.mode != InputMode.PROMPT:
+                return Window(height=Dimension.exact(0), dont_extend_height=True)
+
+            style = getattr(self.store, "border_style", "rounded")
+            if style == "square":
+                tl, tr, bl, br, h, v = "┌", "┐", "└", "┘", "─", "│"
+            else:
+                tl, tr, bl, br, h, v = "╭", "╮", "╰", "╯", "─", "│"
+
+            from prompt_toolkit.widgets import Label
+
+            fill = functools.partial(Window, style="class:card.border")
+            top = VSplit(
+                [
+                    fill(width=2, height=1, char=" "),
+                    fill(width=1, height=1, char=tl),
+                    fill(width=1, height=1, char=h),
+                    Label(" you ", style="class:card.title", dont_extend_width=True),
+                    fill(char=h),
+                    fill(width=1, height=1, char=tr),
+                    fill(width=2, height=1, char=" "),
+                ],
+                height=1,
+            )
+
+            mid = VSplit(
+                [
+                    fill(width=2, char=" "),
+                    fill(width=1, char=v),
+                    Window(width=1, char=" "),
+                    input_window,
+                    Window(width=1, char=" "),
+                    fill(width=1, char=v),
+                    fill(width=2, char=" "),
+                ]
+            )
+
+            bot = VSplit(
+                [
+                    fill(width=2, height=1, char=" "),
+                    fill(width=1, height=1, char=bl),
+                    fill(char=h),
+                    fill(width=1, height=1, char=br),
+                    fill(width=2, height=1, char=" "),
+                ],
+                height=1,
+            )
+
+            return HSplit([top, mid, bot])
+
+        framed_composer = DynamicContainer(_render_framed_composer)
+
         # Footer window
         footer_control = FormattedTextControl(
             text=self._render_footer,
@@ -201,7 +255,7 @@ class TUIApp:
             HSplit(
                 [
                     dynamic_window,
-                    input_window,
+                    framed_composer,
                     footer_window,
                 ]
             ),
@@ -381,11 +435,11 @@ class TUIApp:
 
                                 cols, _ = get_terminal_size()
 
-                                # Commit any completed tool widgets to scrollback before clearing
+                                # Commit completed tools summary card to scrollback before clearing
                                 if self.store.tools:
-                                    for tool_state in self.store.tools.values():
-                                        tool_view = ToolView(tool_state, self.store)
-                                        self.commit_scrollback(tool_view.render(cols))
+                                    summary_card = self.tools_view.render(cols)
+                                    if summary_card:
+                                        self.commit_scrollback(summary_card)
                                     self.store.tools.clear()
 
                                 full_reply = reply_text(
