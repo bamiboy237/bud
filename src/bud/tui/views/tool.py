@@ -355,7 +355,6 @@ class ToolsContainerView(View):
     def __init__(self, store: StateStore) -> None:
         super().__init__()
         self.store: StateStore = store
-        self.store.subscribe(self.mark_dirty)
 
     def _render(self, width: int) -> list[str]:
         if not self.store.tools:
@@ -364,6 +363,13 @@ class ToolsContainerView(View):
         tools_list = list(self.store.tools.values())
         theme = self.store.theme
         border_style: BoxStyle = getattr(self.store, "border_style", "rounded")
+
+        # 0. Expanded (Tab): one disclosure card per tool call
+        if self.store.tools_expanded_global:
+            lines: list[str] = []
+            for t in tools_list:
+                lines.extend(ToolView(t, self.store).render(width))
+            return lines
 
         # 1. If any tool is running, display transient streaming line
         running_tools = [t for t in tools_list if t.status == "running"]

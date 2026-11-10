@@ -1,17 +1,15 @@
-"""Low-level terminal operations, ANSI controls, DECSET 2026, and differential rendering.
+"""Low-level terminal operations, ANSI controls, and DECSET 2026 synchronized output.
 
 Synchronized Output (DECSET 2026: `\\x1b[?2026h` before frame flushes, `\\x1b[?2026l` after)
-ensures flicker-free and tear-free terminal updates.
-The differential renderer commits finalized output directly to native terminal scrollback
-without using DECSET 1049 alternate screen buffer, preserving native scroll history.
+ensures flicker-free and tear-free terminal updates. The app does not use the DECSET
+1049 alternate screen buffer, so native scrollback history is preserved.
 """
 
 from __future__ import annotations
 
 import re
 import shutil
-import sys
-from typing import Any, TextIO
+from typing import Any
 
 import wcwidth
 from prompt_toolkit.cursor_shapes import CursorShape
@@ -23,14 +21,6 @@ from prompt_toolkit.styles import Attrs
 # DECSET 2026 Synchronized Output sequences
 SYNC_START = "\x1b[?2026h"
 SYNC_END = "\x1b[?2026l"
-
-# Cursor and screen controls
-HIDE_CURSOR = "\x1b[?25l"
-SHOW_CURSOR = "\x1b[?25h"
-CLEAR_LINE = "\x1b[2K"
-CLEAR_TO_END = "\x1b[0K"
-CLEAR_BELOW = "\x1b[J"
-CLEAR_SCREEN = "\x1b[2J\x1b[H"
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
@@ -95,119 +85,6 @@ def get_terminal_size() -> tuple[int, int]:
     """Return current terminal dimensions as (columns, lines)."""
     size = shutil.get_terminal_size((80, 24))
     return size.columns, size.lines
-
-
-def cursor_up(n: int) -> str:
-    """Return ANSI cursor up escape sequence if n > 0."""
-    return f"\x1b[{n}A" if n > 0 else ""
-
-
-def cursor_down(n: int) -> str:
-    """Return ANSI cursor down escape sequence if n > 0."""
-    return f"\x1b[{n}B" if n > 0 else ""
-
-
-def cursor_col(n: int = 1) -> str:
-    """Move cursor to 1-based column n."""
-    return f"\x1b[{n}G"
-
-
-class DifferentialRenderer:
-    """Renders dynamic view lines at the bottom of the screen with synchronized output.
-
-    Commits finalized lines into native terminal scrollback so the user retains
-    full scrollback history without alternate screen buffer trapping.
-    """
-
-    def __init__(self, stream: TextIO | None = None) -> None:
-        self.stream: TextIO = stream if stream is not None else sys.stdout
-        self.prev_lines: list[str] = []
-        self._synced: bool = True
-
-    def render_frame(self, lines: list[str]) -> None:
-        """Render a frame differentially over previous lines using DECSET 2026."""
-        if not lines and not self.prev_lines:
-            return
-
-        cols, _ = get_terminal_size()
-        # Truncate lines to terminal width to prevent unexpected wrapping
-        bounded_lines = [
-            truncate_visible(line, cols) if visible_width(line) > cols else line for line in lines
-        ]
-
-        buf: list[str] = []
-        if self._synced:
-            buf.append(SYNC_START)
-
-        # Move cursor to top of previous frame
-        prev_h = len(self.prev_lines)
-        if prev_h > 0:
-            buf.append(cursor_up(prev_h))
-            buf.append(cursor_col(1))
-
-        # Overwrite lines
-        new_h = len(bounded_lines)
-        for line in bounded_lines:
-            buf.append(CLEAR_LINE)
-            buf.append(cursor_col(1))
-            buf.append(line)
-            buf.append("\n")
-
-        # Clear remaining extra lines from previous frame
-        if prev_h > new_h:
-            extra = prev_h - new_h
-            for _ in range(extra):
-                buf.append(CLEAR_LINE)
-                buf.append("\n")
-            buf.append(cursor_up(extra))
-
-        if self._synced:
-            buf.append(SYNC_END)
-
-        self.stream.write("".join(buf))
-        self.stream.flush()
-        self.prev_lines = bounded_lines
-
-    def commit_lines(self, lines: list[str]) -> None:
-        """Clear dynamic active area and permanently commit lines to scrollback."""
-        buf: list[str] = []
-        if self._synced:
-            buf.append(SYNC_START)
-
-        # Clear dynamic frame
-        prev_h = len(self.prev_lines)
-        if prev_h > 0:
-            buf.append(cursor_up(prev_h))
-            buf.append(cursor_col(1))
-            buf.append(CLEAR_BELOW)
-
-        # Output committed lines
-        for line in lines:
-            buf.append(line)
-            buf.append("\n")
-
-        if self._synced:
-            buf.append(SYNC_END)
-
-        self.stream.write("".join(buf))
-        self.stream.flush()
-        self.prev_lines = []
-
-    def clear(self) -> None:
-        """Clear the active dynamic area."""
-        prev_h = len(self.prev_lines)
-        if prev_h > 0:
-            buf: list[str] = []
-            if self._synced:
-                buf.append(SYNC_START)
-            buf.append(cursor_up(prev_h))
-            buf.append(cursor_col(1))
-            buf.append(CLEAR_BELOW)
-            if self._synced:
-                buf.append(SYNC_END)
-            self.stream.write("".join(buf))
-            self.stream.flush()
-            self.prev_lines = []
 
 
 class SynchronizedOutput(Output):

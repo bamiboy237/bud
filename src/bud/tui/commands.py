@@ -119,11 +119,18 @@ async def handle_slash_command(
             lines.append("[Spend History] No ledger requests recorded yet.")
         return "\n".join(lines)
 
+    async def _switch_model(target_model: str) -> str:
+        """Ask the server to pin this session's model, then reflect it locally."""
+        res = await client.post(f"/sessions/{store.session_id}/model", json={"model": target_model})
+        if res.status_code == 422:
+            return f"[model] rejected: {res.json().get('detail', 'unknown model')}"
+        res.raise_for_status()
+        store.set_model(target_model)
+        return f"[model] Session pinned to: {target_model}"
+
     if command == "/model":
         if len(parts) > 1:
-            target_model = parts[1]
-            store.set_model(target_model)
-            return f"[model] Pinned model to: {target_model}"
+            return await _switch_model(parts[1])
 
         # Fetch models from server and launch interactive QUESTION picker
         try:
@@ -144,11 +151,16 @@ async def handle_slash_command(
             # Await choice in background
             async def _await_model_selection() -> None:
                 selected = await future
-                if selected:
-                    store.set_model(selected)
-                    app.commit_scrollback(f"[model] Switched to: {selected}")
-                else:
+                if not selected:
                     app.commit_scrollback("[model] Selection cancelled.")
+                    return
+                try:
+                    app.commit_scrollback(await _switch_model(selected))
+                except httpx.HTTPStatusError as exc:
+                    detail = exc.response.text[:200]
+                    app.commit_scrollback(f"[model] failed: {exc.response.status_code}: {detail}")
+                except httpx.RequestError as exc:
+                    app.commit_scrollback(f"[model] failed: {exc}")
 
             app.spawn_task(_await_model_selection())
             return None

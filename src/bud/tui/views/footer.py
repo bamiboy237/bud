@@ -24,78 +24,79 @@ class FooterView(View):
     def __init__(self, store: StateStore) -> None:
         super().__init__()
         self.store: StateStore = store
-        self.store.subscribe(self.mark_dirty)
 
     def _render(self, width: int) -> list[str]:
         theme = self.store.theme
-        dot = theme.format_dim("·")
 
-        # Status segment
+        # Status segment. Paused is persistent state, not a scrollback event.
         st = self.store.status
-        if st == "idle":
-            status_text = theme.format_dim("idle")
-        elif st in ("thinking", "streaming"):
+        if st in ("thinking", "streaming"):
             status_text = theme.format_accent(st)
         elif st.startswith("tool:"):
             status_text = theme.format_accent("working")
         elif st == "waiting_approval":
             status_text = theme.format_accent("approval needed")
-        elif st == "paused":
-            status_text = theme.format_dim("paused")
+        elif st == "error":
+            status_text = theme.format_error(st)
+        elif self.store.queue_paused or st == "paused":
+            status_text = theme.format_warning("paused")
         else:
-            status_text = theme.format_dim(st)
+            status_text = theme.format_dim("idle")
 
-        # Model
-        model_str = theme.format_primary(self.store.model_id)
+        items: list[str] = [status_text]
 
-        # Tokens
+        queued = len(self.store.queued_messages)
+        if queued:
+            items.append(theme.format_warning(f"{queued} queued"))
+
+        # Optional segments, in the order they should be dropped when space is tight.
+        optional: list[str] = []
         tot_tokens = self.store.input_tokens + self.store.output_tokens
-        token_str = (
-            theme.format_dim(f"{format_token_count(tot_tokens)} tokens") if tot_tokens > 0 else ""
-        )
-
-        # Latency
+        if tot_tokens > 0:
+            optional.append(theme.format_dim(f"{format_token_count(tot_tokens)} tokens"))
         lat = self.store.last_latency_ms
-        lat_str = theme.format_dim(f"{int(lat)}ms") if lat > 0 else ""
+        if lat > 0:
+            optional.append(theme.format_dim(f"{int(lat)}ms"))
+        optional.append(theme.format_primary(self.store.model_id))
 
-        # Shortcuts based on mode
+        # Key hints for the active mode; the footer is the single hint home.
         if self.store.mode == InputMode.APPROVAL:
             hint = theme.format_dim("y approve · n deny · Esc cancel")
+            condensed = theme.format_dim("y · n · Esc")
         elif self.store.mode == InputMode.QUESTION:
             hint = theme.format_dim("↑/↓ navigate · Enter select · Esc cancel")
+            condensed = theme.format_dim("↑/↓ · Enter")
         elif self.store.pending_approvals:
             hint = theme.format_accent("approval pending")
-        else:
+            condensed = theme.format_accent("approval pending")
+        elif st in ("thinking", "streaming") or st.startswith("tool:"):
             hint = theme.format_dim("Tab tools · Esc stop · /help · Ctrl-D exit")
-
-        # Assemble left items with middle dots
-        items = [status_text, model_str]
-        if token_str:
-            items.append(token_str)
-        if lat_str:
-            items.append(lat_str)
-
-        left = f"  {f' {dot} '.join(items)}"
-
-        # Spacing to right-aligned hint (keep 2-col safety margin from right edge)
-        # to prevent terminal emulator automatic wrap onto the next line
-        target_w = max(20, width - 2)
-        total_needed = visible_width(left) + visible_width(hint) + 2
-
-        if total_needed <= target_w:
-            pad = max(1, target_w - visible_width(left) - visible_width(hint))
-            line = f"{left}{' ' * pad}{hint}"
+            condensed = theme.format_dim("Esc stop · /help")
         else:
-            # Try condensed hint if space is tight at standard 80 columns
-            condensed = (
-                theme.format_dim("Tab tools · /help")
-                if self.store.mode == InputMode.PROMPT
-                else theme.format_dim("↑/↓ · Enter")
-            )
-            if visible_width(left) + visible_width(condensed) + 2 <= target_w:
-                pad = max(1, target_w - visible_width(left) - visible_width(condensed))
-                line = f"{left}{' ' * pad}{condensed}"
-            else:
-                line = truncate_visible(left, target_w)
+            hint = theme.format_dim("Tab tools · /help · Ctrl-D exit")
+            condensed = theme.format_dim("/help")
 
-        return [line]
+        dot = theme.format_dim("·")
+        # 2-col safety margin from the right edge prevents emulator wrap.
+        target_w = max(20, width - 2)
+
+        def fits(left: str, right: str) -> bool:
+            return visible_width(left) + 2 + visible_width(right) <= target_w
+
+        def assemble(parts: list[str]) -> str:
+            return f"  {f' {dot} '.join(parts)}"
+
+        hint_str, condensed_str = hint, condensed
+        while True:
+            left = assemble(items + optional)
+            if fits(left, hint_str):
+                pad = max(1, target_w - visible_width(left) - visible_width(hint_str))
+                return [f"{left}{' ' * pad}{hint_str}"]
+            if optional:
+                optional.pop()
+                continue
+            left = assemble(items)
+            if fits(left, condensed_str):
+                pad = max(1, target_w - visible_width(left) - visible_width(condensed_str))
+                return [f"{left}{' ' * pad}{condensed_str}"]
+            return [truncate_visible(left, target_w)]

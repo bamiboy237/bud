@@ -73,7 +73,8 @@ class StateStore:
 
         # Run and live streaming state
         self.active_run_id: str | None = None
-        self.streaming_text: str = ""
+        self._stream_chunks: list[str] = []
+        self.last_event: str = ""
         self.seen_requests: set[str] = set()
         self.turn_start_time: float | None = None
         self.first_token_time: float | None = None
@@ -108,6 +109,15 @@ class StateStore:
         # Subscribers
         self._listeners: list[Callable[[], None]] = []
 
+    @property
+    def streaming_text(self) -> str:
+        """Accumulated streamed text; chunks are buffered to avoid O(n^2) concatenation."""
+        return "".join(self._stream_chunks)
+
+    @streaming_text.setter
+    def streaming_text(self, value: str) -> None:
+        self._stream_chunks = [value] if value else []
+
     def subscribe(self, callback: Callable[[], None]) -> Callable[[], None]:
         """Subscribe to state changes. Returns an unsubscribe callable."""
         self._listeners.append(callback)
@@ -133,6 +143,7 @@ class StateStore:
         new_theme = get_theme(name)
         self.theme_name = new_theme.name
         self.theme = new_theme
+        self.last_event = "ui.theme"
         self.notify()
         return True
 
@@ -141,10 +152,12 @@ class StateStore:
         cleaned = style.strip().lower()
         if cleaned in ("rounded", "round"):
             self.border_style = "rounded"
+            self.last_event = "ui.border"
             self.notify()
             return True
         if cleaned in ("square", "sq"):
             self.border_style = "square"
+            self.last_event = "ui.border"
             self.notify()
             return True
         return False
@@ -184,6 +197,7 @@ class StateStore:
         self.tools_expanded_global = not self.tools_expanded_global
         for tool in self.tools.values():
             tool.expanded = self.tools_expanded_global
+        self.last_event = "tool.toggle"
         self.notify()
 
     def current_approval(self) -> ApprovalState | None:
@@ -249,21 +263,26 @@ class StateStore:
         event_type = event.get("type", "")
         data = event.get("data", {})
         seq = event.get("seq", 0)
+        self.last_event = event_type
 
         match event_type:
             case "user.message":
                 text = data.get("text", "")
                 self.turns.append(Turn(role="you", text=text))
+                # Own terminal messages were already committed to scrollback when
+                # submitted; only echo messages that arrived from other clients.
+                if (data.get("origin") or {}).get("channel") == "terminal":
+                    self.notify()
+                    return None
                 self.notify()
                 return f"{self.theme.format_primary('you ›', bold=True)} {text}"
 
             case "message.queued":
+                # Track for /edit and /cancel, but don't echo: the user.message
+                # turn already shows the sent text.
                 self.queued_messages.append(data)
                 self.notify()
-                return (
-                    f"{self.theme.format_muted('◷ queued')} "
-                    f"{data.get('message_id')}: {data.get('text')}"
-                )
+                return None
 
             case "message.edited":
                 mid = data.get("message_id")
@@ -271,7 +290,7 @@ class StateStore:
                     if msg.get("message_id") == mid:
                         msg["text"] = data.get("text")
                 self.notify()
-                return f"{self.theme.format_muted('✎ edited')} {mid}: {data.get('text')}"
+                return f"{self.theme.format_muted('edited')} {mid}: {data.get('text')}"
 
             case "message.cancelled":
                 mid = data.get("message_id")
@@ -279,17 +298,18 @@ class StateStore:
                     m for m in self.queued_messages if m.get("message_id") != mid
                 ]
                 self.notify()
-                return f"{self.theme.format_muted('✕ cancelled message')} {mid}"
+                return f"{self.theme.format_muted('cancelled message')} {mid}"
 
             case "queue.paused":
+                # Persistent state; shown in the footer rather than the scrollback.
                 self.queue_paused = True
                 self.notify()
-                return self.theme.format_warning("⏸ queue paused", bold=True)
+                return None
 
             case "queue.resumed":
                 self.queue_paused = False
                 self.notify()
-                return self.theme.format_success("▶ queue resumed", bold=True)
+                return None
 
             case "run.started":
                 self.active_run_id = data.get("run_id")
@@ -304,7 +324,7 @@ class StateStore:
             case "run.recovered":
                 self.status = "thinking"
                 self.notify()
-                return self.theme.format_info("↻ recovering interrupted work", bold=True)
+                return self.theme.format_info("recovering interrupted work", bold=True)
 
             case "text.reset":
                 req = data.get("request", "")
@@ -320,7 +340,7 @@ class StateStore:
                 if self.first_token_time is None and self.turn_start_time is not None:
                     self.first_token_time = now
                     self.last_latency_ms = (now - self.turn_start_time) * 1000.0
-                self.streaming_text += chunk
+                self._stream_chunks.append(chunk)
                 self.output_tokens += max(1, len(chunk.split()))
                 self.status = "streaming"
                 self.notify()
@@ -405,12 +425,34 @@ class StateStore:
                 self.notify()
                 return f"{self.theme.format_error('✗ denied', bold=True)} {app_id}"
 
+            case "task.created":
+                ref = data.get("reference") or data.get("task_id", "")
+                text = data.get("text") or data.get("title", "")
+                self.notify()
+                return f"{self.theme.format_muted('task')} {ref}: {text}"
+
+            case "task.completed":
+                ref = data.get("reference") or data.get("task_id", "")
+                text = data.get("text", "")
+                self.notify()
+                return f"{self.theme.format_success('✓ task', bold=True)} {ref}: {text}"
+
+            case "task.failed":
+                ref = data.get("reference") or data.get("task_id", "")
+                text = data.get("text", "")
+                self.notify()
+                return f"{self.theme.format_error('✗ task failed', bold=True)} {ref}: {text}"
+
+            case "task.cancelled":
+                ref = data.get("reference") or data.get("task_id", "")
+                self.notify()
+                return f"{self.theme.format_muted('task cancelled')} {ref}"
+
             case "run.stop_requested":
+                # The slash passthrough already echoed this; the footer carries the state.
                 self.status = "paused"
                 self.notify()
-                return self.theme.format_warning(
-                    "■ stop requested; queue paused; authorized actions may finish", bold=True
-                )
+                return None
 
             case "run.cancelled":
                 self.status = "idle"
@@ -420,9 +462,9 @@ class StateStore:
                 self.notify()
                 if uncertain:
                     return self.theme.format_warning(
-                        f"■ stopped; verify outcome of: {', '.join(uncertain)}", bold=True
+                        f"stopped; verify outcome of: {', '.join(uncertain)}", bold=True
                     )
-                return self.theme.format_muted("■ run cancelled")
+                return self.theme.format_muted("run cancelled")
 
             case "run.failed":
                 reason = data.get("reason", "unknown error")

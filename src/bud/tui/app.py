@@ -7,6 +7,7 @@ import contextlib
 import functools
 import json
 import logging
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -67,6 +68,9 @@ class TUIApp:
         # Reactive subscription
         self.store.subscribe(self._on_state_change)
 
+        # Composer containers are cached per (mode, border style); see _render_framed_composer.
+        self._composer_cache: dict[tuple[InputMode, str], Any] = {}
+
         # Build prompt-toolkit application
         self.pt_app: Application = self._build_pt_app()
 
@@ -80,6 +84,7 @@ class TUIApp:
         self._cached_dynamic_cols: int = 0
         self._cached_dynamic_content: FormattedText | ANSI = FormattedText([])
         self._cached_dynamic_height: int = 0
+        self._last_stream_render: float = 0.0
 
     def spawn_task(self, coro: Any) -> asyncio.Task[Any]:
         """Spawn a background task with strong reference tracking to prevent GC drops."""
@@ -92,19 +97,47 @@ class TUIApp:
         """Called whenever reactive StateStore updates."""
         # Invalidate dynamic content cache
         self._dynamic_dirty = True
+        event = self.store.last_event
 
-        # Sync streaming text
-        if self.store.status in ("thinking", "streaming") or self.store.streaming_text:
+        # Sync streaming text. Markdown re-parse of the full reply is expensive, so
+        # while tokens stream in, re-render at most ~8fps; always render on other
+        # events and the final text when the run ends.
+        streaming_active = (
+            self.store.status in ("thinking", "streaming") or self.store.streaming_text
+        )
+        if streaming_active:
             if not self.streaming_view._is_streaming:
                 self.streaming_view.start_streaming()
-            self.streaming_view.set_text(self.store.streaming_text)
-        else:
-            if self.streaming_view._is_streaming:
-                self.streaming_view.finish_streaming(self.store.streaming_text)
+                self.streaming_view.set_text(self.store.streaming_text)
+                self._last_stream_render = time.monotonic()
+            elif event == "text.delta":
+                now = time.monotonic()
+                if now - self._last_stream_render >= 0.12:
+                    self._last_stream_render = now
+                    self.streaming_view.set_text(self.store.streaming_text)
+            else:
+                self.streaming_view.set_text(self.store.streaming_text)
+        elif self.streaming_view._is_streaming:
+            self.streaming_view.finish_streaming(self.store.streaming_text)
 
-        self.streaming_view.mark_dirty()
-        self.tools_view.mark_dirty()
-        self.question_view.mark_dirty()
+        # Scope dirty-marking to the views the event can affect. The views do not
+        # self-subscribe; this is the single invalidation point.
+        if event.startswith("tool.") or event in (
+            "run.started",
+            "run.completed",
+            "run.waiting",
+            "run.failed",
+            "run.cancelled",
+            "run.recovered",
+        ):
+            self.tools_view.mark_dirty()
+        if event in ("ui.theme", "ui.border"):
+            # Restyle invalidates every cached render.
+            self.tools_view.mark_dirty()
+            self.question_view.mark_dirty()
+            self.streaming_view.mark_dirty()
+        if self.store.mode == InputMode.QUESTION:
+            self.question_view.mark_dirty()
         self.footer_view.mark_dirty()
 
         # Invalidate prompt-toolkit layout to trigger redraw
@@ -211,24 +244,29 @@ class TUIApp:
         )
 
         def _render_framed_composer() -> Any:
-            if self.store.mode != InputMode.PROMPT:
-                return Window(height=Dimension.exact(0), dont_extend_height=True)
+            # The frame only depends on mode and border style; rebuild per frame
+            # would churn ~16 prompt-toolkit objects at event rate for nothing.
+            key = (self.store.mode, self.store.border_style)
+            cached = self._composer_cache.get(key)
+            if cached is not None:
+                return cached
 
-            style = getattr(self.store, "border_style", "rounded")
+            if self.store.mode != InputMode.PROMPT:
+                container: Any = Window(height=Dimension.exact(0), dont_extend_height=True)
+                self._composer_cache[key] = container
+                return container
+
+            style = self.store.border_style
             if style == "square":
                 tl, tr, bl, br, h, v = "┌", "┐", "└", "┘", "─", "│"
             else:
                 tl, tr, bl, br, h, v = "╭", "╮", "╰", "╯", "─", "│"
-
-            from prompt_toolkit.widgets import Label
 
             fill = functools.partial(Window, style="class:card.border")
             top = VSplit(
                 [
                     fill(width=2, height=1, char=" "),
                     fill(width=1, height=1, char=tl),
-                    fill(width=1, height=1, char=h),
-                    Label(" you ", style="class:card.title", dont_extend_width=True),
                     fill(char=h),
                     fill(width=1, height=1, char=tr),
                     fill(width=2, height=1, char=" "),
@@ -259,9 +297,12 @@ class TUIApp:
                 height=1,
             )
 
-            return HSplit([top, mid, bot])
+            container = HSplit([top, mid, bot])
+            self._composer_cache[key] = container
+            return container
 
         framed_composer = DynamicContainer(_render_framed_composer)
+        self._render_composer = _render_framed_composer
 
         # Footer window
         footer_control = FormattedTextControl(
@@ -296,7 +337,6 @@ class TUIApp:
             "style": self.store.theme.to_prompt_toolkit_style(),
             "output": sync_output,
             "full_screen": False,
-            "refresh_interval": 0.05,  # 50ms refresh for smooth spinners and streaming
         }
         if self._custom_input is not None:
             app_kwargs["input"] = self._custom_input
@@ -331,8 +371,22 @@ class TUIApp:
 
     async def _process_user_input(self, text: str) -> None:
         """Process submitted prompt text (slash commands or session message)."""
+        # If an approval is pending but the user dismissed the card with Esc,
+        # reclaim the keyboard so y/n stays reachable.
+        if self.store.pending_approvals and self.store.mode == InputMode.PROMPT:
+            self.store.set_mode(InputMode.APPROVAL)
         if text.startswith("/"):
-            result = await handle_slash_command(self.client, self.store, self, text)
+            try:
+                result = await handle_slash_command(self.client, self.store, self, text)
+            except httpx.HTTPStatusError as exc:
+                self.commit_scrollback(
+                    f"{self.store.theme.format_error('[command failed]')} "
+                    f"{exc.response.status_code}: {exc.response.text[:200]}"
+                )
+                return
+            except httpx.RequestError as exc:
+                self.commit_scrollback(f"{self.store.theme.format_error('[command failed]')} {exc}")
+                return
             if result == "__CLEAR__":
                 self.clear_screen()
             elif result:
@@ -469,6 +523,7 @@ class TUIApp:
                                     if summary_card:
                                         self.commit_scrollback(summary_card)
                                     self.store.tools.clear()
+                                    self.store.notify()  # drop the stale card from the live pane
 
                                 full_reply = reply_text(
                                     raw_event.get("data", {}).get("messages", [])
@@ -516,15 +571,15 @@ class TUIApp:
             welcome = (
                 f"{th.format_accent('bud', bold=True)} "
                 f"{th.format_dim('session:')} {th.format_secondary(self.session_id)} "
-                f"{th.format_dim('•')} {th.format_dim('/help for commands • Ctrl-D to exit')}"
+                f"{th.format_dim('·')} {th.format_dim('/help for commands · Ctrl-D to exit')}"
             )
             self.commit_scrollback(welcome)
 
+            cols, _ = get_terminal_size()
             for turn in snapshot.get("transcript", []):
-                role = turn.get("role", "bud")
+                role = {"user": "you", "assistant": "bud"}.get(turn.get("role", ""), "bud")
                 text = turn.get("text", "")
                 view = MessageView(role, text, self.store)
-                cols, _ = get_terminal_size()
                 self.commit_scrollback(view.render(cols))
 
             # Initial approvals if any

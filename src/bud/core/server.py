@@ -424,6 +424,13 @@ def _create_app(
         _apply_model(session_id, request)
         return {"session_id": session_id}
 
+    @app.post("/sessions/{session_id}/model")
+    def set_session_model(session_id: str, request: NewSession) -> dict[str, str]:
+        require_session(session_id)
+        _apply_model(session_id, request)
+        hub.wake(session_id)
+        return {"session_id": session_id, "model": request.model or ""}
+
     @app.get("/sessions/{session_id}")
     def get_session(session_id: str) -> Snapshot:
         require_session(session_id)

@@ -46,7 +46,6 @@ def render_box(
     width: int = 80,
     theme: Theme | None = None,
     style: BoxStyle = "rounded",
-    footer_text: str = "",
     indent: int = 2,
     inner_padding_x: int = 1,
 ) -> list[str]:
@@ -58,7 +57,6 @@ def render_box(
         width: Total available terminal columns.
         theme: Theme providing format_border and text colors.
         style: 'rounded' (╭─) or 'square' (┌─).
-        footer_text: Optional text/shortcuts embedded in the bottom border.
         indent: Left column indentation margin (defaults to 2 spaces).
         inner_padding_x: Left and right horizontal padding inside the box (defaults to 1 space).
 
@@ -125,25 +123,8 @@ def render_box(
                 )
             lines.append(row)
 
-    # 3. Bottom border with optional footer
-    if footer_text:
-        clean_footer = f" {footer_text.strip()} "
-        footer_w = visible_width(clean_footer)
-        available_h = box_w - 2 - 1 - footer_w
-        if available_h >= 1:
-            right_h = h * available_h
-            bot_line = (
-                f"{indent_str}{style_border(bl + h)}{clean_footer}{style_border(right_h + br)}"
-            )
-        else:
-            truncated_footer = truncate_visible(clean_footer, box_w - 6)
-            rem_h = max(1, box_w - 3 - visible_width(truncated_footer))
-            bot_line = (
-                f"{indent_str}{style_border(bl + h)}{truncated_footer}"
-                f"{style_border((h * rem_h) + br)}"
-            )
-    else:
-        bot_line = f"{indent_str}{style_border(bl + (h * (box_w - 2)) + br)}"
+    # 3. Bottom border
+    bot_line = f"{indent_str}{style_border(bl + (h * (box_w - 2)) + br)}"
 
     lines.append(bot_line)
     return lines
