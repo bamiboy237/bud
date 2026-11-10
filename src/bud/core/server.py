@@ -154,7 +154,7 @@ def _create_app(
         db_path = session_dir / "bud.db"
         gateway = build_gateway(
             settings,
-            providers={"openai-chatgpt", "openai", "meta", "mistral"},
+            providers={"openai-chatgpt", "openai", "meta", "mistral", "deepseek"},
             model_id=model_id,
         )
         tools_policy = policy()

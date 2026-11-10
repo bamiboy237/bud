@@ -46,9 +46,14 @@ def build_gateway(
     elif chatgpt.connected and settings.models_file is None:
         if not selected or selected not in {spec.name for spec in chatgpt_models}:
             raise NoModelAvailable("ChatGPT has no saved model catalog. Run `bud models`.")
+        seen: set[tuple[str, str]] = set()
         registry = Registry(
-            models=[spec for spec in chatgpt_models if spec.name == selected]
-            + [spec for spec in registry.models if spec.provider == "meta"]
+            models=[
+                spec
+                for spec in [spec for spec in chatgpt_models if spec.name == selected]
+                + registry.models
+                if (spec.id, spec.tier) not in seen and not seen.add((spec.id, spec.tier))
+            ]
         )
     if providers is not None:
         registry = Registry(
