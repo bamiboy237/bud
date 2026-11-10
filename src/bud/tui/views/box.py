@@ -13,7 +13,7 @@ from typing import Literal
 from bud.tui.terminal import truncate_visible, visible_width
 from bud.tui.themes import Theme
 
-BoxStyle = Literal["rounded", "square"]
+BoxStyle = Literal["rounded", "square", "left"]
 
 
 ROUNDED_GLYPHS: dict[str, str] = {
@@ -63,17 +63,29 @@ def render_box(
     Returns:
         List of formatted terminal string lines.
     """
+    indent_str = " " * indent
+
+    def style_border(char: str) -> str:
+        return theme.format_border(char) if theme else char
+
+    if style == "left":
+        v_bar = style_border("│")
+        res: list[str] = []
+        if title:
+            res.append(f"{indent_str}{v_bar} {title}")
+        if body_lines:
+            for line in body_lines:
+                res.append(f"{indent_str}{v_bar} {line}")
+        if footer_text:
+            res.append(f"{indent_str}{v_bar} {footer_text}")
+        return res
+
     glyphs = get_box_glyphs(style)
     tl, tr, bl, br = glyphs["tl"], glyphs["tr"], glyphs["bl"], glyphs["br"]
     h, v = glyphs["h"], glyphs["v"]
 
     # Calculate outer box width (ensuring 2-col right margin safety)
-    indent_str = " " * indent
     box_w = max(24, width - indent - 2)
-
-    def style_border(char: str) -> str:
-        return theme.format_border(char) if theme else char
-
     lines: list[str] = []
 
     # 1. Top border with optional title
@@ -128,3 +140,48 @@ def render_box(
 
     lines.append(bot_line)
     return lines
+
+
+def render_user_card(
+    text: str,
+    width: int = 80,
+    theme: Theme | None = None,
+    style: BoxStyle = "rounded",
+    indent: int = 2,
+    title: str = "",
+) -> list[str]:
+    """Render an OpenCode user turn card with proper hairline framing."""
+    lines = text.splitlines() or [""]
+    styled_title = theme.format_primary(title, bold=True) if theme and title else title
+    return render_box(
+        title=styled_title,
+        body_lines=lines,
+        width=width,
+        theme=theme,
+        style=style,
+        indent=indent,
+        inner_padding_x=1,
+    )
+
+
+def render_action_card(
+    title: str,
+    content_lines: list[str],
+    width: int = 80,
+    theme: Theme | None = None,
+    style: BoxStyle = "rounded",
+    footer_text: str = "",
+    indent: int = 2,
+) -> list[str]:
+    """Render a notification or action card (e.g. connections, auth URLs)."""
+    styled_title = theme.format_accent(title, bold=True) if theme else title
+    return render_box(
+        title=styled_title,
+        body_lines=content_lines,
+        width=width,
+        theme=theme,
+        style=style,
+        footer_text=footer_text,
+        indent=indent,
+        inner_padding_x=1,
+    )

@@ -190,12 +190,8 @@ class TUIApp:
         return ANSI(lines[0] if lines else "")
 
     def _get_prompt_prefix(self, line_no: int = 0) -> FormattedText:
-        """Return the prompt symbol prefix."""
-        if self.store.mode != InputMode.PROMPT:
-            return FormattedText([])
-        if line_no == 0:
-            return FormattedText([("class:prompt.symbol", "› ")])
-        return FormattedText([("class:prompt.symbol", "· ")])
+        """Return the prompt symbol prefix. Inside the framed composer, text starts cleanly."""
+        return FormattedText([])
 
     def _build_pt_app(self) -> Application:
         """Assemble the prompt-toolkit inline Application with SynchronizedOutput."""
@@ -286,6 +282,38 @@ class TUIApp:
                 ]
             )
 
+            def get_meta_text() -> FormattedText:
+                model_name = self.store.model_id or "default"
+                return FormattedText(
+                    [
+                        ("class:composer.badge", "Bud"),
+                        ("class:composer.meta", f" · {model_name} Default"),
+                    ]
+                )
+
+            meta_control = FormattedTextControl(
+                text=get_meta_text,
+                focusable=False,
+                show_cursor=False,
+            )
+            meta_window = Window(
+                content=meta_control,
+                height=Dimension.exact(1),
+                dont_extend_height=True,
+            )
+            meta_row = VSplit(
+                [
+                    fill(width=2, height=1, char=" "),
+                    fill(width=1, height=1, char=v),
+                    Window(width=1, height=1, char=" "),
+                    meta_window,
+                    Window(width=1, height=1, char=" "),
+                    fill(width=1, height=1, char=v),
+                    fill(width=2, height=1, char=" "),
+                ],
+                height=1,
+            )
+
             bot = VSplit(
                 [
                     fill(width=2, height=1, char=" "),
@@ -316,13 +344,25 @@ class TUIApp:
             dont_extend_height=True,
         )
 
+        from prompt_toolkit.layout.containers import Float, FloatContainer
+        from prompt_toolkit.layout.menus import CompletionsMenu
+
         root_layout = Layout(
-            HSplit(
-                [
-                    dynamic_window,
-                    framed_composer,
-                    footer_window,
-                ]
+            FloatContainer(
+                content=HSplit(
+                    [
+                        dynamic_window,
+                        framed_composer,
+                        footer_window,
+                    ]
+                ),
+                floats=[
+                    Float(
+                        xcursor=True,
+                        ycursor=True,
+                        content=CompletionsMenu(max_height=8, scroll_offset=1),
+                    )
+                ],
             ),
             focused_element=input_window,
         )
@@ -396,9 +436,14 @@ class TUIApp:
         # Add to prompt history
         self.store.add_prompt_history(text)
 
-        # Commit user's message line to scrollback immediately
-        user_line = f"{self.store.theme.format_primary('you ›', bold=True)} {text}"
-        self.commit_scrollback(user_line)
+        # Commit user's message card to scrollback immediately
+        cols, _ = get_terminal_size()
+        border_style = self.store.border_style
+        from bud.tui.views.box import render_user_card
+
+        user_card = render_user_card(text, width=cols, theme=self.store.theme, style=border_style)
+        self.commit_scrollback(user_card)
+        self.commit_scrollback("")
 
         # Send to server
         try:
@@ -574,6 +619,7 @@ class TUIApp:
                 f"{th.format_dim('·')} {th.format_dim('/help for commands · Ctrl-D to exit')}"
             )
             self.commit_scrollback(welcome)
+            self.commit_scrollback("")
 
             cols, _ = get_terminal_size()
             for turn in snapshot.get("transcript", []):
@@ -581,6 +627,7 @@ class TUIApp:
                 text = turn.get("text", "")
                 view = MessageView(role, text, self.store)
                 self.commit_scrollback(view.render(cols))
+                self.commit_scrollback("")
 
             # Initial approvals if any
             for app_data in snapshot.get("pending_approvals", []):
