@@ -43,7 +43,7 @@ class TestThemes(unittest.TestCase):
         self.assertEqual(hex_to_rgb("#88C0D0"), (136, 192, 208))
 
         formatted = nord.format_primary("test")
-        self.assertIn("\x1b[38;2;136;192;208m", formatted)
+        self.assertIn("\x1b[38;2;236;239;244m", formatted)
         self.assertIn("test", formatted)
 
     def test_theme_fallback(self) -> None:
@@ -155,23 +155,26 @@ class TestToolView(unittest.TestCase):
         )
         tool.finish("File created successfully.")
 
-        # Collapsed render (1 line)
+        # Collapsed render (1 line, natural human summary)
         widget = ToolView(tool)
         collapsed_lines = widget.render(80)
         self.assertEqual(len(collapsed_lines), 1)
         plain_c = strip_ansi(collapsed_lines[0])
-        self.assertIn("▸ workspace_create", plain_c)
-        self.assertIn("✓", plain_c)
+        self.assertIn("Saved test.txt", plain_c)
+        self.assertIn("done", plain_c)
 
-        # Expanded render (shows args & result)
+        # Expanded render (shows clean params & clean result, zero curly braces)
         tool.expanded = True
         widget.mark_dirty()
         expanded_lines = widget.render(80)
         self.assertGreater(len(expanded_lines), 1)
         plain_e = strip_ansi("\n".join(expanded_lines))
-        self.assertIn("▾ workspace_create", plain_e)
-        self.assertIn("path:", plain_e)
+        self.assertIn("Saved test.txt", plain_e)
+        self.assertIn("Path: test.txt", plain_e)
         self.assertIn("File created successfully", plain_e)
+        # Ensure zero curly braces or JSON brackets
+        self.assertNotIn("{", plain_e)
+        self.assertNotIn("}", plain_e)
 
 
 class TestApprovalView(unittest.TestCase):
@@ -187,11 +190,16 @@ class TestApprovalView(unittest.TestCase):
         lines = view.render(80)
         plain = strip_ansi("\n".join(lines))
 
-        self.assertIn("Permission Required: Send an email", plain)
+        self.assertIn("Action Required: Send email to alice@example.com", plain)
         self.assertIn("alice@example.com", plain)
         self.assertIn("[y] Approve", plain)
         self.assertIn("[n] Deny", plain)
-        self.assertIn("[Esc] Cancel", plain)
+        self.assertIn("[esc] Cancel", plain)
+        # Ensure zero ASCII rounded borders and zero curly braces
+        self.assertNotIn("╭", plain)
+        self.assertNotIn("╰", plain)
+        self.assertNotIn("{", plain)
+        self.assertNotIn("}", plain)
 
 
 class TestQuestionView(unittest.TestCase):
@@ -205,8 +213,10 @@ class TestQuestionView(unittest.TestCase):
         plain = strip_ansi("\n".join(lines))
 
         self.assertIn("Choose a model:", plain)
-        self.assertIn("● gpt-4o", plain)
-        self.assertIn("○ mistral-small", plain)
+        self.assertIn("› gpt-4o", plain)
+        self.assertIn("mistral-small", plain)
+        self.assertNotIn("●", plain)
+        self.assertNotIn("○", plain)
 
         # Move down
         store.select_next_choice()
@@ -214,8 +224,9 @@ class TestQuestionView(unittest.TestCase):
 
         lines2 = view.render(80)
         plain2 = strip_ansi("\n".join(lines2))
-        self.assertIn("○ gpt-4o", plain2)
-        self.assertIn("● mistral-small", plain2)
+        self.assertIn("› mistral-small", plain2)
+        self.assertNotIn("●", plain2)
+        self.assertNotIn("○", plain2)
 
 
 class TestFooterView(unittest.TestCase):
@@ -233,6 +244,7 @@ class TestFooterView(unittest.TestCase):
         self.assertIn("gpt-4o-mini", plain)
         self.assertIn("1.3k tokens", plain)
         self.assertIn("185ms", plain)
+        self.assertNotIn("│", plain)
 
 
 class TestStateStore(unittest.TestCase):

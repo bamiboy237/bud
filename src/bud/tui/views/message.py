@@ -12,6 +12,18 @@ from bud.tui.state import StateStore
 from bud.tui.views.base import View
 
 
+def get_code_theme_for_theme(theme_name: str) -> str:
+    """Map UI theme to a subdued, tasteful pygments syntax theme."""
+    mapping = {
+        "nord": "nord",
+        "gruvbox": "gruvbox-dark",
+        "catppuccin": "one-dark",
+        "tokyo-night": "material",
+        "default": "one-dark",
+    }
+    return mapping.get(theme_name, "one-dark")
+
+
 class MessageView(View):
     """Renders a single message with markdown formatting and syntax highlighting."""
 
@@ -69,12 +81,12 @@ class MessageView(View):
 
         if not current_text and self._is_streaming:
             prefix = theme.format_accent("bud ›", bold=True) if theme else "\x1b[1mbud ›\x1b[0m"
-            spinner = theme.format_muted("thinking…") if theme else "thinking…"
+            spinner = theme.format_dim("thinking…") if theme else "thinking…"
             return [f"{prefix} {spinner}"]
 
         # Format user vs assistant
         if self.role == "you":
-            prefix = theme.format_primary("you ›", bold=True) if theme else "\x1b[1;36myou ›\x1b[0m"
+            prefix = theme.format_primary("you ›", bold=True) if theme else "\x1b[1myou ›\x1b[0m"
             user_lines = current_text.splitlines() or [""]
             res = [f"{prefix} {user_lines[0]}"]
             indent = "      "
@@ -83,7 +95,7 @@ class MessageView(View):
             return res
 
         # Assistant role: parse markdown using rich
-        prefix = theme.format_accent("bud ›", bold=True) if theme else "\x1b[1;35mbud ›\x1b[0m"
+        prefix = theme.format_accent("bud ›", bold=True) if theme else "\x1b[1mbud ›\x1b[0m"
         content_width = max(20, width - 2)
 
         try:
@@ -95,7 +107,9 @@ class MessageView(View):
                 width=content_width,
                 highlight=True,
             )
-            md = Markdown(current_text, code_theme="monokai")
+            theme_name = theme.name if theme else "default"
+            pygments_theme = get_code_theme_for_theme(theme_name)
+            md = Markdown(current_text, code_theme=pygments_theme)
             console.print(md)
             rendered_lines = [line.rstrip() for line in buf.getvalue().splitlines()]
         except Exception:

@@ -24,7 +24,7 @@ from bud.tui.commands import handle_slash_command
 from bud.tui.keymap import build_key_bindings
 from bud.tui.state import InputMode, StateStore
 from bud.tui.terminal import SynchronizedOutput, get_terminal_size
-from bud.tui.views.approval import ApprovalView
+from bud.tui.views.approval import ApprovalView, friendly_action_title
 from bud.tui.views.footer import FooterView
 from bud.tui.views.message import MessageView
 from bud.tui.views.question import QuestionView
@@ -306,7 +306,8 @@ class TUIApp:
                 if approved
                 else self.store.theme.format_error(f"[{label}]", bold=True)
             )
-            self.commit_scrollback(f"{tag} {app_id} ({approval.tool})")
+            action_desc = friendly_action_title(approval.tool, approval.args)
+            self.commit_scrollback(f"{tag} {action_desc}")
             # Clear pending approval immediately in local state
             self.store.pending_approvals = [
                 a for a in self.store.pending_approvals if a.approval_id != app_id

@@ -1,6 +1,7 @@
 """Interactive choice selector view for Bud TUI.
 
-Allows keyboard navigation via arrow keys (or j/k), Enter to confirm, and Esc to cancel.
+Provides a clean typographic chevron selector inspired by OpenCode and Claude Code.
+Eliminates web radio circles (○, ●) and question mark icons.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from bud.tui.views.base import View
 
 
 class QuestionView(View):
-    """Renders an interactive choice selector menu."""
+    """Renders an interactive choice selector menu with chevron pointers."""
 
     def __init__(self, store: StateStore) -> None:
         super().__init__()
@@ -20,13 +21,11 @@ class QuestionView(View):
 
     def _render(self, width: int) -> list[str]:
         theme = self.store.theme
-        lines: list[str] = []
+        lines: list[str] = [""]
 
         # Question prompt
         title = self.store.question_title or "Select an option:"
-        prompt_line = (
-            f" {theme.format_accent('?', bold=True)} {theme.format_primary(title, bold=True)}"
-        )
+        prompt_line = f"  {theme.format_primary(title, bold=True)}"
         lines.append(truncate_visible(prompt_line, width))
 
         # Choices
@@ -36,17 +35,18 @@ class QuestionView(View):
         for idx, choice in enumerate(choices):
             is_selected = idx == selected_idx
             if is_selected:
-                bullet = theme.format_accent("●", bold=True)
+                pointer = theme.format_accent("›", bold=True)
                 choice_str = theme.format_accent(choice, bold=True)
-                line = f"   {bullet} {choice_str}"
+                line = f"    {pointer} {choice_str}"
             else:
-                bullet = theme.format_muted("○")
                 choice_str = theme.format_muted(choice)
-                line = f"   {bullet} {choice_str}"
+                line = f"      {choice_str}"
             lines.append(truncate_visible(line, width))
 
         # Navigation hint
-        hint = theme.format_dim(" [↑/↓ navigate • Enter select • Esc cancel]")
+        hint = theme.format_dim("  ↑/↓ navigate · Enter select · Esc cancel")
+        lines.append("")
         lines.append(truncate_visible(hint, width))
+        lines.append("")
 
         return lines

@@ -1,4 +1,8 @@
-"""Muted one-line status bar for Bud TUI displaying model, tokens, latency, and hotkeys."""
+"""Muted one-line status bar for Bud TUI displaying model, metrics, and hotkeys.
+
+Ultra-quiet, calm status bar inspired by Emil Kowalski and pi-tui.
+Eliminates neon circles, warning emojis, and harsh vertical pipes.
+"""
 
 from __future__ import annotations
 
@@ -24,62 +28,63 @@ class FooterView(View):
 
     def _render(self, width: int) -> list[str]:
         theme = self.store.theme
-        pipe = theme.format_dim("│")
+        dot = theme.format_dim("·")
 
-        # Status badge
+        # Status segment
         st = self.store.status
         if st == "idle":
-            status_badge = theme.format_dim("● idle")
-        elif st in ("thinking", "streaming") or st.startswith("tool:"):
-            status_badge = theme.format_accent(f"⠋ {st}")
+            status_text = theme.format_dim("idle")
+        elif st in ("thinking", "streaming"):
+            status_text = theme.format_accent(st)
+        elif st.startswith("tool:"):
+            status_text = theme.format_accent("working")
         elif st == "waiting_approval":
-            status_badge = theme.format_warning("⚠ approval pending", bold=True)
+            status_text = theme.format_accent("approval needed")
         elif st == "paused":
-            status_badge = theme.format_warning("⏸ paused")
+            status_text = theme.format_dim("paused")
         else:
-            status_badge = theme.format_dim(f"● {st}")
+            status_text = theme.format_dim(st)
 
         # Model
-        model_str = theme.format_primary(self.store.model_id, bold=True)
+        model_str = theme.format_primary(self.store.model_id)
 
         # Tokens
         tot_tokens = self.store.input_tokens + self.store.output_tokens
         token_str = (
-            theme.format_secondary(f"{format_token_count(tot_tokens)} tokens")
+            theme.format_dim(f"{format_token_count(tot_tokens)} tokens")
             if tot_tokens > 0
             else ""
         )
 
         # Latency
         lat = self.store.last_latency_ms
-        lat_str = theme.format_muted(f"{int(lat)}ms") if lat > 0 else ""
+        lat_str = theme.format_dim(f"{int(lat)}ms") if lat > 0 else ""
 
         # Shortcuts based on mode
         if self.store.mode == InputMode.APPROVAL:
-            hint = theme.format_warning("[y] approve • [n] deny • [Esc] cancel")
+            hint = theme.format_dim("y approve · n deny · Esc cancel")
         elif self.store.mode == InputMode.QUESTION:
-            hint = theme.format_accent("↑/↓ navigate • Enter select • Esc cancel")
+            hint = theme.format_dim("↑/↓ navigate · Enter select · Esc cancel")
         elif self.store.pending_approvals:
-            hint = theme.format_warning("⚠ approval pending • /status • /help")
+            hint = theme.format_accent("approval pending")
         else:
-            hint = theme.format_dim("Tab tools • Esc stop • /help • Ctrl-D exit")
+            hint = theme.format_dim("Tab tools · Esc stop · /help · Ctrl-D exit")
 
-        # Combine segments
-        left_parts = [status_badge, model_str]
+        # Assemble left items with middle dots
+        items = [status_text, model_str]
         if token_str:
-            left_parts.append(token_str)
+            items.append(token_str)
         if lat_str:
-            left_parts.append(lat_str)
+            items.append(lat_str)
 
-        left = f" {f' {pipe} '.join(left_parts)}"
+        left = f"  {f' {dot} '.join(items)}"
 
-        # If terminal width is tight, drop hints
+        # Spacing to right-aligned hint
         total_w = visible_width(left) + visible_width(hint) + 4
         if total_w <= width:
-            pad = max(1, width - visible_width(left) - visible_width(hint) - 1)
-            line = f"{left}{' ' * pad}{hint} "
+            pad = max(1, width - visible_width(left) - visible_width(hint) - 2)
+            line = f"{left}{' ' * pad}{hint}  "
         else:
-            # Fallback without hint
             line = truncate_visible(left, width)
 
         return [line]
