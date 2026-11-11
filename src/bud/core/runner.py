@@ -61,6 +61,7 @@ from bud.gateway.tracked import TrackedModel, request_session
 from bud.harness.agent import Harness
 from bud.harness.context import BackgroundCompaction
 from bud.harness.learning import Learner
+from bud.harness.recall import Recall, render
 from bud.limits import (
     MAX_MESSAGE_CHARS,
     MAX_MODEL_REQUESTS_PER_RUN,
@@ -102,6 +103,7 @@ class Runner(DBOSConfiguredInstance):
         durable: bool = False,
         jobs: bool = False,
         learner: Learner | None = None,
+        recall: Recall | None = None,
     ) -> None:
         self.hub = hub
         self.gateway = gateway
@@ -118,6 +120,7 @@ class Runner(DBOSConfiguredInstance):
         self.session_models: dict[str, str] = {}
         self.work_items = WorkItems(hub) if jobs else None
         self.learner = learner
+        self.recall = recall
         self._learning: set[asyncio.Task] = set()
         if learner is not None:
             harness.live_instructions.append(self._recent_lessons)
@@ -611,7 +614,7 @@ class Runner(DBOSConfiguredInstance):
 
     def _maybe_learn(self, session_id: str, run_id: str) -> None:
         """Reflect on a completed turn in the background; the reply is already out."""
-        if self.learner is None or self._closing:
+        if (self.learner is None and self.recall is None) or self._closing:
             return
         if self.work_items is not None and self.work_items.for_session(session_id) is not None:
             return  # a job's messages are briefs written by bud, not the owner's words
@@ -640,9 +643,36 @@ class Runner(DBOSConfiguredInstance):
             and (request := requests.get(e.data["approval_id"])) is not None
         ]
         reply = reply_text(end.data.get("messages", []))
-        task = asyncio.create_task(self._learn(session_id, run_id, owner, reply, signals))
-        self._learning.add(task)
-        task.add_done_callback(self._learning.discard)
+        jobs = []
+        if self.learner is not None:
+            jobs.append(self._learn(session_id, run_id, owner, reply, signals))
+        if self.recall is not None:
+            jobs.append(self._index_turn(session_id, run_id, owner, reply))
+        for job in jobs:
+            task = asyncio.create_task(job)
+            self._learning.add(task)
+            task.add_done_callback(self._learning.discard)
+
+    async def _index_turn(self, session_id: str, run_id: str, owner: str, reply: str) -> None:
+        assert self.recall is not None
+        try:
+            await self.recall.index_turn(session_id, run_id, owner, reply)
+        except Exception as exc:  # recall is best effort; the turn already succeeded
+            logger.warning("recall indexing skipped for run %s: %s", run_id, error_summary(exc))
+
+    async def _recalled(self, run: dict) -> str:
+        """Background for a new message: memory lines and earlier turns that bear on it."""
+        if self.recall is None or not run.get("text") or run["trigger"] != "message":
+            return ""
+        if self.work_items is not None and self.work_items.for_session(run["session_id"]):
+            return ""  # a job brief is bud's own words
+        try:
+            await self.recall.index_memory()
+            hits = await self.recall.search(run["text"], exclude_session=run["session_id"])
+        except Exception as exc:
+            logger.warning("recall skipped for run %s: %s", run["run_id"], error_summary(exc))
+            return ""
+        return render(hits)
 
     async def _learn(
         self, session_id: str, run_id: str, owner: str, reply: str, signals: list[str]
@@ -757,8 +787,16 @@ class Runner(DBOSConfiguredInstance):
                     f"No configured model for {model_override}. Check its API key in .env "
                     "or `bud login chatgpt`, then pick again."
                 )
+            # Appended to the newest message, after the cached prefix, so prompt caching holds.
+            recalled = (
+                await DBOS.run_step_async(
+                    {"name": "bud.recall", "retries_allowed": False}, self._recalled, run
+                )
+                if self.durable
+                else await self._recalled(run)
+            )
             result = await self.agent.run(
-                run["text"],
+                (run["text"] + recalled) if run["text"] and recalled else run["text"],
                 model=(
                     # Durable runs resolve pre-registered keys; local runs take the instance.
                     model_override

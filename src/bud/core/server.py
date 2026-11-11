@@ -37,6 +37,7 @@ from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
 from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
+from bud.harness.recall import Recall, embedder
 from bud.limits import MAX_MESSAGE_CHARS
 from bud.photon_config import PhotonConfig
 from bud.web import GUIDANCE as WEB_GUIDANCE
@@ -256,7 +257,12 @@ def _create_app(
         if harness.memory is not None
         else None
     )
-    runner = Runner(hub, gateway, harness, durable=True, jobs=True, learner=learner)
+    recall = Recall(
+        db_path.parent / ("world-recall.db" if world is not None else "recall.db"),
+        embedder=embedder(settings),
+        memory=harness.memory,
+    )
+    runner = Runner(hub, gateway, harness, durable=True, jobs=True, learner=learner, recall=recall)
 
     async def cleanup_results() -> None:
         while True:
