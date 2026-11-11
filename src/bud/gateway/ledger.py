@@ -122,6 +122,16 @@ class Ledger:
             ).fetchone()
         return row[0], row[1]
 
+    def session_profile(self, session_id: str) -> tuple[int, float]:
+        """Model requests and seconds spent waiting on them, for one session."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(latency_ms), 0) FROM model_requests"
+                " WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return row[0], row[1] / 1000
+
     def session_models(self, session_id: str) -> list[dict[str, str]]:
         with self._connect() as db:
             rows = db.execute(

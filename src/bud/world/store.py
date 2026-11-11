@@ -171,14 +171,17 @@ class World:
     def search_email(
         self, query: str = "", sender: str = "", unread_only: bool = False, limit: int = 10
     ) -> list[dict[str, Any]]:
+        # Like Gmail, every word must appear somewhere (subject, body, or sender), not
+        # the query as one exact phrase.
         sql = (
             "SELECT m.id, m.thread_id, t.subject, m.sender, m.sent_at, m.unread, m.body"
             " FROM messages m JOIN threads t ON t.id = m.thread_id"
-            " WHERE m.folder != 'draft'"
-            " AND (t.subject LIKE ? OR m.body LIKE ? OR m.sender LIKE ?) AND m.sender LIKE ?"
+            " WHERE m.folder != 'draft' AND m.sender LIKE ?"
         )
-        pattern = f"%{query}%"
-        params: list[Any] = [pattern, pattern, pattern, f"%{sender}%"]
+        params: list[Any] = [f"%{sender}%"]
+        for word in query.split():
+            sql += " AND (t.subject LIKE ? OR m.body LIKE ? OR m.sender LIKE ?)"
+            params += [f"%{word}%"] * 3
         if unread_only:
             sql += " AND m.unread = 1"
         sql += " ORDER BY m.sent_at DESC LIMIT ?"

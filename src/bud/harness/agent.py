@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from importlib import resources
@@ -88,12 +88,23 @@ class Harness:
         self.system_prompt = f"{load_system_prompt()}\n{profile}\n{CODE_GUIDANCE}\n{SKILL_GUIDANCE}"
         # Instructions that must reflect live state (e.g. the approval mode) are
         # evaluated at the start of every run instead of being baked in at boot.
-        self.live_instructions: list[Callable[..., str]] = []
+        self.live_instructions: list[Callable[..., str]] = [self._today]
+        # The person's clock: real time, or the simulated world's fixed "now".
+        self.clock: Callable[[], datetime] = lambda: datetime.now().astimezone()
         memory_guidance = (memory.guidance or "") if memory is not None else ""
         prompt = self.system_prompt + memory_guidance
         self.prompt_version = sha256(prompt.encode()).hexdigest()[:12]
         self.spend_store = SqliteSpendStore(spend_path)
         self.spend = self.spend_for_run()
+
+    def _today(self) -> str:
+        # Day granularity: instructions lead the prompt, so a per-minute clock here
+        # would invalidate the cached conversation on every turn.
+        now = self.clock()
+        return (
+            f"\nToday is {now:%A, %d %B %Y} (UTC{now:%z}). "
+            "Call current_time when the exact time matters."
+        )
 
     def spend_for_run(self, run_id: str | None = None) -> SpendLimits:
         return SpendLimits(

@@ -96,12 +96,14 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
         return _safely(lambda: world.read_draft(draft_id, body_offset, max_chars))
 
     def draft_reply(ctx: RunContext[None], thread_id: str, body: str) -> Any:
-        """Save a draft reply in a thread; nothing is sent. Then use read_draft to verify it.
+        """Save a draft reply in a thread; nothing is sent.
 
         Use only when the person asks for a draft or says not to send. When they ask
         you to email, reply to, or tell someone, use send_email instead.
 
-        Returns the exact saved draft id, thread, recipients, and body. Replaying the
+        Returns the saved draft as read back from the mailbox, so report it directly;
+        no separate read is needed. Returns the exact saved draft id, thread, recipients,
+        and body. Replaying the
         same approval returns the original draft instead of creating another one.
 
         Args:
@@ -166,12 +168,13 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
         attendees: list[str],
         timezone: str | None = None,
     ) -> Any:
-        """Create an approved synthetic event, then use read_event to verify it.
+        """Create an approved synthetic event.
 
         Check list_events first. Clarify ambiguous dates, attendees, timezones, or
         DST folds with the user. Bookings must fit the fictional seed's weekday
         09:00–17:00 America/Chicago hours and cannot overlap any event, including
-        Focus Blocks. Returns applied and the saved event; a replay has applied=false
+        Focus Blocks. Returns applied and the saved event, read back
+        from the calendar after the write, so report it directly; a replay has applied=false
         and returns current state without writing again.
 
         Args:
@@ -196,8 +199,9 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
         Check list_events for the target range first; resolve ambiguity with the user.
         Focus Blocks cannot be moved, and no booking may overlap another event or
         fall outside the fictional seed's weekday 09:00–17:00 America/Chicago hours.
-        Returns applied and the saved event. A replay returns current state with
-        applied=false without moving again. Use read_event after approval to verify.
+        Returns applied and the saved event, read back from the calendar after the
+        write, so report it directly. A replay returns current state with
+        applied=false without moving again.
 
         Args:
             event_id: The event id from list_events.
