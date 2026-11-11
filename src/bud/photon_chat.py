@@ -157,7 +157,11 @@ class PhotonChat:
                 self.ephemeral[key] = value
 
     async def receive(self, event: dict, meta: dict) -> None:
-        from photon_api.generated.models import ReceivedImessageMessage
+        from photon_api.generated.models import (
+            ReceivedImessageMessage,
+            TextContent,
+            UserSnapshot,
+        )
 
         seq = meta.get("seq")
         if type(seq) is not int or not 0 < seq <= 9007199254740991:
@@ -198,6 +202,15 @@ class PhotonChat:
         ):
             self.store.set("cursor", str(seq))
             return
+        content, sender, agent = message.content, message.sentBy, message.receivedBy
+        if not (
+            isinstance(content, TextContent)
+            and isinstance(sender, UserSnapshot)
+            and isinstance(agent, UserSnapshot)
+        ):
+            # owner_message already rejects these; checked here so the types prove it.
+            self.store.set("cursor", str(seq))
+            return
         await self.check_scope()
         parent = message.parentMessageId if isinstance(message.parentMessageId, str) else None
         # Keep the existing v2 digest algorithm for duplicates retained across restarts.
@@ -206,9 +219,9 @@ class PhotonChat:
             fingerprint(
                 {
                     "space": message.space.root.id,
-                    "sender": message.sentBy.root.id,
-                    "agent": message.receivedBy.root.id,
-                    "text": message.content.text,
+                    "sender": sender.root.id,
+                    "agent": agent.root.id,
+                    "text": content.text,
                 }
             ),
             parent=parent,
@@ -219,13 +232,13 @@ class PhotonChat:
         assert self.session is not None
         route = self.store.route(
             message.space.root.id,
-            message.receivedBy.root.id,
+            agent.root.id,
             message.id,
             self.session,
             self.session_seq,
         )
         await self.ensure_session(route)
-        text = message.content.text.strip()
+        text = content.text.strip()
         command = text.casefold()
         controls = {
             "stop": "/stop",
@@ -277,7 +290,7 @@ class PhotonChat:
                     result = await submit(
                         self.core,
                         route["session"],
-                        controls.get(command, message.content.text),
+                        controls.get(command, content.text),
                         message_id=digest("photon:" + message.id),
                         origin=self.origin(route["space"]),
                     )

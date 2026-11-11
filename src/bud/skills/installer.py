@@ -142,10 +142,13 @@ class Installer:
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
         )
+        stdout = process.stdout
+        if stdout is None:  # stdout=PIPE always provides one
+            raise SkillError("Skill command produced no output stream.")
         try:
             async with asyncio.timeout(180):
                 output = bytearray()
-                while chunk := await process.stdout.read(16_384):
+                while chunk := await stdout.read(16_384):
                     output.extend(chunk)
                     if len(output) > 262_144:
                         raise SkillError("Skill command exceeded its output limit.")

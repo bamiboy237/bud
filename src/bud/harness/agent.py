@@ -187,12 +187,11 @@ class ExecutionBudget(AbstractCapability[None]):
         request_limit = limit.request_limit
         tools = max(
             0,
-            (RUN_LIMITS.tool_calls_limit if tool_limit is None else tool_limit)
-            - ctx.usage.tool_calls,
+            (MAX_TOOL_CALLS_PER_RUN if tool_limit is None else tool_limit) - ctx.usage.tool_calls,
         )
         requests = max(
             0,
-            (RUN_LIMITS.request_limit if request_limit is None else request_limit)
+            (MAX_MODEL_REQUESTS_PER_RUN if request_limit is None else request_limit)
             - ctx.usage.requests,
         )
         finish = tools <= 3 or requests <= 1
