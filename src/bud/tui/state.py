@@ -453,7 +453,11 @@ class StateStore:
                             break
                 if target:
                     res = str(data.get("result", ""))
-                    target.finish(res, failed=bool(data.get("failed")))
+                    # The runner reports outcome (success/failure/retried), not a
+                    # boolean; retried means the tool errored and was re-issued.
+                    target.finish(
+                        res, failed=data.get("outcome", "success") in ("failure", "retried")
+                    )
                 self.status = "thinking"
                 self.notify()
                 return None
@@ -599,13 +603,14 @@ class StateStore:
                 now = time.time()
                 elapsed = now - self.turn_start_time if self.turn_start_time else 0.0
                 stream = (now - self.first_token_time) if self.first_token_time else elapsed
+                model = self.model_id or "bud"
                 if elapsed > 0:
                     if self.output_tokens > 0 and stream > 0:
                         self.last_stats_line = (
-                            f"{elapsed:.1f}s · {self.output_tokens / stream:.1f} tok/s"
+                            f"{model} · {elapsed:.1f}s · {self.output_tokens / stream:.1f} tok/s"
                         )
                     else:
-                        self.last_stats_line = f"{elapsed:.1f}s"
+                        self.last_stats_line = f"{model} · {elapsed:.1f}s"
                 self.notify()
                 return None
 
