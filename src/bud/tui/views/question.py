@@ -21,7 +21,7 @@ class QuestionView(View):
 
     def _render(self, width: int) -> list[str]:
         theme = self.store.theme
-        border_style: BoxStyle = getattr(self.store, "border_style", "rounded")
+        border_style: BoxStyle = self.store.border_style
 
         title = self.store.question_title or "Select an option"
         choices = self.store.question_choices

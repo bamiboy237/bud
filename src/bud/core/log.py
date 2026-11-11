@@ -578,7 +578,7 @@ class EventLog:
         with self._connect() as db:
             rows = db.execute(
                 "SELECT DISTINCT session_id FROM events "
-                "WHERE type IN ('approval.granted', 'approval.denied')"
+                "WHERE type IN ('approval.granted', 'approval.denied', 'question.answered')"
             ).fetchall()
         return [row[0] for row in rows]
 

@@ -1,17 +1,6 @@
 """Lean slash commands handler for Bud TUI.
 
-Supported commands:
-  /help               Show command and hotkey guide
-  /model [model_id]   Switch model (interactive menu if no model specified)
-  /theme [theme_name] Switch palette (aura, opencode, vesper, kanagawa, rosepine, etc.)
-  /cost               Display session tokens and cost summary
-  /connect <app>      Connect gmail or calendar via Composio
-  /clear              Clear screen history
-  /status             Show detailed server and queue status
-  /pause, /resume     Pause or resume message queue
-  /stop               Interrupt active execution
-  /cancel <msg_id>    Cancel queued message
-  /edit <id> <text>   Edit queued message
+COMMANDS is the single source of truth; /help renders from it.
 """
 
 from __future__ import annotations
@@ -46,6 +35,7 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("/stop", "", "Interrupt current run"),
     ("/cancel", "<msg_id>", "Cancel queued message"),
     ("/edit", "<id> <text>", "Edit queued message"),
+    ("/answer", "<id> <text>", "Answer a pending question directly"),
     ("/exit", "", "Exit the terminal application"),
     ("/quit", "", "Exit the terminal application"),
     ("/help", "", "Show this command guide"),
@@ -55,15 +45,16 @@ _MAX_LABEL = max(len(f"{cmd} {usage}".strip()) for cmd, usage, _ in COMMANDS)
 
 HOTKEYS_TEXT = """\
 [Hotkeys]
-  Enter                Submit prompt (accepts menu selection when open)
-  Shift+Enter          Insert newline (also Alt+Enter or \\\\+Enter)
-  Up / Down            Navigate slash menu (when open) or choices
-  Esc                  Close menu (when open); stop active run
+  Enter                Submit prompt
+  Shift+Enter          Insert newline (also Alt+Enter or \\+Enter)
+  Up / Down            Navigate completion menu or choice cards
+  Tab                  Apply selected completion; toggle tool cards when no menu
+  Esc                  Close menu when open; otherwise stop active run
   Esc + Up             Recall previous prompt from history
-  Tab                  Toggle expand/collapse on tool disclosure cards
   Ctrl+C               Clear buffer or stop active run
   Ctrl+D               Exit application (when input buffer is empty)
   Ctrl+L               Clear screen
+  1-5                  Pick a numbered answer while a question card is up
   [y] / [n]            Single-key 1-touch approval / denial (when approval active)"""
 
 HELP_TEXT = "\n".join(

@@ -420,6 +420,13 @@ class Runner(DBOSConfiguredInstance):
             if target is not None:
                 return self.revise(target[0], target[1], text, message_id, origin)
         self._validate_text(text)
+        events = self.hub.log.read(session_id)
+        request = next(
+            (r for r in undecided_approvals(events) if r["approval_id"] == approval_id), None
+        )
+        if request is not None and request.get("tool") == "ask_user":
+            # A question is replaced by its answer, not by a correction.
+            raise DecisionRejected(approval_id, expects_answer=True)
         event = self.hub.log.revise_approval(session_id, approval_id, text, message_id, origin)
         self.hub.wake(session_id)
         self._drain(session_id)
@@ -448,6 +455,7 @@ class Runner(DBOSConfiguredInstance):
             session_id,
             "question.answered",
             {"approval_id": approval_id, "text": text, "origin": origin},
+            key=f"{session_id}:answer:{approval_id}",
         )
         if event is None:
             return False

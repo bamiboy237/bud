@@ -29,7 +29,7 @@ from bud.core.controls import session_snapshot
 from bud.tui.commands import COMMANDS, handle_slash_command
 from bud.tui.keymap import build_key_bindings
 from bud.tui.state import InputMode, StateStore
-from bud.tui.terminal import SynchronizedOutput, get_terminal_size
+from bud.tui.terminal import SynchronizedOutput, get_terminal_size, visible_width
 from bud.tui.views.approval import ApprovalView, friendly_action_title
 from bud.tui.views.box import render_user_turn
 from bud.tui.views.footer import FooterView
@@ -126,6 +126,9 @@ class TUIApp:
         self._cached_dynamic_content: FormattedText | ANSI = FormattedText([])
         self._cached_dynamic_height: int = 0
         self._last_stream_render: float = 0.0
+        # A question card takes over the keyboard; the draft returns when it leaves.
+        self._prev_mode: InputMode = self.store.mode
+        self._question_stash: str | None = None
 
     def spawn_task(self, coro: Any) -> asyncio.Task[Any]:
         """Spawn a background task with strong reference tracking to prevent GC drops."""
@@ -139,6 +142,19 @@ class TUIApp:
         # Invalidate dynamic content cache
         self._dynamic_dirty = True
         event = self.store.last_event
+
+        # Question-mode transitions: the composer is invisible while a choice
+        # card is up, so park the draft first and restore it afterwards.
+        entering = self.store.mode == InputMode.QUESTION and self._prev_mode != InputMode.QUESTION
+        leaving = self._prev_mode == InputMode.QUESTION and self.store.mode != InputMode.QUESTION
+        if entering:
+            self._question_stash = self.input_buffer.text
+            self.input_buffer.text = ""
+        elif leaving and self._question_stash is not None:
+            self.input_buffer.text = self._question_stash
+            self.input_buffer.cursor_position = len(self.input_buffer.text)
+            self._question_stash = None
+        self._prev_mode = self.store.mode
 
         # Sync streaming text. Markdown re-parse of the full reply is expensive, so
         # while tokens stream in, re-render at most ~8fps; always render on other
@@ -244,7 +260,7 @@ class TUIApp:
         th = self.store.theme
 
         def centered(text: str) -> str:
-            pad = max(0, (cols - len(text)) // 2)
+            pad = max(0, (cols - visible_width(text)) // 2)
             return " " * pad + text
 
         return [

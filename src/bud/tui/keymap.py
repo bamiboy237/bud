@@ -69,6 +69,18 @@ def build_key_bindings(store: StateStore, app: TUIApp) -> KeyBindings:
             app.spawn_task(app.submit_question_approval(approval_id, answer))
         # "free-text": nothing to post yet; the composer now awaits the typed answer.
 
+    for _digit_keys in range(1, 6):
+
+        @kb.add(str(_digit_keys), filter=is_question)
+        def _digit_select(event: KeyPressEvent, index: int = _digit_keys - 1) -> None:
+            if index >= len(store.question_choices):
+                return
+            store.question_selected_index = index
+            result = store.confirm_question()
+            if result and result[0] == "posted":
+                approval_id, answer = result[1]
+                app.spawn_task(app.submit_question_approval(approval_id, answer))
+
     @kb.add("escape", filter=is_question)
     def _choice_cancel(event: KeyPressEvent) -> None:
         store.cancel_question()
@@ -81,6 +93,14 @@ def build_key_bindings(store: StateStore, app: TUIApp) -> KeyBindings:
         buf = event.current_buffer
         if buf.complete_state and buf.complete_state.current_completion:
             buf.apply_completion(buf.complete_state.current_completion)
+
+    @kb.add("up", filter=is_prompt & has_completions, eager=True)
+    def _menu_prev(event: KeyPressEvent) -> None:
+        event.current_buffer.complete_previous()
+
+    @kb.add("down", filter=is_prompt & has_completions, eager=True)
+    def _menu_next(event: KeyPressEvent) -> None:
+        event.current_buffer.complete_next()
 
     @kb.add("escape", filter=is_prompt & has_completions, eager=True)
     def _dismiss_completions(event: KeyPressEvent) -> None:

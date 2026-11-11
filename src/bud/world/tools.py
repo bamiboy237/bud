@@ -32,6 +32,7 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
     Evaluated runs pass include_ask_user=False: scripted evals cannot type an
     answer, so the question tool would stall every attempt.
     """
+
     def current_time() -> str:
         """Return the current local date and time for the person."""
         return world.now

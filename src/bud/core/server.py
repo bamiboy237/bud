@@ -534,6 +534,8 @@ def _create_app(
             }
         except QueueFull as exc:
             raise HTTPException(429, str(exc)) from None
+        except DecisionRejected as exc:
+            raise HTTPException(409, str(exc)) from None
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from None
 
@@ -551,6 +553,8 @@ def _create_app(
             raise HTTPException(404, "unknown approval") from None
         except DecisionRejected as exc:
             raise HTTPException(409, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
 
     @app.get("/sessions/{session_id}/events")
     async def stream_events(

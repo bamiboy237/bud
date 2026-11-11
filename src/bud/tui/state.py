@@ -286,6 +286,7 @@ class StateStore:
             self.question_future.set_result(None)
         self.question_future = None
         self.awaiting_free_text = False
+        self.awaiting_question_id = None
         if self.pending_question is None:
             self.set_mode(InputMode.PROMPT)
             self.notify()
@@ -308,6 +309,9 @@ class StateStore:
                 "choices": list(args.get("choices") or []),
             }
             self.pending_question = question
+        if self.question_future is not None and not self.question_future.done():
+            # A local picker (model selection) is open; resolve it before taking over.
+            self.question_future.set_result(None)
         self.question_title = question["question"]
         self.question_choices = [*question["choices"], FREE_TEXT_ANSWER]
         self.question_selected_index = 0
@@ -474,8 +478,6 @@ class StateStore:
                 self.pending_approvals.append(approval)
                 self.status = "waiting_approval"
                 if approval.tool == "ask_user":
-                    if is_historical:
-                        return None
                     self.represent_question()
                     return None
                 self.set_mode(InputMode.APPROVAL)
@@ -557,6 +559,8 @@ class StateStore:
             case "run.stop_requested":
                 # The slash passthrough already echoed this; the footer carries the state.
                 self.status = "paused"
+                self.awaiting_free_text = False
+                self.awaiting_question_id = None
                 self.notify()
                 return None
 
@@ -564,6 +568,8 @@ class StateStore:
                 self.status = "idle"
                 self.active_run_id = None
                 self.streaming_text = ""
+                self.awaiting_free_text = False
+                self.awaiting_question_id = None
                 uncertain = data.get("uncertain_tools", [])
                 self.notify()
                 if uncertain:

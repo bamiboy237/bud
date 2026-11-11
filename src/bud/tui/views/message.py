@@ -9,6 +9,7 @@ from rich.markdown import Markdown
 
 from bud.tui.state import StateStore
 from bud.tui.views.base import View
+from bud.tui.views.box import render_user_turn
 
 
 def get_code_theme_for_theme(theme_name: str) -> str:
@@ -100,8 +101,6 @@ class MessageView(View):
         if self.role == "you":
             # Same left-rail renderer as live submissions, so the transcript
             # replays in the one user-turn language.
-            from bud.tui.views.box import render_user_turn
-
             return render_user_turn(current_text, width, theme if theme else None)
 
         # Assistant role: parse markdown using rich
