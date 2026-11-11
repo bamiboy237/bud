@@ -1,0 +1,32 @@
+
+      ⢀⡠⢤⡤⢤⡤⢄⡀  bud v0.1.0
+   ⢀⠤⡀⠘⠃⡏⠰⠆⢹⠈⣡  stub-fast · bud:main
+   ⠃ ⠈⠶⠦⠻⠟⠺⠿⠉⠉  Type / for commands
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ Select a mascot ───────────────────────────────────────────────────────────────────────────────────
+ ✓ 1. dog  a dog with a cigar
+   2. ant  an ant carrying a crumb
+ ↑↓/jk navigate  Enter select  1-2 pick  / filter  Esc back
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  bud:main

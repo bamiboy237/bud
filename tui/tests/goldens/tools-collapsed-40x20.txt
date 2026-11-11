@@ -1,0 +1,20 @@
+
+      ⢀⡠⢤⡤⢤⡤⢄⡀  bud v0.1.0
+   ⢀⠤⡀⠘⠃⡏⠰⠆⢹⠈⣡  stub-fast · bud:main
+   ⠃ ⠈⠶⠦⠻⠟⠺⠿⠉⠉  Type / for commands
+
+▌ > Check the notes
+
+  ⏵ Read 3 files
+  ⏵ Saved locked.md (failed)
+  ⇢ Searching web for "bud"…
+
+
+
+
+
+  ⠋ Working… 0s
+─────────────────── stub-fast · strict ─
+> Ask anything…
+────────────────────────────────────────
+  bud:main · working    / · Esc/Ctrl+C

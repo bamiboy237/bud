@@ -1,5 +1,6 @@
 """Builds bud's agent with its system prompt, guarded tools, and persistent limits."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from decimal import Decimal
@@ -85,6 +86,9 @@ class Harness:
             }
         )
         self.system_prompt = f"{load_system_prompt()}\n{profile}\n{CODE_GUIDANCE}\n{SKILL_GUIDANCE}"
+        # Instructions that must reflect live state (e.g. the approval mode) are
+        # evaluated at the start of every run instead of being baked in at boot.
+        self.live_instructions: list[Callable[..., str]] = []
         memory_guidance = (memory.guidance or "") if memory is not None else ""
         prompt = self.system_prompt + memory_guidance
         self.prompt_version = sha256(prompt.encode()).hexdigest()[:12]
@@ -135,7 +139,7 @@ class Harness:
             model,
             name="bud",
             deps_type=type(None),
-            instructions=self.system_prompt,
+            instructions=[self.system_prompt, *self.live_instructions],
             toolsets=[self.toolset],
             output_type=[str, DeferredToolRequests],
             capabilities=[

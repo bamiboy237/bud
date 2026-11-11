@@ -1,0 +1,20 @@
+  ⎢ line one
+  ⎣ line two
+  ⏷ Read plan.md
+  ⎢ Path: plan.md
+  ⎢ line one
+  ⎣ line two
+  ⏷ Read todo.md
+  ⎢ Path: todo.md
+  ⎢ line one
+  ⎣ line two
+  ⏷ Saved locked.md (failed)
+  ⎢ Path: locked.md
+  ⎣ read only
+  ⇢ Searching web for "bud"…
+  ⎣ Query: bud
+  ⠋ Working… 0s
+─────────────────── stub-fast · strict ─
+> Ask anything…
+────────────────────────────────────────
+  bud:main · working    / · Esc/Ctrl+C

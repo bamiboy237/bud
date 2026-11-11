@@ -22,6 +22,7 @@ from bud.evals.tasks import SUITE, Outcome, Task
 from bud.gateway import Gateway, build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
+from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
 from bud.world.store import World
 from bud.world.tools import READ_TOOLS, build_tools
@@ -48,19 +49,35 @@ def failure_reason(events: list[Event]) -> str | None:
     return last.data["reason"] if last is not None and last.type == "run.failed" else None
 
 
-async def drive(runner: Runner, log: EventLog, task: Task, session_id: str) -> list[dict]:
-    """Play the user: answer every approval with the task's scripted decision."""
+async def converse(
+    runner: Runner, log: EventLog, session_id: str, text: str, approve: bool
+) -> list[dict]:
+    """Play the user for one message: answer every approval with the scripted decision."""
     approvals: list[dict] = []
-    runner.start(session_id, task.instruction, uuid4().hex)
+    runner.start(session_id, text, uuid4().hex)
     while True:
         while session_id in runner.tasks:
             await asyncio.shield(runner.tasks[session_id])
         pending = undecided_approvals(log.read(session_id))
         if not pending:
+            await runner.settle_learning()
             return approvals
         for request in pending:
             approvals.append(request)
-            runner.decide(session_id, request["approval_id"], task.approve)
+            runner.decide(session_id, request["approval_id"], approve)
+
+
+async def drive(runner: Runner, log: EventLog, task: Task, session_id: str) -> list[dict]:
+    return await converse(runner, log, session_id, task.instruction, task.approve)
+
+
+async def teach(runner: Runner, log: EventLog, task: Task) -> None:
+    """Earlier conversations: separate sessions, always approving, sharing world and memory."""
+    for number, messages in enumerate(task.setup):
+        session_id = f"setup-{task.id}-{number}-{uuid4().hex[:8]}"
+        log.append(session_id, "session.created")
+        for text in messages:
+            await converse(runner, log, session_id, text, True)
 
 
 async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
@@ -79,10 +96,17 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
             result_path=log.path,
             read_tools=READ_TOOLS,
         )
-        runner = Runner(Hub(log), gateway, harness)
-        log.append(session_id, "session.created")
+        assert harness.memory is not None
+        learner = Learner(
+            harness.memory,
+            lambda session: gateway.model("fast", session, require_tools=True),
+        )
+        runner = Runner(Hub(log), gateway, harness, learner=learner)
         before = world.snapshot()
         try:
+            await asyncio.wait_for(teach(runner, log, task), ATTEMPT_TIMEOUT_SECONDS)
+            log.append(session_id, "session.created")
+            before = world.snapshot()
             approvals = await asyncio.wait_for(
                 drive(runner, log, task, session_id), ATTEMPT_TIMEOUT_SECONDS
             )
@@ -98,6 +122,7 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
             answer=transcript[-1].text if transcript else "",
             approvals=approvals,
             failure=failure_reason(events),
+            memory=await memory_text(learner),
         )
     problems = ["timed out"] if timed_out else task.check(outcome)
     if outcome.failure and not timed_out:
@@ -114,6 +139,13 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
         prompt_version=harness.prompt_version,
         models=gateway.ledger.session_models(session_id),
     )
+
+
+async def memory_text(learner: Learner) -> str:
+    store = learner.memory.store
+    assert not callable(store)
+    saved = await store.read(learner.path, max_chars=20_000)
+    return saved.content if saved else ""
 
 
 async def run_suite(tasks: list[Task], trials: int) -> list[Attempt]:

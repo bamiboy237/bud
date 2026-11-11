@@ -1,0 +1,24 @@
+      ⢀⡠⢤⡤⢤⡤⢄⡀  bud v0.1.0
+   ⢀⠤⡀⠘⠃⡏⠰⠆⢹⠈⣡  stub-fast · bud:main
+   ⠃ ⠈⠶⠦⠻⠟⠺⠿⠉⠉  Type / for commands
+  ◷ Waiting for your decision…
+ Review the draft · Send email ─────────────────────────────────────────────────
+ To: dana@example.com, lee@example.com,
+     a-very-long-address.for.testing@subdomain.example.org
+ Cc: boss@example.com
+ Bcc: audit@example.com
+ Subject: Quarterly numbers and the follow-up plan
+ Body:
+ │ Paragraph line 1 of the full draft the owner must read.
+ │ Paragraph line 2 of the full draft the owner must read.
+ │ Paragraph line 3 of the full draft the owner must read.
+ │ Paragraph line 4 of the full draft the owner must read.
+ │ Paragraph line 5 of the full draft the owner must read.
+ │ Paragraph line 6 of the full draft the owner must read.
+ │ Paragraph line 7 of the full draft the owner must read.
+ │ Paragraph line 8 of the full draft the owner must read.
+ │ Paragraph line 9 of the full draft the owner must read.
+ ↓ 22 more lines · line 1-9 of 31
+ ↑↓/jk scroll  y approve  n deny  r revise  Esc back
+────────────────────────────────────────────────────────────────────────────────
+  bud:main · approval needed
