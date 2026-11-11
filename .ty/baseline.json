@@ -45,6 +45,14 @@
         "lineCount": 1
       }
     ],
+    "src/bud/core/profiles.py": [
+      {
+        "rule": "invalid-return-type",
+        "startColumn": 11,
+        "endColumn": 44,
+        "lineCount": 1
+      }
+    ],
     "src/bud/core/runner.py": [
       {
         "rule": "deprecated",
@@ -268,14 +276,6 @@
         "rule": "missing-union-attribute",
         "startColumn": 37,
         "endColumn": 56,
-        "lineCount": 1
-      }
-    ],
-    "src/bud/tui/state.py": [
-      {
-        "rule": "invalid-assignment",
-        "startColumn": 8,
-        "endColumn": 27,
         "lineCount": 1
       }
     ],
