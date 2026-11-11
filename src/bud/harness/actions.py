@@ -20,6 +20,8 @@ from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, ToolsetTool, WrapperToolset
 
+from bud.harness.decisions import auto_candidates
+
 Action = Literal["allow", "ask", "deny"]
 RecordDecision = Callable[[dict[str, Any]], None]
 
@@ -44,6 +46,8 @@ def load_policy(path: Path | None = None) -> Policy:
 class ActionGateway(WrapperToolset[None]):
     policy: Policy = field(kw_only=True)
     record: RecordDecision = field(kw_only=True)
+    decisions: Any = field(kw_only=True, default=None)
+    decision_context: Callable[[], str] = field(kw_only=True, default=lambda: "")
 
     async def get_tools(self, ctx: RunContext[None]) -> dict[str, ToolsetTool[None]]:
         tools = await super().get_tools(ctx)
@@ -75,12 +79,32 @@ class ActionGateway(WrapperToolset[None]):
         tool: ToolsetTool[None],
     ) -> Any:
         action = self.policy.decide(name)
+        rule = action
+        score: float | None = None
         if action == "ask" and not ctx.tool_call_approved:
-            raise ApprovalRequired()
+            # Smart approval: a calibrated decision model may auto-allow self-hosted
+            # writes it is confident about. Protected tools (sends, real accounts)
+            # are never candidates; low score or any error fails closed to asking.
+            if self.decisions is not None and name in auto_candidates():
+                score = await self.decisions.safe_probability(
+                    name, tool_args, self.decision_context()
+                )
+                if score >= self.decisions.threshold:
+                    action, rule = "allow", "auto-allow"
+            if action == "ask":
+                raise ApprovalRequired()
 
-        outcome = "refused" if action == "deny" else "approved" if action == "ask" else "allowed"
+        outcome = "refused" if action == "deny" else "approved" if rule == "ask" else "allowed"
         # The record comes first, so no tool can act without leaving a trace.
-        self.record({"call_id": ctx.tool_call_id, "tool": name, "rule": action, "outcome": outcome})
+        record: dict[str, Any] = {
+            "call_id": ctx.tool_call_id,
+            "tool": name,
+            "rule": rule,
+            "outcome": outcome,
+        }
+        if score is not None:
+            record["score"] = score
+        self.record(record)
         if action == "deny":
             return f"Refused by policy: {name} is not allowed."
         if DBOS.workflow_id is not None and DBOS.step_id is None:
@@ -99,6 +123,8 @@ class ActionGateway(WrapperToolset[None]):
 class GuardTools(AbstractCapability[None]):
     policy: Policy
     record: RecordDecision
+    decisions: Any = None
+    decision_context: Callable[[], str] = lambda: ""
     id: str | None = "bud_action_gateway"
 
     async def before_tool_execute(
@@ -124,4 +150,10 @@ class GuardTools(AbstractCapability[None]):
         return args
 
     def get_wrapper_toolset(self, toolset: AbstractToolset[None]) -> ActionGateway:
-        return ActionGateway(toolset, policy=self.policy, record=self.record)
+        return ActionGateway(
+            toolset,
+            policy=self.policy,
+            record=self.record,
+            decisions=self.decisions,
+            decision_context=self.decision_context,
+        )

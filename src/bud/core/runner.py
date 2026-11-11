@@ -292,6 +292,8 @@ class Runner(DBOSConfiguredInstance):
     ) -> Event | None:
         self._loop = asyncio.get_running_loop()
         self._validate_text(text)
+        # The decision model scores tool calls against the owner's actual request.
+        self.harness.current_request = text
         event = self.hub.log.accept_message(session_id, text, message_id, origin)
         if event is not None:
             self.hub.wake(session_id)
