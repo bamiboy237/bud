@@ -15,15 +15,16 @@ from enum import StrEnum
 from typing import Any, Literal
 
 from bud.tui.themes import DEFAULT_THEME_NAME, Theme, get_theme
+from bud.tui.views.box import BoxStyle
+
+# Last row offered on every owner question: switches the card to free-text input.
+FREE_TEXT_ANSWER = "Type your own answer"
 
 
 class InputMode(StrEnum):
     PROMPT = "PROMPT"
     APPROVAL = "APPROVAL"
     QUESTION = "QUESTION"
-
-
-BoxStyle = Literal["rounded", "square", "left"]
 
 
 @dataclass
@@ -84,6 +85,7 @@ class StateStore:
         self.last_latency_ms: float = 0.0
         self.input_tokens: int = 0
         self.output_tokens: int = 0
+        self.last_stats_line: str = ""
 
         # Tools execution
         self.tools: dict[str, ToolState] = {}
@@ -92,11 +94,16 @@ class StateStore:
         # Approvals
         self.pending_approvals: list[ApprovalState] = []
 
-        # Questions / Choice Selector
+        # Questions / Choice Selector. `question_future` marks a local picker
+        # (model selection); an owner question carries an approval_id instead and
+        # its answer is POSTed to the server.
         self.question_title: str = ""
         self.question_choices: list[str] = []
         self.question_selected_index: int = 0
         self.question_future: asyncio.Future[str | None] | None = None
+        self.pending_question: dict[str, Any] | None = None
+        self.awaiting_free_text: bool = False
+        self.awaiting_question_id: str | None = None
 
         # Theme
         self.theme_name: str = DEFAULT_THEME_NAME
@@ -239,21 +246,80 @@ class StateStore:
             )
             self.notify()
 
-    def confirm_question(self) -> str | None:
+    def confirm_question(self) -> tuple[str, Any] | None:
+        """Close the active question.
+
+        Returns ('posted', (approval_id, answer)) when the answer should go to the
+        server, ('free-text', approval_id) when the person wants to type instead,
+        or None when a local picker was resolved here.
+        """
         choice = (
             self.question_choices[self.question_selected_index] if self.question_choices else None
         )
-        if self.question_future and not self.question_future.done():
-            self.question_future.set_result(choice)
-        self.question_future = None
+        if self.question_future is not None:
+            if not self.question_future.done():
+                self.question_future.set_result(choice)
+            self.question_future = None
+            self._clear_question()
+            self.set_mode(InputMode.PROMPT)
+            return None
+        question = self.pending_question
+        if question is None:
+            self.set_mode(InputMode.PROMPT)
+            return None
+        self.pending_question = None
+        approval_id = question["approval_id"]
+        if choice is None or choice == FREE_TEXT_ANSWER:
+            self.awaiting_free_text = True
+            self.awaiting_question_id = approval_id
+            self._clear_question()
+            self.set_mode(InputMode.PROMPT)
+            self.notify()
+            return ("free-text", approval_id)
+        self._clear_question()
         self.set_mode(InputMode.PROMPT)
-        return choice
+        self.notify()
+        return ("posted", (approval_id, choice))
 
     def cancel_question(self) -> None:
-        if self.question_future and not self.question_future.done():
+        if self.question_future is not None and not self.question_future.done():
             self.question_future.set_result(None)
         self.question_future = None
+        self.awaiting_free_text = False
+        if self.pending_question is None:
+            self.set_mode(InputMode.PROMPT)
+            self.notify()
+            return
+        # An owner question stays pending, like a dismissed approval card.
         self.set_mode(InputMode.PROMPT)
+        self.notify()
+
+    def represent_question(self) -> bool:
+        """(Re)show a pending owner question as the active choice card."""
+        question = self.pending_question
+        if question is None:
+            approval = next((a for a in self.pending_approvals if a.tool == "ask_user"), None)
+            if approval is None:
+                return False
+            args = approval.args or {}
+            question = {
+                "approval_id": approval.approval_id,
+                "question": args.get("question", ""),
+                "choices": list(args.get("choices") or []),
+            }
+            self.pending_question = question
+        self.question_title = question["question"]
+        self.question_choices = [*question["choices"], FREE_TEXT_ANSWER]
+        self.question_selected_index = 0
+        self.question_future = None
+        self.set_mode(InputMode.QUESTION)
+        self.notify()
+        return True
+
+    def _clear_question(self) -> None:
+        self.question_title = ""
+        self.question_choices = []
+        self.question_selected_index = 0
 
     # SSE Event Processing
     def handle_event(
@@ -324,6 +390,7 @@ class StateStore:
                 self.turn_start_time = time.time()
                 self.first_token_time = None
                 self.streaming_text = ""
+                self.last_stats_line = ""
                 self.tools.clear()
                 self.notify()
                 return None
@@ -406,15 +473,42 @@ class StateStore:
                 )
                 self.pending_approvals.append(approval)
                 self.status = "waiting_approval"
+                if approval.tool == "ask_user":
+                    if is_historical:
+                        return None
+                    self.represent_question()
+                    return None
                 self.set_mode(InputMode.APPROVAL)
                 self.notify()
                 return None
+
+            case "question.answered":
+                app_id = data.get("approval_id", "")
+                answer = str(data.get("text", ""))
+                self.pending_approvals = [
+                    a for a in self.pending_approvals if a.approval_id != app_id
+                ]
+                if self.pending_question and self.pending_question.get("approval_id") == app_id:
+                    self.pending_question = None
+                    if self.mode == InputMode.QUESTION:
+                        self.set_mode(InputMode.PROMPT)
+                if self.awaiting_question_id == app_id:
+                    self.awaiting_free_text = False
+                    self.awaiting_question_id = None
+                self._clear_question()
+                self.status = "thinking"
+                self.notify()
+                shown = answer if len(answer) <= 60 else answer[:57] + "…"
+                return f"{self.theme.format_success('✓ answered', bold=True)} {shown}"
 
             case "approval.granted":
                 app_id = data.get("approval_id", "")
                 self.pending_approvals = [
                     a for a in self.pending_approvals if a.approval_id != app_id
                 ]
+                if self.pending_question and self.pending_question.get("approval_id") == app_id:
+                    self.pending_question = None
+                    self._clear_question()
                 if not self.pending_approvals and self.mode == InputMode.APPROVAL:
                     self.set_mode(InputMode.PROMPT)
                 self.status = "thinking"
@@ -426,6 +520,11 @@ class StateStore:
                 self.pending_approvals = [
                     a for a in self.pending_approvals if a.approval_id != app_id
                 ]
+                if self.pending_question and self.pending_question.get("approval_id") == app_id:
+                    self.pending_question = None
+                    self._clear_question()
+                    if self.mode == InputMode.QUESTION:
+                        self.set_mode(InputMode.PROMPT)
                 if not self.pending_approvals and self.mode == InputMode.APPROVAL:
                     self.set_mode(InputMode.PROMPT)
                 self.status = "thinking"
@@ -490,6 +589,16 @@ class StateStore:
                 self.streaming_text = ""
                 self.status = "idle"
                 self.active_run_id = None
+                now = time.time()
+                elapsed = now - self.turn_start_time if self.turn_start_time else 0.0
+                stream = (now - self.first_token_time) if self.first_token_time else elapsed
+                if elapsed > 0:
+                    if self.output_tokens > 0 and stream > 0:
+                        self.last_stats_line = (
+                            f"{elapsed:.1f}s · {self.output_tokens / stream:.1f} tok/s"
+                        )
+                    else:
+                        self.last_stats_line = f"{elapsed:.1f}s"
                 self.notify()
                 return None
 

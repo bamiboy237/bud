@@ -2,8 +2,9 @@
 
 Provides consistent, hairline-bordered container cards inspired by modern
 developer tools (OpenCode, OpenAI Codex, Ghostty).
-Supports both rounded corners (╭─, ╰─) and crisp square corners (┌─, └─)
-with subtle border styling and precise Unicode visible column alignment.
+Supports rounded corners (╭─, ╰─), crisp square corners (┌─, └─), and a
+minimal left-rail style, with subtle border styling and precise Unicode
+visible column alignment.
 """
 
 from __future__ import annotations
@@ -56,7 +57,7 @@ def render_box(
         body_lines: List of formatted lines inside the card.
         width: Total available terminal columns.
         theme: Theme providing format_border and text colors.
-        style: 'rounded' (╭─) or 'square' (┌─).
+        style: 'rounded' (╭─), 'square' (┌─), or 'left' (│ rail, no frame).
         indent: Left column indentation margin (defaults to 2 spaces).
         inner_padding_x: Left and right horizontal padding inside the box (defaults to 1 space).
 
@@ -69,16 +70,17 @@ def render_box(
         return theme.format_border(char) if theme else char
 
     if style == "left":
+        # Rail style: no frame, one rail per row, each row clamped to the width.
         v_bar = style_border("│")
+        budget = max(8, width - 2)
         res: list[str] = []
         if title:
             res.append(f"{indent_str}{v_bar} {title}")
         if body_lines:
-            for line in body_lines:
-                res.append(f"{indent_str}{v_bar} {line}")
-        if footer_text:
-            res.append(f"{indent_str}{v_bar} {footer_text}")
-        return res
+            res.extend(f"{indent_str}{v_bar} {line}" for line in body_lines)
+        return [
+            truncate_visible(line, budget) if visible_width(line) > budget else line for line in res
+        ]
 
     glyphs = get_box_glyphs(style)
     tl, tr, bl, br = glyphs["tl"], glyphs["tr"], glyphs["bl"], glyphs["br"]
@@ -142,46 +144,45 @@ def render_box(
     return lines
 
 
-def render_user_card(
-    text: str,
-    width: int = 80,
-    theme: Theme | None = None,
-    style: BoxStyle = "rounded",
-    indent: int = 2,
-    title: str = "",
-) -> list[str]:
-    """Render an OpenCode user turn card with proper hairline framing."""
-    lines = text.splitlines() or [""]
-    styled_title = theme.format_primary(title, bold=True) if theme and title else title
-    return render_box(
-        title=styled_title,
-        body_lines=lines,
-        width=width,
-        theme=theme,
-        style=style,
-        indent=indent,
-        inner_padding_x=1,
-    )
+def _wrap_visible(text: str, width: int) -> list[str]:
+    """Word-wrap plain text to a visible width, preserving ANSI escapes as zero-width."""
+    words = text.split()
+    if not words:
+        return [""]
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}" if current else word
+        if visible_width(candidate) <= width:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+        if visible_width(word) > width:
+            # A single unbreakable token (URL, hash): clamp it.
+            lines.append(truncate_visible(word, width))
+            current = ""
+        else:
+            current = word
+    if current:
+        lines.append(current)
+    return lines
 
 
-def render_action_card(
-    title: str,
-    content_lines: list[str],
-    width: int = 80,
-    theme: Theme | None = None,
-    style: BoxStyle = "rounded",
-    footer_text: str = "",
-    indent: int = 2,
+def render_user_turn(
+    text: str, width: int, theme: Theme | None = None, indent: int = 2
 ) -> list[str]:
-    """Render a notification or action card (e.g. connections, auth URLs)."""
-    styled_title = theme.format_accent(title, bold=True) if theme else title
-    return render_box(
-        title=styled_title,
-        body_lines=content_lines,
-        width=width,
-        theme=theme,
-        style=style,
-        footer_text=footer_text,
-        indent=indent,
-        inner_padding_x=1,
-    )
+    """Render a user turn as a left rail.
+
+    The rail wraps instead of truncating, so the user's own message is never
+    shortened in scrollback. This is the single renderer for user turns:
+    live submit, echo and history replay all route through it.
+    """
+    rail = theme.format_border("│") if theme else "│"
+    indent_str = " " * indent
+    content_w = max(8, width - indent - 2)
+    lines: list[str] = []
+    for logical in text.splitlines() or [""]:
+        for piece in _wrap_visible(logical, content_w):
+            lines.append(f"{indent_str}{rail} {piece}")
+    return lines

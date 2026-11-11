@@ -45,7 +45,7 @@ def load_system_prompt() -> str:
 class Harness:
     def __init__(
         self,
-        tools: list[Tool] | AbstractToolset[None],
+        tools: list[Tool[None]] | AbstractToolset[None],
         policy: Policy,
         registry: Registry,
         profile: str,

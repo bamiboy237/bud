@@ -280,9 +280,9 @@ def waiting_batch(events: list[Event]) -> list[dict[str, Any]]:
 
 def decisions(events: list[Event]) -> dict[str, bool]:
     return {
-        event.data["approval_id"]: event.type == "approval.granted"
+        event.data["approval_id"]: event.type in ("approval.granted", "question.answered")
         for event in events
-        if event.type in ("approval.granted", "approval.denied")
+        if event.type in ("approval.granted", "approval.denied", "question.answered")
     }
 
 

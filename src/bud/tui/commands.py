@@ -30,33 +30,47 @@ from bud.tui.themes import list_theme_names
 if TYPE_CHECKING:
     from bud.tui.app import TUIApp
 
-HELP_TEXT = """\
-[Commands]
-  /model [id]          Switch model (opens choice selector if omitted)
-  /theme [name]        Switch palette (aura, opencode, vesper, kanagawa, rosepine, etc.)
-  /border [round|sq]   Switch border styling (rounded, square)
-  /cost                Print token spend and request ledger
-  /connect <gmail|cal> Connect account through Composio
-  /clear               Clear screen scrollback
-  /status              View queue, runs, and pending actions
-  /pause, /resume      Pause or resume message queue
-  /stop                Interrupt current run
-  /cancel <msg_id>     Cancel queued message
-  /edit <id> <text>    Edit queued message
-  /exit, /quit         Exit the terminal application
-  /help                Show this command guide
+# Single source of truth for slash commands: the autocomplete menu and /help
+# are both generated from this registry, so they can never drift apart.
+COMMANDS: list[tuple[str, str, str]] = [
+    # (command, usage, description)
+    ("/model", "[id]", "Switch model (opens choice selector if omitted)"),
+    ("/theme", "[name]", "Switch palette (aura, opencode, vesper, kanagawa, ...)"),
+    ("/border", "[round|sq|left]", "Switch card styling (frame, square frame, left rail)"),
+    ("/cost", "", "Print token spend and request ledger"),
+    ("/connect", "<gmail|cal>", "Connect account through Composio"),
+    ("/clear", "", "Clear screen scrollback"),
+    ("/status", "", "View queue, runs, and pending actions"),
+    ("/pause", "", "Pause message queue"),
+    ("/resume", "", "Resume message queue"),
+    ("/stop", "", "Interrupt current run"),
+    ("/cancel", "<msg_id>", "Cancel queued message"),
+    ("/edit", "<id> <text>", "Edit queued message"),
+    ("/exit", "", "Exit the terminal application"),
+    ("/quit", "", "Exit the terminal application"),
+    ("/help", "", "Show this command guide"),
+]
 
+_MAX_LABEL = max(len(f"{cmd} {usage}".strip()) for cmd, usage, _ in COMMANDS)
+
+HOTKEYS_TEXT = """\
 [Hotkeys]
-  Enter                Submit prompt
-  Shift+Enter          Insert newline (also Alt+Enter or \\+Enter)
-  Esc                  Stop active run
-  Esc + ↑              Recall previous prompt from history
+  Enter                Submit prompt (accepts menu selection when open)
+  Shift+Enter          Insert newline (also Alt+Enter or \\\\+Enter)
+  Up / Down            Navigate slash menu (when open) or choices
+  Esc                  Close menu (when open); stop active run
+  Esc + Up             Recall previous prompt from history
   Tab                  Toggle expand/collapse on tool disclosure cards
   Ctrl+C               Clear buffer or stop active run
   Ctrl+D               Exit application (when input buffer is empty)
   Ctrl+L               Clear screen
-  [y] / [n]            Single-key 1-touch approval / denial (when approval active)
-  ↑ / ↓                Navigate choices (when menu active)"""
+  [y] / [n]            Single-key 1-touch approval / denial (when approval active)"""
+
+HELP_TEXT = "\n".join(
+    ["[Commands]"]
+    + [f"  {f'{cmd} {usage}'.strip():<{_MAX_LABEL + 2}}{desc}" for cmd, usage, desc in COMMANDS]
+    + ["", HOTKEYS_TEXT]
+)
 
 
 async def handle_slash_command(
@@ -98,7 +112,11 @@ async def handle_slash_command(
             if raw in ("sq", "square"):
                 store.set_border_style("square")
                 return "[border] Switched border style to: square"
-        return f"[border] Current: {store.border_style} (usage: /border rounded | /border square)"
+            if raw in ("l", "left"):
+                store.set_border_style("left")
+                return "[border] Switched border style to: left rail (frameless composer)"
+        usage = "[border] Current: {} (usage: /border rounded | /border square | /border left)"
+        return usage.format(store.border_style)
 
     if command == "/cost":
         ledger_path = get_settings().data_dir / "bud.db"

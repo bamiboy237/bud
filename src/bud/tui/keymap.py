@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from prompt_toolkit.application import get_app
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 
@@ -28,6 +29,7 @@ def build_key_bindings(store: StateStore, app: TUIApp) -> KeyBindings:
     is_prompt = Condition(lambda: store.mode == InputMode.PROMPT)
     is_approval = Condition(lambda: store.mode == InputMode.APPROVAL)
     is_question = Condition(lambda: store.mode == InputMode.QUESTION)
+    has_completions = Condition(lambda: get_app().current_buffer.complete_state is not None)
 
     # -------------------------------------------------------------
     # APPROVAL Mode: Single-key traps
@@ -61,7 +63,11 @@ def build_key_bindings(store: StateStore, app: TUIApp) -> KeyBindings:
 
     @kb.add("enter", filter=is_question)
     def _choice_select(event: KeyPressEvent) -> None:
-        store.confirm_question()
+        result = store.confirm_question()
+        if result and result[0] == "posted":
+            approval_id, answer = result[1]
+            app.spawn_task(app.submit_question_approval(approval_id, answer))
+        # "free-text": nothing to post yet; the composer now awaits the typed answer.
 
     @kb.add("escape", filter=is_question)
     def _choice_cancel(event: KeyPressEvent) -> None:
@@ -70,6 +76,16 @@ def build_key_bindings(store: StateStore, app: TUIApp) -> KeyBindings:
     # -------------------------------------------------------------
     # PROMPT Mode: Submission, newlines, disclosure, interruption
     # -------------------------------------------------------------
+    @kb.add("tab", filter=is_prompt & has_completions, eager=True)
+    def _apply_completion(event: KeyPressEvent) -> None:
+        buf = event.current_buffer
+        if buf.complete_state and buf.complete_state.current_completion:
+            buf.apply_completion(buf.complete_state.current_completion)
+
+    @kb.add("escape", filter=is_prompt & has_completions, eager=True)
+    def _dismiss_completions(event: KeyPressEvent) -> None:
+        event.current_buffer.cancel_completion()
+
     @kb.add("tab", filter=is_prompt)
     def _toggle_disclosure(event: KeyPressEvent) -> None:
         store.toggle_tool_disclosure()

@@ -70,7 +70,7 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
         log = EventLog(Path(folder) / "events.db")
         world = World(Path(folder) / "world.db")
         harness = Harness(
-            build_tools(world),
+            build_tools(world, include_ask_user=False),
             load_policy(),
             gateway.registry,
             world.profile(),

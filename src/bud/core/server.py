@@ -28,7 +28,7 @@ from bud.core.events import Event, MessageOrigin
 from bud.core.hub import Hub
 from bud.core.log import EventLog, QueueFull
 from bud.core.projection import Snapshot
-from bud.core.runner import Runner, UnknownApproval
+from bud.core.runner import DecisionRejected, Runner, UnknownApproval
 from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
@@ -68,6 +68,11 @@ class EditMessage(BaseModel):
 
 class Decision(BaseModel):
     approved: bool
+    origin: MessageOrigin = Field(default_factory=MessageOrigin)
+
+
+class Answer(BaseModel):
+    text: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
     origin: MessageOrigin = Field(default_factory=MessageOrigin)
 
 
@@ -510,6 +515,8 @@ def _create_app(
             }
         except UnknownApproval:
             raise HTTPException(404, "unknown approval") from None
+        except DecisionRejected as exc:
+            raise HTTPException(409, str(exc)) from None
 
     @app.post("/sessions/{session_id}/approvals/{approval_id}/revise")
     async def revise(session_id: str, approval_id: str, message: NewMessage) -> dict[str, bool]:
@@ -528,6 +535,21 @@ def _create_app(
         except QueueFull as exc:
             raise HTTPException(429, str(exc)) from None
         except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+
+    @app.post("/sessions/{session_id}/approvals/{approval_id}/answer")
+    async def answer(session_id: str, approval_id: str, answer: Answer) -> dict[str, bool]:
+        require_session(session_id)
+        require_current_binding()
+        try:
+            return {
+                "answered": runner.answer(
+                    session_id, approval_id, answer.text, answer.origin.model_dump()
+                )
+            }
+        except UnknownApproval:
+            raise HTTPException(404, "unknown approval") from None
+        except DecisionRejected as exc:
             raise HTTPException(409, str(exc)) from None
 
     @app.get("/sessions/{session_id}/events")

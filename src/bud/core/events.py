@@ -33,6 +33,7 @@ EventType = Literal[
     "approval.requested",
     "approval.granted",
     "approval.denied",
+    "question.answered",
     "run.waiting",
     "run.completed",
     "run.failed",
