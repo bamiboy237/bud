@@ -170,8 +170,9 @@ class StateStore:
             self.last_event = "ui.border"
             self.notify()
             return True
-        if cleaned == "left":
+        if cleaned in ("left", "l"):
             self.border_style = "left"
+            self.last_event = "ui.border"
             self.notify()
             return True
         return False
