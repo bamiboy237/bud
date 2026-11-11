@@ -9,7 +9,7 @@ import hashlib
 import logging
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, TextIO
 from uuid import uuid4
@@ -27,11 +27,15 @@ from bud.core.auth import OwnerAuthentication, owner_token
 from bud.core.events import Event, MessageOrigin
 from bud.core.hub import Hub
 from bud.core.log import EventLog, QueueFull
+from bud.core.profiles import Mode, ProfileStore, apply_mode, as_mode, mode_summary
+from bud.core.profiles import guidance as MODE_GUIDANCE
 from bud.core.projection import Snapshot
 from bud.core.runner import DecisionRejected, Runner, UnknownApproval
+from bud.core.setup import SetupJournal, build_setup_toolset, setup_registry
 from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
+from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
 from bud.limits import MAX_MESSAGE_CHARS
 from bud.photon_config import PhotonConfig
@@ -47,6 +51,10 @@ from bud.world.tools import READ_TOOLS as WORLD_READ_TOOLS
 from bud.world.tools import build_tools
 
 logger = logging.getLogger(__name__)
+
+
+class ModeRequest(BaseModel):
+    mode: str
 
 
 class NewMessage(BaseModel):
@@ -130,6 +138,12 @@ def _create_app(
     connections = None
     binding = None
     photon = None
+    setup_journal = None
+    world: World | None = None
+    # The approval mode applies to the harness policy after composition (the
+    # Harness unions memory/skill rules in), one seam for every tool class.
+    profile_store = ProfileStore(settings.data_dir / "approval-mode.json")
+    approval_mode = profile_store.load()
     if not simulate and any(
         (
             settings.photon_api_key,
@@ -164,6 +178,9 @@ def _create_app(
         )
         tools_policy = policy()
         tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS | WORKSPACE_READ_TOOLS, "allow"))
+        tools_policy.tools["setup_capability"] = "allow"
+        setup = setup_registry(connections)
+        setup_journal = SetupJournal()
         tools_policy.tools.update(dict.fromkeys(WORKSPACE_WRITE_TOOLS, "ask"))
         harness = Harness(
             CombinedToolset(
@@ -171,6 +188,7 @@ def _create_app(
                     build_toolset(connections, accounts, session_dir),
                     build_web_tools(settings),
                     workspace_tools(session_dir),
+                    build_setup_toolset(setup, setup_journal),
                 ]
             ),
             tools_policy,
@@ -178,9 +196,11 @@ def _create_app(
             PROFILE
             + "\nConnected apps: "
             + (", ".join(sorted(accounts)) or "none")
-            + "\nUse /connect gmail or /connect calendar for a missing/disconnected app. "
-            "Then /refresh and restart the bud server process; start a new conversation. "
-            "Connection commands are user controls, not model tools."
+            + "\nFor a missing or disconnected app, call setup_capability('gmail'|'calendar'): "
+            "it surfaces an actionable setup card with the sign-in link in the person's chat, "
+            "and the person authorizes in their browser. Never send the person to a command "
+            "line (/connect remains a manual fallback). A connected account loads its tools "
+            "only after /refresh and a full bud serve restart with a new conversation; say so."
             + WEB_GUIDANCE
             + WORKSPACE_GUIDANCE,
             memory=build_memory(session_dir / "memory.db", namespace="owner"),
@@ -209,10 +229,40 @@ def _create_app(
             read_tools=WORLD_READ_TOOLS | WORKSPACE_READ_TOOLS,
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
         )
+    # One seam for both branches: memory/skill rules are unioned inside the
+    # Harness, so the profile overlay lands on the composed policy. The
+    # guards hold this Policy by reference and re-read decide() per call.
+    apply_mode(harness.policy, approval_mode)
+    live_mode: dict[str, Mode] = {"mode": approval_mode}
+    harness.live_instructions.append(lambda: MODE_GUIDANCE(live_mode["mode"]))
+
+    def today() -> str:
+        # Day granularity: instructions lead the prompt, so a per-minute clock here
+        # would invalidate the cached conversation on every turn.
+        now = datetime.fromisoformat(world.now) if world is not None else None
+        now = now or datetime.now().astimezone()
+        return (
+            f"\nToday is {now:%A, %d %B %Y} (UTC{now:%z}). "
+            "Call current_time when the exact time matters."
+        )
+
+    harness.live_instructions.append(today)
     gateway.model("fast", require_tools=True)
     log = EventLog(db_path)
     hub = Hub(log)
-    runner = Runner(hub, gateway, harness, durable=True, jobs=True)
+    if setup_journal is not None:
+        # The setup toolset was built before the log and hub existed; one seam
+        # hands its journal over so every setup event is a journaled event.
+        setup_journal.bind(hub)
+    learner = (
+        Learner(
+            harness.memory,
+            lambda session_id: gateway.model("fast", session_id, require_tools=True),
+        )
+        if harness.memory is not None
+        else None
+    )
+    runner = Runner(hub, gateway, harness, durable=True, jobs=True, learner=learner)
 
     async def cleanup_results() -> None:
         while True:
@@ -315,6 +365,31 @@ def _create_app(
                 "scope": scope_id,
                 "restart_required": connections is not None and connections.restart_required(),
                 "messaging": messaging_state["status"],
+                "approval_mode": profile_store.load(),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/mode")
+    def switch_mode(body: ModeRequest) -> JSONResponse:
+        """Switch the approval mode for the next tool call, and persist it.
+
+        The policy object is shared with the dispatch guard and re-read per
+        call, so this applies without a server restart. Real-account writes
+        keep their ``ask`` classification in every mode (bud.core.profiles).
+        """
+        target = as_mode(body.mode)
+        if target is None:
+            raise HTTPException(400, "Unknown mode; one of strict/balanced/autonomous.")
+        profile_store.save(target)
+        overlay = apply_mode(harness.policy, target)
+        live_mode["mode"] = target
+        auto = sum(1 for action in overlay.values() if action == "allow")
+        return JSONResponse(
+            {
+                "mode": target,
+                "auto_writes": auto,
+                "summary": mode_summary(target),
             },
             headers={"Cache-Control": "no-store"},
         )

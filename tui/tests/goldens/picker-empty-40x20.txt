@@ -1,0 +1,20 @@
+
+      ⢀⡠⢤⡤⢤⡤⢄⡀  bud v0.1.0
+   ⢀⠤⡀⠘⠃⡏⠰⠆⢹⠈⣡  stub-fast · bud:main
+   ⠃ ⠈⠶⠦⠻⠟⠺⠿⠉⠉  Type / for commands
+
+
+
+
+
+
+
+
+
+
+ Edit which message? ───────────────────
+ Nothing is queued. Messages you send
+ while bud is busy wait here.
+ Enter · / · Esc
+────────────────────────────────────────
+  bud:main

@@ -1,0 +1,32 @@
+
+      ⢀⡠⢤⡤⢤⡤⢄⡀  bud v0.1.0
+   ⢀⠤⡀⠘⠃⡏⠰⠆⢹⠈⣡  stub-fast · bud:main
+   ⠃ ⠈⠶⠦⠻⠟⠺⠿⠉⠉  Type / for commands
+
+▌ > remind me to call Dana about the quarterly numbers · queued
+
+▌ > and book the review · queued
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ⠋ Thinking… 0s  Esc/Ctrl+C interrupt   » 2 queued
+ Cancel which message? ─────────────────────────────────────────────────────────────────────────────
+   1. remind me to call Dana about the quarterly numbe…  m1
+   2. and book the review                                m2
+ ↑↓/jk navigate  Enter select  1-2 pick  / filter  Esc back
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  bud:main · thinking · 2 queued

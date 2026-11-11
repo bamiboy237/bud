@@ -18,6 +18,17 @@ READ_TOOLS = {
     "search_contacts",
 }
 
+# The profile matrix (bud.core.profiles) treats these as "simulated world
+# writes": they ask in strict mode and may auto-run (journaled) in higher
+# modes. They stay dangerous-adjacent in one way — send_email delivers inside
+# the simulation — but never touch a real account.
+WRITE_TOOLS = {
+    "draft_reply",
+    "send_email",
+    "create_event",
+    "move_event",
+}
+
 
 def _action_key(ctx: RunContext[None]) -> str:
     metadata = ctx.tool_call_metadata or {}
@@ -85,7 +96,10 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
         return _safely(lambda: world.read_draft(draft_id, body_offset, max_chars))
 
     def draft_reply(ctx: RunContext[None], thread_id: str, body: str) -> Any:
-        """Save an approved draft reply, without sending it, then use read_draft to verify it.
+        """Save a draft reply in a thread; nothing is sent. Then use read_draft to verify it.
+
+        Use only when the person asks for a draft or says not to send. When they ask
+        you to email, reply to, or tell someone, use send_email instead.
 
         Returns the exact saved draft id, thread, recipients, and body. Replaying the
         same approval returns the original draft instead of creating another one.
@@ -101,7 +115,10 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
         return _safely(draft)
 
     def send_email(ctx: RunContext[None], to: list[str], subject: str, body: str) -> Any:
-        """Send an email.
+        """Send an email now; the person approves it before it goes out.
+
+        Use when the person asks you to email, send, reply to, or tell someone,
+        including a reply on an existing thread (subject "Re: <thread subject>").
 
         Args:
             to: Recipient email addresses.

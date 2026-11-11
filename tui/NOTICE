@@ -1,0 +1,27 @@
+bud-tui
+Copyright the bud authors. Licensed under Apache-2.0.
+
+This crate adapts conventions and algorithms from Mistral Vibe's Rust terminal UI
+(vibe/cli-rust, Apache-2.0, Copyright Mistral AI), used as a licensed reference. No
+source file was copied verbatim; the following designs were re-implemented from reading
+that code and its documentation, with bud's own names, colors, copy, and art:
+
+- Theme token model and blend math (src/theme.rs): named palette slots, a single module
+  that owns every color, truncating channel blends with named stops, the brand-ramp
+  ping-pong for the loading label, and the unit test that bans color literals elsewhere
+  (tests/color_literals.rs, after tests/units/color_literals.rs).
+- Shortcut-hint grammar (src/hints.rs): unpadded (key, action) pairs, renderer-owned
+  spacing, every line ending with its Esc pair (after src/hints.rs and the
+  vibe-rust-tui skill).
+- List-cursor bar, digit rows, and Esc-backs-out-one-level navigation (src/keys.rs,
+  src/ui/cards.rs).
+- Braille mascot engine (src/mascot/): dots on a grid rendered as 2x4 braille cells,
+  160 ms beats, rest rules with a resume frame (after src/ui/banner/petit_chat.rs).
+  The dog and ant art are original to bud.
+- Markdown block margins, heading scale, fenced-code boxes, quote bars, bullet cycle,
+  and keyline tables (src/ui/markdown.rs); quiet one-line tool cards with the marker
+  table and 100 ms pulse (src/ui/tool.rs); composer geometry with the model and mode
+  title in the top border (src/ui/mod.rs).
+
+Dependencies keep their own licenses: ratatui, crossterm, tokio, reqwest, serde,
+pulldown-cmark, unicode-width, unicode-segmentation, clap, anyhow, url, uuid.

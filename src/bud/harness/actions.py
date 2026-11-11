@@ -63,6 +63,8 @@ class ActionGateway(WrapperToolset[None]):
             if self.policy.decide(name) == "ask" and name != "ask_user"
             else tool
             for name, tool in tools.items()
+            # A denied tool is never offered: the model cannot waste a turn on it.
+            if self.policy.decide(name) != "deny"
         }
 
     async def call_tool(

@@ -5,11 +5,15 @@ user types as a message.
 
 import asyncio
 import json
+import os
+import re
 import shutil
 import sys
+from pathlib import Path
 from uuid import uuid4
 
 import httpx
+from rich.cells import cell_len
 from rich.console import Console
 from rich.prompt import Prompt
 
@@ -18,6 +22,36 @@ from bud.core.auth import OwnerAuthError, owner_token
 from bud.core.controls import approval_text, session_snapshot
 from bud.core.controls import submit as submit_control
 from bud.core.projection import reply_text
+
+ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\\\)|[@-Z\\\\-_])")
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI.sub("", text) if "\x1b" in text else text
+
+
+def truncate_visible(text: str, width: int, tail: str = "…") -> str:
+    """Fit one line to `width` terminal cells. Styling is dropped when it must be cut."""
+    if width <= 0:
+        return ""
+    plain = strip_ansi(text).rstrip("\n")
+    if cell_len(plain) <= width:
+        return text
+    out, used = [], 0
+    for char in plain:
+        if used + cell_len(char) > width - cell_len(tail):
+            break
+        out.append(char)
+        used += cell_len(char)
+    return "".join(out) + tail + ("\n" if text.endswith("\n") else "")
+
+
+def tui_binary() -> str | None:
+    """The Rust client: $BUD_TUI, then `bud-tui` on PATH, then a source-tree build."""
+    candidates = [os.environ.get("BUD_TUI"), shutil.which("bud-tui")]
+    root = Path(__file__).resolve().parents[3] / "tui" / "target" / "release" / "bud-tui"
+    candidates.append(str(root))
+    return next((c for c in candidates if c and os.access(c, os.X_OK)), None)
 
 
 def render(
@@ -230,8 +264,6 @@ def pick_model(models: list[dict]) -> str | None:
     def repaint() -> None:
         nonlocal painted
         cols = shutil.get_terminal_size((80, 24)).columns
-        from bud.tui.terminal import truncate_visible
-
         # Rows must fit one terminal line each, or the cursor-up math below
         # lands mid-frame and every keystroke leaves wrapped fragments.
         lines = [
@@ -283,8 +315,6 @@ MAX_STDIN_BYTES = 10 * 1024 * 1024  # 10MB
 
 async def headless_chat(base_url: str, session_id: str | None, *, new: bool = False) -> None:
     """Headless streaming client when stdin or stdout is non-interactive / piped."""
-    from bud.tui.terminal import strip_ansi
-
     # Read piped stdin if stdin is not a tty
     piped_input: str | None = None
     if not sys.stdin.isatty():
@@ -404,9 +434,22 @@ async def headless_chat(base_url: str, session_id: str | None, *, new: bool = Fa
 
 
 async def chat(base_url: str, session_id: str | None, *, new: bool = False) -> None:
-    if sys.stdin.isatty() and sys.stdout.isatty():
-        from bud.tui.app import run_tui
-
-        await run_tui(base_url, session_id, new=new)
-    else:
+    binary = tui_binary() if sys.stdin.isatty() and sys.stdout.isatty() else None
+    if binary is None:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            print(
+                "bud-tui is not built; using the plain client. "
+                "Build it with: cargo build --release --manifest-path tui/Cargo.toml",
+                file=sys.stderr,
+            )
         await headless_chat(base_url, session_id, new=new)
+        return
+    args = [
+        binary,
+        "--url",
+        base_url,
+        *([session_id] if session_id else []),
+        *(["--new"] if new else []),
+    ]
+    # Hand the terminal to the Rust client; it restores the terminal on every exit path.
+    os.execv(binary, args)

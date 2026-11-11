@@ -1,0 +1,20 @@
+
+      ⢀⡠⢤⡤⢤⡤⢄⡀  bud v0.1.0
+   ⢀⠤⡀⠘⠃⡏⠰⠆⢹⠈⣡  stub-fast · bud:main
+   ⠃ ⠈⠶⠦⠻⠟⠺⠿⠉⠉  Type / for commands
+
+
+
+
+
+
+ Connect Gmail ─────────────────────────
+ Open the sign-in link below in a
+ browser to finish connecting Gmail.
+ The card settles once the connection
+ completes.
+ ⇢ Waiting for Gmail…
+ https://connect.example.com/oauth/sta…
+ Enter copy url  Esc back
+────────────────────────────────────────
+  bud:main

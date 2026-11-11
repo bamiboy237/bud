@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterable
 from contextvars import Context, ContextVar
 from dataclasses import replace
@@ -44,6 +45,7 @@ from bud.core.projection import (
     message_batch,
     model_history,
     queue_paused,
+    reply_text,
     runs,
     snapshot,
     undecided_approvals,
@@ -52,12 +54,13 @@ from bud.core.projection import (
 from bud.core.runtime import replay_version
 from bud.core.tasks import CONTROL_TOOLS, FINISHED, TaskFlow, WorkItems
 from bud.gateway import Gateway
-from bud.gateway.errors import error_summary
+from bud.gateway.errors import NEXT_STEP, error_summary, failure
 from bud.gateway.registry import Tier
 from bud.gateway.router import NoModelAvailable
 from bud.gateway.tracked import TrackedModel, request_session
 from bud.harness.agent import Harness
 from bud.harness.context import BackgroundCompaction
+from bud.harness.learning import Learner
 from bud.limits import (
     MAX_MESSAGE_CHARS,
     MAX_MODEL_REQUESTS_PER_RUN,
@@ -65,6 +68,8 @@ from bud.limits import (
 )
 
 RESULTS = TypeAdapter(DeferredToolResults)
+logger = logging.getLogger(__name__)
+RECENT_LESSONS = 5
 
 
 class UnknownApproval(Exception):
@@ -96,6 +101,7 @@ class Runner(DBOSConfiguredInstance):
         *,
         durable: bool = False,
         jobs: bool = False,
+        learner: Learner | None = None,
     ) -> None:
         self.hub = hub
         self.gateway = gateway
@@ -111,6 +117,10 @@ class Runner(DBOSConfiguredInstance):
         self._current: ContextVar[dict] = ContextVar("bud_run")
         self.session_models: dict[str, str] = {}
         self.work_items = WorkItems(hub) if jobs else None
+        self.learner = learner
+        self._learning: set[asyncio.Task] = set()
+        if learner is not None:
+            harness.live_instructions.append(self._recent_lessons)
         if jobs:
             harness.policy.tools.update(dict.fromkeys(CONTROL_TOOLS, "allow"))
         self.version = replay_version()
@@ -523,9 +533,12 @@ class Runner(DBOSConfiguredInstance):
             )
         run = self._inputs(session_id, None, results, origin=origin)
         run["skills"] = next(
-            event.data.get("skills", {})
-            for event in reversed(events)
-            if event.type == "run.queued" and event.data["run_id"] == batch[0]["run_id"]
+            (
+                event.data.get("skills", {})
+                for event in reversed(events)
+                if event.type == "run.queued" and event.data["run_id"] == batch[0]["run_id"]
+            ),
+            run["skills"],
         )
         run["quiet"] = any(request["approval_id"] in revised for request in batch) and not any(
             decided[request["approval_id"]] for request in batch
@@ -586,18 +599,89 @@ class Runner(DBOSConfiguredInstance):
                 session_id,
                 run_id,
                 "run.failed",
-                {
-                    "run_id": run_id,
-                    "reason": str(error)
-                    if isinstance(error, RecoveryRefused)
-                    else error_summary(error),
-                },
+                {"run_id": run_id, **_failure(error)},
                 [],
             )
             self.hub.wake(session_id)
         if not task.cancelled():
+            if error is None and not stopped:
+                self._maybe_learn(session_id, run_id)
             self._publish_task(session_id)
             self._drain(session_id)
+
+    def _maybe_learn(self, session_id: str, run_id: str) -> None:
+        """Reflect on a completed turn in the background; the reply is already out."""
+        if self.learner is None or self._closing:
+            return
+        if self.work_items is not None and self.work_items.for_session(session_id) is not None:
+            return  # a job's messages are briefs written by bud, not the owner's words
+        events = self.hub.log.read(session_id)
+        end = next(
+            (
+                e
+                for e in reversed(events)
+                if e.type == "run.completed" and e.data["run_id"] == run_id
+            ),
+            None,
+        )
+        if end is None:
+            return
+        start = max(
+            (e.seq for e in events if e.type == "run.completed" and e.seq < end.seq), default=0
+        )
+        turn = [e for e in events if start < e.seq <= end.seq]
+        owner = "\n\n".join(e.data["text"] for e in turn if e.type == "user.message")
+        requests = {e.data["approval_id"]: e.data for e in turn if e.type == "approval.requested"}
+        signals = [
+            f"The owner denied {request['tool']} {json.dumps(request['args'])[:300]}"
+            for e in turn
+            if e.type == "approval.denied"
+            and not e.data.get("revision_message_id")
+            and (request := requests.get(e.data["approval_id"])) is not None
+        ]
+        reply = reply_text(end.data.get("messages", []))
+        task = asyncio.create_task(self._learn(session_id, run_id, owner, reply, signals))
+        self._learning.add(task)
+        task.add_done_callback(self._learning.discard)
+
+    async def _learn(
+        self, session_id: str, run_id: str, owner: str, reply: str, signals: list[str]
+    ) -> None:
+        assert self.learner is not None
+        try:
+            applied = await self.learner.learn(session_id, owner, reply, signals)
+        except Exception as exc:  # learning is best effort; the turn already succeeded
+            logger.warning("learning skipped for run %s: %s", run_id, error_summary(exc))
+            return
+        if applied:
+            self.hub.publish_once(
+                session_id,
+                "memory.learned",
+                {"run_id": run_id, "lessons": applied},
+                key=f"{run_id}:learned",
+            )
+
+    async def settle_learning(self) -> None:
+        await asyncio.gather(*self._learning, return_exceptions=True)
+
+    def _recent_lessons(self, ctx: RunContext) -> str:
+        session_id = (ctx.metadata or {}).get("bud_session_id")
+        if not session_id:
+            return ""
+        lessons = [
+            lesson["fact"]
+            for event in self.hub.log.read(session_id)
+            if event.type == "memory.learned"
+            for lesson in event.data["lessons"]
+        ][-RECENT_LESSONS:]
+        if not lessons:
+            return ""
+        listed = "\n".join(f"- {fact}" for fact in lessons)
+        return (
+            "\nbud saved these to memory in this conversation and told the owner:\n"
+            f"{listed}\nIf the owner says to forget or undo one, remove that MEMORY.md line "
+            "with write_memory (old_text) and confirm."
+        )
 
     async def stop(self) -> None:
         self._closing = True
@@ -610,6 +694,7 @@ class Runner(DBOSConfiguredInstance):
         # Keep ownership until launch submissions and actual executions have exited.
         await asyncio.gather(*self._monitors, return_exceptions=True)
         await asyncio.gather(*self._executing.values(), return_exceptions=True)
+        await self.settle_learning()
         await self.context.close()
 
     @DBOS.workflow(name="bud.run", max_recovery_attempts=5)
@@ -639,6 +724,8 @@ class Runner(DBOSConfiguredInstance):
                     {
                         "run_id": run["run_id"],
                         "reason": "Code or configuration changed; recovery stopped before tools.",
+                        "kind": "recovery",
+                        "next": NEXT_STEP["recovery"],
                     },
                     [],
                 )
@@ -749,7 +836,7 @@ class Runner(DBOSConfiguredInstance):
                 self._finish,
                 run,
                 "run.failed",
-                {"run_id": run["run_id"], "reason": error_summary(exc)},
+                {"run_id": run["run_id"], **_failure(exc)},
                 [],
             )
         finally:
@@ -861,6 +948,12 @@ class Runner(DBOSConfiguredInstance):
                         },
                         key=f"{run['run_id']}:result:{result.tool_call_id}",
                     )
+
+
+def _failure(error: BaseException) -> dict[str, str]:
+    if isinstance(error, RecoveryRefused):
+        return {"reason": str(error), "kind": "recovery", "next": NEXT_STEP["recovery"]}
+    return failure(error)
 
 
 def _artifact(part: ToolReturnPart | RetryPromptPart) -> dict[str, str] | None:

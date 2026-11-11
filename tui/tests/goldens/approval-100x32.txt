@@ -1,0 +1,32 @@
+
+      ⢀⡠⢤⡤⢤⡤⢄⡀  bud v0.1.0
+   ⢀⠤⡀⠘⠃⡏⠰⠆⢹⠈⣡  stub-fast · bud:main
+   ⠃ ⠈⠶⠦⠻⠟⠺⠿⠉⠉  Type / for commands
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ◷ Waiting for your decision…
+ Review the draft · Send email to dana@example.com ─────────────────────────────────────────────────
+ To: dana@example.com
+ Subject: Quarterly numbers
+ Body:
+ │ Hi Dana,
+ │
+ │ The numbers are attached.
+ │ Best,
+ │ Alex
+ y approve  n deny  r revise  Esc back
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  bud:main · approval needed

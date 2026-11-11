@@ -31,6 +31,14 @@ cd bud
 uv sync
 ```
 
+The terminal client is a Rust program. Build it once with [Rust](https://rustup.rs):
+
+```bash
+cargo build --release --manifest-path tui/Cargo.toml
+```
+
+Without it, `bud chat` falls back to a plain streaming client.
+
 ### 2. Connect a model
 
 Sign in with your ChatGPT subscription:

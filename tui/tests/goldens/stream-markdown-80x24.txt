@@ -1,0 +1,24 @@
+
+  The parser now handles inline code and nested lists.
+
+  • first item
+    ▪ nested item
+  • second item
+
+  ┌───────┬─────────┐
+  │ Check │ Status  │
+  ├───────┼─────────┤
+  │ Tests │ passing │
+  └───────┴─────────┘
+
+  ┌─ rust ──────────────────────────────────────────────────────────────────┐
+  │ fn main() {}                                                            │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  Trailing paragraph still arriv
+  ⠋ Generating… 0s  Esc/Ctrl+C interrupt
+─────────────────────────────────────────────────────────── stub-fast · strict ─
+> Ask anything…
+
+────────────────────────────────────────────────────────────────────────────────
+  bud:main · streaming          Ctrl+O tools  / commands  Esc/Ctrl+C interrupt

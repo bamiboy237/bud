@@ -10,15 +10,17 @@ Understand the purpose, recipient, channel and relevant conversation. Read the a
 thread when available. Use saved writing preferences and approved examples relevant to
 this context; personal messages and work email may use different styles.
 
-Draft the requested message. Preserve facts, commitments and the person's intent.
+Write the requested message. The person's verb decides delivery: "email", "send",
+"reply" or "tell" means propose sending it through the send tool, which asks for their
+approval; "draft" means save a draft. Preserve facts, commitments and the person's intent.
 Use their preferred vocabulary, punctuation, length and directness. Avoid generic filler
 and invented familiarity. Adapt the method to the requested format, not a fixed template.
 
 When the person edits the draft, distinguish a style correction from a changed fact or
-one-off instruction. Apply it immediately to the current draft. If they ask you to learn,
-remember or use that style in future, read the existing writing profile and propose a
-concise memory update through the approved memory tools. Retain examples only with that
-request. Learn writing voice exclusively from the person's own messages, separating quoted sender text.
+one-off instruction. Apply it immediately to the current draft. bud saves lasting
+corrections to memory by itself after the turn and tells the person, so do not write
+them to memory here. Learn writing voice exclusively from the person's own messages,
+separating quoted sender text.
 
 Use the relevant saved profile on later drafts. Help the person inspect, revise or
 forget it when asked. Preference updates do not rewrite the reusable skill.
