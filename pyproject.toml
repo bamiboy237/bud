@@ -37,13 +37,12 @@ select = ["E", "F", "I", "B", "UP", "SIM"]
 
 [dependency-groups]
 dev = [
-    "basedpyright>=1.40.2",
     "ruff>=0.17.2",
+    "ty>=0.0.101",
 ]
 
-[tool.basedpyright]
-include = ["src"]
-typeCheckingMode = "standard"
-pythonVersion = "3.12"
-venvPath = "."
-venv = ".venv"
+[tool.ty]
+# src/ layout is auto-discovered. Existing diagnostics recorded in the baseline
+# are suppressed (preview feature, >=0.0.93); new ones fail `ty check`.
+# Regenerate with `uv run ty check --update-baseline`.
+baseline = ".ty/baseline.json"
