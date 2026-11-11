@@ -244,10 +244,27 @@ class PhotonChat:
         else:
             try:
                 snapshot = await session_snapshot(self.core, route["session"])
-                if command in ("status", "/status") or (
-                    permission_intent(text) and snapshot["pending_approvals"]
+                pending = snapshot["pending_approvals"]
+                question = next((p for p in pending if p["tool"] == "ask_user"), None)
+                if (
+                    question is not None
+                    and len(pending) == 1
+                    and not is_control
+                    and command not in controls
                 ):
-                    for proposal in snapshot["pending_approvals"]:
+                    # A question blocks the run, so a plain reply is the answer.
+                    result = await submit(
+                        self.core,
+                        route["session"],
+                        f"/answer {question['approval_id']} {text.strip()}",
+                        message_id=digest("photon:" + message.id),
+                        origin=self.origin(route["space"]),
+                    )
+                    if result and result.startswith("[not a pending question]"):
+                        result = "That question is no longer waiting. Send /status to check."
+                    self.enqueue(route, "control:" + message.id, result or "Got it.")
+                elif command in ("status", "/status") or (permission_intent(text) and pending):
+                    for proposal in pending:
                         self.enqueue(
                             route,
                             "status:" + message.id + ":" + proposal_hash(proposal),

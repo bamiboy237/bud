@@ -91,6 +91,26 @@ def current_time() -> str:
     return datetime.now().astimezone().isoformat()
 
 
+def ask_user(ctx: RunContext[None], question: str, choices: list[str] | None = None) -> str:
+    """Ask the person a question and wait for their answer.
+
+    Use this only when a missing preference or decision genuinely blocks the
+    task and no available tool can supply the fact: prefer reading data with
+    tools first. It pauses and returns the person's exact reply. Offer 2-5
+    concrete choices when the options are known; omit choices for a free-text
+    answer. Ask one question at a time. For risky actions, still call the
+    action tool so it goes through approval.
+
+    Args:
+        question: One complete question for the person.
+        choices: Exact option labels, 2 to 5 items, when known.
+    """
+    metadata = ctx.tool_call_metadata or {}
+    if ctx.tool_call_approved and metadata.get("question_answer"):
+        return str(metadata["question_answer"])
+    raise RuntimeError("ask_user needs an answer from the person through the question flow.")
+
+
 def single_recipient(value: str) -> str | None:
     """Return one mailbox for validation and read-back, not a recipient list."""
     if "\r" in value or "\n" in value:
@@ -108,6 +128,7 @@ def policy() -> Policy:
         tools={
             **dict.fromkeys(READ_TOOLS | {"current_time"}, "allow"),
             **dict.fromkeys(WRITE_TOOLS, "ask"),
+            "ask_user": "ask",
         }
     )
 
@@ -369,7 +390,7 @@ def build_toolset(
     connections: Connections, accounts: dict[str, str], session_dir: Path
 ) -> CombinedToolset[None]:
     if not accounts:
-        return CombinedToolset([FunctionToolset([current_time])])
+        return CombinedToolset([FunctionToolset([current_time, ask_user])])
     binding = connections.binding
     if binding is None or binding.accounts != accounts:
         raise ConnectionError("Capture the verified account binding before constructing tools.")
@@ -408,6 +429,6 @@ def build_toolset(
                 connections=connections,
                 binding=binding,
             ),
-            FunctionToolset([current_time]),
+            FunctionToolset([current_time, ask_user]),
         ]
     )

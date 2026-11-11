@@ -96,7 +96,10 @@ class Theme:
         return Style.from_dict(
             {
                 "prompt.symbol": f"fg:{self.accent} bold",
+                "input.prompt": f"fg:{self.accent} bold",
                 "card.border": f"fg:{self.border}",
+                "composer.badge": f"fg:{self.accent} bold",
+                "composer.meta": f"fg:{self.muted}",
             }
         )
 

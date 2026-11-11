@@ -8,31 +8,69 @@ import functools
 import json
 import logging
 import time
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import httpx
 from prompt_toolkit import Application, print_formatted_text
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import ANSI, FormattedText
 from prompt_toolkit.layout import DynamicContainer, HSplit, Layout, VSplit, Window
+from prompt_toolkit.layout.containers import Float, FloatContainer
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.output import create_output
 from prompt_toolkit.patch_stdout import patch_stdout
 
 from bud.core.controls import session_snapshot
-from bud.tui.commands import handle_slash_command
+from bud.tui.commands import COMMANDS, handle_slash_command
 from bud.tui.keymap import build_key_bindings
 from bud.tui.state import InputMode, StateStore
-from bud.tui.terminal import SynchronizedOutput, get_terminal_size
+from bud.tui.terminal import SynchronizedOutput, get_terminal_size, visible_width
 from bud.tui.views.approval import ApprovalView, friendly_action_title
+from bud.tui.views.box import render_user_turn
 from bud.tui.views.footer import FooterView
 from bud.tui.views.message import MessageView
 from bud.tui.views.question import QuestionView
 from bud.tui.views.tool import ToolsContainerView
 
 logger = logging.getLogger(__name__)
+
+
+def _context_label() -> str:
+    """Return 'name:branch' for the working directory, like 'bud:master'."""
+    cwd = Path.cwd()
+    git = cwd / ".git"
+    head = git / "HEAD"
+    branch = ""
+    try:
+        if git.is_file():  # linked worktree: .git is a pointer, not a directory
+            head = Path(git.read_text(encoding="utf-8").strip().removeprefix("gitdir: ")) / "HEAD"
+        raw = head.read_text(encoding="utf-8").strip()
+        branch = raw.removeprefix("ref: refs/heads/")
+    except OSError:
+        branch = ""
+    return f"{cwd.name}:{branch}" if branch else cwd.name
+
+
+class SlashCommandCompleter(Completer):
+    """Completes the first word of a slash command from the single command registry."""
+
+    def get_completions(self, document: Any, complete_event: Any) -> Any:
+        text = document.text_before_cursor
+        if not text.startswith("/") or " " in text:
+            return
+        for cmd, _usage, desc in COMMANDS:
+            if cmd.startswith(text):
+                yield Completion(
+                    cmd,
+                    start_position=-len(text),
+                    display=cmd,
+                    display_meta=desc,
+                )
 
 
 class TUIApp:
@@ -50,6 +88,7 @@ class TUIApp:
         self.client: httpx.AsyncClient = client
         self.session_id: str = session_id
         self.store: StateStore = StateStore(session_id, model_id=model_id, scope=scope)
+        self._context_label = _context_label()
         self._custom_input: Any = input
         self._custom_output: Any = output
 
@@ -63,6 +102,8 @@ class TUIApp:
         self.input_buffer: Buffer = Buffer(
             multiline=True,
             accept_handler=self._on_prompt_accept,
+            completer=SlashCommandCompleter(),
+            complete_while_typing=True,
         )
 
         # Reactive subscription
@@ -85,6 +126,9 @@ class TUIApp:
         self._cached_dynamic_content: FormattedText | ANSI = FormattedText([])
         self._cached_dynamic_height: int = 0
         self._last_stream_render: float = 0.0
+        # A question card takes over the keyboard; the draft returns when it leaves.
+        self._prev_mode: InputMode = self.store.mode
+        self._question_stash: str | None = None
 
     def spawn_task(self, coro: Any) -> asyncio.Task[Any]:
         """Spawn a background task with strong reference tracking to prevent GC drops."""
@@ -98,6 +142,19 @@ class TUIApp:
         # Invalidate dynamic content cache
         self._dynamic_dirty = True
         event = self.store.last_event
+
+        # Question-mode transitions: the composer is invisible while a choice
+        # card is up, so park the draft first and restore it afterwards.
+        entering = self.store.mode == InputMode.QUESTION and self._prev_mode != InputMode.QUESTION
+        leaving = self._prev_mode == InputMode.QUESTION and self.store.mode != InputMode.QUESTION
+        if entering:
+            self._question_stash = self.input_buffer.text
+            self.input_buffer.text = ""
+        elif leaving and self._question_stash is not None:
+            self.input_buffer.text = self._question_stash
+            self.input_buffer.cursor_position = len(self.input_buffer.text)
+            self._question_stash = None
+        self._prev_mode = self.store.mode
 
         # Sync streaming text. Markdown re-parse of the full reply is expensive, so
         # while tokens stream in, re-render at most ~8fps; always render on other
@@ -173,6 +230,15 @@ class TUIApp:
                 if stream_lines:
                     lines.extend(stream_lines)
 
+            if (
+                not lines
+                and not self.store.turns
+                and self.store.status == "idle"
+                and not self.store.pending_approvals
+                and not self.store.queued_messages
+            ):
+                lines.extend(self._render_wordmark(cols))
+
         if not lines:
             self._cached_dynamic_content = FormattedText([])
             self._cached_dynamic_height = 0
@@ -189,13 +255,26 @@ class TUIApp:
         lines = self.footer_view.render(cols)
         return ANSI(lines[0] if lines else "")
 
+    def _render_wordmark(self, cols: int) -> list[str]:
+        """Idle empty-session state: centered wordmark, like modern TUI agents."""
+        th = self.store.theme
+
+        def centered(text: str) -> str:
+            pad = max(0, (cols - visible_width(text)) // 2)
+            return " " * pad + text
+
+        return [
+            "",
+            centered(th.format_accent("b  u  d", bold=True)),
+            centered(th.format_dim("/help for commands · ask anything")),
+            "",
+        ]
+
     def _get_prompt_prefix(self, line_no: int = 0) -> FormattedText:
-        """Return the prompt symbol prefix."""
-        if self.store.mode != InputMode.PROMPT:
-            return FormattedText([])
-        if line_no == 0:
-            return FormattedText([("class:prompt.symbol", "› ")])
-        return FormattedText([("class:prompt.symbol", "· ")])
+        """Return the per-line prompt prefix; framed modes start text cleanly."""
+        if self.store.border_style == "left":
+            return FormattedText([("class:input.prompt", "› " if line_no == 0 else "  ")])
+        return FormattedText([])
 
     def _build_pt_app(self) -> Application:
         """Assemble the prompt-toolkit inline Application with SynchronizedOutput."""
@@ -257,6 +336,47 @@ class TUIApp:
                 return container
 
             style = self.store.border_style
+
+            def get_meta_text() -> FormattedText:
+                model_name = self.store.model_id or "default"
+                return FormattedText(
+                    [
+                        ("class:composer.badge", "bud"),
+                        ("class:composer.meta", f" · {model_name} · {self._context_label}"),
+                    ]
+                )
+
+            meta_control = FormattedTextControl(
+                text=get_meta_text,
+                focusable=False,
+                show_cursor=False,
+            )
+            meta_window = Window(
+                content=meta_control,
+                height=Dimension.exact(1),
+                dont_extend_height=True,
+            )
+
+            if style == "left":
+                # Frameless: rail prompt prefix carries the affordance (see
+                # _get_prompt_prefix), so the composer is bare text + one meta line.
+                container = HSplit(
+                    [
+                        Window(width=2, height=1, char=" "),
+                        input_window,
+                        VSplit(
+                            [
+                                Window(width=4, height=1, char=" "),
+                                meta_window,
+                                Window(width=2, height=1, char=" "),
+                            ],
+                            height=1,
+                        ),
+                    ]
+                )
+                self._composer_cache[key] = container
+                return container
+
             if style == "square":
                 tl, tr, bl, br, h, v = "┌", "┐", "└", "┘", "─", "│"
             else:
@@ -286,6 +406,19 @@ class TUIApp:
                 ]
             )
 
+            meta_row = VSplit(
+                [
+                    fill(width=2, height=1, char=" "),
+                    fill(width=1, height=1, char=v),
+                    Window(width=1, height=1, char=" "),
+                    meta_window,
+                    Window(width=1, height=1, char=" "),
+                    fill(width=1, height=1, char=v),
+                    fill(width=2, height=1, char=" "),
+                ],
+                height=1,
+            )
+
             bot = VSplit(
                 [
                     fill(width=2, height=1, char=" "),
@@ -297,7 +430,7 @@ class TUIApp:
                 height=1,
             )
 
-            container = HSplit([top, mid, bot])
+            container = HSplit([top, mid, meta_row, bot])
             self._composer_cache[key] = container
             return container
 
@@ -317,12 +450,21 @@ class TUIApp:
         )
 
         root_layout = Layout(
-            HSplit(
-                [
-                    dynamic_window,
-                    framed_composer,
-                    footer_window,
-                ]
+            FloatContainer(
+                content=HSplit(
+                    [
+                        dynamic_window,
+                        framed_composer,
+                        footer_window,
+                    ]
+                ),
+                floats=[
+                    Float(
+                        xcursor=True,
+                        ycursor=True,
+                        content=CompletionsMenu(max_height=8, scroll_offset=1),
+                    )
+                ],
             ),
             focused_element=input_window,
         )
@@ -351,6 +493,10 @@ class TUIApp:
         if text:
             print_formatted_text(ANSI(text))
 
+    def commit_blank_line(self) -> None:
+        """Commit one blank line to scrollback (spacing between committed blocks)."""
+        print_formatted_text("")
+
     def clear_screen(self) -> None:
         """Clear screen scrollback."""
         if self.pt_app.output:
@@ -373,7 +519,8 @@ class TUIApp:
         """Process submitted prompt text (slash commands or session message)."""
         # If an approval is pending but the user dismissed the card with Esc,
         # reclaim the keyboard so y/n stays reachable.
-        if self.store.pending_approvals and self.store.mode == InputMode.PROMPT:
+        pending = self.store.pending_approvals and self.store.mode == InputMode.PROMPT
+        if pending and not self.store.represent_question():
             self.store.set_mode(InputMode.APPROVAL)
         if text.startswith("/"):
             try:
@@ -393,12 +540,25 @@ class TUIApp:
                 self.commit_scrollback(result)
             return
 
+        # Free-text answer to a pending question: posted to the approval, not sent as chat.
+        if self.store.awaiting_free_text and self.store.awaiting_question_id:
+            approval_id = self.store.awaiting_question_id
+            self.store.awaiting_free_text = False
+            self.store.awaiting_question_id = None
+            self.store.add_prompt_history(text)
+            cols, _ = get_terminal_size()
+            self.commit_scrollback(render_user_turn(text, width=cols, theme=self.store.theme))
+            self.commit_blank_line()
+            self.spawn_task(self.submit_question_approval(approval_id, text))
+            return
+
         # Add to prompt history
         self.store.add_prompt_history(text)
 
-        # Commit user's message line to scrollback immediately
-        user_line = f"{self.store.theme.format_primary('you ›', bold=True)} {text}"
-        self.commit_scrollback(user_line)
+        # Commit user's message turn to scrollback immediately
+        cols, _ = get_terminal_size()
+        self.commit_scrollback(render_user_turn(text, width=cols, theme=self.store.theme))
+        self.commit_blank_line()
 
         # Send to server
         try:
@@ -415,6 +575,24 @@ class TUIApp:
             self.commit_scrollback(f"{err_tag} {exc.response.status_code}: {exc.response.text}")
         except Exception as exc:
             self.commit_scrollback(f"{self.store.theme.format_error('[Request Failed]')} {exc}")
+
+    async def submit_question_approval(self, approval_id: str, answer: str) -> None:
+        """POST the owner's answer to a pending ask_user question."""
+        try:
+            res = await self.client.post(
+                f"/sessions/{self.session_id}/approvals/{approval_id}/answer",
+                json={"text": answer, "origin": {"channel": "terminal", "client_id": "terminal"}},
+            )
+            res.raise_for_status()
+            if not res.json().get("answered", True):
+                self.commit_scrollback(self.store.theme.format_muted("[question already answered]"))
+        except httpx.HTTPStatusError as exc:
+            self.commit_scrollback(
+                f"{self.store.theme.format_error('[answer failed]')} "
+                f"{exc.response.status_code}: {exc.response.text[:200]}"
+            )
+        except httpx.RequestError as exc:
+            self.commit_scrollback(f"{self.store.theme.format_error('[answer failed]')} {exc}")
 
     async def handle_approval_decision(self, approved: bool) -> None:
         """Submit 1-key approval decision (approve or deny) to server."""
@@ -538,6 +716,15 @@ class TUIApp:
                                 if full_reply:
                                     reply_view = MessageView("bud", full_reply, self.store)
                                     self.commit_scrollback(reply_view.render(cols))
+                                    self.commit_blank_line()
+
+                                # Turn stats under the reply, like modern agent TUIs.
+                                if self.store.last_stats_line:
+                                    self.commit_scrollback(
+                                        self.store.theme.format_dim(self.store.last_stats_line)
+                                    )
+                                    self.store.last_stats_line = ""
+                                    self.commit_blank_line()
 
                                 # Clear streaming view
                                 self.streaming_view.set_text("")
@@ -574,6 +761,7 @@ class TUIApp:
                 f"{th.format_dim('·')} {th.format_dim('/help for commands · Ctrl-D to exit')}"
             )
             self.commit_scrollback(welcome)
+            self.commit_blank_line()
 
             cols, _ = get_terminal_size()
             for turn in snapshot.get("transcript", []):
@@ -581,6 +769,7 @@ class TUIApp:
                 text = turn.get("text", "")
                 view = MessageView(role, text, self.store)
                 self.commit_scrollback(view.render(cols))
+                self.commit_blank_line()
 
             # Initial approvals if any
             for app_data in snapshot.get("pending_approvals", []):

@@ -15,7 +15,7 @@ from bud.core.events import MessageOrigin
 HELP = (
     "/status /pause /resume /stop /cancel <message-id> "
     "/edit <message-id> <text> /approve <approval-id> /deny <approval-id> "
-    "/connect gmail|calendar /connections /refresh"
+    "/answer <approval-id> <text> /connect gmail|calendar /connections /refresh"
 )
 IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
@@ -42,6 +42,12 @@ def approval_text(approval: dict) -> str:
         "workspace_update": "Update a workspace file",
     }
     task = f"Task {approval['reference']}: " if approval.get("reference") else ""
+    if approval["tool"] == "ask_user":
+        lines = [f"{task}Question: {approval['args'].get('question', '')}"]
+        for index, choice in enumerate(approval["args"].get("choices") or [], start=1):
+            lines.append(f"  {index}. {choice}")
+        lines.append(f"/answer {identity} <your reply>")
+        return "\n".join(lines)
     lines = [f"{task}Permission needed: {titles.get(approval['tool'], approval['tool'])}"]
     for name, value in approval["args"].items():
         label = name.replace("_", " ").capitalize()
@@ -130,9 +136,32 @@ async def submit(
             f"{path}/approvals/{parts[1]}",
             json={"approved": command == "/approve", "origin": source},
         )
+        if response.status_code == 409:
+            return f"[needs an answer] {parts[1]} is a question; /answer {parts[1]} <reply>."
         response.raise_for_status()
         label = "approved" if command == "/approve" else "denied"
         return f"[{label}] {parts[1]}" if response.json()["applied"] else "[already decided]"
+    if command == "/answer":
+        if len(parts) != 3 or not IDENTIFIER.fullmatch(parts[1]):
+            return "[usage] /answer <approval-id> <reply>; use /status to see the question."
+        state = await session_snapshot(client, session_id)
+        references = {
+            identity
+            for item in state["pending_approvals"]
+            if item["tool"] == "ask_user"
+            for identity in (item["approval_id"], item.get("reference"))
+            if identity is not None
+        }
+        if parts[1] not in references:
+            return "[not a pending question] Use /status for current questions."
+        response = await client.post(
+            f"{path}/approvals/{parts[1]}/answer",
+            json={"text": parts[2], "origin": source},
+        )
+        if response.status_code == 409:
+            return f"[needs a decision] {parts[1]} is an action; /approve or /deny it."
+        response.raise_for_status()
+        return f"[answered] {parts[1]}" if response.json().get("answered") else "[already answered]"
     if command == "/connect":
         if len(parts) != 2 or parts[1] not in ("gmail", "calendar"):
             return "[usage] /connect gmail|calendar"

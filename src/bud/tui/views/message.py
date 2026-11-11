@@ -9,6 +9,7 @@ from rich.markdown import Markdown
 
 from bud.tui.state import StateStore
 from bud.tui.views.base import View
+from bud.tui.views.box import render_user_turn
 
 
 def get_code_theme_for_theme(theme_name: str) -> str:
@@ -98,13 +99,9 @@ class MessageView(View):
 
         # Format user vs assistant
         if self.role == "you":
-            prefix = theme.format_primary("you ›", bold=True) if theme else "\x1b[1myou ›\x1b[0m"
-            user_lines = current_text.splitlines() or [""]
-            res = [f"  {prefix} {user_lines[0]}"]
-            indent = "        "
-            for uline in user_lines[1:]:
-                res.append(f"{indent}{uline}")
-            return res
+            # Same left-rail renderer as live submissions, so the transcript
+            # replays in the one user-turn language.
+            return render_user_turn(current_text, width, theme if theme else None)
 
         # Assistant role: parse markdown using rich
         prefix = theme.format_accent("bud ›", bold=True) if theme else "\x1b[1mbud ›\x1b[0m"

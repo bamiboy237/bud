@@ -26,7 +26,13 @@ def _action_key(ctx: RunContext[None]) -> str:
     return metadata["approval_id"]
 
 
-def build_tools(world: World) -> list[Tool]:
+def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[None]]:
+    """Build the world toolset.
+
+    Evaluated runs pass include_ask_user=False: scripted evals cannot type an
+    answer, so the question tool would stall every attempt.
+    """
+
     def current_time() -> str:
         """Return the current local date and time for the person."""
         return world.now
@@ -197,23 +203,43 @@ def build_tools(world: World) -> list[Tool]:
         """
         return _safely(lambda: world.search_contacts(query))
 
-    return [
-        Tool(tool)
-        for tool in (
-            current_time,
-            search_email,
-            read_thread,
-            list_drafts,
-            read_draft,
-            draft_reply,
-            send_email,
-            list_events,
-            read_event,
-            create_event,
-            move_event,
-            search_contacts,
-        )
+    def ask_user(ctx: RunContext[None], question: str, choices: list[str] | None = None) -> str:
+        """Ask the person a question and wait for their answer.
+
+        Use this only when a missing preference or decision genuinely blocks the
+        task and no available tool can supply the fact: prefer reading data with
+        tools first. It pauses and returns the person's exact reply. Offer 2-5
+        concrete choices when the options are known; omit choices for a
+        free-text answer. Ask one question at a time. For risky actions, still
+        call the action tool so it goes through approval.
+
+        Args:
+            question: One complete question for the person.
+            choices: Exact option labels, 2 to 5 items, when known.
+        """
+        metadata = ctx.tool_call_metadata or {}
+        if ctx.tool_call_approved and metadata.get("question_answer"):
+            return str(metadata["question_answer"])
+        raise WorldError("ask_user needs an answer from the person through the question flow.")
+
+    fns = [
+        current_time,
+        search_email,
+        read_thread,
+        list_drafts,
+        read_draft,
+        draft_reply,
+        send_email,
+        list_events,
+        read_event,
+        create_event,
+        move_event,
+        search_contacts,
     ]
+    if include_ask_user:
+        fns.append(ask_user)
+    tools: list[Tool[None]] = [Tool(tool) for tool in fns]
+    return tools
 
 
 def _safely(call: Callable[[], Any]) -> Any:

@@ -71,6 +71,16 @@ class UnknownApproval(Exception):
     pass
 
 
+class DecisionRejected(Exception):
+    """The approval exists but expects the other interaction (answer vs decision)."""
+
+    def __init__(self, approval_id: str, expects_answer: bool) -> None:
+        self.approval_id = approval_id
+        self.expects_answer = expects_answer
+        verb = "an answer" if expects_answer else "an approve/deny decision"
+        super().__init__(f"approval {approval_id} expects {verb}")
+
+
 class RecoveryRefused(Exception):
     pass
 
@@ -386,8 +396,13 @@ class Runner(DBOSConfiguredInstance):
         events = self.hub.log.read(session_id)
         if approval_id in decisions(events):
             return False
-        if not any(request["approval_id"] == approval_id for request in waiting_batch(events)):
+        batch = waiting_batch(events)
+        request = next((r for r in batch if r["approval_id"] == approval_id), None)
+        if request is None:
             raise UnknownApproval(approval_id)
+        if request.get("tool") == "ask_user":
+            # Questions carry information; a decision cannot. Send the answer instead.
+            raise DecisionRejected(approval_id, expects_answer=True)
         event_type = "approval.granted" if approved else "approval.denied"
         event = self.hub.publish_once(
             session_id, event_type, {"approval_id": approval_id, "origin": origin}
@@ -405,10 +420,47 @@ class Runner(DBOSConfiguredInstance):
             if target is not None:
                 return self.revise(target[0], target[1], text, message_id, origin)
         self._validate_text(text)
+        events = self.hub.log.read(session_id)
+        request = next(
+            (r for r in undecided_approvals(events) if r["approval_id"] == approval_id), None
+        )
+        if request is not None and request.get("tool") == "ask_user":
+            # A question is replaced by its answer, not by a correction.
+            raise DecisionRejected(approval_id, expects_answer=True)
         event = self.hub.log.revise_approval(session_id, approval_id, text, message_id, origin)
         self.hub.wake(session_id)
         self._drain(session_id)
         return event is not None
+
+    def answer(
+        self, session_id: str, approval_id: str, text: str, origin: dict | None = None
+    ) -> bool:
+        """Record the owner's answer to an ask_user question and resume the run."""
+        if self.work_items is not None:
+            target = self.work_items.resolve(session_id, approval_id)
+            if target is not None:
+                return self.answer(target[0], target[1], text, origin)
+        self._validate_text(text)
+        events = self.hub.log.read(session_id)
+        if approval_id in decisions(events):
+            return False
+        batch = waiting_batch(events)
+        request = next((r for r in batch if r["approval_id"] == approval_id), None)
+        if request is None:
+            raise UnknownApproval(approval_id)
+        if request.get("tool") != "ask_user":
+            # Action approvals are approved or denied; answers must not grant them.
+            raise DecisionRejected(approval_id, expects_answer=False)
+        event = self.hub.publish_once(
+            session_id,
+            "question.answered",
+            {"approval_id": approval_id, "text": text, "origin": origin},
+            key=f"{session_id}:answer:{approval_id}",
+        )
+        if event is None:
+            return False
+        self._resume_if_ready(session_id)
+        return True
 
     def _resume_if_ready(self, session_id: str) -> None:
         events = self.hub.log.read(session_id)
@@ -420,6 +472,11 @@ class Runner(DBOSConfiguredInstance):
             event.data["approval_id"]
             for event in events
             if event.type == "approval.denied" and event.data.get("revision_message_id")
+        }
+        answers = {
+            event.data["approval_id"]: event.data["text"]
+            for event in events
+            if event.type == "question.answered"
         }
         results = DeferredToolResults(
             approvals={
@@ -433,7 +490,15 @@ class Runner(DBOSConfiguredInstance):
                 for request in batch
             },
             metadata={
-                request["call_id"]: {"approval_id": request["approval_id"]} for request in batch
+                request["call_id"]: (
+                    {
+                        "approval_id": request["approval_id"],
+                        "question_answer": answers[request["approval_id"]],
+                    }
+                    if request["approval_id"] in answers
+                    else {"approval_id": request["approval_id"]}
+                )
+                for request in batch
             },
         )
         ids = {request["approval_id"] for request in batch}

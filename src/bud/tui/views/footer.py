@@ -29,17 +29,22 @@ class FooterView(View):
         theme = self.store.theme
 
         # Status segment. Paused is persistent state, not a scrollback event.
+        # Pending approvals are read from state, not the transient status field,
+        # because run.waiting rewrites status while the choice card is still up.
         st = self.store.status
-        if st in ("thinking", "streaming"):
+        pending_question = any(a.tool == "ask_user" for a in self.store.pending_approvals)
+        if st == "error":
+            status_text = theme.format_error(st)
+        elif pending_question:
+            status_text = theme.format_accent("answer needed")
+        elif self.store.pending_approvals:
+            status_text = theme.format_accent("approval needed")
+        elif self.store.queue_paused or st == "paused":
+            status_text = theme.format_warning("paused")
+        elif st in ("thinking", "streaming"):
             status_text = theme.format_accent(st)
         elif st.startswith("tool:"):
             status_text = theme.format_accent("working")
-        elif st == "waiting_approval":
-            status_text = theme.format_accent("approval needed")
-        elif st == "error":
-            status_text = theme.format_error(st)
-        elif self.store.queue_paused or st == "paused":
-            status_text = theme.format_warning("paused")
         else:
             status_text = theme.format_dim("idle")
 
@@ -50,6 +55,7 @@ class FooterView(View):
             items.append(theme.format_warning(f"{queued} queued"))
 
         # Optional segments, in the order they should be dropped when space is tight.
+        # The model lives in the composer meta row; the footer carries state only.
         optional: list[str] = []
         tot_tokens = self.store.input_tokens + self.store.output_tokens
         if tot_tokens > 0:
@@ -57,7 +63,6 @@ class FooterView(View):
         lat = self.store.last_latency_ms
         if lat > 0:
             optional.append(theme.format_dim(f"{int(lat)}ms"))
-        optional.append(theme.format_primary(self.store.model_id))
 
         # Key hints for the active mode; the footer is the single hint home.
         if self.store.mode == InputMode.APPROVAL:

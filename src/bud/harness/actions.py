@@ -59,7 +59,8 @@ class ActionGateway(WrapperToolset[None]):
                     ),
                 ),
             )
-            if self.policy.decide(name) == "ask"
+            # ask_user asks for information, not permission; it needs no prefix.
+            if self.policy.decide(name) == "ask" and name != "ask_user"
             else tool
             for name, tool in tools.items()
         }

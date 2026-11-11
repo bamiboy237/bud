@@ -21,7 +21,7 @@ class QuestionView(View):
 
     def _render(self, width: int) -> list[str]:
         theme = self.store.theme
-        border_style: BoxStyle = getattr(self.store, "border_style", "rounded")
+        border_style: BoxStyle = self.store.border_style
 
         title = self.store.question_title or "Select an option"
         choices = self.store.question_choices
@@ -29,14 +29,14 @@ class QuestionView(View):
 
         body_lines: list[str] = []
         for idx, choice in enumerate(choices):
-            is_selected = idx == selected_idx
-            if is_selected:
+            marker = theme.format_dim(f"{idx + 1}.")
+            if idx == selected_idx:
                 pointer = theme.format_accent("›", bold=True)
                 choice_str = theme.format_accent(choice, bold=True)
-                body_lines.append(f"{pointer} {choice_str}")
             else:
+                pointer = theme.format_dim(" ")
                 choice_str = theme.format_muted(choice)
-                body_lines.append(f"  {choice_str}")
+            body_lines.append(f"{pointer} {marker} {choice_str}")
 
         # Key hints live in the footer; the card carries content only.
         return render_box(
