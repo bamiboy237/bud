@@ -32,8 +32,8 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check src
       - run: uv run ruff format --check src
-      # Errors already in .basedpyright/baseline.json are tolerated; new ones fail.
-      - run: uv run basedpyright
+      # Diagnostics already in .ty/baseline.json are suppressed; new ones fail.
+      - run: uv run ty check
 
   # The Rust terminal client in tui/ only exists on branches that carry it;
   # skip the job entirely where there is no crate to check.
