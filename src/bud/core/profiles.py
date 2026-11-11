@@ -66,7 +66,7 @@ _SKILL_ACTIONS: dict[Mode, Action] = {
 
 def as_mode(value: object) -> Mode | None:
     """Coerce a stored or posted value into a Mode, or None if foreign."""
-    return value if value in MODES else None  # type: ignore[return-value]
+    return next((mode for mode in MODES if mode == value), None)
 
 
 def _overlay(mode: Mode) -> dict[str, Action]:

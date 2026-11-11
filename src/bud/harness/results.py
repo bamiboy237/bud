@@ -157,7 +157,7 @@ class SqliteResultStore:
         return len(deleted)
 
 
-def build_output_limits(store: SqliteResultStore, read_tools: set[str]) -> ToolOutputLimits:
+def build_output_limits(store: SqliteResultStore, read_tools: set[str]) -> ToolOutputLimits[None]:
     limited = read_tools | {"read_memory", "search_memory", "load_tool_result"}
 
     def model_visible_result(ctx: RunContext[None], tool: ToolDefinition) -> bool:
