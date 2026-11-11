@@ -8,16 +8,63 @@ on:
 permissions:
   contents: read
 
+# Superseded runs on a PR branch are cancelled. Runs on master are never cancelled,
+# so every merged commit keeps its own result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # requires-python is >=3.12 while .python-version pins 3.14 for local
+        # dev; exercise both ends of the supported range.
+        python-version: ["3.12", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           enable-cache: true
+          python-version: ${{ matrix.python-version }}
       - run: uv sync --locked
       - run: uv run ruff check src
       - run: uv run ruff format --check src
-      # Errors already in .basedpyright/baseline.json are tolerated; new ones fail.
-      - run: uv run basedpyright
+      # Diagnostics already in .ty/baseline.json are suppressed; new ones fail.
+      - run: uv run ty check
+
+  # The Rust terminal client in tui/ only exists on branches that carry it;
+  # skip the job entirely where there is no crate to check.
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tui: ${{ steps.detect.outputs.tui }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - id: detect
+        run: echo "tui=$([ -f tui/Cargo.toml ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+
+  tui:
+    needs: detect
+    if: needs.detect.outputs.tui == 'yes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: tui
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: tui
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
