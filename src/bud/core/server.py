@@ -236,17 +236,11 @@ def _create_app(
     live_mode: dict[str, Mode] = {"mode": approval_mode}
     harness.live_instructions.append(lambda: MODE_GUIDANCE(live_mode["mode"]))
 
-    def today() -> str:
-        # Day granularity: instructions lead the prompt, so a per-minute clock here
-        # would invalidate the cached conversation on every turn.
-        now = datetime.fromisoformat(world.now) if world is not None else None
-        now = now or datetime.now().astimezone()
-        return (
-            f"\nToday is {now:%A, %d %B %Y} (UTC{now:%z}). "
-            "Call current_time when the exact time matters."
-        )
-
-    harness.live_instructions.append(today)
+    harness.clock = (
+        (lambda: datetime.fromisoformat(world.now))
+        if world is not None
+        else (lambda: datetime.now().astimezone())
+    )
     gateway.model("fast", require_tools=True)
     log = EventLog(db_path)
     hub = Hub(log)
@@ -257,7 +251,7 @@ def _create_app(
     learner = (
         Learner(
             harness.memory,
-            lambda session_id: gateway.model("fast", session_id, require_tools=True),
+            lambda session_id: gateway.model("fast", f"{session_id}:learn", require_tools=True),
         )
         if harness.memory is not None
         else None

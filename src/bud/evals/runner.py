@@ -42,6 +42,9 @@ class Attempt:
     session_id: str
     prompt_version: str
     models: list[dict[str, str]]
+    requests: int = 0
+    model_seconds: float = 0.0
+    wasted: int = 0
 
 
 def failure_reason(events: list[Event]) -> str | None:
@@ -96,10 +99,11 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
             result_path=log.path,
             read_tools=READ_TOOLS,
         )
+        harness.clock = lambda: datetime.fromisoformat(world.now)
         assert harness.memory is not None
         learner = Learner(
             harness.memory,
-            lambda session: gateway.model("fast", session, require_tools=True),
+            lambda session: gateway.model("fast", f"{session}:learn", require_tools=True),
         )
         runner = Runner(Hub(log), gateway, harness, learner=learner)
         before = world.snapshot()
@@ -115,6 +119,14 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
             approvals, timed_out = [], True
         await runner.stop()
         events = log.read(session_id)
+        # A call the model aimed at a tool it cannot see costs a whole model round trip.
+        wasted = sum(
+            1
+            for e in events
+            if e.type == "tool.result"
+            and e.data.get("outcome") == "retried"
+            and "Unknown tool name" in str(e.data.get("result", ""))
+        )
         transcript = snapshot(session_id, events).transcript
         outcome = Outcome(
             before=before,
@@ -128,6 +140,7 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
     if outcome.failure and not timed_out:
         problems.insert(0, f"run failed: {outcome.failure}")
     cost, tokens = gateway.ledger.session_totals(session_id)
+    requests, model_seconds = gateway.ledger.session_profile(session_id)
     return Attempt(
         task=task.id,
         passed=not problems,
@@ -138,6 +151,9 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
         session_id=session_id,
         prompt_version=harness.prompt_version,
         models=gateway.ledger.session_models(session_id),
+        requests=requests,
+        model_seconds=model_seconds,
+        wasted=wasted,
     )
 
 
@@ -167,20 +183,33 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str) -> Path:
     for attempt in attempts:
         by_task.setdefault(attempt.task, []).append(attempt)
 
-    print(f"{'Task':<20} {'Passed':>7} {'Seconds':>8} {'API USD':>9}")
+    print(
+        f"{'Task':<20} {'Passed':>7} {'Seconds':>8} {'Model s':>8} {'Reqs':>5} "
+        f"{'Wasted':>6} {'API USD':>9}"
+    )
     for task, runs in by_task.items():
+        n = len(runs)
         passed = sum(run.passed for run in runs)
-        seconds = sum(run.seconds for run in runs) / len(runs)
-        cost = sum(run.cost_usd for run in runs) / len(runs)
-        print(f"{task:<20} {f'{passed}/{len(runs)}':>7} {seconds:>8.1f} {cost:>9.5f}")
+        seconds = sum(run.seconds for run in runs) / n
+        model = sum(run.model_seconds for run in runs) / n
+        reqs = sum(run.requests for run in runs) / n
+        wasted = sum(run.wasted for run in runs) / n
+        cost = sum(run.cost_usd for run in runs) / n
+        print(
+            f"{task:<20} {f'{passed}/{n}':>7} {seconds:>8.1f} {model:>8.1f} {reqs:>5.1f} "
+            f"{wasted:>6.1f} {cost:>9.5f}"
+        )
 
     pass_rate = sum(a.passed for a in attempts) / len(attempts)
     pass_all = sum(all(r.passed for r in runs) for runs in by_task.values()) / len(by_task)
     total = sum(a.cost_usd for a in attempts)
+    mean_reqs = sum(a.requests for a in attempts) / len(attempts)
+    mean_wasted = sum(a.wasted for a in attempts) / len(attempts)
     print(
         f"\nPass rate: {pass_rate:.0%}   pass^{trials}: {pass_all:.0%}   "
         f"Metered API total: ${total:.4f}"
     )
+    print(f"Model requests per task: {mean_reqs:.1f}   wasted calls per task: {mean_wasted:.2f}")
     if any(model["billing"] == "subscription" for a in attempts for model in a.models):
         print("ChatGPT plan usage is included in token counts, not API USD.")
 
