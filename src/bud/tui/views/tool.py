@@ -347,16 +347,26 @@ class ToolView(View):
                         continue
                     label = k.replace("_", " ").capitalize()
                     val_str = str(v).replace("{", "").replace("}", "")
-                    if len(val_str) > _MAX_ARG_CHARS:
-                        val_str = val_str[:_MAX_ARG_CHARS] + "…"
+                    val_str = truncate_visible(val_str, _MAX_ARG_CHARS)
                     arg_line = f"    {dim_pipe} {label}: {val_str}"
                     lines.append(truncate_visible(arg_line, width))
 
             if t.result is not None:
                 clean_results = format_clean_result(t.result)
                 if t.status == "failed":
-                    # An error line is one line; the stack belongs to the server log.
-                    clean_results = clean_results[:1]
+                    # One informative error line; the stack stays in the server log.
+                    informative = [
+                        ln
+                        for ln in clean_results
+                        if not ln.lstrip().startswith(("Traceback", 'File "', "During handling"))
+                    ]
+                    if informative:
+                        clean_results = informative[:1]
+                    elif t.result.strip():
+                        first = format_clean_result(t.result.strip().splitlines()[0])
+                        clean_results = first or ["  (no diagnostic output)"]
+                    else:
+                        clean_results = ["  (no diagnostic output)"]
                 for rline in clean_results[:12]:
                     lines.append(truncate_visible(f"    {dim_pipe} {rline}", width))
                 if len(clean_results) > 12:

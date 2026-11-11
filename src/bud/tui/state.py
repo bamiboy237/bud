@@ -453,7 +453,11 @@ class StateStore:
                             break
                 if target:
                     res = str(data.get("result", ""))
-                    target.finish(res, failed=bool(data.get("failed")))
+                    # The runner reports outcome (success/failure/retried), not a
+                    # boolean; retried means the tool errored and was re-issued.
+                    target.finish(
+                        res, failed=data.get("outcome", "success") in ("failure", "retried")
+                    )
                 self.status = "thinking"
                 self.notify()
                 return None

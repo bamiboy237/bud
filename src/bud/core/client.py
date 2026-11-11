@@ -5,6 +5,7 @@ user types as a message.
 
 import asyncio
 import json
+import shutil
 import sys
 from uuid import uuid4
 
@@ -228,9 +229,21 @@ def pick_model(models: list[dict]) -> str | None:
 
     def repaint() -> None:
         nonlocal painted
-        lines = ["\x1b[1mSelect a model\x1b[0m  (up/down + Enter, q/ESC to quit)"]
+        cols = shutil.get_terminal_size((80, 24)).columns
+        from bud.tui.terminal import truncate_visible
+
+        # Rows must fit one terminal line each, or the cursor-up math below
+        # lands mid-frame and every keystroke leaves wrapped fragments.
+        lines = [
+            truncate_visible(
+                "\x1b[1mSelect a model\x1b[0m  (up/down + Enter, q/ESC to quit)\n",
+                cols,
+                tail="",
+            ).rstrip("\n")
+        ]
         for i, m in enumerate(options):
             row = f"   {m['id']:<42} {m['tier']:<9} {m['billing']}"
+            row = truncate_visible(row, cols, tail="…")
             lines.append(f"\x1b[7m{row}\x1b[0m" if i == index else row)
         if painted:
             # Repaint in place: move to the top of the frame we painted and erase
