@@ -417,24 +417,6 @@
                     "lineCount": 1
                 }
             }
-        ],
-        "./src/bud/world/tools.py": [
-            {
-                "code": "reportReturnType",
-                "range": {
-                    "startColumn": 11,
-                    "endColumn": 5,
-                    "lineCount": 17
-                }
-            },
-            {
-                "code": "reportArgumentType",
-                "range": {
-                    "startColumn": 13,
-                    "endColumn": 17,
-                    "lineCount": 1
-                }
-            }
         ]
     }
 }
