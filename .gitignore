@@ -33,6 +33,7 @@ data/
 # Local agent tooling
 .agents/
 .claude/
+.vibe/
 skills-lock.json
 
 # Private course material and working notes
@@ -50,3 +51,6 @@ run_live_test.py
 # Worktrees
 .worktrees/
 worktrees/
+
+# Local backup of the retired Python TUI (history keeps it)
+archive/

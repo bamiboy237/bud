@@ -1,0 +1,32 @@
+      ⢀⡠⢤⡤⢤⡤⢄⡀  bud v0.1.0
+   ⢀⠤⡀⠘⠃⡏⠰⠆⢹⠈⣡  stub-fast · bud:main
+   ⠃ ⠈⠶⠦⠻⠟⠺⠿⠉⠉  Type / for commands
+
+▌ > Summarize the release notes.
+
+                                           Release notes
+
+  The parser now handles inline code and nested lists.
+
+  • first item
+    ▪ nested item
+  • second item
+
+  ┌───────┬─────────┐
+  │ Check │ Status  │
+  ├───────┼─────────┤
+  │ Tests │ passing │
+  └───────┴─────────┘
+
+  ┌─ rust ──────────────────────────────────────────────────────────────────────────────────────┐
+  │ fn main() {}                                                                                │
+  └─────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  Trailing paragraph still arriv
+  ⠋ Generating… 0s  Esc/Ctrl+C interrupt
+─────────────────────────────────────────────────────────────────────────────── stub-fast · strict ─
+> Ask anything…
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  bud:main · streaming                 ~58 tokens · Ctrl+O tools  / commands  Esc/Ctrl+C interrupt

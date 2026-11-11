@@ -1,0 +1,20 @@
+
+      ⢀⡠⢤⡤⢤⡤⢄⡀  bud v0.1.0
+   ⢀⠤⡀⠘⠃⡏⠰⠆⢹⠈⣡  stub-fast · bud:main
+   ⠃ ⠈⠶⠦⠻⠟⠺⠿⠉⠉  Type / for commands
+
+
+
+
+
+
+
+
+
+
+ Connect an account ────────────────────
+ ✓ 1. Gmail     connected
+   2. Calendar  not connected
+ Enter · 1-2 · / · Esc
+────────────────────────────────────────
+  bud:main

@@ -1,0 +1,20 @@
+
+      ⢀⡠⢤⡤⢤⡤⢄⡀  bud v0.1.0
+   ⢀⠤⡀⠘⠃⡏⠰⠆⢹⠈⣡  stub-fast · bud:main
+   ⠃ ⠈⠶⠦⠻⠟⠺⠿⠉⠉  Type / for commands
+
+
+
+
+
+
+
+
+
+ Select a theme ────────────────────────
+ ✓ 1. dark   zinc on near-black
+   2. light  zinc on near-white
+   3. auto   follow the terminal backg…
+ Enter · 1-3 · / · Esc
+────────────────────────────────────────
+  bud:main

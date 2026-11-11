@@ -36,6 +36,7 @@ cached = 0.006
 provider = "openai"
 name = "gpt-6-luna"
 tier = "fast"
+reasoning_effort = "medium"
 input = 0.10
 output = 0.50
 cached = 0.01

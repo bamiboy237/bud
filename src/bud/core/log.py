@@ -13,7 +13,9 @@ from uuid import uuid4
 
 from bud.core.events import RUN_END_EVENTS, Event, EventType
 from bud.core.projection import (
+    AUTO_PAUSES,
     message_batch,
+    pause_reason,
     queue_paused,
     queued_messages,
     runs,
@@ -276,6 +278,16 @@ class EventLog:
             event = self._accept_message(db, session_id, text, message_id, origin)
             if event is not None:
                 self._supersede(db, session_id, message_id, origin)
+                reason = pause_reason(self._read(db, session_id))
+                if reason in AUTO_PAUSES:
+                    # A new message is the owner saying "carry on"; the failure note
+                    # in model history tells the next run what went wrong.
+                    self._insert(
+                        db,
+                        session_id,
+                        "queue.resumed",
+                        {"reason": "new_message", "after": reason, "message_id": message_id},
+                    )
             return event
 
     def _supersede(self, db, session_id: str, message_id: str, origin: dict | None) -> None:
@@ -390,7 +402,12 @@ class EventLog:
             db.execute("BEGIN IMMEDIATE")
             if queue_paused(self._read(db, session_id)) == paused:
                 return False
-            self._insert(db, session_id, "queue.paused" if paused else "queue.resumed", {})
+            self._insert(
+                db,
+                session_id,
+                "queue.paused" if paused else "queue.resumed",
+                {"reason": "owner"},
+            )
             return True
 
     def dispatch_message(self, session_id: str, message_id: str, run: dict) -> bool:
@@ -450,7 +467,7 @@ class EventLog:
             db.execute("BEGIN IMMEDIATE")
             events = self._read(db, session_id)
             if not queue_paused(events):
-                self._insert(db, session_id, "queue.paused", {})
+                self._insert(db, session_id, "queue.paused", {"reason": "stopped"})
             states = runs(events)
             if not states or states[-1].status not in (
                 "queued",
@@ -513,8 +530,11 @@ class EventLog:
             once=True,
             key=f"{run_id}:stopped",
         )
-        if cancelled is not None and uncertain and not queue_paused(self._read(db, session_id)):
-            self._insert(db, session_id, "queue.paused", {})
+        if cancelled is not None and uncertain:
+            # Stays paused even through new messages: the owner must check first.
+            self._insert(
+                db, session_id, "queue.paused", {"reason": "uncertain", "tools": uncertain}
+            )
 
     def record_action(self, session_id: str, run_id: str, decision: dict) -> None:
         # Permission and Stop serialize on the same database transaction.
@@ -572,7 +592,7 @@ class EventLog:
                 and kind == "run.failed"
                 and not queue_paused(self._read(db, session_id))
             ):
-                self._insert(db, session_id, "queue.paused", {})
+                self._insert(db, session_id, "queue.paused", {"reason": "failed"})
 
     def sessions_with_decisions(self) -> list[str]:
         with self._connect() as db:

@@ -1,0 +1,20 @@
+ • first item
+   ▪ nested item
+ • second item
+
+ ┌───────┬─────────┐
+ │ Check │ Status  │
+ ├───────┼─────────┤
+ │ Tests │ passing │
+ └───────┴─────────┘
+
+ ┌─ rust ────────────────────────────┐
+ │ fn main() {}                      │
+ └───────────────────────────────────┘
+
+ Trailing paragraph still arriv
+  ⠋ Generating… 0s
+─────────────────── stub-fast · strict ─
+> Ask anything…
+────────────────────────────────────────
+  bud:main · streaming  / · Esc/Ctrl+C

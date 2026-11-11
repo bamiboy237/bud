@@ -1,0 +1,20 @@
+
+         ⢀⠔⡠⠄   bud v0.1.0
+  ⢴⣟⣻⡦⢤⣶⡦⣼⣞⣄⣠⢄  stub-fast · bud:main
+   ⠉⠉ ⢀⢿⠣⡌⠉ ⠙⠛  Type / for commands
+
+
+
+
+
+  ◷ Waiting for your decision…
+ Question ──────────────────────────────
+ Which calendar should I use for the
+ meeting?
+ 1. Work
+ 2. Personal
+ 3. Team shared
+ 4. Type your own answer
+ Enter · 1-4 · Esc
+────────────────────────────────────────
+  bud:main · answer needed

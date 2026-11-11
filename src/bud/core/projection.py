@@ -35,6 +35,18 @@ class QueuedMessage(BaseModel):
     origin: MessageOrigin | None = None
 
 
+class PendingSetup(BaseModel):
+    """One capability setup card, tracked until it connects or is replaced."""
+
+    capability: str
+    label: str
+    status: str = "waiting"
+    kind: str | None = None
+    url: str | None = None
+    steps: list[str] = Field(default_factory=list)
+    reason: str | None = None
+
+
 class SavedArtifact(BaseModel):
     path: str
     revision: str
@@ -64,6 +76,7 @@ class Snapshot(BaseModel):
     last_seq: int
     run_active: bool
     pending_approvals: list[PendingApproval]
+    pending_setup: list[PendingSetup] = Field(default_factory=list)
     transcript: list[Turn]
     status: str = "idle"
     queue_paused: bool = False
@@ -123,6 +136,46 @@ def queue_paused(events: list[Event]) -> bool:
         ),
         False,
     )
+
+
+# Pauses bud made itself; the owner's next message lifts them. An owner /pause and a
+# stop that left an action's outcome unknown stay until the owner resumes.
+AUTO_PAUSES = ("failed", "stopped")
+
+
+def pause_reason(events: list[Event]) -> str | None:
+    """Why the queue is paused, or None when it is open. Old pauses had no reason and
+    are treated as the owner's own."""
+    last = next((e for e in reversed(events) if e.type in ("queue.paused", "queue.resumed")), None)
+    if last is None or last.type == "queue.resumed":
+        return None
+    return last.data.get("reason", "owner")
+
+
+def pending_setups(events: list[Event]) -> list[PendingSetup]:
+    """Fold capability cards: one per capability, kept until it connects.
+
+    A `capability.setup` event replaces a capability's card wholesale; a
+    `capability.status` recheck only moves its state, so the sign-in link or
+    steps the card already showed stay with it. A connected card has settled
+    and stops being pending, like a decided approval; a failed card stays —
+    its reason sentence is the recovery move the person still needs.
+    """
+    cards: dict[str, PendingSetup] = {}
+    for event in events:
+        if event.type not in ("capability.setup", "capability.status"):
+            continue
+        try:
+            incoming = PendingSetup.model_validate(event.data)
+        except ValidationError:
+            continue
+        card = cards.get(incoming.capability)
+        if event.type == "capability.status" and card is not None:
+            incoming = card.model_copy(
+                update={"status": incoming.status, "reason": incoming.reason}
+            )
+        cards[incoming.capability] = incoming
+    return [card for card in cards.values() if card.status != "connected"]
 
 
 def runs(events: list[Event], *, summaries: bool = False) -> list[RunView]:
@@ -258,6 +311,7 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
             PendingApproval(**{key: request[key] for key in ("approval_id", "tool", "args")})
             for request in undecided_approvals(events)
         ],
+        pending_setup=pending_setups(events),
         transcript=transcript,
     )
 

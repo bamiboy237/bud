@@ -1,0 +1,32 @@
+
+      ⢀⡠⢤⡤⢤⡤⢄⡀  bud v0.1.0
+   ⢀⠤⡀⠘⠃⡏⠰⠆⢹⠈⣡  stub-fast · bud:main
+   ⠃ ⠈⠶⠦⠻⠟⠺⠿⠉⠉  Type / for commands
+
+▌ > Check the notes
+
+  ⏷ Read notes.md
+  ⎢ Path: notes.md
+  ⎢ line one
+  ⎣ line two
+  ⏷ Read plan.md
+  ⎢ Path: plan.md
+  ⎢ line one
+  ⎣ line two
+  ⏷ Read todo.md
+  ⎢ Path: todo.md
+  ⎢ line one
+  ⎣ line two
+  ⏷ Saved locked.md (failed)
+  ⎢ Path: locked.md
+  ⎣ read only
+  ⇢ Searching web for "bud"…
+  ⎣ Query: bud
+
+  ⠋ Working… 0s  Esc/Ctrl+C interrupt
+─────────────────────────────────────────────────────────────────────────────── stub-fast · strict ─
+> Ask anything…
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  bud:main · working                                Ctrl+O tools  / commands  Esc/Ctrl+C interrupt
