@@ -488,14 +488,19 @@ class TUIApp:
         return app
 
     def commit_scrollback(self, lines: str | list[str]) -> None:
-        """Commit finalized text lines permanently into native terminal scrollback."""
+        """Commit finalized text lines permanently into native terminal scrollback.
+
+        Everything the TUI writes goes through the app's synchronized output:
+        a second bare output object interleaves with frame paints at the TTY
+        and leaves duplicated lines on the screen.
+        """
         text = "\n".join(lines) if isinstance(lines, list) else lines
         if text:
-            print_formatted_text(ANSI(text))
+            print_formatted_text(ANSI(text), output=self.pt_app.output)
 
     def commit_blank_line(self) -> None:
         """Commit one blank line to scrollback (spacing between committed blocks)."""
-        print_formatted_text("")
+        print_formatted_text("", output=self.pt_app.output)
 
     def clear_screen(self) -> None:
         """Clear screen scrollback."""

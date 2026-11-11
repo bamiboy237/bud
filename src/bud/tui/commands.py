@@ -178,4 +178,7 @@ async def handle_slash_command(
 
     # Passthrough to core server controls
     result = await submit_control(client, store.session_id, text)
+    if result and result.startswith("[unknown command]"):
+        # The shared CLI help format is for other channels; the TUI has its own.
+        return "[unknown command] Type /help for the built-in commands."
     return result

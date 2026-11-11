@@ -223,23 +223,39 @@ def pick_model(models: list[dict]) -> str | None:
         default = next((m["id"] for m in options if m["tier"] == "fast"), choices[0])
         return Prompt.ask("[bold]Select a model[/bold]", choices=choices, default=default)
     index = next((i for i, m in enumerate(options) if m["tier"] == "fast"), 0)
-    while True:
-        console.clear()
-        console.print("[bold]Select a model[/bold]  (up/down + Enter, q/ESC to quit)\n")
+    rows = len(options) + 2  # header, list, blank spacer
+    painted = False
+
+    def repaint() -> None:
+        nonlocal painted
+        lines = ["\x1b[1mSelect a model\x1b[0m  (up/down + Enter, q/ESC to quit)"]
         for i, m in enumerate(options):
-            style = "reverse" if i == index else ""
-            console.print(f"  {m['id']:<42} {m['tier']:<9} {m['billing']}", style=style)
+            row = f"   {m['id']:<42} {m['tier']:<9} {m['billing']}"
+            lines.append(f"\x1b[7m{row}\x1b[0m" if i == index else row)
+        if painted:
+            # Repaint in place: move to the top of the frame we painted and erase
+            # down. Nothing is ever pushed into scrollback.
+            console.file.write(f"\x1b[{rows}A\x1b[J")
+        console.file.write("\n".join(lines) + "\n\n")
+        console.file.flush()
+        painted = True
+
+    repaint()
+    while True:
         key = _read_key()
         if key in ("\x1b[A", "\x1bOA"):
             index = (index - 1) % len(options)
         elif key in ("\x1b[B", "\x1bOB"):
             index = (index + 1) % len(options)
         elif key in ("\r", "\n"):
-            console.clear()
+            console.file.write(f"\x1b[{rows}A\x1b[J")
+            console.file.flush()
             return options[index]["id"]
         elif key in ("q", "\x03", "\x1b"):
-            console.clear()
+            console.file.write(f"\x1b[{rows}A\x1b[J")
+            console.file.flush()
             return None
+        repaint()
 
 
 async def select_model(client: httpx.AsyncClient) -> str | None:

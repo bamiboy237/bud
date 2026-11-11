@@ -99,6 +99,20 @@ _IGNORE_METADATA_KEYS = {
     "status_code",
 }
 
+# Machine plumbing never explains an action to the person looking at the card.
+_NOISY_ARG_KEYS = {
+    "verbose",
+    "user_id",
+    "max_results",
+    "include_payload",
+    "session_id",
+    "message_id",
+    "approval_id",
+    "origin",
+    "instructions",
+}
+_MAX_ARG_CHARS = 120
+
 
 def _format_list_result(data: list[Any]) -> list[str]:
     lines: list[str] = []
@@ -329,13 +343,20 @@ class ToolView(View):
                 for k, v in t.args.items():
                     if isinstance(v, (dict, list)):
                         continue
+                    if k in _NOISY_ARG_KEYS:
+                        continue
                     label = k.replace("_", " ").capitalize()
                     val_str = str(v).replace("{", "").replace("}", "")
+                    if len(val_str) > _MAX_ARG_CHARS:
+                        val_str = val_str[:_MAX_ARG_CHARS] + "…"
                     arg_line = f"    {dim_pipe} {label}: {val_str}"
                     lines.append(truncate_visible(arg_line, width))
 
             if t.result is not None:
                 clean_results = format_clean_result(t.result)
+                if t.status == "failed":
+                    # An error line is one line; the stack belongs to the server log.
+                    clean_results = clean_results[:1]
                 for rline in clean_results[:12]:
                     lines.append(truncate_visible(f"    {dim_pipe} {rline}", width))
                 if len(clean_results) > 12:
