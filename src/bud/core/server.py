@@ -214,19 +214,25 @@ def _create_app(
         gateway = build_gateway(settings, model_id=model_id)
         world = World(settings.data_dir / "world.db")
         tools_policy = load_policy()
-        tools_policy.tools.update(dict.fromkeys(WORKSPACE_READ_TOOLS, "allow"))
+        # The simulated world gets the production web tools: research is read-only, and a
+        # mock search engine would teach habits that break against the real web.
+        tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS | WORKSPACE_READ_TOOLS, "allow"))
         tools_policy.tools.update(dict.fromkeys(WORKSPACE_WRITE_TOOLS, "ask"))
         harness = Harness(
             CombinedToolset(
-                [FunctionToolset(build_tools(world)), workspace_tools(settings.data_dir)]
+                [
+                    FunctionToolset(build_tools(world)),
+                    build_web_tools(settings),
+                    workspace_tools(settings.data_dir),
+                ]
             ),
             tools_policy,
             gateway.registry,
-            world.profile() + WORKSPACE_GUIDANCE,
+            world.profile() + WEB_GUIDANCE + WORKSPACE_GUIDANCE,
             memory=build_memory(settings.data_dir / "world-memory.db", namespace="world"),
             spend_path=settings.data_dir / "world-spend.db",
             result_path=db_path,
-            read_tools=WORLD_READ_TOOLS | WORKSPACE_READ_TOOLS,
+            read_tools=WORLD_READ_TOOLS | WEB_READ_TOOLS | WORKSPACE_READ_TOOLS,
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
         )
     # One seam for both branches: memory/skill rules are unioned inside the

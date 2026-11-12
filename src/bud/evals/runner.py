@@ -12,6 +12,8 @@ from tempfile import TemporaryDirectory
 from time import perf_counter
 from uuid import uuid4
 
+from pydantic_ai.toolsets import CombinedToolset, FunctionToolset
+
 from bud.config import get_settings
 from bud.core.events import Event
 from bud.core.hub import Hub
@@ -24,10 +26,14 @@ from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
 from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
+from bud.web import READ_TOOLS as WEB_READ_TOOLS
+from bud.web import Cassette
+from bud.web import build_tools as build_web_tools
 from bud.world.store import World
 from bud.world.tools import READ_TOOLS, build_tools
 
 ATTEMPT_TIMEOUT_SECONDS = 180
+WEB_CASSETTE = Cassette(get_settings().data_dir / "evals" / "web-cassette.json")
 MAX_CONCURRENT_ATTEMPTS = 4
 
 
@@ -89,15 +95,23 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
     with TemporaryDirectory() as folder:
         log = EventLog(Path(folder) / "events.db")
         world = World(Path(folder) / "world.db")
+        policy = load_policy()
+        policy.tools.update(dict.fromkeys(WEB_READ_TOOLS, "allow"))
         harness = Harness(
-            build_tools(world, include_ask_user=False),
-            load_policy(),
+            CombinedToolset(
+                [
+                    FunctionToolset(build_tools(world, include_ask_user=False)),
+                    # Production web tools behind a record/replay cassette: repeatable, free.
+                    build_web_tools(get_settings(), cassette=WEB_CASSETTE),
+                ]
+            ),
+            policy,
             gateway.registry,
             world.profile(),
             memory=build_memory(Path(folder) / "memory.db", namespace="world"),
             spend_path=Path(folder) / "spend.db",
             result_path=log.path,
-            read_tools=READ_TOOLS,
+            read_tools=READ_TOOLS | WEB_READ_TOOLS,
         )
         harness.clock = lambda: datetime.fromisoformat(world.now)
         assert harness.memory is not None
