@@ -6,7 +6,6 @@ from typing import Literal
 import httpx
 from pydantic_ai import exceptions as ai
 from pydantic_ai.exceptions import ModelAPIError
-from pydantic_ai_harness.spend import SpendLimitExceeded
 
 from bud.composio.connection import ConnectionError as AccountConnectionError
 from bud.gateway.chatgpt import ChatGPTError
@@ -22,7 +21,6 @@ ErrorKind = Literal[
     "permission",
     "rate_limit",
     "quota",
-    "budget",
     "network",
     "timeout",
     "service",
@@ -42,7 +40,6 @@ NEXT_STEP: dict[ErrorKind, str] = {
     "permission": "Pick a model this key can use (/model), then resend.",
     "rate_limit": "The provider is rate-limiting; resend in a minute.",
     "quota": "The provider account is out of credit; top it up or pick another model.",
-    "budget": "bud's spend limit was reached; it resets tomorrow, or raise the limit.",
     "network": "Check the internet connection, then resend.",
     "timeout": "The provider took too long; resend, or pick a faster model.",
     "service": "The provider is having trouble; resend shortly or pick another model.",
@@ -62,8 +59,6 @@ def error_kind(exc: BaseException) -> ErrorKind:
     if isinstance(exc, BaseExceptionGroup) and exc.exceptions:
         return error_kind(exc.exceptions[0])
     checks: list[tuple[type[BaseException] | tuple[type[BaseException], ...], ErrorKind]] = [
-        (SpendLimitExceeded, "budget"),
-        (ai.UsageLimitExceeded, "budget"),
         (ai.ModelQuotaExceededError, "quota"),
         (ai.ModelRateLimitError, "rate_limit"),
         (ai.ModelContextWindowExceededError, "context_full"),

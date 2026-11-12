@@ -416,7 +416,7 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool]:
         return write(ctx, path, content, expected_revision)
 
     return [
-        Tool(fn, requires_approval=fn.__name__ in WRITE_TOOLS)
+        Tool(fn)
         for fn in (
             workspace_list,
             workspace_read,

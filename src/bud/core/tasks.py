@@ -17,6 +17,7 @@ from pydantic_ai.toolsets import FunctionToolset
 
 from bud.core.events import EventType
 from bud.core.hub import Hub
+from bud.core.log import QueueFull
 from bud.core.projection import (
     TaskView,
     pause_reason,
@@ -28,6 +29,9 @@ from bud.core.projection import (
 )
 from bud.harness.actions import Policy
 from bud.limits import MAX_MESSAGE_CHARS, MAX_OPEN_TASKS
+
+# A job reads its queue between steps; more waiting updates than this is a flood.
+MAX_PENDING_UPDATES = 3
 
 CONTROL_TOOLS = {"start_task", "update_task", "inspect_task", "stop_task"}
 FINISHED = {"completed", "failed", "cancelled"}
@@ -384,7 +388,7 @@ class TaskFlow(AbstractCapability[None]):
             if (
                 tool.name not in CONTROL_TOOLS
                 if worker
-                else self.policy.decide(tool.name) in ("allow", "ask")
+                else self.policy.decide(tool.name) in ("allow", "ask", "decide")
             )
         ]
 
@@ -458,15 +462,30 @@ class TaskFlow(AbstractCapability[None]):
         task_id: int,
         instruction: Annotated[str, Field(min_length=1, max_length=MAX_MESSAGE_CHARS)],
     ) -> TaskView:
-        """Continue or revise a named job. Its affected proposal gets a fresh approval."""
+        """Continue or revise a named job with the owner's new instruction.
+
+        Send only what the owner asked for; the job already knows its brief. Its
+        affected proposal gets a fresh approval.
+        """
         item = self.store.get(self._feed(ctx), task_id)
-        self.store.update(
-            item,
-            instruction,
-            self._source(ctx),
-            (ctx.metadata or {}).get("bud_origin"),
-            ctx.run_id,
-        )
+        waiting = len(queued_messages(self.store.log.read(item.session_id)))
+        if waiting >= MAX_PENDING_UPDATES:
+            raise ModelRetry(
+                f"Job {task_id} already has {waiting} updates it has not read yet. Wait for "
+                "it to act on them; tell the owner the job is working on it."
+            )
+        try:
+            self.store.update(
+                item,
+                instruction,
+                self._source(ctx),
+                (ctx.metadata or {}).get("bud_origin"),
+                ctx.run_id,
+            )
+        except QueueFull:
+            raise ModelRetry(
+                f"Job {task_id} cannot take more updates right now; wait for it to act."
+            ) from None
         self.kick(item.session_id)
         return self.store.view(item)
 
