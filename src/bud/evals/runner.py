@@ -25,19 +25,22 @@ from bud.evals.tasks import SUITE, Outcome, Task
 from bud.gateway import Gateway, build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
-from bud.harness.decisions import DecisionClient
 from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
 from bud.harness.recall import Recall, embedder
+from bud.harness.review import ToolReviewer, build_reviewer
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
 from bud.web import Cassette
 from bud.web import build_tools as build_web_tools
+from bud.world.describe import build_describers
 from bud.world.store import World
 from bud.world.tools import READ_TOOLS, build_tools
 
 ATTEMPT_TIMEOUT_SECONDS = 180
 WEB_CASSETTE = Cassette(get_settings().data_dir / "evals" / "web-cassette.json")
 MAX_CONCURRENT_ATTEMPTS = 4
+# The Decisions API bills input tokens only, at $0.10 per million for gpt-6-luna.
+REVIEW_USD_PER_TOKEN = 0.10 / 1_000_000
 
 
 @dataclass(frozen=True)
@@ -60,9 +63,12 @@ class Attempt:
     loop_kinds: tuple[str, ...] = ()
     # Approval requests the owner (the scripted user) had to answer in the checked session.
     interruptions: int = 0
-    # Calls the decision model let through without asking, each marked wrong or not.
+    # Calls the reviewer let through without asking, each marked wrong or not.
     auto_allowed: list[dict] = field(default_factory=list)
-    # Every call the decision model scored (including those it sent to the owner).
+    # Calls the reviewer held for the owner, each marked wrong or not. A held call that is
+    # not wrong is a false prompt.
+    held: list[dict] = field(default_factory=list)
+    # Every review the model made. Calls settled by a session grant skip the model.
     scored: list[dict] = field(default_factory=list)
 
 
@@ -102,25 +108,31 @@ async def teach(runner: Runner, log: EventLog, task: Task) -> None:
             await converse(runner, log, session_id, text, True)
 
 
-def decision_client() -> DecisionClient:
-    settings = get_settings()
-    if settings.openai_api_key is None:
-        raise SystemExit("Balanced evals need OPENAI_API_KEY for the decision model.")
-    return DecisionClient(
-        settings.openai_api_key.get_secret_value(), threshold=settings.decision_threshold
-    )
+def eval_reviewer() -> ToolReviewer:
+    reviewer = build_reviewer()
+    if reviewer is None:
+        raise SystemExit("Auto evals need OPENAI_API_KEY and APPROVAL_REVIEW on for the reviewer.")
+    return reviewer
 
 
-def auto_allowed(task: Task, events: list[Event]) -> list[dict]:
-    """The checked session's auto-allowed calls, with args and whether the task calls them wrong."""
+def reviewed_calls(task: Task, events: list[Event], rule: str, outcome: str) -> list[dict]:
+    """The checked session's reviewer verdicts, with args and whether the task calls them wrong.
+
+    rule "auto-allow" is a call the reviewer let run; rule "review" with outcome "asked" is a
+    call it held for the owner.
+    """
     args = {e.data["call_id"]: e.data["args"] for e in events if e.type == "tool.call"}
     calls = []
     for e in events:
-        if e.type == "action.decided" and e.data.get("rule") == "auto-allow":
+        if (
+            e.type == "action.decided"
+            and e.data.get("rule") == rule
+            and e.data.get("outcome") == outcome
+        ):
             call = {
                 "tool": e.data["tool"],
                 "args": args.get(e.data["call_id"], {}),
-                "score": e.data.get("score"),
+                "review": e.data.get("review", {}),
             }
             calls.append({**call, "wrong": task.wrong(call["tool"], call["args"])})
     return calls
@@ -156,9 +168,10 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
         harness.clock = lambda: datetime.fromisoformat(world.now)
         if task.spiral_config:
             harness.spiral = replace(harness.spiral, **task.spiral_config)
-        # Set before the Runner builds its agent: balanced mode needs the decision model.
-        harness.decisions = decision_client() if mode == "balanced" else None
-        apply_mode(harness.policy, mode, decisions=harness.decisions is not None)
+        # Set before the Runner builds its agent: auto mode needs the reviewer.
+        harness.reviewer = eval_reviewer() if mode == "auto" else None
+        harness.describers = build_describers(world)
+        apply_mode(harness.policy, mode, reviewer=harness.reviewer is not None)
         assert harness.memory is not None
         learner = Learner(
             harness.memory,
@@ -176,7 +189,7 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
             await asyncio.wait_for(teach(runner, log, task), ATTEMPT_TIMEOUT_SECONDS)
             log.append(session_id, "session.created")
             before = world.snapshot()
-            scored_before = len(harness.decisions.recent) if harness.decisions else 0
+            scored_before = len(harness.reviewer.recent) if harness.reviewer else 0
             approvals = await asyncio.wait_for(drive(runner, log, task, session_id), timeout)
             timed_out = False
         except TimeoutError:
@@ -192,8 +205,9 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
             and "Unknown tool name" in str(e.data.get("result", ""))
         )
         transcript = snapshot(session_id, events).transcript
-        allowed = auto_allowed(task, events)
-        scored = list(harness.decisions.recent)[scored_before:] if harness.decisions else []
+        allowed = reviewed_calls(task, events, "auto-allow", "allowed")
+        held = reviewed_calls(task, events, "review", "asked")
+        scored = list(harness.reviewer.recent)[scored_before:] if harness.reviewer else []
         outcome = Outcome(
             before=before,
             after=world.snapshot(),
@@ -238,6 +252,7 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
         loop_kinds=tuple(loop["kind"] for loop in outcome.loops),
         interruptions=len(approvals),
         auto_allowed=allowed,
+        held=held,
         scored=scored,
     )
 
@@ -284,8 +299,9 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str, mode: Mode
         by_task.setdefault(attempt.task, []).append(attempt)
 
     print(
-        f"{'Task':<20} {'Passed':>7} {'Asks':>5} {'Auto':>5} {'Wrong':>5} {'Seconds':>8} "
-        f"{'Model s':>8} {'Reqs':>5} {'Wasted':>6} {'Notes':>5} {'Pauses':>6} {'API USD':>9}"
+        f"{'Task':<20} {'Passed':>7} {'Asks':>5} {'Auto':>5} {'Wrong':>5} {'Held':>5} "
+        f"{'False':>5} {'Seconds':>8} {'Model s':>8} {'Reqs':>5} {'Wasted':>6} {'Notes':>5} "
+        f"{'Pauses':>6} {'API USD':>9}"
     )
     for task, runs in by_task.items():
         n = len(runs)
@@ -300,10 +316,12 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str, mode: Mode
         asks = sum(run.interruptions for run in runs) / n
         auto = sum(len(run.auto_allowed) for run in runs) / n
         wrong = sum(call["wrong"] for run in runs for call in run.auto_allowed)
+        held = sum(len(run.held) for run in runs) / n
+        false = sum(not call["wrong"] for run in runs for call in run.held)
         print(
             f"{task:<20} {f'{passed}/{n}':>7} {asks:>5.1f} {auto:>5.1f} {wrong:>5} "
-            f"{seconds:>8.1f} {model:>8.1f} {reqs:>5.1f} {wasted:>6.1f} {notes:>5} {pauses:>6} "
-            f"{cost:>9.5f}"
+            f"{held:>5.1f} {false:>5} {seconds:>8.1f} {model:>8.1f} {reqs:>5.1f} "
+            f"{wasted:>6.1f} {notes:>5} {pauses:>6} {cost:>9.5f}"
         )
 
     pass_rate = sum(a.passed for a in attempts) / len(attempts)
@@ -319,14 +337,27 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str, mode: Mode
     allowed = [call for a in attempts for call in a.auto_allowed]
     wrong = [call for call in allowed if call["wrong"]]
     mean_asks = sum(a.interruptions for a in attempts) / len(attempts)
+    held = [call for a in attempts for call in a.held]
+    false_prompts = [call for call in held if not call["wrong"]]
     print(
         f"Mode: {mode}   Asks per task: {mean_asks:.2f}   "
-        f"auto-allows: {len(allowed)} ({len(wrong)} wrong)"
+        f"auto-runs: {len(allowed)} ({len(wrong)} wrong)   "
+        f"held by the reviewer: {len(held)} ({len(false_prompts)} false prompts)"
     )
-    for call in wrong:
-        print(
-            f"  WRONG auto-allow {call['tool']} {json.dumps(call['args'])[:160]} p={call['score']}"
-        )
+    reviews = [entry for a in attempts for entry in a.scored]
+    tokens = sum(entry["input_tokens"] for entry in reviews)
+    print(
+        f"Reviewer: {len(reviews)} reviews, {tokens} input tokens, "
+        f"about ${tokens * REVIEW_USD_PER_TOKEN:.4f} (not in the metered total above)"
+    )
+    for label, calls in (("WRONG auto-run", wrong), ("false prompt", false_prompts)):
+        for call in calls:
+            review = call["review"]
+            print(
+                f"  {label} {call['tool']} {json.dumps(call['args'])[:140]} "
+                f"risk={review.get('risk')} auth={review.get('authorization')} "
+                f"concern={review.get('concern')}"
+            )
     if any(model["billing"] == "subscription" for a in attempts for model in a.models):
         print("ChatGPT plan usage is included in token counts, not API USD.")
 

@@ -358,8 +358,7 @@ fn draw_loading(frame: &mut Frame, app: &App, area: Rect) {
 fn mode_color(theme: &Theme, mode: &str) -> ratatui::style::Color {
     match mode {
         "strict" => theme.text_success,
-        "balanced" => theme.warning,
-        "autonomous" => theme.error,
+        "auto" => theme.warning,
         _ => theme.muted,
     }
 }

@@ -15,10 +15,10 @@
 
 
 
+
  Approval mode ─────────────────────────────────────────────────────────────────
-   1. strict      every write asks: workspace, memory, skills
- ✓ 2. balanced    workspace and memory writes auto-run; sends still ask
-   3. autonomous  also auto-runs skill installs; sends still ask
- ↑↓/jk navigate  Enter select  1-3 pick  / filter  Esc back
+   1. strict  every write asks: workspace, memory, skills
+ ✓ 2. auto    a reviewer runs safe, requested writes; sends still ask
+ ↑↓/jk navigate  Enter select  1-2 pick  / filter  Esc back
 ────────────────────────────────────────────────────────────────────────────────
   bud:main

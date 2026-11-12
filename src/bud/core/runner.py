@@ -497,7 +497,7 @@ class Runner(DBOSConfiguredInstance):
                 else ToolDenied(
                     "The user sent new input. Stop this proposal; the updated request will follow."
                     if request["approval_id"] in revised
-                    else "The user denied this action."
+                    else _denial(request)
                 )
                 for request in batch
             },
@@ -508,7 +508,10 @@ class Runner(DBOSConfiguredInstance):
                         "question_answer": answers[request["approval_id"]],
                     }
                     if request["approval_id"] in answers
-                    else {"approval_id": request["approval_id"]}
+                    else {
+                        "approval_id": request["approval_id"],
+                        **_review_of(request.get("review")),
+                    }
                 )
                 for request in batch
             },
@@ -737,8 +740,8 @@ class Runner(DBOSConfiguredInstance):
         await asyncio.gather(*self._executing.values(), return_exceptions=True)
         await self.settle_learning()
         await self.context.close()
-        if self.harness.decisions is not None:
-            await self.harness.decisions.close()
+        if self.harness.reviewer is not None:
+            await self.harness.reviewer.close()
 
     @DBOS.workflow(name="bud.run", max_recovery_attempts=5)
     async def _workflow(self, run: dict) -> None:
@@ -841,9 +844,8 @@ class Runner(DBOSConfiguredInstance):
                 "messages": json.loads(result.new_messages_json()),
                 "conversation": ConversationTypeAdapter.dump_json(result.conversation).decode(),
             }
-            requests = (
-                result.output.approvals if isinstance(result.output, DeferredToolRequests) else None
-            )
+            deferred = result.output if isinstance(result.output, DeferredToolRequests) else None
+            requests = deferred.approvals if deferred is not None else None
             approvals = [
                 {
                     "run_id": run["run_id"],
@@ -853,6 +855,8 @@ class Runner(DBOSConfiguredInstance):
                     "call_id": call.tool_call_id,
                     "tool": call.tool_name,
                     "args": call.args_as_dict(),
+                    # Why the reviewer held this call; absent when a rule asked, not it.
+                    **_review_of(deferred.metadata.get(call.tool_call_id) if deferred else None),
                 }
                 for call in requests or []
             ]
@@ -1027,3 +1031,20 @@ def _artifact(part: ToolReturnPart | RetryPromptPart) -> dict[str, str] | None:
             return None
         fields[key] = value
     return fields
+
+
+def _review_of(review: object) -> dict[str, dict]:
+    """The reviewer's record of a held call, as an extra key on an approval or its metadata."""
+    return {"review": review} if isinstance(review, dict) and review else {}
+
+
+def _denial(request: dict) -> str:
+    """What the agent hears when the owner denies a call. A held call carries its reason."""
+    review = request.get("review")
+    reason = review.get("reason") if isinstance(review, dict) else None
+    if not isinstance(reason, str) or not reason:
+        return "The user denied this action."
+    return (
+        f"The user denied this action. Reviewer's concern: {reason} If a safer way to do what "
+        "the user asked exists, use it. Otherwise tell the user what you wanted to do and why."
+    )

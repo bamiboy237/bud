@@ -48,7 +48,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import ModelRequestContext
 
-from bud.harness.decisions import DECISIONS_URL
+from bud.harness.review import DECISIONS_URL
 
 logger = logging.getLogger(__name__)
 

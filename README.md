@@ -11,7 +11,7 @@ proposed write before it runs.
 ## Highlights
 
 * **Crash recovery:** DBOS and SQLite retain execution state across restarts.
-* **Write approvals:** Reads run automatically. Changes pause for your exact approval.
+* **Write approvals:** Reads run automatically. In `strict` mode every change pauses for your exact approval; in `auto` mode a reviewer runs the safe, requested ones and asks you about the rest. Sends and real-account writes always ask.
 * **Connected tools:** Gmail and Google Calendar use Composio; public web research uses Exa.
 * **Progressive skills:** Bud loads task instructions when it needs them.
 * **Simulation mode:** Experiment with synthetic accounts and files using your model access.
