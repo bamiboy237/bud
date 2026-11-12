@@ -647,18 +647,22 @@ class Runner(DBOSConfiguredInstance):
         if self.learner is not None:
             jobs.append(self._learn(session_id, run_id, owner, reply, signals))
         if self.recall is not None:
-            jobs.append(self._index_turn(session_id, run_id, owner, reply))
+            try:
+                self.recall.add_turn(session_id, run_id, owner, reply)
+            except Exception as exc:
+                logger.warning("recall indexing skipped for run %s: %s", run_id, exc)
+            jobs.append(self._embed_pending(run_id))
         for job in jobs:
             task = asyncio.create_task(job)
             self._learning.add(task)
             task.add_done_callback(self._learning.discard)
 
-    async def _index_turn(self, session_id: str, run_id: str, owner: str, reply: str) -> None:
+    async def _embed_pending(self, run_id: str) -> None:
         assert self.recall is not None
         try:
-            await self.recall.index_turn(session_id, run_id, owner, reply)
+            await self.recall.embed_pending()
         except Exception as exc:  # recall is best effort; the turn already succeeded
-            logger.warning("recall indexing skipped for run %s: %s", run_id, error_summary(exc))
+            logger.warning("recall embedding skipped for run %s: %s", run_id, error_summary(exc))
 
     async def _recalled(self, run: dict) -> str:
         """Background for a new message: memory lines and earlier turns that bear on it."""

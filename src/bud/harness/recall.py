@@ -151,7 +151,8 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 
 def _match_query(text: str) -> str | None:
-    words = {w.lower().strip(".-'") for w in WORD.findall(text)}
+    # "When's" must not become the FTS tokens "when" + "s": every "what's" matches "s".
+    words = {re.split(r"['’]", w.lower())[0].strip(".-") for w in WORD.findall(text)}
     words = {w for w in words if len(w) > 2 and w not in STOP}
     return " OR ".join(f'"{w}"' for w in sorted(words)) or None
 
@@ -193,12 +194,30 @@ class Recall:
                 )
                 db.execute("INSERT INTO chunks_fts (text, id) VALUES (?, ?)", (text, chunk_id))
 
-    async def index_turn(self, session_id: str, run_id: str, owner: str, reply: str) -> None:
+    def add_turn(self, session_id: str, run_id: str, owner: str, reply: str) -> None:
+        """Make a finished turn searchable by keyword at once; its vector follows later.
+
+        A message sent a moment after the previous turn ends must already find it.
+        """
         if not owner.strip():
             return
         text = f"Owner: {owner.strip()[:MAX_TURN_CHARS]}\nbud: {reply.strip()[:MAX_TURN_CHARS]}"
-        vectors = await self._embed([text])
-        self._upsert([(f"turn:{run_id}", "conversation", session_id, text)], vectors)
+        self._upsert([(f"turn:{run_id}", "conversation", session_id, text)], None)
+
+    async def embed_pending(self) -> None:
+        """Add vectors to chunks that were indexed without one."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT id, text FROM chunks WHERE embedding IS NULL LIMIT 64"
+            ).fetchall()
+        vectors = await self._embed([text for _, text in rows])
+        if not vectors:
+            return
+        with self._connect() as db:
+            for (chunk_id, _), vector in zip(rows, vectors, strict=True):
+                db.execute(
+                    "UPDATE chunks SET embedding = ? WHERE id = ?", (_pack(vector), chunk_id)
+                )
 
     async def index_memory(self) -> None:
         """Mirror MEMORY.md's bullet lines; drop lines that were edited away."""
