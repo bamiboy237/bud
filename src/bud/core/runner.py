@@ -279,6 +279,10 @@ class Runner(DBOSConfiguredInstance):
             "session_id": session_id,
             "run_id": uuid4().hex,
             "text": text,
+            # What the owner asked for, kept for the approval-triage model: the message text,
+            # or (set in _resume_if_ready) the original message of a resumed run. Jobs get
+            # none: a job's brief is written by bud, possibly after reading untrusted mail.
+            "request": text if item is None else None,
             "trigger": "message" if results is None else "approval",
             "origin": origin,
             "task_id": item.task_id if item is not None else None,
@@ -543,6 +547,14 @@ class Runner(DBOSConfiguredInstance):
             ),
             run["skills"],
         )
+        run["request"] = next(
+            (
+                event.data.get("request")
+                for event in reversed(events)
+                if event.type == "run.queued" and event.data["run_id"] == batch[0]["run_id"]
+            ),
+            None,
+        )
         run["quiet"] = any(request["approval_id"] in revised for request in batch) and not any(
             decided[request["approval_id"]] for request in batch
         )
@@ -730,6 +742,8 @@ class Runner(DBOSConfiguredInstance):
         await asyncio.gather(*self._executing.values(), return_exceptions=True)
         await self.settle_learning()
         await self.context.close()
+        if self.harness.decisions is not None:
+            await self.harness.decisions.close()
 
     @DBOS.workflow(name="bud.run", max_recovery_attempts=5)
     async def _workflow(self, run: dict) -> None:
@@ -826,6 +840,7 @@ class Runner(DBOSConfiguredInstance):
                     "bud_session_id": run["session_id"],
                     "bud_task_id": run.get("task_id"),
                     "bud_origin": run.get("origin"),
+                    "bud_request": run.get("request"),
                     "bud_revision_pending": bool(run.get("quiet")),
                     "bud_inline_approval": run.get("task_id") is None
                     and run["trigger"] == "approval",

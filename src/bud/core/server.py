@@ -35,6 +35,7 @@ from bud.core.setup import SetupJournal, build_setup_toolset, setup_registry
 from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
+from bud.harness.decisions import build_decision_client
 from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
 from bud.harness.recall import Recall, embedder
@@ -239,9 +240,15 @@ def _create_app(
     # One seam for both branches: memory/skill rules are unioned inside the
     # Harness, so the profile overlay lands on the composed policy. The
     # guards hold this Policy by reference and re-read decide() per call.
-    apply_mode(harness.policy, approval_mode)
+    # Opt-in only (DECISION_AUTO_ALLOW): balanced mode then asks a decision model about
+    # reversible writes. Set before the Runner builds its agent, which captures the client.
+    harness.decisions = build_decision_client()
+    has_decisions = harness.decisions is not None
+    apply_mode(harness.policy, approval_mode, decisions=has_decisions)
     live_mode: dict[str, Mode] = {"mode": approval_mode}
-    harness.live_instructions.append(lambda: MODE_GUIDANCE(live_mode["mode"]))
+    harness.live_instructions.append(
+        lambda: MODE_GUIDANCE(live_mode["mode"], decisions=has_decisions)
+    )
 
     harness.clock = (
         (lambda: datetime.fromisoformat(world.now))
@@ -388,14 +395,14 @@ def _create_app(
         if target is None:
             raise HTTPException(400, "Unknown mode; one of strict/balanced/autonomous.")
         profile_store.save(target)
-        overlay = apply_mode(harness.policy, target)
+        overlay = apply_mode(harness.policy, target, decisions=has_decisions)
         live_mode["mode"] = target
         auto = sum(1 for action in overlay.values() if action == "allow")
         return JSONResponse(
             {
                 "mode": target,
                 "auto_writes": auto,
-                "summary": mode_summary(target),
+                "summary": mode_summary(target, decisions=has_decisions),
             },
             headers={"Cache-Control": "no-store"},
         )

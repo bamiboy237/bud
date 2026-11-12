@@ -4,7 +4,10 @@ Three modes (design fork B, step A; `notes/approval-levels.md`):
 
 - ``strict``: today's behavior — every write asks.
 - ``balanced``: workspace, memory, and simulated-world writes auto-run
-  (journaled); account writes and skill installs still ask.
+  (journaled); account writes and skill installs still ask. With the opt-in decision
+  model on (``DECISION_AUTO_ALLOW``), reversible writes become ``decide`` instead: the
+  model scores each call, a high score auto-runs it, anything else asks. Every other
+  self-hosted write (deletes, unclassified tools) then asks outright.
 - ``autonomous``: skill installs auto-run too (journaled).
 
 Two invariants survive every mode:
@@ -30,10 +33,8 @@ from pathlib import Path
 from typing import Literal
 
 from bud.harness.actions import Action, Policy
-from bud.harness.memory import MEMORY_RULES
+from bud.harness.writes import decidable_tools, self_hosted_writes
 from bud.skills import RULES as SKILL_RULES
-from bud.workspace import WRITE_TOOLS as WORKSPACE_WRITE_TOOLS
-from bud.world.tools import WRITE_TOOLS as WORLD_WRITE_TOOLS
 
 Mode = Literal["strict", "balanced", "autonomous"]
 MODES: tuple[Mode, ...] = ("strict", "balanced", "autonomous")
@@ -45,11 +46,8 @@ DEFAULT_MODE: Mode = "autonomous"
 # Sending is never automatic in any mode: the owner always sees the full draft
 # (recipients, subject, body) on an approval card before anything goes out.
 SEND_TOOLS = frozenset({"send_email"})
-_SELF_HOSTED_WRITES = (
-    (WORLD_WRITE_TOOLS - SEND_TOOLS)
-    | WORKSPACE_WRITE_TOOLS
-    | {name for name, action in MEMORY_RULES.items() if action == "ask"}
-)
+_SELF_HOSTED_WRITES = self_hosted_writes()
+_DECIDABLE = decidable_tools()
 _SKILL_WRITES = {name for name, action in SKILL_RULES.items() if action == "ask"}
 
 _MODE_ACTIONS: dict[Mode, Action] = {
@@ -69,39 +67,60 @@ def as_mode(value: object) -> Mode | None:
     return next((mode for mode in MODES if mode == value), None)
 
 
-def _overlay(mode: Mode) -> dict[str, Action]:
+def _overlay(mode: Mode, decisions: bool) -> dict[str, Action]:
     self_hosted, skills = _MODE_ACTIONS[mode], _SKILL_ACTIONS[mode]
     overlay: dict[str, Action] = {name: self_hosted for name in _SELF_HOSTED_WRITES}
+    if mode == "balanced" and decisions:
+        overlay.update(
+            {name: "decide" if name in _DECIDABLE else "ask" for name in _SELF_HOSTED_WRITES}
+        )
     overlay.update({name: skills for name in _SKILL_WRITES})
     return overlay
 
 
-def apply_mode(policy: Policy, mode: Mode) -> dict[str, Action]:
+def apply_mode(policy: Policy, mode: Mode, *, decisions: bool = False) -> dict[str, Action]:
     """Shift the inspectable classes onto ``mode``, in place.
 
-    Returns the overlay it applied, so callers (the `/mode` endpoint) can
-    report exactly what changed. Real-account write tools are untouched:
-    their base classification is ``ask`` in every mode.
+    ``decisions`` says a decision model is configured; only balanced mode uses it. Returns
+    the overlay it applied, so callers (the `/mode` endpoint) can report exactly what
+    changed. Real-account write tools are untouched: their base classification is ``ask``
+    in every mode.
     """
-    overlay = _overlay(mode)
+    overlay = _overlay(mode, decisions)
     policy.tools.update(overlay)
     return overlay
 
 
-def mode_summary(mode: Mode) -> str:
+def mode_summary(mode: Mode, *, decisions: bool = False) -> str:
     """One line for the chat: what auto-runs now, what still asks."""
     if mode == "strict":
         return "strict: every write (workspace, memory, simulated world, skills) asks."
+    if mode == "balanced" and decisions:
+        return (
+            "balanced: reversible workspace, memory, and simulated-world writes are reviewed by a "
+            "decision model and auto-run only when it is confident they match your request "
+            "(otherwise they ask) · deletes and skill installs ask · sends and real "
+            "Gmail/Calendar writes still ask"
+        )
     self_hosted = "workspace, memory, and simulated-world writes auto-run (sends still ask)"
     skills = "skill installs auto-run" if mode == "autonomous" else "skill installs ask"
     return " · ".join([f"{mode}: {self_hosted}", skills, "real Gmail/Calendar writes still ask"])
 
 
-def guidance(mode: Mode) -> str:
+def guidance(mode: Mode, *, decisions: bool = False) -> str:
     """The system-prompt paragraph that keeps the model's claims honest."""
     if mode == "strict":
         # The base instructions and tool descriptions already say writes ask.
         return ""
+    if mode == "balanced" and decisions:
+        return (
+            "\nApproval mode is balanced: a reviewer checks each reversible workspace, memory, "
+            "and simulated-world write against the owner's request. It either runs at once "
+            "(journaled; say plainly what you did) or the owner is asked first; you cannot "
+            "tell in advance, so call the tool without asking in text. Deletes, skill "
+            "installs, sending email, and real Gmail/Calendar writes always ask. The reviewer "
+            "judges only what the owner asked for, so make the call match their request."
+        )
     auto_scope = (
         "skills activation, workspace, memory, and simulated-world writes"
         if mode == "autonomous"

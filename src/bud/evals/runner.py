@@ -5,7 +5,7 @@ Model calls use the real gateway, so `bud costs` includes eval spend.
 
 import asyncio
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -18,12 +18,14 @@ from bud.config import get_settings
 from bud.core.events import Event
 from bud.core.hub import Hub
 from bud.core.log import EventLog
+from bud.core.profiles import Mode, apply_mode
 from bud.core.projection import snapshot, undecided_approvals
 from bud.core.runner import Runner
 from bud.evals.tasks import SUITE, Outcome, Task
 from bud.gateway import Gateway, build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
+from bud.harness.decisions import DecisionClient
 from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
 from bud.harness.recall import Recall, embedder
@@ -52,6 +54,12 @@ class Attempt:
     requests: int = 0
     model_seconds: float = 0.0
     wasted: int = 0
+    # Approval requests the owner (the scripted user) had to answer in the checked session.
+    interruptions: int = 0
+    # Calls the decision model let through without asking, each marked wrong or not.
+    auto_allowed: list[dict] = field(default_factory=list)
+    # Every call the decision model scored (including those it sent to the owner).
+    scored: list[dict] = field(default_factory=list)
 
 
 def failure_reason(events: list[Event]) -> str | None:
@@ -90,7 +98,31 @@ async def teach(runner: Runner, log: EventLog, task: Task) -> None:
             await converse(runner, log, session_id, text, True)
 
 
-async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
+def decision_client() -> DecisionClient:
+    settings = get_settings()
+    if settings.openai_api_key is None:
+        raise SystemExit("Balanced evals need OPENAI_API_KEY for the decision model.")
+    return DecisionClient(
+        settings.openai_api_key.get_secret_value(), threshold=settings.decision_threshold
+    )
+
+
+def auto_allowed(task: Task, events: list[Event]) -> list[dict]:
+    """The checked session's auto-allowed calls, with args and whether the task calls them wrong."""
+    args = {e.data["call_id"]: e.data["args"] for e in events if e.type == "tool.call"}
+    calls = []
+    for e in events:
+        if e.type == "action.decided" and e.data.get("rule") == "auto-allow":
+            call = {
+                "tool": e.data["tool"],
+                "args": args.get(e.data["call_id"], {}),
+                "score": e.data.get("score"),
+            }
+            calls.append({**call, "wrong": task.wrong(call["tool"], call["args"])})
+    return calls
+
+
+async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> Attempt:
     session_id = f"eval-{task.id}-{uuid4().hex[:8]}"
     started = perf_counter()
     with TemporaryDirectory() as folder:
@@ -115,6 +147,9 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
             read_tools=READ_TOOLS | WEB_READ_TOOLS,
         )
         harness.clock = lambda: datetime.fromisoformat(world.now)
+        # Set before the Runner builds its agent: balanced mode needs the decision model.
+        harness.decisions = decision_client() if mode == "balanced" else None
+        apply_mode(harness.policy, mode, decisions=harness.decisions is not None)
         assert harness.memory is not None
         learner = Learner(
             harness.memory,
@@ -127,10 +162,12 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
         )
         runner = Runner(Hub(log), gateway, harness, learner=learner, recall=recall)
         before = world.snapshot()
+        scored_before = 0
         try:
             await asyncio.wait_for(teach(runner, log, task), ATTEMPT_TIMEOUT_SECONDS)
             log.append(session_id, "session.created")
             before = world.snapshot()
+            scored_before = len(harness.decisions.recent) if harness.decisions else 0
             approvals = await asyncio.wait_for(
                 drive(runner, log, task, session_id), ATTEMPT_TIMEOUT_SECONDS
             )
@@ -148,6 +185,8 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
             and "Unknown tool name" in str(e.data.get("result", ""))
         )
         transcript = snapshot(session_id, events).transcript
+        allowed = auto_allowed(task, events)
+        scored = list(harness.decisions.recent)[scored_before:] if harness.decisions else []
         outcome = Outcome(
             before=before,
             after=world.snapshot(),
@@ -155,6 +194,12 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
             approvals=approvals,
             failure=failure_reason(events),
             memory=await memory_text(learner),
+            auto_allowed=tuple(allowed),
+            policy_allowed=tuple(
+                e.data["tool"]
+                for e in events
+                if e.type == "action.decided" and e.data.get("rule") == "allow"
+            ),
         )
     problems = ["timed out"] if timed_out else task.check(outcome)
     if outcome.failure and not timed_out:
@@ -174,6 +219,9 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
         requests=requests,
         model_seconds=model_seconds,
         wasted=wasted,
+        interruptions=len(approvals),
+        auto_allowed=allowed,
+        scored=scored,
     )
 
 
@@ -184,13 +232,13 @@ async def memory_text(learner: Learner) -> str:
     return saved.content if saved else ""
 
 
-async def run_suite(tasks: list[Task], trials: int) -> list[Attempt]:
+async def run_suite(tasks: list[Task], trials: int, mode: Mode = "strict") -> list[Attempt]:
     gateway = build_gateway()
     limit = asyncio.Semaphore(MAX_CONCURRENT_ATTEMPTS)
 
     async def one(task: Task) -> Attempt:
         async with limit:
-            return await run_attempt(task, gateway)
+            return await run_attempt(task, gateway, mode)
 
     try:
         return list(await asyncio.gather(*(one(task) for task in tasks for _ in range(trials))))
@@ -198,14 +246,14 @@ async def run_suite(tasks: list[Task], trials: int) -> list[Attempt]:
         gateway.close()
 
 
-def report(attempts: list[Attempt], trials: int, prompt_version: str) -> Path:
+def report(attempts: list[Attempt], trials: int, prompt_version: str, mode: Mode) -> Path:
     by_task: dict[str, list[Attempt]] = {}
     for attempt in attempts:
         by_task.setdefault(attempt.task, []).append(attempt)
 
     print(
-        f"{'Task':<20} {'Passed':>7} {'Seconds':>8} {'Model s':>8} {'Reqs':>5} "
-        f"{'Wasted':>6} {'API USD':>9}"
+        f"{'Task':<20} {'Passed':>7} {'Asks':>5} {'Auto':>5} {'Wrong':>5} {'Seconds':>8} "
+        f"{'Model s':>8} {'Reqs':>5} {'Wasted':>6} {'API USD':>9}"
     )
     for task, runs in by_task.items():
         n = len(runs)
@@ -215,9 +263,12 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str) -> Path:
         reqs = sum(run.requests for run in runs) / n
         wasted = sum(run.wasted for run in runs) / n
         cost = sum(run.cost_usd for run in runs) / n
+        asks = sum(run.interruptions for run in runs) / n
+        auto = sum(len(run.auto_allowed) for run in runs) / n
+        wrong = sum(call["wrong"] for run in runs for call in run.auto_allowed)
         print(
-            f"{task:<20} {f'{passed}/{n}':>7} {seconds:>8.1f} {model:>8.1f} {reqs:>5.1f} "
-            f"{wasted:>6.1f} {cost:>9.5f}"
+            f"{task:<20} {f'{passed}/{n}':>7} {asks:>5.1f} {auto:>5.1f} {wrong:>5} "
+            f"{seconds:>8.1f} {model:>8.1f} {reqs:>5.1f} {wasted:>6.1f} {cost:>9.5f}"
         )
 
     pass_rate = sum(a.passed for a in attempts) / len(attempts)
@@ -230,6 +281,17 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str) -> Path:
         f"Metered API total: ${total:.4f}"
     )
     print(f"Model requests per task: {mean_reqs:.1f}   wasted calls per task: {mean_wasted:.2f}")
+    allowed = [call for a in attempts for call in a.auto_allowed]
+    wrong = [call for call in allowed if call["wrong"]]
+    mean_asks = sum(a.interruptions for a in attempts) / len(attempts)
+    print(
+        f"Mode: {mode}   Asks per task: {mean_asks:.2f}   "
+        f"auto-allows: {len(allowed)} ({len(wrong)} wrong)"
+    )
+    for call in wrong:
+        print(
+            f"  WRONG auto-allow {call['tool']} {json.dumps(call['args'])[:160]} p={call['score']}"
+        )
     if any(model["billing"] == "subscription" for a in attempts for model in a.models):
         print("ChatGPT plan usage is included in token counts, not API USD.")
 
@@ -246,6 +308,7 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str) -> Path:
         json.dumps(
             {
                 "prompt_version": prompt_version,
+                "mode": mode,
                 "trials": trials,
                 "pass_rate": pass_rate,
                 "pass_all_trials": pass_all,
@@ -259,10 +322,10 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str) -> Path:
     return path
 
 
-def evaluate(trials: int, task_id: str | None) -> None:
+def evaluate(trials: int, task_id: str | None, mode: Mode = "strict") -> None:
     tasks = [task for task in SUITE if task_id in (None, task.id)]
     if not tasks:
         raise SystemExit(f"Unknown task: {task_id}")
-    attempts = asyncio.run(run_suite(tasks, trials))
+    attempts = asyncio.run(run_suite(tasks, trials, mode))
     version = attempts[0].prompt_version
-    report(attempts, trials, version)
+    report(attempts, trials, version, mode)

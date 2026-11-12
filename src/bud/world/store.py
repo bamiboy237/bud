@@ -43,10 +43,37 @@ CREATE TABLE IF NOT EXISTS contacts (
     name TEXT NOT NULL,
     relationship TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS archived_threads (thread_id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    due TEXT NOT NULL DEFAULT '',
+    done INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS applied_actions (key TEXT PRIMARY KEY);
 """
 
-TABLES = ("threads", "messages", "events", "contacts")
+# Columns added after the first release. Existing databases get them through ALTER TABLE
+# in World.__init__, so every INSERT must name its columns.
+ADDED_COLUMNS = {
+    "applied_actions": {
+        "draft_id": "TEXT",
+        "calendar_payload": "TEXT",
+        "event_id": "TEXT",
+        "send_payload": "TEXT",
+        "write_payload": "TEXT",
+        "result_id": "TEXT",
+    },
+    "events": {
+        "organizer": "TEXT NOT NULL DEFAULT ''",
+        "rsvp": "TEXT NOT NULL DEFAULT 'none'",
+        "description": "TEXT NOT NULL DEFAULT ''",
+    },
+    "contacts": {"note": "TEXT NOT NULL DEFAULT ''"},
+}
+
+RSVP_RESPONSES = ("accepted", "declined", "tentative")
+TABLES = ("threads", "messages", "events", "contacts", "archived_threads", "tasks")
 MAX_DRAFT_BODY_CHARS = 20_000
 
 
@@ -76,12 +103,11 @@ class World:
         with self._connect() as db:
             db.executescript(SCHEMA)
             db.execute("BEGIN IMMEDIATE")
-            columns = {row["name"] for row in db.execute("PRAGMA table_info(applied_actions)")}
-            if "draft_id" not in columns:
-                db.execute("ALTER TABLE applied_actions ADD COLUMN draft_id TEXT")
-            for column in ("calendar_payload", "event_id", "send_payload"):
-                if column not in columns:
-                    db.execute(f"ALTER TABLE applied_actions ADD COLUMN {column} TEXT")
+            for table, added in ADDED_COLUMNS.items():
+                columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+                for column, definition in added.items():
+                    if column not in columns:
+                        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
             empty = all(
                 db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
                 for table in (*TABLES, "applied_actions")
@@ -139,19 +165,29 @@ class World:
                 )
         for event in self.seed["events"]:
             db.execute(
-                "INSERT INTO events VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO events"
+                " (id, title, start, end, attendees, organizer, rsvp, description)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     event["id"],
                     event["title"],
                     event["start"],
                     event["end"],
                     json.dumps(event["attendees"]),
+                    event.get("organizer", ""),
+                    event.get("rsvp", "none"),
+                    event.get("description", ""),
                 ),
             )
         for contact in self.seed["contacts"]:
             db.execute(
-                "INSERT INTO contacts VALUES (?, ?, ?)",
+                "INSERT INTO contacts (email, name, relationship) VALUES (?, ?, ?)",
                 (contact["email"], contact["name"], contact["relationship"]),
+            )
+        for task in self.seed.get("tasks", []):
+            db.execute(
+                "INSERT INTO tasks (id, title, due) VALUES (?, ?, ?)",
+                (task["id"], task["title"], task.get("due", "")),
             )
 
     def snapshot(self) -> dict[str, list[dict[str, Any]]]:
@@ -169,7 +205,12 @@ class World:
         return cursor.rowcount == 1
 
     def search_email(
-        self, query: str = "", sender: str = "", unread_only: bool = False, limit: int = 10
+        self,
+        query: str = "",
+        sender: str = "",
+        unread_only: bool = False,
+        limit: int = 10,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
         # Like Gmail, every word must appear somewhere (subject, body, or sender), not
         # the query as one exact phrase.
@@ -178,6 +219,8 @@ class World:
             " FROM messages m JOIN threads t ON t.id = m.thread_id"
             " WHERE m.folder != 'draft' AND m.sender LIKE ?"
         )
+        if not include_archived:
+            sql += " AND m.thread_id NOT IN (SELECT thread_id FROM archived_threads)"
         params: list[Any] = [f"%{sender}%"]
         for word in query.split():
             sql += " AND (t.subject LIKE ? OR m.body LIKE ? OR m.sender LIKE ?)"
@@ -452,8 +495,16 @@ class World:
             self._check_booking(db, begin, finish)
             event_id = f"e-{uuid4().hex[:8]}"
             db.execute(
-                "INSERT INTO events VALUES (?, ?, ?, ?, ?)",
-                (event_id, title, begin.isoformat(), finish.isoformat(), json.dumps(attendees)),
+                "INSERT INTO events (id, title, start, end, attendees, organizer, rsvp)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'none')",
+                (
+                    event_id,
+                    title,
+                    begin.isoformat(),
+                    finish.isoformat(),
+                    json.dumps(attendees),
+                    self.info["email"],
+                ),
             )
             db.execute("UPDATE applied_actions SET event_id = ? WHERE key = ?", (event_id, key))
             return {"applied": True, "event": self._read_event(db, event_id)}
@@ -483,6 +534,136 @@ class World:
             )
             db.execute("UPDATE applied_actions SET event_id = ? WHERE key = ?", (event_id, key))
             return {"applied": True, "event": self._read_event(db, event_id)}
+
+    def _once(self, db: sqlite3.Connection, key: str, payload: dict[str, Any]) -> str | None | bool:
+        """Claim an approval key for a state write.
+
+        Returns True on first use (the payload is recorded). On a replay of the same write it
+        returns the result id saved the first time, or None when the write had none. A key
+        reused for a different write is refused.
+        """
+        if not key.strip():
+            raise WorldError("Writes require an action key.")
+        encoded = json.dumps(payload, sort_keys=True)
+        if self._apply_once(db, key):
+            db.execute("UPDATE applied_actions SET write_payload = ? WHERE key = ?", (encoded, key))
+            return True
+        saved = db.execute(
+            "SELECT write_payload, result_id FROM applied_actions WHERE key = ?", (key,)
+        ).fetchone()
+        if saved["write_payload"] != encoded:
+            raise WorldError("This action key was already used for a different write.")
+        return saved["result_id"]
+
+    def _remember(self, db: sqlite3.Connection, key: str, result_id: str) -> None:
+        db.execute("UPDATE applied_actions SET result_id = ? WHERE key = ?", (result_id, key))
+
+    def _thread(self, db: sqlite3.Connection, thread_id: str) -> sqlite3.Row:
+        row = db.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
+        if row is None:
+            raise WorldError(f"No thread {thread_id}. Use search_email to find thread ids.")
+        return row
+
+    def archive_email(self, key: str, thread_id: str) -> dict[str, Any]:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            thread = self._thread(db, thread_id)
+            first = self._once(db, key, {"action": "archive_email", "thread_id": thread_id})
+            db.execute("INSERT OR IGNORE INTO archived_threads VALUES (?)", (thread_id,))
+            return {"applied": first is True, "thread_id": thread_id, "subject": thread["subject"]}
+
+    def mark_read(self, key: str, thread_id: str) -> dict[str, Any]:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            thread = self._thread(db, thread_id)
+            first = self._once(db, key, {"action": "mark_read", "thread_id": thread_id})
+            db.execute("UPDATE messages SET unread = 0 WHERE thread_id = ?", (thread_id,))
+            return {"applied": first is True, "thread_id": thread_id, "subject": thread["subject"]}
+
+    def list_tasks(self, include_done: bool = False) -> list[dict[str, Any]]:
+        sql = "SELECT id, title, due, done FROM tasks"
+        if not include_done:
+            sql += " WHERE done = 0"
+        with self._connect() as db:
+            return [
+                {**dict(row), "done": bool(row["done"])}
+                for row in db.execute(sql + " ORDER BY due = '', due, id")
+            ]
+
+    def add_task(self, key: str, title: str, due: str = "") -> dict[str, Any]:
+        if not title.strip() or len(title) > 200:
+            raise WorldError("A task needs a title of at most 200 characters.")
+        if due:
+            try:
+                datetime.fromisoformat(due)
+            except ValueError as exc:
+                raise WorldError("A due date must look like 2026-11-06.") from exc
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            first = self._once(db, key, {"action": "add_task", "title": title, "due": due})
+            if first is not True:
+                row = db.execute("SELECT * FROM tasks WHERE id = ?", (first,)).fetchone()
+                if row is None:
+                    raise WorldError("This action key was already used for a different write.")
+                return {"applied": False, "task": {**dict(row), "done": bool(row["done"])}}
+            task_id = f"tk-{uuid4().hex[:8]}"
+            db.execute("INSERT INTO tasks (id, title, due) VALUES (?, ?, ?)", (task_id, title, due))
+            self._remember(db, key, task_id)
+            return {"applied": True, "task": {"id": task_id, "title": title, "due": due}}
+
+    def complete_task(self, key: str, task_id: str) -> dict[str, Any]:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            task = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if task is None:
+                raise WorldError(f"No task {task_id}. Use list_tasks to find task ids.")
+            first = self._once(db, key, {"action": "complete_task", "task_id": task_id})
+            db.execute("UPDATE tasks SET done = 1 WHERE id = ?", (task_id,))
+            return {"applied": first is True, "task": {**dict(task), "done": True}}
+
+    def update_contact_note(self, key: str, email: str, note: str) -> dict[str, Any]:
+        if len(note) > 1_000:
+            raise WorldError("A contact note is at most 1,000 characters.")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            contact = db.execute("SELECT * FROM contacts WHERE email = ?", (email,)).fetchone()
+            if contact is None:
+                raise WorldError(f"No contact {email}. Use search_contacts to find addresses.")
+            first = self._once(
+                db, key, {"action": "update_contact_note", "email": email, "note": note}
+            )
+            db.execute("UPDATE contacts SET note = ? WHERE email = ?", (note, email))
+            return {"applied": first is True, "contact": {**dict(contact), "note": note}}
+
+    def rsvp_event(self, key: str, event_id: str, response: str) -> dict[str, Any]:
+        """Answer an invitation. The organizer sees the response."""
+        if response not in RSVP_RESPONSES:
+            raise WorldError(f"Respond with one of: {', '.join(RSVP_RESPONSES)}.")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            event = self._read_event(db, event_id)
+            if event["rsvp"] == "none":
+                raise WorldError(f"{event_id} is not an invitation to answer.")
+            first = self._once(
+                db, key, {"action": "rsvp_event", "event_id": event_id, "response": response}
+            )
+            db.execute("UPDATE events SET rsvp = ? WHERE id = ?", (response, event_id))
+            return {"applied": first is True, "event": self._read_event(db, event_id)}
+
+    def delete_event(self, key: str, event_id: str) -> dict[str, Any]:
+        """Remove an event for good. Attendees are not notified by the simulation."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute("SELECT id FROM events WHERE id = ?", (event_id,)).fetchone()
+            first = self._once(db, key, {"action": "delete_event", "event_id": event_id})
+            if first is not True:
+                return {"applied": False, "deleted": event_id}
+            if existing is None:
+                raise WorldError(f"No event {event_id}. Use list_events to find event ids.")
+            if self._read_event(db, event_id)["protected"]:
+                raise WorldError("Focus Block events are protected and cannot be deleted.")
+            db.execute("DELETE FROM events WHERE id = ?", (event_id,))
+            return {"applied": True, "deleted": event_id}
 
     def search_contacts(self, query: str) -> list[dict[str, Any]]:
         pattern = f"%{query}%"
