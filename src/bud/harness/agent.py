@@ -21,7 +21,7 @@ from bud.gateway.registry import Registry
 from bud.harness.actions import GuardTools, Policy, RecordDecision
 from bud.harness.code import CODE_GUIDANCE, CODE_TOOL_CALL_LIMIT, build_code_mode
 from bud.harness.context import BackgroundCompaction
-from bud.harness.decisions import build_decision_client
+from bud.harness.decisions import DecisionClient
 from bud.harness.memory import MEMORY_RULES
 from bud.harness.results import SqliteResultStore, build_output_limits
 from bud.harness.spend import SqliteSpendStore
@@ -87,10 +87,9 @@ class Harness:
             }
         )
         self.system_prompt = f"{load_system_prompt()}\n{profile}\n{CODE_GUIDANCE}\n{SKILL_GUIDANCE}"
-        self.world_profile = profile
-        self.decisions = build_decision_client()
-        # The owner's latest message, set by Runner.start on every accepted message.
-        self.current_request = ""
+        # Set by the composition root (bud serve, evals) only when the owner opts in; balanced
+        # mode then lets it score eligible writes. None means nothing is ever scored.
+        self.decisions: DecisionClient | None = None
         # Instructions that must reflect live state (e.g. the approval mode) are
         # evaluated at the start of every run instead of being baked in at boot.
         self.live_instructions: list[Callable[..., str]] = [self._today]
@@ -101,9 +100,6 @@ class Harness:
         self.prompt_version = sha256(prompt.encode()).hexdigest()[:12]
         self.spend_store = SqliteSpendStore(spend_path)
         self.spend = self.spend_for_run()
-
-    def decision_context(self) -> str:
-        return f"{self.world_profile}\nOwner's current request: {self.current_request or '(none)'}"
 
     def _today(self) -> str:
         # Day granularity: instructions lead the prompt, so a per-minute clock here
@@ -166,7 +162,7 @@ class Harness:
                     policy=self.policy,
                     record=record,
                     decisions=self.decisions,
-                    decision_context=self.decision_context,
+                    facts=self._today,
                 ),
                 self.spend,
                 self.output_limits,

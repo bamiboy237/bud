@@ -27,8 +27,10 @@ class Settings(BaseSettings):
     models_file: Path | None = None
     default_model: str | None = None
     model_fallback: bool = True
-    decision_auto_allow: bool = True
-    decision_threshold: float = 0.9
+    # Opt-in: in balanced mode, a decision model scores eligible writes and a score at or above
+    # the threshold skips the owner's approval. Off by default; strict never uses it.
+    decision_auto_allow: bool = False
+    decision_threshold: float = Field(default=0.9, gt=0, le=1, allow_inf_nan=False)
     model_api_keys: dict[str, SecretStr] = Field(default_factory=dict, repr=False)
     tool_result_retention_hours: float = Field(default=24, gt=0, allow_inf_nan=False)
 
