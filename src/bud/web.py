@@ -1,6 +1,9 @@
 """Bounded public research through Exa's hosted MCP service."""
 
+import json
+from hashlib import sha256
 from ipaddress import ip_address
+from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlsplit
 
@@ -38,8 +41,45 @@ def _public_url(url: str) -> None:
         raise ValueError("Private and special IP addresses are not public page URLs")
 
 
-def build_tools(settings: Settings) -> FunctionToolset[None]:
+class Cassette:
+    """Record each live result once, then replay it: evaluations stay repeatable and free
+    while still exercising the production tools and their checks. Only the network
+    response is cached; failures are never recorded, so a later run can retry them."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.entries: dict[str, Any] = json.loads(path.read_text()) if path.exists() else {}
+
+    @staticmethod
+    def key(name: str, arguments: dict[str, Any]) -> str:
+        return sha256(json.dumps([name, arguments], sort_keys=True).encode()).hexdigest()
+
+    def get(self, name: str, arguments: dict[str, Any]) -> tuple[bool, Any]:
+        entry = self.entries.get(self.key(name, arguments))
+        return (True, entry["result"]) if entry is not None else (False, None)
+
+    def put(self, name: str, arguments: dict[str, Any], result: Any) -> None:
+        self.entries[self.key(name, arguments)] = {
+            "tool": name,
+            "arguments": arguments,
+            "result": result,
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self.entries, indent=1, default=str))
+
+
+def build_tools(settings: Settings, *, cassette: Cassette | None = None) -> FunctionToolset[None]:
     async def call(name: str, arguments: dict[str, Any]) -> Any:
+        if cassette is not None:
+            found, result = cassette.get(name, arguments)
+            if found:
+                return result
+        result = await live(name, arguments)
+        if cassette is not None and not (isinstance(result, dict) and "error" in result):
+            cassette.put(name, arguments, result)
+        return result
+
+    async def live(name: str, arguments: dict[str, Any]) -> Any:
         key = settings.exa_api_key
         remote = MCPToolset(
             "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa",
