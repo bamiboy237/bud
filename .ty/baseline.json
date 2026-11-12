@@ -45,14 +45,6 @@
         "lineCount": 1
       }
     ],
-    "src/bud/core/profiles.py": [
-      {
-        "rule": "invalid-return-type",
-        "startColumn": 11,
-        "endColumn": 44,
-        "lineCount": 1
-      }
-    ],
     "src/bud/core/runner.py": [
       {
         "rule": "deprecated",
@@ -141,18 +133,6 @@
         "startColumn": 4,
         "endColumn": 6,
         "lineCount": 1
-      },
-      {
-        "rule": "unsupported-operator",
-        "startColumn": 12,
-        "endColumn": 34,
-        "lineCount": 2
-      },
-      {
-        "rule": "unsupported-operator",
-        "startColumn": 12,
-        "endColumn": 32,
-        "lineCount": 2
       }
     ],
     "src/bud/harness/code.py": [
@@ -163,26 +143,12 @@
         "lineCount": 9
       }
     ],
-    "src/bud/harness/context.py": [
-      {
-        "rule": "missing-union-attribute",
-        "startColumn": 34,
-        "endColumn": 45,
-        "lineCount": 1
-      }
-    ],
     "src/bud/harness/results.py": [
       {
         "rule": "deprecated",
         "startColumn": 5,
         "endColumn": 19,
         "lineCount": 1
-      },
-      {
-        "rule": "invalid-return-type",
-        "startColumn": 11,
-        "endColumn": 5,
-        "lineCount": 10
       }
     ],
     "src/bud/harness/spend.py": [
@@ -201,53 +167,9 @@
         "lineCount": 1
       },
       {
-        "rule": "missing-union-attribute",
-        "startColumn": 29,
-        "endColumn": 52,
-        "lineCount": 1
-      },
-      {
-        "rule": "missing-union-attribute",
-        "startColumn": 28,
-        "endColumn": 48,
-        "lineCount": 1
-      },
-      {
-        "rule": "missing-union-attribute",
-        "startColumn": 12,
-        "endColumn": 35,
-        "lineCount": 1
-      },
-      {
-        "rule": "missing-union-attribute",
-        "startColumn": 15,
-        "endColumn": 35,
-        "lineCount": 1
-      },
-      {
-        "rule": "missing-union-attribute",
-        "startColumn": 46,
-        "endColumn": 66,
-        "lineCount": 1
-      },
-      {
         "rule": "deprecated",
         "startColumn": 1,
         "endColumn": 20,
-        "lineCount": 1
-      }
-    ],
-    "src/bud/photon_config.py": [
-      {
-        "rule": "missing-union-attribute",
-        "startColumn": 16,
-        "endColumn": 29,
-        "lineCount": 1
-      },
-      {
-        "rule": "missing-union-attribute",
-        "startColumn": 16,
-        "endColumn": 28,
         "lineCount": 1
       }
     ],
@@ -268,14 +190,6 @@
         "rule": "incompatible-mutable-override",
         "startColumn": 4,
         "endColumn": 6,
-        "lineCount": 1
-      }
-    ],
-    "src/bud/skills/installer.py": [
-      {
-        "rule": "missing-union-attribute",
-        "startColumn": 37,
-        "endColumn": 56,
         "lineCount": 1
       }
     ],

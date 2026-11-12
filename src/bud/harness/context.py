@@ -175,6 +175,7 @@ class BackgroundCompaction(AbstractCapability[None]):
 
         compacted = None
         source = "foreground"
+        preparation_id: str | None = None
         if prepared is not None:
             # A preparation in use must not be evicted by another session's cache sweep.
             self._prepared.pop(session_id)
@@ -186,10 +187,12 @@ class BackgroundCompaction(AbstractCapability[None]):
             else:
                 compacted = [*compacted, *messages[prepared.count :]]
                 source = "background"
+                preparation_id = prepared.id
                 if not self._fits_rewritten(compacted, request_context, threshold):
                     compacted = None
         if compacted is None:
             source = "foreground"
+            preparation_id = None
             self._reserve(ctx)
             compacted = await self._summarize(ctx, request_context)
         if _digest(compacted) == _digest(messages) or not self._fits_rewritten(
@@ -206,7 +209,7 @@ class BackgroundCompaction(AbstractCapability[None]):
                 "id": f"{run_id}:{ctx.run_step}",
                 "stage": "compacted",
                 "source": source,
-                "preparation_id": prepared.id if source == "background" else None,
+                "preparation_id": preparation_id,
                 "before_messages": len(messages),
                 "after_messages": len(compacted),
             }

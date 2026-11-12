@@ -79,9 +79,9 @@ def owner_message(message: ReceivedImessageMessage, config: PhotonConfig) -> boo
             and message.status == "received"
             and space.kind == "direct"
             and sender.kind == "human"
-            and sender.handle == config.owner
+            and getattr(sender, "handle", None) == config.owner
             and agent.kind == "agent"
-            and agent.handle == config.agent
+            and getattr(agent, "handle", None) == config.agent
             and bool(sender.id and agent.id and space.id and message.id)
             and sender.id != agent.id
             and isinstance(message.content, TextContent)
