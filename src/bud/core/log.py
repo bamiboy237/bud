@@ -410,6 +410,13 @@ class EventLog:
             )
             return True
 
+    def pause_queue(self, session_id: str, reason: str) -> None:
+        """Pause queued work for a reason bud found itself; the owner's next message lifts it."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not queue_paused(self._read(db, session_id)):
+                self._insert(db, session_id, "queue.paused", {"reason": reason})
+
     def dispatch_message(self, session_id: str, message_id: str, run: dict) -> bool:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")

@@ -45,6 +45,9 @@ class Attempt:
     requests: int = 0
     model_seconds: float = 0.0
     wasted: int = 0
+    loop_pauses: int = 0
+    loop_notes: int = 0
+    loop_kinds: tuple[str, ...] = ()
 
 
 def failure_reason(events: list[Event]) -> str | None:
@@ -85,17 +88,21 @@ async def teach(runner: Runner, log: EventLog, task: Task) -> None:
 
 async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
     session_id = f"eval-{task.id}-{uuid4().hex[:8]}"
+    timeout = task.timeout or ATTEMPT_TIMEOUT_SECONDS
     started = perf_counter()
     with TemporaryDirectory() as folder:
         log = EventLog(Path(folder) / "events.db")
         world = World(Path(folder) / "world.db")
+        policy = load_policy()
+        extra = task.tools() if task.tools is not None else []
+        policy.tools.update({tool.name: "allow" for tool in extra})
         harness = Harness(
-            build_tools(world, include_ask_user=False),
-            load_policy(),
+            [*build_tools(world, include_ask_user=False), *extra],
+            policy,
             gateway.registry,
             world.profile(),
             memory=build_memory(Path(folder) / "memory.db", namespace="world"),
-            spend_path=Path(folder) / "spend.db",
+            state_dir=Path(folder),
             result_path=log.path,
             read_tools=READ_TOOLS,
         )
@@ -111,9 +118,7 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
             await asyncio.wait_for(teach(runner, log, task), ATTEMPT_TIMEOUT_SECONDS)
             log.append(session_id, "session.created")
             before = world.snapshot()
-            approvals = await asyncio.wait_for(
-                drive(runner, log, task, session_id), ATTEMPT_TIMEOUT_SECONDS
-            )
+            approvals = await asyncio.wait_for(drive(runner, log, task, session_id), timeout)
             timed_out = False
         except TimeoutError:
             approvals, timed_out = [], True
@@ -135,8 +140,14 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
             approvals=approvals,
             failure=failure_reason(events),
             memory=await memory_text(learner),
+            loops=[e.data for e in events if e.type == "run.loop_detected"],
+            notes=loop_notes(events),
         )
     problems = ["timed out"] if timed_out else task.check(outcome)
+    if not task.spiral and (outcome.loops or outcome.notes):
+        # A normal task has no reason to look like a spiral; any detection is a false alarm.
+        kinds = [loop["kind"] for loop in outcome.loops]
+        problems.append(f"false loop detection: {outcome.notes} notes, pauses {kinds}")
     if outcome.failure and not timed_out:
         problems.insert(0, f"run failed: {outcome.failure}")
     cost, tokens = gateway.ledger.session_totals(session_id)
@@ -154,7 +165,21 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
         requests=requests,
         model_seconds=model_seconds,
         wasted=wasted,
+        loop_pauses=len(outcome.loops),
+        loop_notes=outcome.notes,
+        loop_kinds=tuple(loop["kind"] for loop in outcome.loops),
     )
+
+
+def loop_notes(events: list[Event]) -> int:
+    """How many self-check notes were written into the model's history across the session."""
+    count = 0
+    for event in events:
+        if event.type in ("run.completed", "run.waiting"):
+            for message in event.data.get("messages", []):
+                mark = (message.get("metadata") or {}).get("bud_spiral") or {}
+                count += sum(1 for note in mark.get("notes", []) if note.get("phase") == "note")
+    return count
 
 
 async def memory_text(learner: Learner) -> str:
@@ -185,7 +210,7 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str) -> Path:
 
     print(
         f"{'Task':<20} {'Passed':>7} {'Seconds':>8} {'Model s':>8} {'Reqs':>5} "
-        f"{'Wasted':>6} {'API USD':>9}"
+        f"{'Wasted':>6} {'Notes':>5} {'Pauses':>6} {'API USD':>9}"
     )
     for task, runs in by_task.items():
         n = len(runs)
@@ -195,9 +220,11 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str) -> Path:
         reqs = sum(run.requests for run in runs) / n
         wasted = sum(run.wasted for run in runs) / n
         cost = sum(run.cost_usd for run in runs) / n
+        notes = sum(run.loop_notes for run in runs)
+        pauses = sum(run.loop_pauses for run in runs)
         print(
             f"{task:<20} {f'{passed}/{n}':>7} {seconds:>8.1f} {model:>8.1f} {reqs:>5.1f} "
-            f"{wasted:>6.1f} {cost:>9.5f}"
+            f"{wasted:>6.1f} {notes:>5} {pauses:>6} {cost:>9.5f}"
         )
 
     pass_rate = sum(a.passed for a in attempts) / len(attempts)

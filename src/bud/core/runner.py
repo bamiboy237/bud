@@ -5,7 +5,6 @@ import json
 import logging
 from collections.abc import AsyncIterable
 from contextvars import Context, ContextVar
-from dataclasses import replace
 from hashlib import sha256
 from typing import cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -34,7 +33,6 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 from pydantic_ai.models import Model
-from pydantic_ai.usage import UsageLimits
 
 from bud.core.events import RUN_END_EVENTS, Event, EventType
 from bud.core.hub import Hub
@@ -61,11 +59,8 @@ from bud.gateway.tracked import TrackedModel, request_session
 from bud.harness.agent import Harness
 from bud.harness.context import BackgroundCompaction
 from bud.harness.learning import Learner
-from bud.limits import (
-    MAX_MESSAGE_CHARS,
-    MAX_MODEL_REQUESTS_PER_RUN,
-    MAX_TOOL_CALLS_PER_RUN,
-)
+from bud.harness.spiral import paused_in
+from bud.limits import MAX_MESSAGE_CHARS
 
 RESULTS = TypeAdapter(DeferredToolResults)
 logger = logging.getLogger(__name__)
@@ -162,13 +157,12 @@ class Runner(DBOSConfiguredInstance):
             if durable
             else None
         )
-        self.context = BackgroundCompaction(
-            spend_for_run=harness.spend_for_run, record=self._record_context
-        )
+        self.context = BackgroundCompaction(record=self._record_context)
         self.agent = harness.agent(
             gateway.model(tier, require_tools=True),
             self._record_decision,
             context=self.context,
+            loop_report=self._loop_detected,
             durability=durability,
             capabilities=(
                 TaskFlow(
@@ -735,16 +729,6 @@ class Runner(DBOSConfiguredInstance):
             conversation, history = self._history(run)
             if conversation is not None and conversation.conversation_id != run["session_id"]:
                 raise RecoveryRefused("Conversation does not belong to this session.")
-            limits = UsageLimits(
-                request_limit=MAX_MODEL_REQUESTS_PER_RUN,
-                tool_calls_limit=MAX_TOOL_CALLS_PER_RUN,
-            )
-            if conversation is not None:
-                limits = replace(
-                    limits,
-                    request_limit=conversation.usage.requests + MAX_MODEL_REQUESTS_PER_RUN,
-                    tool_calls_limit=conversation.usage.tool_calls + MAX_TOOL_CALLS_PER_RUN,
-                )
             model_override = self.session_models.get(run["session_id"])
             if (
                 model_override is not None
@@ -788,7 +772,6 @@ class Runner(DBOSConfiguredInstance):
                     "bud_inline_approval": run.get("task_id") is None
                     and run["trigger"] == "approval",
                 },
-                usage_limits=limits,
                 event_stream_handler=None if self.durable else self._stream,
             )
             data = {
@@ -811,6 +794,9 @@ class Runner(DBOSConfiguredInstance):
                 }
                 for call in requests or []
             ]
+            if run.get("task_id") is not None and paused_in(result.new_messages()) is not None:
+                # The job wrote its handoff and stopped; it stays paused until the owner replies.
+                self.hub.log.pause_queue(run["session_id"], "looping")
             await self._step(
                 "bud.finished",
                 self._finish,
@@ -886,6 +872,16 @@ class Runner(DBOSConfiguredInstance):
             cast(EventType, f"context.{event['stage']}"),
             event,
             key=f"context:{event['id']}:{event['stage']}",
+        )
+
+    def _loop_detected(self, detection: dict) -> None:
+        """A run is going in circles: tell the clients. This is a pause, not a failure."""
+        run = self._current.get()
+        self.hub.publish_once(
+            run["session_id"],
+            "run.loop_detected",
+            {**detection, "run_id": run["run_id"]},
+            key=f"{run['run_id']}:loop_detected",
         )
 
     def _record_decision(self, decision: dict) -> None:

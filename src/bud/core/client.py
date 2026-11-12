@@ -134,6 +134,13 @@ def render(
             print(f"\n[run failed] {data['reason']}", flush=True)
         case "task.completed" | "task.failed" | "task.cancelled":
             print(f"\nTask {data['task_id']}: {data['text']}", flush=True)
+        case "task.paused":
+            print(
+                f"\nTask {data['task_id']} paused (it was going in circles): {data['text']}",
+                flush=True,
+            )
+        case "run.loop_detected":
+            print(f"\n[paused: going in circles ({data['kind']})] {data['detail']}", flush=True)
 
 
 def print_http_error(error: httpx.HTTPStatusError) -> None:

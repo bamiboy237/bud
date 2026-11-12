@@ -11,11 +11,11 @@ from time import monotonic
 from pydantic import TypeAdapter
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability, durable_operation
-from pydantic_ai.exceptions import UsageLimitExceeded, UserError
+from pydantic_ai.exceptions import UserError
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
 from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
 from pydantic_ai.usage import RunUsage, UsageLimits
-from pydantic_ai_harness import SpendLimits, SummarizingCompaction
+from pydantic_ai_harness import SummarizingCompaction
 from pydantic_ai_harness.compaction import drain_summary_events, estimate_token_count
 from pydantic_ai_harness.compaction._shared import (
     exceeds,
@@ -84,7 +84,6 @@ class Preparation:
 
 @dataclass(kw_only=True)
 class BackgroundCompaction(AbstractCapability[None]):
-    spend_for_run: Callable[[str], SpendLimits] = field(repr=False)
     record: Callable[[dict], None] = field(repr=False)
     max_fraction: float = 0.65
     background_fraction: float = 0.8
@@ -158,19 +157,19 @@ class BackgroundCompaction(AbstractCapability[None]):
             None,
             model_request_parameters=request_context.model_request_parameters,
         ):
-            if prepared is None and exceeds(
-                messages,
-                None,
-                int(threshold * self.background_fraction),
-                None,
-                model_request_parameters=request_context.model_request_parameters,
+            if (
+                prepared is None
+                and exceeds(
+                    messages,
+                    None,
+                    int(threshold * self.background_fraction),
+                    None,
+                    model_request_parameters=request_context.model_request_parameters,
+                )
+                and find_token_cutoff(messages, self.keep_tokens, None) > 0
             ):
-                limit = ctx.usage_limits.request_limit if ctx.usage_limits is not None else None
-                if (limit is None or ctx.usage.requests + 2 <= limit) and find_token_cutoff(
-                    messages, self.keep_tokens, None
-                ) > 0:
-                    self._reserve(ctx)
-                    await self._start(ctx, request_context, signature)
+                self._reserve(ctx)
+                await self._start(ctx, request_context, signature)
             return request_context
 
         compacted = None
@@ -218,11 +217,6 @@ class BackgroundCompaction(AbstractCapability[None]):
 
     @staticmethod
     def _reserve(ctx: RunContext[None]) -> None:
-        limit = ctx.usage_limits.request_limit if ctx.usage_limits is not None else None
-        if limit is not None and ctx.usage.requests + 2 > limit:
-            raise UsageLimitExceeded(
-                "No request allowance left for a summary and the next response"
-            )
         # Preparation is a real request even when its result is never adopted.
         ctx.usage.requests += 1
 
@@ -285,7 +279,6 @@ class BackgroundCompaction(AbstractCapability[None]):
             summary_prompt=SUMMARY_PROMPT,
             model_settings={"max_tokens": 4096},
             event_stream_handler=drain_summary_events,
-            summarization_capabilities=[self.spend_for_run(run_id)],
             tool_return_max_chars=4000,
         )
         event = {"session_id": session_id, "run_id": run_id, "id": f"{run_id}:{ctx.run_step}"}

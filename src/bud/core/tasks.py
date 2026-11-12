@@ -17,7 +17,15 @@ from pydantic_ai.toolsets import FunctionToolset
 
 from bud.core.events import EventType
 from bud.core.hub import Hub
-from bud.core.projection import TaskView, queue_paused, queued_messages, reply_text, runs, snapshot
+from bud.core.projection import (
+    TaskView,
+    pause_reason,
+    queue_paused,
+    queued_messages,
+    reply_text,
+    runs,
+    snapshot,
+)
 from bud.harness.actions import Policy
 from bud.limits import MAX_MESSAGE_CHARS, MAX_OPEN_TASKS
 
@@ -236,6 +244,11 @@ class WorkItems:
             status = "paused" if state.queue_paused else "queued"
         if state.queue_paused and status == "queued":
             status = "paused"
+        # A job that stopped itself for going in circles is finished with its handoff, but
+        # it is paused, not done: the owner decides whether to point it somewhere new.
+        looping = status == "completed" and self._looping(item.session_id)
+        if looping:
+            status = "paused"
         return TaskView(
             task_id=item.task_id,
             session_id=item.session_id,
@@ -249,11 +262,14 @@ class WorkItems:
             ],
             artifacts=[artifact for run in state.recent_runs for artifact in run.artifacts],
             result=state.transcript[-1].text
-            if status == "completed"
+            if (status == "completed" or looping)
             and state.transcript
             and state.transcript[-1].role == "assistant"
             else None,
         )
+
+    def _looping(self, session_id: str) -> bool:
+        return pause_reason(self.log.read(session_id)) == "looping"
 
     def views(self, feed_id: str) -> list[TaskView]:
         return [self.view(item) for item in self.items(feed_id)]
@@ -282,6 +298,7 @@ class WorkItems:
                 key=f"task:{item.task_id}:approval:{approval.approval_id}",
             )
         events = self.log.read(session_id)
+        looping = {"paused"} if state.status == "paused" and self._looping(session_id) else set()
         terminal = next(
             (
                 event
@@ -293,7 +310,7 @@ class WorkItems:
         if (
             terminal is None
             or terminal.data.get("quiet")
-            or state.status not in FINISHED | {"needs_review"}
+            or state.status not in FINISHED | {"needs_review"} | looping
         ):
             return
         kind = terminal.type.removeprefix("run.")
@@ -303,7 +320,7 @@ class WorkItems:
             else terminal.data.get("reason", kind)
         )
         notices: dict[str, EventType] = {
-            "completed": "task.completed",
+            "completed": "task.paused" if state.status == "paused" else "task.completed",
             "failed": "task.failed",
             "cancelled": "task.cancelled",
         }

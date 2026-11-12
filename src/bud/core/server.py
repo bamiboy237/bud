@@ -204,7 +204,7 @@ def _create_app(
             + WEB_GUIDANCE
             + WORKSPACE_GUIDANCE,
             memory=build_memory(session_dir / "memory.db", namespace="owner"),
-            spend_path=session_dir / "spend.db",
+            state_dir=session_dir,
             result_path=db_path,
             read_tools=READ_TOOLS | WEB_READ_TOOLS | WORKSPACE_READ_TOOLS | {"current_time"},
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
@@ -224,7 +224,7 @@ def _create_app(
             gateway.registry,
             world.profile() + WORKSPACE_GUIDANCE,
             memory=build_memory(settings.data_dir / "world-memory.db", namespace="world"),
-            spend_path=settings.data_dir / "world-spend.db",
+            state_dir=settings.data_dir,
             result_path=db_path,
             read_tools=WORLD_READ_TOOLS | WORKSPACE_READ_TOOLS,
             result_retention=timedelta(hours=settings.tool_result_retention_hours),

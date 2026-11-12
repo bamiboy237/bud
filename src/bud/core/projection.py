@@ -140,7 +140,7 @@ def queue_paused(events: list[Event]) -> bool:
 
 # Pauses bud made itself; the owner's next message lifts them. An owner /pause and a
 # stop that left an action's outcome unknown stay until the owner resumes.
-AUTO_PAUSES = ("failed", "stopped")
+AUTO_PAUSES = ("failed", "stopped", "looping")
 
 
 def pause_reason(events: list[Event]) -> str | None:
@@ -242,8 +242,14 @@ def reply_text(messages: list[dict]) -> str:
         for message in messages
         if message.get("kind") == "response"
         for part in message.get("parts", [])
-        if part.get("part_kind") == "text"
+        # bud's self-check notes are for the model, not the owner.
+        if part.get("part_kind") == "text" and part.get("content") not in spiral_notes(message)
     )
+
+
+def spiral_notes(message: dict) -> set[str]:
+    mark = (message.get("metadata") or {}).get("bud_spiral") or {}
+    return {note["text"] for note in mark.get("notes", [])}
 
 
 def snapshot(session_id: str, events: list[Event]) -> Snapshot:
@@ -264,7 +270,7 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
                     run_turns[run_id] = Turn(role="assistant", text="")
                     transcript.append(run_turns[run_id])
                 run_turns[run_id].text = text
-            case "task.completed" | "task.failed" | "task.cancelled":
+            case "task.completed" | "task.failed" | "task.paused" | "task.cancelled":
                 transcript.append(
                     Turn(
                         role="assistant",
