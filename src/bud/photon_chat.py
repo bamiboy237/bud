@@ -50,6 +50,8 @@ def notification(event: dict, origin: MessageOrigin) -> str | None:
             return action_preview(data)
         case "task.completed" | "task.failed" | "task.cancelled":
             return f"Task {data['task_id']}: {data['text']}"
+        case "task.paused":
+            return f"Task {data['task_id']} paused because it was going in circles: {data['text']}"
         case "run.completed":
             if data.get("quiet"):
                 return None

@@ -5,7 +5,7 @@ Model calls use the real gateway, so `bud costs` includes eval spend.
 
 import asyncio
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -54,6 +54,10 @@ class Attempt:
     requests: int = 0
     model_seconds: float = 0.0
     wasted: int = 0
+    loop_pauses: int = 0
+    loop_notes: int = 0
+    loop_note_details: tuple[str, ...] = ()
+    loop_kinds: tuple[str, ...] = ()
     # Approval requests the owner (the scripted user) had to answer in the checked session.
     interruptions: int = 0
     # Calls the decision model let through without asking, each marked wrong or not.
@@ -124,16 +128,19 @@ def auto_allowed(task: Task, events: list[Event]) -> list[dict]:
 
 async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> Attempt:
     session_id = f"eval-{task.id}-{uuid4().hex[:8]}"
+    timeout = task.timeout or ATTEMPT_TIMEOUT_SECONDS
     started = perf_counter()
     with TemporaryDirectory() as folder:
         log = EventLog(Path(folder) / "events.db")
         world = World(Path(folder) / "world.db")
         policy = load_policy()
+        extra = task.tools() if task.tools is not None else []
+        policy.tools.update({tool.name: "allow" for tool in extra})
         policy.tools.update(dict.fromkeys(WEB_READ_TOOLS, "allow"))
         harness = Harness(
             CombinedToolset(
                 [
-                    FunctionToolset(build_tools(world, include_ask_user=False)),
+                    FunctionToolset([*build_tools(world, include_ask_user=False), *extra]),
                     # Production web tools behind a record/replay cassette: repeatable, free.
                     build_web_tools(get_settings(), cassette=WEB_CASSETTE),
                 ]
@@ -142,11 +149,13 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
             gateway.registry,
             world.profile(),
             memory=build_memory(Path(folder) / "memory.db", namespace="world"),
-            spend_path=Path(folder) / "spend.db",
+            state_dir=Path(folder),
             result_path=log.path,
             read_tools=READ_TOOLS | WEB_READ_TOOLS,
         )
         harness.clock = lambda: datetime.fromisoformat(world.now)
+        if task.spiral_config:
+            harness.spiral = replace(harness.spiral, **task.spiral_config)
         # Set before the Runner builds its agent: balanced mode needs the decision model.
         harness.decisions = decision_client() if mode == "balanced" else None
         apply_mode(harness.policy, mode, decisions=harness.decisions is not None)
@@ -168,9 +177,7 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
             log.append(session_id, "session.created")
             before = world.snapshot()
             scored_before = len(harness.decisions.recent) if harness.decisions else 0
-            approvals = await asyncio.wait_for(
-                drive(runner, log, task, session_id), ATTEMPT_TIMEOUT_SECONDS
-            )
+            approvals = await asyncio.wait_for(drive(runner, log, task, session_id), timeout)
             timed_out = False
         except TimeoutError:
             approvals, timed_out = [], True
@@ -194,6 +201,8 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
             approvals=approvals,
             failure=failure_reason(events),
             memory=await memory_text(learner),
+            loops=[e.data for e in events if e.type == "run.loop_detected"],
+            notes=loop_notes(events),
             auto_allowed=tuple(allowed),
             policy_allowed=tuple(
                 e.data["tool"]
@@ -202,6 +211,10 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
             ),
         )
     problems = ["timed out"] if timed_out else task.check(outcome)
+    if not task.spiral and (outcome.loops or outcome.notes):
+        # A normal task has no reason to look like a spiral; any detection is a false alarm.
+        kinds = [loop["kind"] for loop in outcome.loops]
+        problems.append(f"false loop detection: notes {outcome.notes}, pauses {kinds}")
     if outcome.failure and not timed_out:
         problems.insert(0, f"run failed: {outcome.failure}")
     cost, tokens = gateway.ledger.session_totals(session_id)
@@ -219,10 +232,29 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
         requests=requests,
         model_seconds=model_seconds,
         wasted=wasted,
+        loop_pauses=len(outcome.loops),
+        loop_notes=len(outcome.notes),
+        loop_note_details=tuple(outcome.notes),
+        loop_kinds=tuple(loop["kind"] for loop in outcome.loops),
         interruptions=len(approvals),
         auto_allowed=allowed,
         scored=scored,
     )
+
+
+def loop_notes(events: list[Event]) -> list[str]:
+    """The self-check notes written into the model's history across the session."""
+    found = []
+    for event in events:
+        if event.type in ("run.completed", "run.waiting"):
+            for message in event.data.get("messages", []):
+                mark = (message.get("metadata") or {}).get("bud_spiral") or {}
+                found.extend(
+                    f"{note['kind']}: {note['detail']}"
+                    for note in mark.get("notes", [])
+                    if note.get("phase") == "note"
+                )
+    return found
 
 
 async def memory_text(learner: Learner) -> str:
@@ -253,7 +285,7 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str, mode: Mode
 
     print(
         f"{'Task':<20} {'Passed':>7} {'Asks':>5} {'Auto':>5} {'Wrong':>5} {'Seconds':>8} "
-        f"{'Model s':>8} {'Reqs':>5} {'Wasted':>6} {'API USD':>9}"
+        f"{'Model s':>8} {'Reqs':>5} {'Wasted':>6} {'Notes':>5} {'Pauses':>6} {'API USD':>9}"
     )
     for task, runs in by_task.items():
         n = len(runs)
@@ -263,12 +295,15 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str, mode: Mode
         reqs = sum(run.requests for run in runs) / n
         wasted = sum(run.wasted for run in runs) / n
         cost = sum(run.cost_usd for run in runs) / n
+        notes = sum(run.loop_notes for run in runs)
+        pauses = sum(run.loop_pauses for run in runs)
         asks = sum(run.interruptions for run in runs) / n
         auto = sum(len(run.auto_allowed) for run in runs) / n
         wrong = sum(call["wrong"] for run in runs for call in run.auto_allowed)
         print(
             f"{task:<20} {f'{passed}/{n}':>7} {asks:>5.1f} {auto:>5.1f} {wrong:>5} "
-            f"{seconds:>8.1f} {model:>8.1f} {reqs:>5.1f} {wasted:>6.1f} {cost:>9.5f}"
+            f"{seconds:>8.1f} {model:>8.1f} {reqs:>5.1f} {wasted:>6.1f} {notes:>5} {pauses:>6} "
+            f"{cost:>9.5f}"
         )
 
     pass_rate = sum(a.passed for a in attempts) / len(attempts)
