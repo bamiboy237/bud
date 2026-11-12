@@ -26,6 +26,7 @@ from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
 from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
+from bud.harness.recall import Recall, embedder
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
 from bud.web import Cassette
 from bud.web import build_tools as build_web_tools
@@ -119,7 +120,12 @@ async def run_attempt(task: Task, gateway: Gateway) -> Attempt:
             harness.memory,
             lambda session: gateway.model("fast", f"{session}:learn", require_tools=True),
         )
-        runner = Runner(Hub(log), gateway, harness, learner=learner)
+        recall = Recall(
+            Path(folder) / "recall.db",
+            embedder=embedder(get_settings()),
+            memory=harness.memory,
+        )
+        runner = Runner(Hub(log), gateway, harness, learner=learner, recall=recall)
         before = world.snapshot()
         try:
             await asyncio.wait_for(teach(runner, log, task), ATTEMPT_TIMEOUT_SECONDS)
