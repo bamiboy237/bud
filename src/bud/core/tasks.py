@@ -346,7 +346,11 @@ class WorkItems:
         text = (
             reply_text(terminal.data.get("messages", []))
             if kind == "completed"
-            else terminal.data.get("reason", kind)
+            else " ".join(
+                part
+                for part in (terminal.data.get("reason", kind), terminal.data.get("next"))
+                if part
+            )
         )
         notices: dict[str, EventType] = {
             "completed": "task.paused" if state.status == "paused" else "task.completed",

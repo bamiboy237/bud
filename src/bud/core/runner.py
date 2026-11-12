@@ -33,6 +33,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 from pydantic_ai.models import Model
+from pydantic_ai.usage import UsageLimits
 
 from bud.core.events import RUN_END_EVENTS, Event, EventType
 from bud.core.hub import Hub
@@ -833,6 +834,10 @@ class Runner(DBOSConfiguredInstance):
                     "bud_inline_approval": run.get("task_id") is None
                     and run["trigger"] == "approval",
                 },
+                # No step cap: SpiralGuard ends runaway loops. Explicit, because pydantic-ai
+                # otherwise applies request_limit=50 to the whole conversation's running
+                # total, which fails every message once a long-lived thread passes 50.
+                usage_limits=UsageLimits(request_limit=None),
                 event_stream_handler=None if self.durable else self._stream,
             )
             data = {
