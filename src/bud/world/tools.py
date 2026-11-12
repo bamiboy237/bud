@@ -16,6 +16,7 @@ READ_TOOLS = {
     "list_events",
     "read_event",
     "search_contacts",
+    "list_tasks",
 }
 
 # The profile matrix (bud.core.profiles) treats these as "simulated world
@@ -27,6 +28,13 @@ WRITE_TOOLS = {
     "send_email",
     "create_event",
     "move_event",
+    "delete_event",
+    "rsvp_event",
+    "archive_email",
+    "mark_read",
+    "add_task",
+    "complete_task",
+    "update_contact_note",
 }
 
 
@@ -49,17 +57,26 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
         return world.now
 
     def search_email(
-        query: str = "", sender: str = "", unread_only: bool = False, limit: int = 10
+        query: str = "",
+        sender: str = "",
+        unread_only: bool = False,
+        limit: int = 10,
+        include_archived: bool = False,
     ) -> Any:
         """Search the mailbox, newest first. Results include thread ids and short snippets.
+
+        Archived threads are hidden unless include_archived is true.
 
         Args:
             query: Text to find in the subject, body, or sender. Empty matches everything.
             sender: Part of the sender's address.
             unread_only: Return only unread messages.
             limit: Maximum results, up to 25.
+            include_archived: Also search threads that were archived.
         """
-        return _safely(lambda: world.search_email(query, sender, unread_only, limit))
+        return _safely(
+            lambda: world.search_email(query, sender, unread_only, limit, include_archived)
+        )
 
     def read_thread(thread_id: str) -> Any:
         """Read every message in a thread without changing its unread state.
@@ -140,7 +157,8 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
 
         Resolve unclear dates or timezone with the user first. Times need explicit
         offsets consistent with timezone; DST folds require choosing the intended offset.
-        Results include ids, local/UTC times, attendees, and protected status.
+        Results include ids, local/UTC times, attendees, organizer, rsvp state, description,
+        and protected status.
 
         Args:
             start: Range start, for example 2026-11-02T00:00:00-06:00.
@@ -170,6 +188,8 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
     ) -> Any:
         """Create an approved synthetic event.
 
+        Attendees receive an invitation, so an event with attendees is visible to other people.
+        Pass an empty attendees list for a personal block only the person sees.
         Check list_events first. Clarify ambiguous dates, attendees, timezones, or
         DST folds with the user. Bookings must fit the fictional seed's weekday
         09:00–17:00 America/Chicago hours and cannot overlap any event, including
@@ -216,6 +236,98 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
 
         return _safely(move)
 
+    def delete_event(ctx: RunContext[None], event_id: str) -> Any:
+        """Permanently delete a calendar event. This cannot be undone.
+
+        Use only when the person asks to delete or cancel a specific event. Never use it to
+        decline an invitation (use rsvp_event) or to make room for something else. Attendees
+        lose the event too. Focus Block events are protected and cannot be deleted.
+
+        Args:
+            event_id: The event id from list_events.
+        """
+        return _safely(lambda: world.delete_event(_action_key(ctx), event_id))
+
+    def rsvp_event(ctx: RunContext[None], event_id: str, response: str) -> Any:
+        """Answer a calendar invitation. The organizer sees your answer right away.
+
+        Use only when the person asks you to accept, decline, or tentatively accept a
+        specific invitation. Reading or summarising invitations never needs an answer.
+        Invitations show rsvp "needs_action" in list_events; events the person organized
+        have rsvp "none" and cannot be answered.
+
+        Args:
+            event_id: The invitation's event id from list_events.
+            response: One of accepted, declined, tentative.
+        """
+        return _safely(lambda: world.rsvp_event(_action_key(ctx), event_id, response))
+
+    def archive_email(ctx: RunContext[None], thread_id: str) -> Any:
+        """Move a whole thread out of the inbox into the archive. It stays searchable.
+
+        Private and reversible, but the person stops seeing the thread in their inbox, so
+        archive only the threads they asked for. Never archive a thread just because it
+        looks unimportant, and never one that is waiting for a reply or a payment.
+
+        Args:
+            thread_id: The thread id from search_email.
+        """
+        return _safely(lambda: world.archive_email(_action_key(ctx), thread_id))
+
+    def mark_read(ctx: RunContext[None], thread_id: str) -> Any:
+        """Mark every message in a thread as read. Private and reversible.
+
+        Use only when the person asks, or says they have handled the thread. Reading a thread
+        with read_thread already leaves its unread state alone on purpose.
+
+        Args:
+            thread_id: The thread id from search_email.
+        """
+        return _safely(lambda: world.mark_read(_action_key(ctx), thread_id))
+
+    def list_tasks(include_done: bool = False) -> Any:
+        """List the person's personal to-do list, soonest due first.
+
+        Args:
+            include_done: Also list tasks that are already done.
+        """
+        return _safely(lambda: world.list_tasks(include_done))
+
+    def add_task(ctx: RunContext[None], title: str, due: str = "") -> Any:
+        """Add an item to the person's private to-do list. Nobody else sees it.
+
+        Use when the person asks you to remember, track, or add a to-do. Check list_tasks
+        first so you do not add a duplicate. Returns the saved task with its id.
+
+        Args:
+            title: Short task title, at most 200 characters.
+            due: Optional due date such as 2026-11-06; empty for none.
+        """
+        return _safely(lambda: world.add_task(_action_key(ctx), title, due))
+
+    def complete_task(ctx: RunContext[None], task_id: str) -> Any:
+        """Mark a to-do item done. Private and reversible.
+
+        Use only when the person says the task is done or asks you to tick it off.
+
+        Args:
+            task_id: The task id from list_tasks.
+        """
+        return _safely(lambda: world.complete_task(_action_key(ctx), task_id))
+
+    def update_contact_note(ctx: RunContext[None], email: str, note: str) -> Any:
+        """Replace the private note kept on a contact. Nobody else sees it.
+
+        The new note replaces the old one, so include any existing note text you want to keep
+        (search_contacts shows it). Use when the person asks you to remember something about
+        a contact.
+
+        Args:
+            email: The contact's exact email address from search_contacts.
+            note: The full new note, at most 1,000 characters.
+        """
+        return _safely(lambda: world.update_contact_note(_action_key(ctx), email, note))
+
     def search_contacts(query: str) -> Any:
         """Find people by name or email address.
 
@@ -255,6 +367,14 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
         read_event,
         create_event,
         move_event,
+        delete_event,
+        rsvp_event,
+        archive_email,
+        mark_read,
+        list_tasks,
+        add_task,
+        complete_task,
+        update_contact_note,
         search_contacts,
     ]
     if include_ask_user:

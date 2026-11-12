@@ -21,6 +21,7 @@ from bud.gateway.registry import Registry
 from bud.harness.actions import GuardTools, Policy, RecordDecision
 from bud.harness.code import CODE_GUIDANCE, CODE_TOOL_CALL_LIMIT, build_code_mode
 from bud.harness.context import BackgroundCompaction
+from bud.harness.decisions import DecisionClient
 from bud.harness.memory import MEMORY_RULES
 from bud.harness.results import SqliteResultStore, build_output_limits
 from bud.harness.spend import SqliteSpendStore
@@ -86,6 +87,9 @@ class Harness:
             }
         )
         self.system_prompt = f"{load_system_prompt()}\n{profile}\n{CODE_GUIDANCE}\n{SKILL_GUIDANCE}"
+        # Set by the composition root (bud serve, evals) only when the owner opts in; balanced
+        # mode then lets it score eligible writes. None means nothing is ever scored.
+        self.decisions: DecisionClient | None = None
         # Instructions that must reflect live state (e.g. the approval mode) are
         # evaluated at the start of every run instead of being baked in at boot.
         self.live_instructions: list[Callable[..., str]] = [self._today]
@@ -154,7 +158,12 @@ class Harness:
             toolsets=[self.toolset],
             output_type=[str, DeferredToolRequests],
             capabilities=[
-                GuardTools(policy=self.policy, record=record),
+                GuardTools(
+                    policy=self.policy,
+                    record=record,
+                    decisions=self.decisions,
+                    facts=self._today,
+                ),
                 self.spend,
                 self.output_limits,
                 self.code_mode,
