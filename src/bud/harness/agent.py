@@ -78,6 +78,8 @@ class Harness:
         # What each write's ids point to, rendered from the store: the reviewer's only view
         # of a target that is not spelled out in the call's own arguments.
         self.describers: dict[str, Describer] = {}
+        # Per tool: does this call notify people other than the owner? Computed in code.
+        self.notifies_others: dict[str, Callable[[dict], bool]] = {}
         # Calls the owner approved after a hold, per session; see SessionGrants.
         self.grants = SessionGrants()
         # Instructions that must reflect live state (e.g. the approval mode) are
@@ -122,6 +124,7 @@ class Harness:
                     record=record,
                     reviewer=self.reviewer,
                     describers=self.describers,
+                    notifies_others=self.notifies_others,
                     facts=self._today,
                     grants=self.grants,
                 ),

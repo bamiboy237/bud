@@ -63,6 +63,11 @@ class ActionGateway(WrapperToolset[None]):
     reviewer: ToolReviewer | None = field(kw_only=True, default=None)
     # Renders what a call's ids refer to from bud's own store, per tool name.
     describers: Mapping[str, Describer] = field(kw_only=True, default_factory=dict)
+    # Hard rule: a write that would notify people other than the owner (an invitation, a
+    # moved or cancelled meeting) always waits for the owner, in every mode.
+    notifies_others: Mapping[str, Callable[[dict], bool]] = field(
+        kw_only=True, default_factory=dict
+    )
     # Trusted, non-owner context for the reviewer, such as today's date.
     facts: Callable[[], str] = field(kw_only=True, default=lambda: "")
     grants: SessionGrants = field(kw_only=True, default_factory=SessionGrants)
@@ -118,6 +123,15 @@ class ActionGateway(WrapperToolset[None]):
             today=self.facts(),
         )
 
+    def _notifies_others(self, name: str, tool_args: dict[str, Any]) -> bool:
+        check = self.notifies_others.get(name)
+        if check is None:
+            return False
+        try:
+            return check(tool_args)
+        except Exception:
+            return True  # unsure who would be notified: the owner decides
+
     async def _review(
         self, name: str, tool_args: dict[str, Any], ctx: RunContext[None], tool: ToolsetTool[None]
     ) -> ReviewResult:
@@ -153,6 +167,8 @@ class ActionGateway(WrapperToolset[None]):
         tool: ToolsetTool[None],
     ) -> Any:
         action = self.policy.decide(name)
+        if action == "review" and self._notifies_others(name, tool_args):
+            action = "ask"  # hard rule: other people would be notified
         rule: str = action
         outcome = "refused" if action == "deny" else "allowed"
         review: dict[str, Any] | None = None
@@ -224,6 +240,7 @@ class GuardTools(AbstractCapability[None]):
     record: RecordDecision
     reviewer: ToolReviewer | None = None
     describers: Mapping[str, Describer] = field(default_factory=dict)
+    notifies_others: Mapping[str, Callable[[dict], bool]] = field(default_factory=dict)
     facts: Callable[[], str] = lambda: ""
     # One set of grants for the life of the process, shared by every wrapper built from this.
     grants: SessionGrants = field(default_factory=SessionGrants)
@@ -258,6 +275,7 @@ class GuardTools(AbstractCapability[None]):
             record=self.record,
             reviewer=self.reviewer,
             describers=self.describers,
+            notifies_others=self.notifies_others,
             facts=self.facts,
             grants=self.grants,
         )

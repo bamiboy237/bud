@@ -5,6 +5,7 @@ import json
 import logging
 from collections.abc import AsyncIterable
 from contextvars import Context, ContextVar
+from datetime import datetime
 from hashlib import sha256
 from typing import cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -279,6 +280,8 @@ class Runner(DBOSConfiguredInstance):
             # the owner's words that started or steered it, never its brief: bud writes the
             # brief, possibly after reading untrusted mail.
             "request": text if item is None else item.owner_request,
+            # The owner's clock when this run was queued (the simulated clock in sim mode).
+            "clock": self.harness.clock().isoformat(),
             "trigger": "message" if results is None else "approval",
             "origin": origin,
             "task_id": item.task_id if item is not None else None,
@@ -802,8 +805,10 @@ class Runner(DBOSConfiguredInstance):
                 if self.durable
                 else await self._recalled(run)
             )
+            # A conversation picked up on a later day must not reuse "today"/"tomorrow".
+            gap = time_gap_note(self.hub.log.read(run["session_id"]), run)
             result = await self.agent.run(
-                (run["text"] + recalled) if run["text"] and recalled else run["text"],
+                (run["text"] + recalled + gap) if run["text"] else run["text"],
                 model=(
                     # Durable runs resolve pre-registered keys; local runs take the instance.
                     model_override
@@ -1017,6 +1022,37 @@ def _failure(error: BaseException) -> dict[str, str]:
     if isinstance(error, RecoveryRefused):
         return {"reason": str(error), "kind": "recovery", "next": NEXT_STEP["recovery"]}
     return failure(error)
+
+
+def time_gap_note(events: list[Event], run: dict) -> str:
+    """A note when this message arrives on a later date than the conversation's last one.
+
+    Built only from the log and the run's own recorded clock, so a replay agrees.
+    """
+    if run.get("trigger") != "message" or not run.get("text") or not run.get("clock"):
+        return ""
+    earlier = next(
+        (
+            event.data["clock"]
+            for event in reversed(events)
+            if event.type == "run.queued"
+            and event.data.get("run_id") != run["run_id"]
+            and event.data.get("text")
+            and event.data.get("clock")
+        ),
+        None,
+    )
+    if earlier is None:
+        return ""
+    now = datetime.fromisoformat(run["clock"])
+    then = datetime.fromisoformat(earlier)
+    if now.date() <= then.date():
+        return ""
+    return (
+        f"\n\n<time>It is now {now:%A, %d %B %Y}. This conversation's previous message was "
+        f"on {then:%A, %d %B %Y}. Answers given earlier about today, tomorrow, or this week "
+        "may be out of date: check again before relying on them.</time>"
+    )
 
 
 def _artifact(part: ToolReturnPart | RetryPromptPart) -> dict[str, str] | None:

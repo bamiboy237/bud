@@ -32,7 +32,7 @@ from bud.harness.review import ToolReviewer, build_reviewer
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
 from bud.web import Cassette
 from bud.web import build_tools as build_web_tools
-from bud.world.describe import build_describers
+from bud.world.describe import build_describers, build_notifies_others
 from bud.world.store import World
 from bud.world.tools import READ_TOOLS, build_tools
 
@@ -171,6 +171,7 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
         # Set before the Runner builds its agent: auto mode needs the reviewer.
         harness.reviewer = eval_reviewer() if mode == "auto" else None
         harness.describers = build_describers(world)
+        harness.notifies_others = build_notifies_others(world)
         apply_mode(harness.policy, mode, reviewer=harness.reviewer is not None)
         assert harness.memory is not None
         learner = Learner(
