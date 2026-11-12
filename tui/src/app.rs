@@ -852,6 +852,22 @@ impl App {
                     format!("✗ task failed · {}", sanitize::clean_line(ev.str("text"))),
                 );
             }
+            "task.paused" => {
+                self.note(
+                    Level::Warn,
+                    format!("⏸ task paused · {}", sanitize::clean_line(ev.str("text"))),
+                );
+            }
+            "run.loop_detected" => {
+                self.note(
+                    Level::Warn,
+                    format!(
+                        "⏸ paused: going in circles ({}) · {}",
+                        ev.str("kind"),
+                        sanitize::clean_line(ev.str("detail"))
+                    ),
+                );
+            }
             "task.cancelled" => self.note(Level::Muted, "task cancelled"),
             "context.compacted" => self.note(Level::Muted, "conversation compacted"),
             "memory.learned" => self.ev_memory_learned(ev),

@@ -40,12 +40,14 @@ EventType = Literal[
     "run.waiting",
     "run.completed",
     "run.failed",
+    "run.loop_detected",
     "run.stop_requested",
     "run.cancelled",
     "task.created",
     "task.approval",
     "task.completed",
     "task.failed",
+    "task.paused",
     "task.cancelled",
 ]
 
