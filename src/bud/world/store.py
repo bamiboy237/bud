@@ -98,7 +98,8 @@ class World:
         self.path = path
         self.seed = load_seed()
         self.info = self.seed["world"]
-        self.now: str = self.info["now"]
+        # Multi-day simulations move time forward by writing an ISO timestamp here.
+        self.clock_path = path.with_name("world-clock.txt")
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.executescript(SCHEMA)
@@ -114,6 +115,42 @@ class World:
             )
             if empty:
                 self._reset(db)
+
+    @property
+    def now(self) -> str:
+        """The seed's fixed moment, unless a simulation has advanced the clock."""
+        try:
+            text = self.clock_path.read_text().strip()
+        except FileNotFoundError:
+            return self.info["now"]
+        datetime.fromisoformat(text)  # a malformed clock fails loudly, never silently
+        return text
+
+    def set_now(self, moment: str) -> None:
+        datetime.fromisoformat(moment)
+        self.clock_path.write_text(moment)
+
+    def deliver(self, sender: str, subject: str, body: str, thread_id: str | None = None) -> str:
+        """Simulate an incoming email at the current clock; returns its thread id."""
+        thread = thread_id or f"t-{uuid4().hex[:8]}"
+        with self._connect() as db:
+            if thread_id is None:
+                db.execute("INSERT INTO threads (id, subject) VALUES (?, ?)", (thread, subject))
+            elif db.execute("SELECT 1 FROM threads WHERE id = ?", (thread,)).fetchone() is None:
+                raise WorldError(f"No thread {thread}.")
+            db.execute(
+                "INSERT INTO messages (id, thread_id, folder, sender, recipients, sent_at, body, "
+                "unread) VALUES (?, ?, 'inbox', ?, ?, ?, ?, 1)",
+                (
+                    f"{thread}-m{uuid4().hex[:6]}",
+                    thread,
+                    sender,
+                    json.dumps([self.info["email"]]),
+                    self.now,
+                    body,
+                ),
+            )
+        return thread
 
     def profile(self) -> str:
         info = self.info
