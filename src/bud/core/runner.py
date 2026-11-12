@@ -40,6 +40,7 @@ from bud.core.events import RUN_END_EVENTS, Event, EventType
 from bud.core.hub import Hub
 from bud.core.log import StopRequested
 from bud.core.projection import (
+    JobReport,
     Snapshot,
     decisions,
     message_batch,
@@ -52,7 +53,7 @@ from bud.core.projection import (
     waiting_batch,
 )
 from bud.core.runtime import replay_version
-from bud.core.tasks import CONTROL_TOOLS, FINISHED, TaskFlow, WorkItems
+from bud.core.tasks import CONTROL_TOOLS, FINISHED, JOB_OUTPUT, TaskFlow, WorkItems
 from bud.gateway import Gateway
 from bud.gateway.errors import NEXT_STEP, error_summary, failure
 from bud.gateway.registry import Tier
@@ -847,6 +848,8 @@ class Runner(DBOSConfiguredInstance):
                 # otherwise applies request_limit=50 to the whole conversation's running
                 # total, which fails every message once a long-lived thread passes 50.
                 usage_limits=UsageLimits(request_limit=None),
+                # A job ends only by filing a typed report; chat ends in text.
+                output_type=JOB_OUTPUT if run.get("task_id") is not None else None,
                 event_stream_handler=None if self.durable else self._stream,
             )
             data = {
@@ -854,6 +857,8 @@ class Runner(DBOSConfiguredInstance):
                 "messages": json.loads(result.new_messages_json()),
                 "conversation": ConversationTypeAdapter.dump_json(result.conversation).decode(),
             }
+            if isinstance(result.output, JobReport):
+                data["report"] = result.output.model_dump()
             deferred = result.output if isinstance(result.output, DeferredToolRequests) else None
             requests = deferred.approvals if deferred is not None else None
             approvals = [

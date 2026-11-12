@@ -4,11 +4,11 @@ import json
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pydantic import BaseModel, Field
-from pydantic_ai import ModelRetry, RunContext
+from pydantic_ai import DeferredToolRequests, ModelRetry, RunContext, ToolOutput
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 from pydantic_ai.models import ModelRequestContext
@@ -19,15 +19,18 @@ from bud.core.events import EventType
 from bud.core.hub import Hub
 from bud.core.log import QueueFull
 from bud.core.projection import (
+    JobReport,
     TaskView,
     pause_reason,
     queue_paused,
     queued_messages,
     reply_text,
+    report_text,
     runs,
     snapshot,
 )
 from bud.harness.actions import Policy
+from bud.harness.spiral import work_tools_off
 from bud.limits import MAX_MESSAGE_CHARS, MAX_OPEN_TASKS
 
 # A job reads its queue between steps; more waiting updates than this is a flood.
@@ -35,6 +38,48 @@ MAX_PENDING_UPDATES = 3
 
 CONTROL_TOOLS = {"start_task", "update_task", "inspect_task", "stop_task"}
 FINISHED = {"completed", "failed", "cancelled"}
+
+
+def finish_job(
+    ctx: RunContext[None],
+    outcome: Literal["delivered", "partly_delivered", "not_delivered"],
+    summary: str,
+    missing: list[str] | None = None,
+) -> JobReport:
+    """End this job with a report for the owner. This is the only way a job finishes.
+
+    Args:
+        outcome: Judged against the brief's expected result. delivered: every requested
+            item exists and is confirmed. partly_delivered: some of it exists. not_delivered:
+            none of it does, for example only a note saying it could not be done.
+        summary: What the job produced or found, in a few plain sentences for the owner.
+        missing: Each requested item that does not exist or is unconfirmed, and why.
+    """
+    missing = [item for item in (missing or []) if item.strip()]
+    if outcome == "delivered" and missing:
+        raise ModelRetry(
+            "A delivered job has nothing missing. Report partly_delivered with those items, "
+            "or leave missing empty if they are actually done."
+        )
+    if outcome != "delivered" and not missing:
+        raise ModelRetry(f"Outcome {outcome} needs missing: name what is not done and why.")
+    return JobReport(outcome=outcome, summary=summary, missing=missing, saved=saved_paths(ctx))
+
+
+def saved_paths(ctx: RunContext[None]) -> list[str]:
+    """Workspace files this job saved, read from tool return metadata the model never sees."""
+    paths: dict[str, None] = {}
+    for message in ctx.messages:
+        for part in getattr(message, "parts", []):
+            metadata = getattr(part, "metadata", None)
+            artifact = metadata.get("artifact") if isinstance(metadata, dict) else None
+            if isinstance(artifact, dict) and isinstance(artifact.get("path"), str):
+                paths[artifact["path"]] = None
+    return list(paths)
+
+
+# Job runs end only through finish_job (or wait on an approval); free text is not an ending.
+JOB_OUTPUT = [ToolOutput(finish_job, name="finish_job"), DeferredToolRequests]
 
 
 class TaskBrief(BaseModel):
@@ -84,6 +129,14 @@ def _owner_words(ctx: RunContext[None]) -> str | None:
     """The owner's message behind the current run, never a brief bud wrote itself."""
     request = (ctx.metadata or {}).get("bud_request")
     return request if isinstance(request, str) and request.strip() else None
+
+
+def _last_report(events: list) -> dict:
+    """The report filed by the job's latest finished run, if it filed one."""
+    for event in reversed(events):
+        if event.type == "run.completed":
+            return event.data.get("report") or {}
+    return {}
 
 
 class WorkItems:
@@ -266,7 +319,8 @@ class WorkItems:
         }
 
     def view(self, item: WorkItem) -> TaskView:
-        state = snapshot(item.session_id, self.log.read(item.session_id))
+        events = self.log.read(item.session_id)
+        state = snapshot(item.session_id, events)
         references = self.references(item)
         status = state.recent_runs[-1].status if state.recent_runs else "queued"
         if state.queued_messages and status in FINISHED:
@@ -295,6 +349,7 @@ class WorkItems:
             and state.transcript
             and state.transcript[-1].role == "assistant"
             else None,
+            outcome=_last_report(events).get("outcome") if status == "completed" else None,
         )
 
     def _looping(self, session_id: str) -> bool:
@@ -343,8 +398,9 @@ class WorkItems:
         ):
             return
         kind = terminal.type.removeprefix("run.")
+        report = terminal.data.get("report")
         text = (
-            reply_text(terminal.data.get("messages", []))
+            (report_text(report) if report else reply_text(terminal.data.get("messages", [])))
             if kind == "completed"
             else " ".join(
                 part
@@ -384,7 +440,7 @@ class TaskFlow(AbstractCapability[None]):
                 return (
                     "Complete the supplied job brief using tools. Submit requested changes "
                     "through their tools; the system collects approval. "
-                    "Return the confirmed result."
+                    "When the work is done or cannot go further, end with finish_job."
                 )
             return (
                 "Answer quick questions here. For work that takes time, produces a deliverable "
@@ -425,10 +481,7 @@ class TaskFlow(AbstractCapability[None]):
         self, ctx: RunContext[None], request_context: ModelRequestContext
     ) -> ModelRequestContext:
         if (ctx.metadata or {}).get("bud_revision_pending"):
-            return replace(
-                request_context,
-                model_settings=(request_context.model_settings or {}) | {"tool_choice": "none"},
-            )
+            return work_tools_off(request_context)
         if self._worker(ctx):
             return request_context
         jobs = self.store.views(self._feed(ctx))
@@ -441,6 +494,7 @@ class TaskFlow(AbstractCapability[None]):
                 "task_id": job.task_id,
                 "title": job.title,
                 "status": job.status,
+                "outcome": job.outcome,
                 "approvals": [a.reference for a in job.pending_approvals],
                 "result": job.result[:1000] if job.result else None,
             }

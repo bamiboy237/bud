@@ -1,7 +1,7 @@
 """Fold session events into conversation, approval, queue, and run views."""
 
 from contextlib import suppress
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai.messages import (
@@ -61,6 +61,33 @@ class RunView(BaseModel):
     artifacts: list[SavedArtifact] = Field(default_factory=list)
 
 
+class JobReport(BaseModel):
+    """How a job ended. The job files it with finish_job; the harness fills `saved`."""
+
+    outcome: Literal["delivered", "partly_delivered", "not_delivered"]
+    summary: str
+    missing: list[str] = Field(default_factory=list)
+    # Workspace files this job actually saved, from tool metadata, never from the model.
+    saved: list[str] = Field(default_factory=list)
+
+
+OUTCOME_WORDS = {
+    "delivered": "Delivered",
+    "partly_delivered": "Partly delivered",
+    "not_delivered": "Not delivered",
+}
+
+
+def report_text(report: dict) -> str:
+    job = JobReport.model_validate(report)
+    lines = [f"{OUTCOME_WORDS[job.outcome]}. {job.summary}"]
+    if job.missing:
+        lines.append("Missing: " + "; ".join(job.missing))
+    if job.saved:
+        lines.append("Saved: " + ", ".join(job.saved))
+    return "\n".join(lines)
+
+
 class TaskView(BaseModel):
     task_id: int
     session_id: str
@@ -69,6 +96,8 @@ class TaskView(BaseModel):
     pending_approvals: list[PendingApproval]
     artifacts: list[SavedArtifact]
     result: str | None = None
+    # The job's filed outcome; "completed" alone only means it stopped working.
+    outcome: str | None = None
 
 
 class Snapshot(BaseModel):
@@ -262,7 +291,8 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
                 transcript.append(Turn(role="user", text=event.data["text"]))
                 blocks = {}
             case "run.waiting" | "run.completed":
-                text = reply_text(event.data.get("messages", []))
+                report = event.data.get("report")
+                text = report_text(report) if report else reply_text(event.data.get("messages", []))
                 if not text:
                     continue
                 run_id = event.data["run_id"]
