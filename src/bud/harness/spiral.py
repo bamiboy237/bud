@@ -48,6 +48,8 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import ModelRequestContext
 
+from bud.harness.decisions import DECISIONS_URL
+
 logger = logging.getLogger(__name__)
 
 LoopKind = Literal["repeat", "cycle", "chanting", "no_progress"]
@@ -56,8 +58,6 @@ LoopReport = Callable[[dict[str, Any]], None]
 # Key in ModelResponse.metadata. Metadata is saved with the conversation but never sent
 # to the model, so it is where a run's own earlier decisions are remembered.
 MARK = "bud_spiral"
-
-DECISIONS_URL = "https://api.openai.com/v1/decisions"
 
 JUDGE_RULES = (
     "You watch one run of a personal AI assistant and judge whether it is still making "
@@ -85,8 +85,8 @@ REQUEST_CHARS = 4_000
 @dataclass(frozen=True)
 class SpiralConfig:
     enabled: bool = True
-    repeat_note: int = 2
-    repeat_pause: int = 3
+    repeat_note: int = 3
+    repeat_pause: int = 4
     cycle_max_period: int = 4
     cycle_repeats: int = 3
     chant_repeats: int = 3
@@ -521,6 +521,12 @@ class SpiralGuard(AbstractCapability[None]):
         self._judged[run_id] = state.requests
         probability = await self._ask(
             ctx, state.request_text, step_log(state.steps), len(state.steps)
+        )
+        logger.info(
+            "progress check in run %s after %d requests: probability of progress %s",
+            run_id,
+            state.requests,
+            "unavailable" if probability is None else f"{probability:.2f}",
         )
         if probability is None or probability >= self.config.progress_threshold:
             return None

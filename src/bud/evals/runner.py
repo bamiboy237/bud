@@ -5,7 +5,7 @@ Model calls use the real gateway, so `bud costs` includes eval spend.
 
 import asyncio
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -56,6 +56,7 @@ class Attempt:
     wasted: int = 0
     loop_pauses: int = 0
     loop_notes: int = 0
+    loop_note_details: tuple[str, ...] = ()
     loop_kinds: tuple[str, ...] = ()
     # Approval requests the owner (the scripted user) had to answer in the checked session.
     interruptions: int = 0
@@ -153,6 +154,8 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
             read_tools=READ_TOOLS | WEB_READ_TOOLS,
         )
         harness.clock = lambda: datetime.fromisoformat(world.now)
+        if task.spiral_config:
+            harness.spiral = replace(harness.spiral, **task.spiral_config)
         # Set before the Runner builds its agent: balanced mode needs the decision model.
         harness.decisions = decision_client() if mode == "balanced" else None
         apply_mode(harness.policy, mode, decisions=harness.decisions is not None)
@@ -211,7 +214,7 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
     if not task.spiral and (outcome.loops or outcome.notes):
         # A normal task has no reason to look like a spiral; any detection is a false alarm.
         kinds = [loop["kind"] for loop in outcome.loops]
-        problems.append(f"false loop detection: {outcome.notes} notes, pauses {kinds}")
+        problems.append(f"false loop detection: notes {outcome.notes}, pauses {kinds}")
     if outcome.failure and not timed_out:
         problems.insert(0, f"run failed: {outcome.failure}")
     cost, tokens = gateway.ledger.session_totals(session_id)
@@ -230,7 +233,8 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
         model_seconds=model_seconds,
         wasted=wasted,
         loop_pauses=len(outcome.loops),
-        loop_notes=outcome.notes,
+        loop_notes=len(outcome.notes),
+        loop_note_details=tuple(outcome.notes),
         loop_kinds=tuple(loop["kind"] for loop in outcome.loops),
         interruptions=len(approvals),
         auto_allowed=allowed,
@@ -238,15 +242,19 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
     )
 
 
-def loop_notes(events: list[Event]) -> int:
-    """How many self-check notes were written into the model's history across the session."""
-    count = 0
+def loop_notes(events: list[Event]) -> list[str]:
+    """The self-check notes written into the model's history across the session."""
+    found = []
     for event in events:
         if event.type in ("run.completed", "run.waiting"):
             for message in event.data.get("messages", []):
                 mark = (message.get("metadata") or {}).get("bud_spiral") or {}
-                count += sum(1 for note in mark.get("notes", []) if note.get("phase") == "note")
-    return count
+                found.extend(
+                    f"{note['kind']}: {note['detail']}"
+                    for note in mark.get("notes", [])
+                    if note.get("phase") == "note"
+                )
+    return found
 
 
 async def memory_text(learner: Learner) -> str:
