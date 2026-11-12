@@ -69,6 +69,7 @@ class WorkItem(BaseModel):
     brief: TaskBrief
     origin: dict | None
     skills: dict[str, str] | None
+    owner_request: str | None = None
 
 
 def letter(number: int) -> str:
@@ -77,6 +78,12 @@ def letter(number: int) -> str:
         number, digit = divmod(number - 1, 26)
         result = chr(65 + digit) + result
     return result
+
+
+def _owner_words(ctx: RunContext[None]) -> str | None:
+    """The owner's message behind the current run, never a brief bud wrote itself."""
+    request = (ctx.metadata or {}).get("bud_request")
+    return request if isinstance(request, str) and request.strip() else None
 
 
 class WorkItems:
@@ -97,8 +104,13 @@ class WorkItems:
                 );
                 CREATE INDEX IF NOT EXISTS tasks_by_feed ON tasks(feed_id);
             """)
-            if "skills" not in {row[1] for row in db.execute("PRAGMA table_info(tasks)")}:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(tasks)")}
+            if "skills" not in columns:
                 db.execute("ALTER TABLE tasks ADD COLUMN skills TEXT")
+            if "owner_request" not in columns:
+                # The owner's own words that started or steered the job; the approval
+                # reviewer judges the job's writes against these, never against the brief.
+                db.execute("ALTER TABLE tasks ADD COLUMN owner_request TEXT")
 
     @staticmethod
     def _item(row) -> WorkItem:
@@ -110,6 +122,7 @@ class WorkItems:
             brief=TaskBrief.model_validate_json(row[4]),
             origin=json.loads(row[5]),
             skills=json.loads(row[7]) if row[7] is not None else None,
+            owner_request=row[8] if len(row) > 8 else None,
         )
 
     def items(self, feed_id: str | None = None) -> list[WorkItem]:
@@ -158,6 +171,7 @@ class WorkItems:
         origin: dict | None,
         source_run: str | None,
         skills: dict[str, str] | None = None,
+        owner_request: str | None = None,
     ) -> WorkItem:
         with self.log._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -184,8 +198,9 @@ class WorkItems:
                 raise ModelRetry(f"There are already {MAX_OPEN_TASKS} open jobs.")
             session_id = uuid4().hex
             row = db.execute(
-                "INSERT INTO tasks(feed_id,session_id,title,brief,origin,source_id,skills) "
-                "VALUES(?,?,?,?,?,?,?) RETURNING task_id",
+                "INSERT INTO tasks"
+                "(feed_id,session_id,title,brief,origin,source_id,skills,owner_request) "
+                "VALUES(?,?,?,?,?,?,?,?) RETURNING task_id",
                 (
                     feed_id,
                     session_id,
@@ -194,6 +209,7 @@ class WorkItems:
                     json.dumps(origin),
                     source_id,
                     json.dumps(skills) if skills is not None else None,
+                    owner_request,
                 ),
             ).fetchone()
             task_id = row[0]
@@ -215,6 +231,7 @@ class WorkItems:
         source_id: str,
         origin: dict | None,
         source_run: str | None,
+        owner_words: str | None = None,
     ) -> None:
         if not text.strip() or len(text) > MAX_MESSAGE_CHARS:
             raise ModelRetry("Supply a task instruction within the message limit.")
@@ -223,6 +240,14 @@ class WorkItems:
             if source_run is not None and self.log._stopped(db, source_run):
                 raise ModelRetry("The conversation was stopped.")
             event = self.log._accept_message(db, item.session_id, text, source_id, origin)
+            if event is not None and owner_words:
+                # A steering message from the owner joins what the job was asked for.
+                db.execute(
+                    "UPDATE tasks SET owner_request = CASE WHEN owner_request IS NULL "
+                    "THEN ? ELSE owner_request || char(10) || char(10) || 'Later: ' || ? END "
+                    "WHERE task_id = ?",
+                    (owner_words, owner_words, item.task_id),
+                )
             if event is not None:
                 self.log._supersede(db, item.session_id, source_id, origin)
                 if queue_paused(self.log._read(db, item.session_id)):
@@ -452,6 +477,7 @@ class TaskFlow(AbstractCapability[None]):
             (ctx.metadata or {}).get("bud_origin"),
             ctx.run_id,
             skills=(ctx.metadata or {}).get("bud_skills", {}),
+            owner_request=_owner_words(ctx),
         )
         self.kick(item.session_id)
         return self.store.view(item)
@@ -481,6 +507,7 @@ class TaskFlow(AbstractCapability[None]):
                 self._source(ctx),
                 (ctx.metadata or {}).get("bud_origin"),
                 ctx.run_id,
+                _owner_words(ctx),
             )
         except QueueFull:
             raise ModelRetry(

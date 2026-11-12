@@ -119,14 +119,16 @@ class World:
         info = self.info
         return (
             f"The person is {info['person']} <{info['email']}>, timezone {info['timezone']}.\n"
+            "This is a simulated mailbox, calendar, contact list, and task list for testing. "
+            "No real account (Gmail, Google Calendar, or any other) is connected; say so if "
+            "asked about connections.\n"
             f"Synthetic scheduling hours only: {info['working_hours']} in {info['timezone']}.\n"
             f"{info['protected_blocks']}\n"
             "Resolve unclear dates, people, timezone, or DST folds with the user; do not guess. "
             "Calendar input times need explicit offsets matching the supplied IANA timezone "
             "(default: the person's timezone; use timezone='UTC' for UTC inputs). "
-            "Check list_events before proposing a change. Calendar writes require approval; "
-            "read_event after each approved write before claiming it is verified. "
-            "Save reply drafts only after approval, then read_draft to verify the saved result. "
+            "Check list_events before proposing a change. Writes may wait for the person's "
+            "approval. A write's result is read back from storage, so report it directly. "
             "Use list_drafts and read_draft to find drafts in new conversations. "
             "A denied draft must not be saved or sent."
         )

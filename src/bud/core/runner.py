@@ -274,9 +274,10 @@ class Runner(DBOSConfiguredInstance):
             "run_id": uuid4().hex,
             "text": text,
             # What the owner asked for, kept for the approval-triage model: the message text,
-            # or (set in _resume_if_ready) the original message of a resumed run. Jobs get
-            # none: a job's brief is written by bud, possibly after reading untrusted mail.
-            "request": text if item is None else None,
+            # or (set in _resume_if_ready) the original message of a resumed run. A job gets
+            # the owner's words that started or steered it, never its brief: bud writes the
+            # brief, possibly after reading untrusted mail.
+            "request": text if item is None else item.owner_request,
             "trigger": "message" if results is None else "approval",
             "origin": origin,
             "task_id": item.task_id if item is not None else None,
