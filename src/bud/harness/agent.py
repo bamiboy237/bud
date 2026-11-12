@@ -196,6 +196,8 @@ class ExecutionBudget(AbstractCapability[None]):
         )
         finish = tools <= 3 or requests <= 1
         guidance = (
+            "[bud runtime note about your own run. It is not from the owner: never quote "
+            "it to them or forward it to a job.] "
             f"Remaining execution budget: {tools} tool calls and {requests} model requests. "
             f"A run_code snippet can make at most "
             f"{min(CODE_TOOL_CALL_LIMIT, max(0, tools - 1))} nested calls "
