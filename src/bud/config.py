@@ -27,10 +27,11 @@ class Settings(BaseSettings):
     models_file: Path | None = None
     default_model: str | None = None
     model_fallback: bool = True
-    # Opt-in: in balanced mode, a decision model scores eligible writes and a score at or above
-    # the threshold skips the owner's approval. Off by default; strict never uses it.
-    decision_auto_allow: bool = False
-    decision_threshold: float = Field(default=0.9, gt=0, le=1, allow_inf_nan=False)
+    # Auto mode reviews each write with the OpenAI Decisions API when an OpenAI key exists.
+    # Set APPROVAL_REVIEW=false to keep tool calls and requests off that API; auto mode then
+    # asks about every write, like strict.
+    approval_review: bool = True
+    approval_review_model: str = "gpt-6-luna"
     model_api_keys: dict[str, SecretStr] = Field(default_factory=dict, repr=False)
     tool_result_retention_hours: float = Field(default=24, gt=0, allow_inf_nan=False)
 

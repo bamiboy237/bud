@@ -186,9 +186,14 @@ def _main(argv: list[str] | None = None) -> None:
     eval_parser.add_argument("--task", help="run one task by id")
     eval_parser.add_argument(
         "--mode",
-        choices=["strict", "balanced", "autonomous"],
+        choices=["strict", "auto"],
         default="strict",
-        help="approval mode; balanced turns on the decision model",
+        help="approval mode; auto reviews every write with the approval reviewer",
+    )
+    eval_parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="test the approval reviewer directly on hand-written good and bad calls",
     )
     serve_parser = commands.add_parser(
         "serve", help="run bud and its configured iMessage connection on localhost"
@@ -222,7 +227,12 @@ def _main(argv: list[str] | None = None) -> None:
     elif args.command == "connections":
         connections()
     elif args.command == "eval":
-        evaluate(args.trials, args.task, args.mode)
+        if args.probe:
+            from bud.evals.probe import probe
+
+            probe(args.trials)
+        else:
+            evaluate(args.trials, args.task, args.mode)
     elif args.command == "serve":
         from bud.core.server import create_app
 

@@ -462,7 +462,7 @@ fn picker_frames(name: &str, open: impl Fn(&mut App)) {
     all_sizes(name, || {
         let mut a = app(Kind::Dog, Theme::dark(ColorDepth::TrueColor));
         a.theme_pref = "dark".into();
-        a.approval_mode = "balanced".into();
+        a.approval_mode = "auto".into();
         open(&mut a);
         a
     });

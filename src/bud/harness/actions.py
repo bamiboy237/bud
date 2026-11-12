@@ -4,7 +4,7 @@ Tools may also enforce their own safety checks.
 """
 
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from importlib import resources
 from pathlib import Path
@@ -20,16 +20,26 @@ from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, ToolsetTool, WrapperToolset
 
-from bud.harness.decisions import DecisionClient, evidence
-from bud.harness.writes import decidable_tools, is_protected, self_hosted_writes
+from bud.harness.review import (
+    Describer,
+    ReviewRequest,
+    ReviewResult,
+    SessionGrants,
+    ToolReviewer,
+    Verdict,
+    held,
+    owner_answers,
+)
+from bud.harness.writes import never_reviewed, reviewable_tools, self_hosted_writes
 
-Action = Literal["allow", "ask", "deny", "decide"]
+Action = Literal["allow", "ask", "deny", "review"]
 RecordDecision = Callable[[dict[str, Any]], None]
 
 
 class Policy(BaseModel):
-    """What each tool may do. "decide" means a decision model scores the call: a high score
-    runs it, anything else asks the owner. Only balanced mode sets it (bud.core.profiles)."""
+    """What each tool may do. "review" means the approval reviewer judges the call: if it is
+    safe and clearly requested the call runs, otherwise the owner is asked. Only auto mode
+    sets it (bud.core.profiles)."""
 
     tools: dict[str, Action]
 
@@ -50,9 +60,12 @@ def load_policy(path: Path | None = None) -> Policy:
 class ActionGateway(WrapperToolset[None]):
     policy: Policy = field(kw_only=True)
     record: RecordDecision = field(kw_only=True)
-    decisions: DecisionClient | None = field(kw_only=True, default=None)
-    # Trusted, non-owner context for the decision model, such as today's date.
+    reviewer: ToolReviewer | None = field(kw_only=True, default=None)
+    # Renders what a call's ids refer to from bud's own store, per tool name.
+    describers: Mapping[str, Describer] = field(kw_only=True, default_factory=dict)
+    # Trusted, non-owner context for the reviewer, such as today's date.
     facts: Callable[[], str] = field(kw_only=True, default=lambda: "")
+    grants: SessionGrants = field(kw_only=True, default_factory=SessionGrants)
 
     async def get_tools(self, ctx: RunContext[None]) -> dict[str, ToolsetTool[None]]:
         tools = await super().get_tools(ctx)
@@ -65,7 +78,7 @@ class ActionGateway(WrapperToolset[None]):
                         (
                             "Submit this change for review. A reviewer lets it run now or "
                             "the system asks the user first. "
-                            if self.policy.decide(name) == "decide"
+                            if self.policy.decide(name) == "review"
                             else "Submit this change for approval. "
                             "The system asks the user before execution. "
                         )
@@ -74,40 +87,63 @@ class ActionGateway(WrapperToolset[None]):
                 ),
             )
             # ask_user asks for information, not permission; it needs no prefix.
-            if self.policy.decide(name) in ("ask", "decide") and name != "ask_user"
+            if self.policy.decide(name) in ("ask", "review") and name != "ask_user"
             else tool
             for name, tool in tools.items()
             # A denied tool is never offered: the model cannot waste a turn on it.
             if self.policy.decide(name) != "deny"
         }
 
-    async def _score(
+    def _request(
         self, name: str, tool_args: dict[str, Any], ctx: RunContext[None], tool: ToolsetTool[None]
-    ) -> float:
-        """The decision model's P(safe), or a refusal to score, which asks the owner."""
-        # The allowlist is the real guard; the protected check is a second, explicit one.
-        if is_protected(name) or name not in decidable_tools():
-            raise ApprovalRequired()
+    ) -> ReviewRequest | None:
+        """The stripped reviewer input, or None when there is no owner request to judge by."""
         request = (ctx.metadata or {}).get("bud_request")
-        if self.decisions is None or not isinstance(request, str) or not request.strip():
-            raise ApprovalRequired()
-        arguments = (
-            name,
-            tool_args,
-            request,
-            tool.tool_def.description or "",
-            evidence(ctx.messages),
-            self.facts(),
+        if not isinstance(request, str) or not request.strip():
+            return None
+        details: str | None = None
+        describe = self.describers.get(name)
+        if describe is not None:
+            try:
+                details = describe(tool_args)
+            except Exception:
+                details = "The target could not be resolved from bud's records."
+        return ReviewRequest(
+            tool=name,
+            args=tool_args,
+            description=tool.tool_def.description or "",
+            details=details,
+            owner_request=request,
+            clarifications=owner_answers(ctx.messages),
+            today=self.facts(),
         )
+
+    async def _review(
+        self, name: str, tool_args: dict[str, Any], ctx: RunContext[None], tool: ToolsetTool[None]
+    ) -> ReviewResult:
+        """Judge one call. Anything but an explicit ALLOW means the owner is asked."""
+        # The policy overlay already keeps these off "review"; this is a second, explicit guard.
+        if never_reviewed(name) or name not in reviewable_tools():
+            return held("This kind of change always needs the owner.")
+        if self.reviewer is None:
+            return held("No reviewer is configured, so the owner decides.")
+        request = self._request(name, tool_args, ctx, tool)
+        if request is None:
+            return held("There is no owner request to judge this call against.")
+        session = (ctx.metadata or {}).get("bud_session_id")
+        if isinstance(session, str) and self.grants.has(session, request):
+            return ReviewResult(
+                verdict=Verdict.ALLOW,
+                tier="session",
+                reason="The owner approved this exact call earlier in this session.",
+            )
         if DBOS.workflow_id is not None and DBOS.step_id is None:
-            # A checkpointed step: crash recovery replays this score instead of asking the
+            # A checkpointed step: crash recovery replays this verdict instead of asking the
             # model again, so a retry cannot flip a verdict the journal already recorded.
             return await DBOS.run_step_async(
-                {"name": "bud.decision", "retries_allowed": False},
-                self.decisions.safe_probability,
-                *arguments,
+                {"name": "bud.review", "retries_allowed": False}, self.reviewer.review, request
             )
-        return await self.decisions.safe_probability(*arguments)
+        return await self.reviewer.review(request)
 
     async def call_tool(
         self,
@@ -119,15 +155,34 @@ class ActionGateway(WrapperToolset[None]):
         action = self.policy.decide(name)
         rule: str = action
         outcome = "refused" if action == "deny" else "allowed"
-        score: float | None = None
-        if action in ("ask", "decide") and ctx.tool_call_approved:
+        review: dict[str, Any] | None = None
+        if action in ("ask", "review") and ctx.tool_call_approved:
             rule, outcome = "ask", "approved"  # the owner already approved this exact call
+            held_review = (ctx.tool_call_metadata or {}).get("review")
+            if isinstance(held_review, dict):
+                review = held_review
+                session = (ctx.metadata or {}).get("bud_session_id")
+                request = self._request(name, tool_args, ctx, tool)
+                if action == "review" and isinstance(session, str) and request is not None:
+                    self.grants.remember(session, request)
         elif action == "ask":
             raise ApprovalRequired()
-        elif action == "decide":
-            score = await self._score(name, tool_args, ctx, tool)
-            if self.decisions is None or score < self.decisions.threshold:
-                raise ApprovalRequired()
+        elif action == "review":
+            result = await self._review(name, tool_args, ctx, tool)
+            review = result.public()
+            if not result.allowed:
+                self.record(
+                    {
+                        "call_id": ctx.tool_call_id,
+                        "tool": name,
+                        "rule": "review",
+                        "outcome": "asked",
+                        "review": review,
+                    }
+                )
+                # The runner stores this beside the approval request and hands it back when
+                # the owner decides, so a denial can carry the reviewer's concern.
+                raise ApprovalRequired(metadata=review)
             rule = "auto-allow"
         if action != "deny" and not ctx.tool_call_approved and name in self_hosted_writes():
             # The world and workspace writes refuse to run without an approval id, which they
@@ -146,8 +201,8 @@ class ActionGateway(WrapperToolset[None]):
             "rule": rule,
             "outcome": outcome,
         }
-        if score is not None:
-            record["score"] = score
+        if review is not None:
+            record["review"] = review
         self.record(record)
         if action == "deny":
             return f"Refused by policy: {name} is not allowed."
@@ -167,8 +222,11 @@ class ActionGateway(WrapperToolset[None]):
 class GuardTools(AbstractCapability[None]):
     policy: Policy
     record: RecordDecision
-    decisions: DecisionClient | None = None
+    reviewer: ToolReviewer | None = None
+    describers: Mapping[str, Describer] = field(default_factory=dict)
     facts: Callable[[], str] = lambda: ""
+    # One set of grants for the life of the process, shared by every wrapper built from this.
+    grants: SessionGrants = field(default_factory=SessionGrants)
     id: str | None = "bud_action_gateway"
 
     async def before_tool_execute(
@@ -198,6 +256,8 @@ class GuardTools(AbstractCapability[None]):
             toolset,
             policy=self.policy,
             record=self.record,
-            decisions=self.decisions,
+            reviewer=self.reviewer,
+            describers=self.describers,
             facts=self.facts,
+            grants=self.grants,
         )

@@ -24,7 +24,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/mode",
-        usage: "[strict|balanced|autonomous]",
+        usage: "[strict|auto]",
         desc: "Set what asks for approval",
     },
     Command {

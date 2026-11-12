@@ -13,15 +13,11 @@ use crate::ui::text::elide;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 
-const MODES: [(&str, &str); 3] = [
+const MODES: [(&str, &str); 2] = [
     ("strict", "every write asks: workspace, memory, skills"),
     (
-        "balanced",
-        "workspace and memory writes auto-run; sends still ask",
-    ),
-    (
-        "autonomous",
-        "also auto-runs skill installs; sends still ask",
+        "auto",
+        "a reviewer runs safe, requested writes; sends still ask",
     ),
 ];
 

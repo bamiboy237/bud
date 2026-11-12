@@ -21,9 +21,9 @@ from bud.gateway.registry import Registry
 from bud.harness.actions import GuardTools, Policy, RecordDecision
 from bud.harness.code import CODE_GUIDANCE, CODE_TOOL_CALL_LIMIT, build_code_mode
 from bud.harness.context import BackgroundCompaction
-from bud.harness.decisions import DecisionClient
 from bud.harness.memory import MEMORY_RULES
 from bud.harness.results import SqliteResultStore, build_output_limits
+from bud.harness.review import Describer, SessionGrants, ToolReviewer
 from bud.harness.spend import SqliteSpendStore
 from bud.limits import MAX_MODEL_REQUESTS_PER_RUN, MAX_TOOL_CALLS_PER_RUN
 from bud.skills import GUIDANCE as SKILL_GUIDANCE
@@ -87,9 +87,14 @@ class Harness:
             }
         )
         self.system_prompt = f"{load_system_prompt()}\n{profile}\n{CODE_GUIDANCE}\n{SKILL_GUIDANCE}"
-        # Set by the composition root (bud serve, evals) only when the owner opts in; balanced
-        # mode then lets it score eligible writes. None means nothing is ever scored.
-        self.decisions: DecisionClient | None = None
+        # Set by the composition root (bud serve, evals); auto mode then lets it review each
+        # write. None means nothing is ever reviewed and auto mode asks like strict.
+        self.reviewer: ToolReviewer | None = None
+        # What each write's ids point to, rendered from the store: the reviewer's only view
+        # of a target that is not spelled out in the call's own arguments.
+        self.describers: dict[str, Describer] = {}
+        # Calls the owner approved after a hold, per session; see SessionGrants.
+        self.grants = SessionGrants()
         # Instructions that must reflect live state (e.g. the approval mode) are
         # evaluated at the start of every run instead of being baked in at boot.
         self.live_instructions: list[Callable[..., str]] = [self._today]
@@ -161,8 +166,10 @@ class Harness:
                 GuardTools(
                     policy=self.policy,
                     record=record,
-                    decisions=self.decisions,
+                    reviewer=self.reviewer,
+                    describers=self.describers,
                     facts=self._today,
+                    grants=self.grants,
                 ),
                 self.spend,
                 self.output_limits,
