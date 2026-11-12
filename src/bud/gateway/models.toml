@@ -37,6 +37,7 @@ provider = "openai"
 name = "gpt-6-luna"
 tier = "fast"
 reasoning_effort = "high"
+service_tier = "default"  # never Fast mode (2x price)
 input = 0.10
 output = 0.50
 cached = 0.01

@@ -34,6 +34,9 @@ class ModelSpec(BaseModel):
     reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None = (
         None
     )
+    # OpenAI processing tier. Pin it: an unpinned request follows the project's default,
+    # and "priority" (Fast mode) costs twice "default".
+    service_tier: Literal["default", "flex"] | None = None
     allow_accounts: bool = False
     input: float = Field(default=0, ge=0)
     output: float = Field(default=0, ge=0)

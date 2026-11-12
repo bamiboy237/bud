@@ -123,6 +123,8 @@ def provider_model_factory(settings: Settings, chatgpt: ChatGPTStore) -> ModelFa
             options["max_tokens"] = spec.max_tokens
         if spec.reasoning_effort is not None:
             options["openai_reasoning_effort"] = spec.reasoning_effort
+        if spec.service_tier is not None:
+            options["openai_service_tier"] = spec.service_tier
         profile = None
         if spec.supports_tools is not None or spec.context_window is not None:
             profile = profile or {}
