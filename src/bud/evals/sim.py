@@ -108,16 +108,25 @@ def _session(data: Path, client: httpx.Client, which: str) -> str:
     return which
 
 
-def _wait(client: httpx.Client, session: str, limit: float = 600) -> dict:
-    """Until the run settles: idle, or waiting on the owner (an approval or a question)."""
+def _wait(data: Path, client: httpx.Client, session: str, after: int, limit: float = 600) -> dict:
+    """Until a run that ended after `after` leaves the session idle or waiting on the owner.
+
+    Right after a message or a decision the next run may not be queued yet, so an idle
+    snapshot only counts once the log shows a run ending after `after`.
+    """
     deadline = time.time() + limit
     snapshot: dict = {}
     while time.time() < deadline:
         time.sleep(1.5)
         snapshot = client.get(f"/sessions/{session}").json()
-        if snapshot["pending_approvals"] or not (
-            snapshot["run_active"] or snapshot["queued_messages"]
-        ):
+        with sqlite3.connect(data / "bud.db") as db:
+            ended = db.execute(
+                "SELECT 1 FROM events WHERE session_id = ? AND seq > ? AND type IN "
+                "('run.completed', 'run.waiting', 'run.failed', 'run.cancelled') LIMIT 1",
+                (session, after),
+            ).fetchone()
+        busy = snapshot["run_active"] or snapshot["queued_messages"]
+        if ended and (snapshot["pending_approvals"] or not busy):
             return snapshot
     return {**snapshot, "timed_out": True}
 
@@ -142,7 +151,8 @@ def _turn_summary(data: Path, session: str, after: int) -> dict:
             )
         elif kind == "run.failed":
             summary["failed"] = {k: event.get(k) for k in ("reason", "kind", "next")}
-        elif kind == "run.completed":
+        elif kind == "run.completed" and not event.get("quiet"):
+            # A quiet run closes a superseded proposal; surfaces hide it, and so does this.
             summary["reply"] = reply_text(event.get("messages", []))
     return summary
 
@@ -154,7 +164,7 @@ def say(data: Path, text: str, which: str) -> None:
         client.post(
             f"/sessions/{session}/messages", json={"text": text, "message_id": uuid4().hex}
         ).raise_for_status()
-        snapshot = _wait(client, session)
+        snapshot = _wait(data, client, session, before)
     _report_turn(data, session, before, snapshot)
 
 
@@ -168,7 +178,7 @@ def decide(data: Path, approval_id: str, approved: bool | None, answer: str | No
         else:
             path = f"/sessions/{session}/approvals/{approval_id}"
             client.post(path, json={"approved": approved}).raise_for_status()
-        snapshot = _wait(client, session)
+        snapshot = _wait(data, client, session, before)
     _report_turn(data, session, before, snapshot)
 
 

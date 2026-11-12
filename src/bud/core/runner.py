@@ -499,7 +499,9 @@ class Runner(DBOSConfiguredInstance):
                 request["call_id"]: ToolApproved()
                 if decided[request["approval_id"]]
                 else ToolDenied(
-                    "The user sent new input. Stop this proposal; the updated request will follow."
+                    "The owner sent another message before answering this. If it corrects or "
+                    "replaces this request, follow it. If it is about something else, handle it, "
+                    "then return to this request: it is still open, so ask again."
                     if request["approval_id"] in revised
                     else _denial(request)
                 )
@@ -806,9 +808,11 @@ class Runner(DBOSConfiguredInstance):
                 else await self._recalled(run)
             )
             # A conversation picked up on a later day must not reuse "today"/"tomorrow".
-            gap = time_gap_note(self.hub.log.read(run["session_id"]), run)
+            history_events = self.hub.log.read(run["session_id"])
+            gap = time_gap_note(history_events, run)
+            still_open = superseded_note(history_events, run)
             result = await self.agent.run(
-                (run["text"] + recalled + gap) if run["text"] else run["text"],
+                (run["text"] + recalled + gap + still_open) if run["text"] else run["text"],
                 model=(
                     # Durable runs resolve pre-registered keys; local runs take the instance.
                     model_override
@@ -1024,6 +1028,42 @@ def _failure(error: BaseException) -> dict[str, str]:
     return failure(error)
 
 
+def superseded_note(events: list[Event], run: dict) -> str:
+    """What this message interrupted: proposals or questions it superseded before the owner
+    answered. A burst of messages must not silently drop the earlier request."""
+    if run.get("trigger") != "message":
+        return ""
+    messages = set(run.get("message_ids") or [run.get("message_id")])
+    requested = {e.data["approval_id"]: e.data for e in events if e.type == "approval.requested"}
+    asks = {
+        e.data["run_id"]: e.data.get("request") or e.data.get("text")
+        for e in events
+        if e.type == "run.queued"
+    }
+    lines = []
+    for event in events:
+        if event.type != "approval.denied" or event.data.get("revision_message_id") not in messages:
+            continue
+        pending = requested.get(event.data["approval_id"])
+        if pending is None:
+            continue
+        what = (
+            f"your question: {str(pending['args'].get('question', ''))[:200]}"
+            if pending["tool"] == "ask_user"
+            else f"approval to run {pending['tool']} {json.dumps(pending['args'])[:200]}"
+        )
+        asked = asks.get(pending["run_id"])
+        lines.append(f"- The owner had asked: {str(asked)[:300]!r}. You were waiting on {what}.")
+    if not lines:
+        return ""
+    return (
+        "\n\n<still_open>This message arrived before the owner answered:\n"
+        + "\n".join(lines)
+        + "\nIf this message replaces or cancels that, follow it. Otherwise handle this message "
+        "and then return to the earlier request in the same reply.</still_open>"
+    )
+
+
 def time_gap_note(events: list[Event], run: dict) -> str:
     """A note when this message arrives on a later date than the conversation's last one.
 
@@ -1080,8 +1120,12 @@ def _denial(request: dict) -> str:
     review = request.get("review")
     reason = review.get("reason") if isinstance(review, dict) else None
     if not isinstance(reason, str) or not reason:
-        return "The user denied this action."
+        return (
+            "The owner declined this action; nothing failed. Say plainly that you won't do it, "
+            "and don't retry it unless they ask."
+        )
     return (
-        f"The user denied this action. Reviewer's concern: {reason} If a safer way to do what "
+        f"The owner declined this action; nothing failed. Reviewer's concern: {reason} "
+        "If a safer way to do what "
         "the user asked exists, use it. Otherwise tell the user what you wanted to do and why."
     )
