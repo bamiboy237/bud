@@ -10,6 +10,7 @@ the whole block as data, not instructions.
 An id that does not exist says so plainly: an invented id is evidence the call is wrong.
 """
 
+import json
 from collections.abc import Callable
 from typing import Any
 
@@ -109,3 +110,28 @@ def build_describers(world: World) -> dict[str, Describer]:
         "complete_task": bind(_task),
         "update_contact_note": bind(_contact),
     }
+
+
+def build_notifies_others(world: World) -> dict[str, Callable[[dict[str, Any]], bool]]:
+    """Calendar writes that would notify someone besides the owner, decided from bud's own
+    data: a new event's guest list, or the stored attendees of the event being changed."""
+    owner = world.info["email"].lower()
+
+    def others(addresses: object) -> bool:
+        if not isinstance(addresses, list):
+            return False
+        return any(str(a).strip().lower() not in ("", owner) for a in addresses)
+
+    def new_event(args: dict[str, Any]) -> bool:
+        return others(args.get("attendees"))
+
+    def existing_event(args: dict[str, Any]) -> bool:
+        event = next(
+            (e for e in world.snapshot()["events"] if e["id"] == args.get("event_id")), None
+        )
+        if event is None:
+            return False  # nothing to notify; the call will fail as an unknown event
+        attendees = event["attendees"]
+        return others(json.loads(attendees) if isinstance(attendees, str) else attendees)
+
+    return {"create_event": new_event, "move_event": existing_event, "delete_event": existing_event}

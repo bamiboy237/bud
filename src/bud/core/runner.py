@@ -5,6 +5,7 @@ import json
 import logging
 from collections.abc import AsyncIterable
 from contextvars import Context, ContextVar
+from datetime import datetime
 from hashlib import sha256
 from typing import cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -16,6 +17,7 @@ from pydantic_ai import (
     ConversationTypeAdapter,
     DeferredToolRequests,
     DeferredToolResults,
+    ModelRetry,
     RunContext,
     ToolApproved,
     ToolDenied,
@@ -25,11 +27,14 @@ from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
     ModelMessage,
+    ModelResponse,
     PartDeltaEvent,
+    PartEndEvent,
     PartStartEvent,
     RetryPromptPart,
     TextPart,
     TextPartDelta,
+    ToolCallPart,
     ToolReturnPart,
 )
 from pydantic_ai.models import Model
@@ -39,10 +44,13 @@ from bud.core.events import RUN_END_EVENTS, Event, EventType
 from bud.core.hub import Hub
 from bud.core.log import StopRequested
 from bud.core.projection import (
+    JobReport,
     Snapshot,
     decisions,
     message_batch,
     model_history,
+    parked_approvals,
+    parked_ids,
     queue_paused,
     reply_text,
     runs,
@@ -51,7 +59,7 @@ from bud.core.projection import (
     waiting_batch,
 )
 from bud.core.runtime import replay_version
-from bud.core.tasks import CONTROL_TOOLS, FINISHED, TaskFlow, WorkItems
+from bud.core.tasks import CONTROL_TOOLS, FINISHED, TaskFlow, WorkItems, job_output
 from bud.gateway import Gateway
 from bud.gateway.errors import NEXT_STEP, error_summary, failure
 from bud.gateway.registry import Tier
@@ -62,6 +70,7 @@ from bud.harness.context import BackgroundCompaction
 from bud.harness.learning import Learner
 from bud.harness.recall import Recall, render
 from bud.harness.spiral import paused_in
+from bud.harness.verify import build_verifier
 from bud.limits import MAX_MESSAGE_CHARS
 
 RESULTS = TypeAdapter(DeferredToolResults)
@@ -115,6 +124,9 @@ class Runner(DBOSConfiguredInstance):
         self._current: ContextVar[dict] = ContextVar("bud_run")
         self.session_models: dict[str, str] = {}
         self.work_items = WorkItems(hub) if jobs else None
+        # Checks each finished job's deliverable; without it, reports say "not checked".
+        self.verifier = build_verifier() if jobs else None
+        self.job_output = job_output(self.verifier)
         self.learner = learner
         self.recall = recall
         self._learning: set[asyncio.Task] = set()
@@ -174,6 +186,7 @@ class Runner(DBOSConfiguredInstance):
                     policy=harness.policy,
                     kick=self._kick,
                     stop=self._stop_task,
+                    withdraw=self._withdraw,
                 ),
             )
             if self.work_items is not None
@@ -275,9 +288,12 @@ class Runner(DBOSConfiguredInstance):
             "run_id": uuid4().hex,
             "text": text,
             # What the owner asked for, kept for the approval-triage model: the message text,
-            # or (set in _resume_if_ready) the original message of a resumed run. Jobs get
-            # none: a job's brief is written by bud, possibly after reading untrusted mail.
-            "request": text if item is None else None,
+            # or (set in _resume_if_ready) the original message of a resumed run. A job gets
+            # the owner's words that started or steered it, never its brief: bud writes the
+            # brief, possibly after reading untrusted mail.
+            "request": text if item is None else item.owner_request,
+            # The owner's clock when this run was queued (the simulated clock in sim mode).
+            "clock": self.harness.clock().isoformat(),
             "trigger": "message" if results is None else "approval",
             "origin": origin,
             "task_id": item.task_id if item is not None else None,
@@ -356,6 +372,9 @@ class Runner(DBOSConfiguredInstance):
                 self.hub.wake(session_id)
             self._resume_if_ready(session_id)
             return
+        # A parked action the owner approved while another run was busy runs first.
+        if self._run_late_approval(session_id, events):
+            return
         pending = message_batch(events)
         if queue_paused(events) or not pending:
             return
@@ -410,6 +429,10 @@ class Runner(DBOSConfiguredInstance):
             return False
         batch = waiting_batch(events)
         request = next((r for r in batch if r["approval_id"] == approval_id), None)
+        if request is None:
+            request = next(
+                (r for r in parked_approvals(events) if r["approval_id"] == approval_id), None
+            )
         if request is None:
             raise UnknownApproval(approval_id)
         if request.get("tool") == "ask_user":
@@ -474,17 +497,98 @@ class Runner(DBOSConfiguredInstance):
         self._resume_if_ready(session_id)
         return True
 
+    def _brief(self, run: dict) -> dict | None:
+        if run.get("task_id") is None or self.work_items is None:
+            return None
+        item = self.work_items.for_session(run["session_id"])
+        return item.brief.model_dump() if item is not None else None
+
+    def _withdraw(self, session_id: str, approval_id: str, reason: str) -> None:
+        """bud retires a parked request of its own; the owner's decision can no longer apply."""
+        events = self.hub.log.read(session_id)
+        if approval_id not in {r["approval_id"] for r in parked_approvals(events)}:
+            raise ModelRetry(
+                f"{approval_id} is not an open request in this conversation: it was already "
+                "decided or withdrawn, or the id is wrong."
+            )
+        self.hub.publish_once(
+            session_id,
+            "approval.denied",
+            {"approval_id": approval_id, "reason": f"Withdrawn by bud: {reason[:300]}"},
+        )
+
+    def _run_late_approval(self, session_id: str, events: list[Event]) -> bool:
+        """Run one parked action the owner approved after the conversation moved on.
+
+        The history gets the exact call the model proposed (same tool and arguments) and the
+        run resumes it with the owner's approval, as an ordinary approval would. The model
+        does not re-propose anything, and the approval id keeps the write idempotent.
+        """
+        started = {
+            event.data["late_call"]["approval_id"]
+            for event in events
+            if event.type == "run.queued" and event.data.get("late_call")
+        }
+        granted = {e.data["approval_id"] for e in events if e.type == "approval.granted"}
+        ready = (parked_ids(events) & granted) - started
+        request = next(
+            (
+                event.data
+                for event in events
+                if event.type == "approval.requested" and event.data["approval_id"] in ready
+            ),
+            None,
+        )
+        if request is None:
+            return False
+        call_id = f"{request['call_id']}-approved"
+        results = DeferredToolResults(
+            approvals={call_id: ToolApproved()},
+            metadata={call_id: {"approval_id": request["approval_id"]}},
+        )
+        run = self._inputs(session_id, None, results)
+        queued = next(
+            event.data
+            for event in events
+            if event.type == "run.queued" and event.data["run_id"] == request["run_id"]
+        )
+        run |= {
+            # Rebuild history from the log, then append the approved call to it.
+            "conversation_run": None,
+            "history_seq": events[-1].seq,
+            "late_call": {
+                "approval_id": request["approval_id"],
+                "tool": request["tool"],
+                "args": request["args"],
+                "call_id": call_id,
+            },
+            "skills": queued.get("skills", run["skills"]),
+            "request": queued.get("request"),
+        }
+        self.hub.publish_once(
+            session_id, "run.queued", run, key=f"late:{request['approval_id']}:queued"
+        )
+        self._launch(run)
+        return True
+
     def _resume_if_ready(self, session_id: str) -> None:
         events = self.hub.log.read(session_id)
+        if (
+            not self._busy(session_id)
+            and not waiting_batch(events)
+            and self._run_late_approval(session_id, events)
+        ):
+            return
         batch = waiting_batch(events)
         if not batch or undecided_approvals(events) or self._busy(session_id):
             return
         decided = decisions(events)
+        parked = parked_ids(events)
         revised = {
             event.data["approval_id"]
             for event in events
             if event.type == "approval.denied" and event.data.get("revision_message_id")
-        }
+        } | parked
         answers = {
             event.data["approval_id"]: event.data["text"]
             for event in events
@@ -493,9 +597,13 @@ class Runner(DBOSConfiguredInstance):
         results = DeferredToolResults(
             approvals={
                 request["call_id"]: ToolApproved()
-                if decided[request["approval_id"]]
+                if decided.get(request["approval_id"])
+                else ToolDenied(_parked_note(request["approval_id"]))
+                if request["approval_id"] in parked
                 else ToolDenied(
-                    "The user sent new input. Stop this proposal; the updated request will follow."
+                    "The owner sent another message before answering this. If it corrects or "
+                    "replaces this request, follow it. If it is about something else, handle it, "
+                    "then return to this request: it is still open, so ask again."
                     if request["approval_id"] in revised
                     else _denial(request)
                 )
@@ -554,7 +662,7 @@ class Runner(DBOSConfiguredInstance):
             None,
         )
         run["quiet"] = any(request["approval_id"] in revised for request in batch) and not any(
-            decided[request["approval_id"]] for request in batch
+            decided.get(request["approval_id"]) for request in batch
         )
         self.hub.publish_once(session_id, "run.queued", run, key=f"{run['run_id']}:queued")
         self._launch(run)
@@ -742,6 +850,8 @@ class Runner(DBOSConfiguredInstance):
         await self.context.close()
         if self.harness.reviewer is not None:
             await self.harness.reviewer.close()
+        if self.verifier is not None:
+            await self.verifier.close()
 
     @DBOS.workflow(name="bud.run", max_recovery_attempts=5)
     async def _workflow(self, run: dict) -> None:
@@ -779,6 +889,9 @@ class Runner(DBOSConfiguredInstance):
             await self._step("bud.started", self._started, run)
 
             conversation, history = self._history(run)
+            if late := run.get("late_call"):
+                call = ToolCallPart(late["tool"], late["args"], tool_call_id=late["call_id"])
+                history = [*history, ModelResponse(parts=[call])]
             if conversation is not None and conversation.conversation_id != run["session_id"]:
                 raise RecoveryRefused("Conversation does not belong to this session.")
             model_override = self.session_models.get(run["session_id"])
@@ -801,8 +914,12 @@ class Runner(DBOSConfiguredInstance):
                 if self.durable
                 else await self._recalled(run)
             )
+            # A conversation picked up on a later day must not reuse "today"/"tomorrow".
+            history_events = self.hub.log.read(run["session_id"])
+            gap = time_gap_note(history_events, run)
+            still_open = superseded_note(history_events, run)
             result = await self.agent.run(
-                (run["text"] + recalled) if run["text"] and recalled else run["text"],
+                (run["text"] + recalled + gap + still_open) if run["text"] else run["text"],
                 model=(
                     # Durable runs resolve pre-registered keys; local runs take the instance.
                     model_override
@@ -827,6 +944,8 @@ class Runner(DBOSConfiguredInstance):
                     "bud_skills": run.get("skills", {}),
                     "bud_session_id": run["session_id"],
                     "bud_task_id": run.get("task_id"),
+                    # What the job's result is checked against when it calls finish_job.
+                    "bud_brief": self._brief(run),
                     "bud_origin": run.get("origin"),
                     "bud_request": run.get("request"),
                     "bud_revision_pending": bool(run.get("quiet")),
@@ -837,6 +956,8 @@ class Runner(DBOSConfiguredInstance):
                 # otherwise applies request_limit=50 to the whole conversation's running
                 # total, which fails every message once a long-lived thread passes 50.
                 usage_limits=UsageLimits(request_limit=None),
+                # A job ends only by filing a typed report; chat ends in text.
+                output_type=self.job_output if run.get("task_id") is not None else None,
                 event_stream_handler=None if self.durable else self._stream,
             )
             data = {
@@ -844,6 +965,8 @@ class Runner(DBOSConfiguredInstance):
                 "messages": json.loads(result.new_messages_json()),
                 "conversation": ConversationTypeAdapter.dump_json(result.conversation).decode(),
             }
+            if isinstance(result.output, JobReport):
+                data["report"] = result.output.model_dump()
             deferred = result.output if isinstance(result.output, DeferredToolRequests) else None
             requests = deferred.approvals if deferred is not None else None
             approvals = [
@@ -981,6 +1104,18 @@ class Runner(DBOSConfiguredInstance):
                         "text.delta",
                         {**data, "block": f"{request}:{index}", "text": text},
                     )
+                case PartEndEvent(index=index, part=TextPart(content=text)) if (
+                    text.strip() and run.get("task_id") is not None
+                ):
+                    # A job can only end through finish_job, so any text it writes is a
+                    # progress note. Saved as it is written, so status can read it mid-job;
+                    # history never reads run.note (run.completed holds the full messages).
+                    self.hub.publish_once(
+                        run["session_id"],
+                        "run.note",
+                        {**data, "text": text.strip()[:NOTE_CHARS]},
+                        key=f"{request}:note:{index}",
+                    )
                 case FunctionToolCallEvent(part=part):
                     self.hub.publish_once(
                         run["session_id"],
@@ -1012,10 +1147,89 @@ class Runner(DBOSConfiguredInstance):
                     )
 
 
+NOTE_CHARS = 300
+
+
 def _failure(error: BaseException) -> dict[str, str]:
     if isinstance(error, RecoveryRefused):
         return {"reason": str(error), "kind": "recovery", "next": NEXT_STEP["recovery"]}
     return failure(error)
+
+
+def _parked_note(approval_id: str) -> str:
+    return (
+        "Not run yet. The owner sent another message before deciding, so this request stays "
+        f"open as approval {approval_id}: it runs only if they approve it, and you will be "
+        "told. Do not propose it again. If their new message changes or cancels this request, "
+        f"call withdraw_request('{approval_id}') and, for a change, propose the corrected action."
+    )
+
+
+def superseded_note(events: list[Event], run: dict) -> str:
+    """What this message interrupted: proposals or questions it superseded before the owner
+    answered. A burst of messages must not silently drop the earlier request."""
+    if run.get("trigger") != "message":
+        return ""
+    messages = set(run.get("message_ids") or [run.get("message_id")])
+    requested = {e.data["approval_id"]: e.data for e in events if e.type == "approval.requested"}
+    asks = {
+        e.data["run_id"]: e.data.get("request") or e.data.get("text")
+        for e in events
+        if e.type == "run.queued"
+    }
+    lines = []
+    for event in events:
+        if event.type != "approval.denied" or event.data.get("revision_message_id") not in messages:
+            continue
+        pending = requested.get(event.data["approval_id"])
+        if pending is None:
+            continue
+        what = (
+            f"your question: {str(pending['args'].get('question', ''))[:200]}"
+            if pending["tool"] == "ask_user"
+            else f"approval to run {pending['tool']} {json.dumps(pending['args'])[:200]}"
+        )
+        asked = asks.get(pending["run_id"])
+        lines.append(f"- The owner had asked: {str(asked)[:300]!r}. You were waiting on {what}.")
+    if not lines:
+        return ""
+    return (
+        "\n\n<still_open>This message arrived before the owner answered:\n"
+        + "\n".join(lines)
+        + "\nIf this message replaces or cancels that, follow it. Otherwise handle this message "
+        "and then return to the earlier request in the same reply.</still_open>"
+    )
+
+
+def time_gap_note(events: list[Event], run: dict) -> str:
+    """A note when this message arrives on a later date than the conversation's last one.
+
+    Built only from the log and the run's own recorded clock, so a replay agrees.
+    """
+    if run.get("trigger") != "message" or not run.get("text") or not run.get("clock"):
+        return ""
+    earlier = next(
+        (
+            event.data["clock"]
+            for event in reversed(events)
+            if event.type == "run.queued"
+            and event.data.get("run_id") != run["run_id"]
+            and event.data.get("text")
+            and event.data.get("clock")
+        ),
+        None,
+    )
+    if earlier is None:
+        return ""
+    now = datetime.fromisoformat(run["clock"])
+    then = datetime.fromisoformat(earlier)
+    if now.date() <= then.date():
+        return ""
+    return (
+        f"\n\n<time>It is now {now:%A, %d %B %Y}. This conversation's previous message was "
+        f"on {then:%A, %d %B %Y}. Answers given earlier about today, tomorrow, or this week "
+        "may be out of date: check again before relying on them.</time>"
+    )
 
 
 def _artifact(part: ToolReturnPart | RetryPromptPart) -> dict[str, str] | None:
@@ -1043,8 +1257,12 @@ def _denial(request: dict) -> str:
     review = request.get("review")
     reason = review.get("reason") if isinstance(review, dict) else None
     if not isinstance(reason, str) or not reason:
-        return "The user denied this action."
+        return (
+            "The owner declined this action; nothing failed. Say plainly that you won't do it, "
+            "and don't retry it unless they ask."
+        )
     return (
-        f"The user denied this action. Reviewer's concern: {reason} If a safer way to do what "
+        f"The owner declined this action; nothing failed. Reviewer's concern: {reason} "
+        "If a safer way to do what "
         "the user asked exists, use it. Otherwise tell the user what you wanted to do and why."
     )

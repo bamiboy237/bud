@@ -50,7 +50,8 @@ NEXT_STEP: dict[ErrorKind, str] = {
     "account": "Reconnect the account, then resend.",
     "skill": "Check the skill, then resend.",
     "recovery": "bud restarted with different code or settings; resend the request.",
-    "unknown": "Resend; if it fails again, check `bud serve` output.",
+    "unknown": "Resend the request. If it fails again, it is a bug in bud: note the time "
+    "so it can be traced.",
 }
 
 

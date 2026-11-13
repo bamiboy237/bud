@@ -1,7 +1,7 @@
 """Fold session events into conversation, approval, queue, and run views."""
 
 from contextlib import suppress
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai.messages import (
@@ -61,6 +61,41 @@ class RunView(BaseModel):
     artifacts: list[SavedArtifact] = Field(default_factory=list)
 
 
+class JobReport(BaseModel):
+    """How a job ended. The job writes the summary and notes; code sets everything else."""
+
+    outcome: Literal["delivered", "partly_delivered", "not_delivered"]
+    summary: str
+    # Expected items the checker found absent, never the job's own claim.
+    missing: list[str] = Field(default_factory=list)
+    # The job's own account of what it could not do, and why.
+    notes: list[str] = Field(default_factory=list)
+    # Workspace files this job actually saved, from tool metadata, never from the model.
+    saved: list[str] = Field(default_factory=list)
+    # False when no separate check ran: the outcome is then the job's own account.
+    checked: bool = False
+
+
+OUTCOME_WORDS = {
+    "delivered": "Delivered",
+    "partly_delivered": "Partly delivered",
+    "not_delivered": "Not delivered",
+}
+
+
+def report_text(report: dict) -> str:
+    job = JobReport.model_validate(report)
+    label = OUTCOME_WORDS[job.outcome] + ("" if job.checked else " (job's own report, not checked)")
+    lines = [f"{label}. {job.summary}"]
+    if job.missing:
+        lines.append("Missing: " + "; ".join(job.missing))
+    if job.notes:
+        lines.append("Job notes: " + "; ".join(job.notes))
+    if job.saved:
+        lines.append("Saved: " + ", ".join(job.saved))
+    return "\n".join(lines)
+
+
 class TaskView(BaseModel):
     task_id: int
     session_id: str
@@ -69,6 +104,8 @@ class TaskView(BaseModel):
     pending_approvals: list[PendingApproval]
     artifacts: list[SavedArtifact]
     result: str | None = None
+    # The job's filed outcome; "completed" alone only means it stopped working.
+    outcome: str | None = None
 
 
 class Snapshot(BaseModel):
@@ -262,7 +299,8 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
                 transcript.append(Turn(role="user", text=event.data["text"]))
                 blocks = {}
             case "run.waiting" | "run.completed":
-                text = reply_text(event.data.get("messages", []))
+                report = event.data.get("report")
+                text = report_text(report) if report else reply_text(event.data.get("messages", []))
                 if not text:
                     continue
                 run_id = event.data["run_id"]
@@ -315,7 +353,7 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
         recent_runs=recent[-20:],
         pending_approvals=[
             PendingApproval(**{key: request[key] for key in ("approval_id", "tool", "args")})
-            for request in undecided_approvals(events)
+            for request in [*undecided_approvals(events), *parked_approvals(events)]
         ],
         pending_setup=pending_setups(events),
         transcript=transcript,
@@ -346,9 +384,33 @@ def decisions(events: list[Event]) -> dict[str, bool]:
     }
 
 
+def parked_ids(events: list[Event]) -> set[str]:
+    return {event.data["approval_id"] for event in events if event.type == "approval.parked"}
+
+
 def undecided_approvals(events: list[Event]) -> list[dict[str, Any]]:
-    decided = decisions(events)
-    return [req for req in waiting_batch(events) if req["approval_id"] not in decided]
+    """Requests the latest waiting run still needs an answer for before it can resume.
+
+    A parked request is not one of them: its run moved on, and it waits on its own."""
+    decided, parked = decisions(events), parked_ids(events)
+    return [
+        req
+        for req in waiting_batch(events)
+        if req["approval_id"] not in decided and req["approval_id"] not in parked
+    ]
+
+
+def parked_approvals(events: list[Event]) -> list[dict[str, Any]]:
+    """Requests set aside when the owner sent another message first. Each stays open and
+    approvable until the owner decides it or bud withdraws it (THE-169)."""
+    decided, parked = decisions(events), parked_ids(events)
+    return [
+        event.data
+        for event in events
+        if event.type == "approval.requested"
+        and event.data["approval_id"] in parked
+        and event.data["approval_id"] not in decided
+    ]
 
 
 def model_history(events: list[Event]) -> list[ModelMessage]:

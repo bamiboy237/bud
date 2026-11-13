@@ -269,6 +269,18 @@ def owner_request(messages: Sequence[ModelMessage]) -> str:
     return ""
 
 
+def work_tools_off(request_context: ModelRequestContext) -> ModelRequestContext:
+    """No more work tools for this request. A run that must end through an output tool (a
+    job's finish_job) keeps only that tool; any other run is told to answer in text."""
+    params = request_context.model_request_parameters
+    if params.output_tools and not params.allow_text_output:
+        return replace(request_context, model_request_parameters=replace(params, function_tools=[]))
+    return replace(
+        request_context,
+        model_settings=(request_context.model_settings or {}) | {"tool_choice": "none"},
+    )
+
+
 def paused_in(messages: Sequence[ModelMessage]) -> dict[str, Any] | None:
     """The pause a finished run carries, if any. Used to pause a job after its handoff."""
     for message in messages:
@@ -445,6 +457,13 @@ PAUSE_TEXT = (
 )
 
 
+JOB_HANDOFF = (
+    "This job is paused because it was going in circles, and its work tools are now off. "
+    "End it with finish_job: outcome not_delivered or partly_delivered; summary says what "
+    "you confirmed; missing says what keeps blocking you, why, and what to try next. Do not "
+    "claim anything succeeded that you did not confirm."
+)
+
 HANDOFF = (
     "This run is paused because it was going in circles, and tools are now off. Reply to the "
     "owner with a short handoff in exactly three labeled parts, in plain text with no "
@@ -548,14 +567,13 @@ class SpiralGuard(AbstractCapability[None]):
     def _tools_off(request_context: ModelRequestContext) -> ModelRequestContext:
         """Disable tools and ask for the handoff. Only the paused run's last requests see this."""
         params = request_context.model_request_parameters
+        report = bool(params.output_tools) and not params.allow_text_output
         if params.instruction_parts is not None:
-            parts = [*params.instruction_parts, InstructionPart(content=HANDOFF, dynamic=True)]
-            params = replace(params, instruction_parts=InstructionPart.sorted(parts))
-        return replace(
-            request_context,
-            model_request_parameters=params,
-            model_settings=(request_context.model_settings or {}) | {"tool_choice": "none"},
-        )
+            note = InstructionPart(content=JOB_HANDOFF if report else HANDOFF, dynamic=True)
+            params = replace(
+                params, instruction_parts=InstructionPart.sorted([*params.instruction_parts, note])
+            )
+        return work_tools_off(replace(request_context, model_request_parameters=params))
 
     @staticmethod
     def _write(

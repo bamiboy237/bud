@@ -75,6 +75,33 @@ def package_version(files: dict[str, bytes]) -> str:
     return digest.hexdigest()
 
 
+FOUND = re.compile(r"^([\w.-]+/[\w.-]+)@([\w.:-]+)\s+(\d+)\s+installs?\s*$")
+MAX_FOUND = 10
+
+
+def search_results(output: str) -> dict:
+    """The registry CLI prints a block-letter banner and an `npx` install hint; the model
+    needs neither (bud installs through prepare_skill and approval). Keep the listings."""
+    lines = output.splitlines()
+    found = []
+    for index, line in enumerate(lines):
+        match = FOUND.match(line.strip())
+        if match is None:
+            continue
+        url = lines[index + 1].strip().lstrip("└ ").strip() if index + 1 < len(lines) else ""
+        found.append(
+            {
+                "source": match[1],
+                "name": match[2],
+                "installs": int(match[3]),
+                "url": url if url.startswith("https://skills.sh/") else None,
+            }
+        )
+    if not found:
+        return {"results": [], "note": "No matching skills were listed."}
+    return {"results": found[:MAX_FOUND], "next": "Use prepare_skill(source, name) to inspect one."}
+
+
 class SkillStore:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
@@ -165,7 +192,7 @@ class SkillStore:
                 )
             ]
 
-    async def find_skills(self, query: str) -> str:
+    async def find_skills(self, query: str) -> dict:
         """Search the public ecosystem registry for reusable skills using a generic task phrase.
 
         Query using general capability descriptions. Omit private messages, personal
@@ -173,7 +200,7 @@ class SkillStore:
         """
         if not 2 <= len(query.strip()) <= 200 or query.startswith("-"):
             raise SkillError("Use a search phrase between 2 and 200 characters.")
-        return (await self.installer.run(["find", query], self.root))[:16_000]
+        return search_results(await self.installer.run(["find", query], self.root))
 
     async def prepare_skill(self, source: str, name: str) -> dict:
         """Fetch and inspect a public owner/repository skill before proposing installation."""

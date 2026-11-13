@@ -98,7 +98,8 @@ class World:
         self.path = path
         self.seed = load_seed()
         self.info = self.seed["world"]
-        self.now: str = self.info["now"]
+        # Multi-day simulations move time forward by writing an ISO timestamp here.
+        self.clock_path = path.with_name("world-clock.txt")
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.executescript(SCHEMA)
@@ -115,18 +116,56 @@ class World:
             if empty:
                 self._reset(db)
 
+    @property
+    def now(self) -> str:
+        """The seed's fixed moment, unless a simulation has advanced the clock."""
+        try:
+            text = self.clock_path.read_text().strip()
+        except FileNotFoundError:
+            return self.info["now"]
+        datetime.fromisoformat(text)  # a malformed clock fails loudly, never silently
+        return text
+
+    def set_now(self, moment: str) -> None:
+        datetime.fromisoformat(moment)
+        self.clock_path.write_text(moment)
+
+    def deliver(self, sender: str, subject: str, body: str, thread_id: str | None = None) -> str:
+        """Simulate an incoming email at the current clock; returns its thread id."""
+        thread = thread_id or f"t-{uuid4().hex[:8]}"
+        with self._connect() as db:
+            if thread_id is None:
+                db.execute("INSERT INTO threads (id, subject) VALUES (?, ?)", (thread, subject))
+            elif db.execute("SELECT 1 FROM threads WHERE id = ?", (thread,)).fetchone() is None:
+                raise WorldError(f"No thread {thread}.")
+            db.execute(
+                "INSERT INTO messages (id, thread_id, folder, sender, recipients, sent_at, body, "
+                "unread) VALUES (?, ?, 'inbox', ?, ?, ?, ?, 1)",
+                (
+                    f"{thread}-m{uuid4().hex[:6]}",
+                    thread,
+                    sender,
+                    json.dumps([self.info["email"]]),
+                    self.now,
+                    body,
+                ),
+            )
+        return thread
+
     def profile(self) -> str:
         info = self.info
         return (
             f"The person is {info['person']} <{info['email']}>, timezone {info['timezone']}.\n"
+            "This is a simulated mailbox, calendar, contact list, and task list for testing. "
+            "No real account (Gmail, Google Calendar, or any other) is connected; say so if "
+            "asked about connections.\n"
             f"Synthetic scheduling hours only: {info['working_hours']} in {info['timezone']}.\n"
             f"{info['protected_blocks']}\n"
             "Resolve unclear dates, people, timezone, or DST folds with the user; do not guess. "
             "Calendar input times need explicit offsets matching the supplied IANA timezone "
             "(default: the person's timezone; use timezone='UTC' for UTC inputs). "
-            "Check list_events before proposing a change. Calendar writes require approval; "
-            "read_event after each approved write before claiming it is verified. "
-            "Save reply drafts only after approval, then read_draft to verify the saved result. "
+            "Check list_events before proposing a change. Writes may wait for the person's "
+            "approval. A write's result is read back from storage, so report it directly. "
             "Use list_drafts and read_draft to find drafts in new conversations. "
             "A denied draft must not be saved or sent."
         )

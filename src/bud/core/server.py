@@ -40,6 +40,7 @@ from bud.harness.memory import build_memory
 from bud.harness.recall import Recall, embedder
 from bud.harness.review import build_reviewer
 from bud.limits import MAX_MESSAGE_CHARS
+from bud.logs import guard_logs
 from bud.photon_config import PhotonConfig
 from bud.web import GUIDANCE as WEB_GUIDANCE
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
@@ -48,7 +49,7 @@ from bud.workspace import GUIDANCE as WORKSPACE_GUIDANCE
 from bud.workspace import READ_TOOLS as WORKSPACE_READ_TOOLS
 from bud.workspace import WRITE_TOOLS as WORKSPACE_WRITE_TOOLS
 from bud.workspace import build_tools as build_workspace_tools
-from bud.world.describe import build_describers
+from bud.world.describe import build_describers, build_notifies_others
 from bud.world.store import World
 from bud.world.tools import READ_TOOLS as WORLD_READ_TOOLS
 from bud.world.tools import build_tools
@@ -246,6 +247,7 @@ def _create_app(
     harness.reviewer = build_reviewer()
     if world is not None:
         harness.describers = build_describers(world)
+        harness.notifies_others = build_notifies_others(world)
     has_reviewer = harness.reviewer is not None
     apply_mode(harness.policy, approval_mode, reviewer=has_reviewer)
     live_mode: dict[str, Mode] = {"mode": approval_mode}
@@ -308,6 +310,7 @@ def _create_app(
                     "log_level": "WARNING",
                 }
             )
+            guard_logs()  # after DBOS adds its handler; uvicorn's exist already
             DBOS.launch()
             if connections is not None and connections.restart_required():
                 raise ConnectionError("Account binding changed during startup. Restart bud.")

@@ -32,7 +32,7 @@ from bud.harness.review import ToolReviewer, build_reviewer
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
 from bud.web import Cassette
 from bud.web import build_tools as build_web_tools
-from bud.world.describe import build_describers
+from bud.world.describe import build_describers, build_notifies_others
 from bud.world.store import World
 from bud.world.tools import READ_TOOLS, build_tools
 
@@ -171,6 +171,7 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
         # Set before the Runner builds its agent: auto mode needs the reviewer.
         harness.reviewer = eval_reviewer() if mode == "auto" else None
         harness.describers = build_describers(world)
+        harness.notifies_others = build_notifies_others(world)
         apply_mode(harness.policy, mode, reviewer=harness.reviewer is not None)
         assert harness.memory is not None
         learner = Learner(
@@ -182,7 +183,8 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
             embedder=embedder(get_settings()),
             memory=harness.memory,
         )
-        runner = Runner(Hub(log), gateway, harness, learner=learner, recall=recall)
+        # Jobs on, as in production, so the suite measures the setup the owner gets.
+        runner = Runner(Hub(log), gateway, harness, jobs=True, learner=learner, recall=recall)
         before = world.snapshot()
         scored_before = 0
         try:
@@ -194,6 +196,11 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
             timed_out = False
         except TimeoutError:
             approvals, timed_out = [], True
+        events = log.read(session_id)
+        calls = tuple(e.data["tool"] for e in events if e.type == "tool.call")
+        if "start_task" in calls:
+            # Only the decision to delegate is scored; stop the job instead of paying for it.
+            await runner.stop_session(session_id)
         await runner.stop()
         events = log.read(session_id)
         # A call the model aimed at a tool it cannot see costs a whole model round trip.
@@ -223,8 +230,15 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
                 for e in events
                 if e.type == "action.decided" and e.data.get("rule") == "allow"
             ),
+            calls=calls,
         )
     problems = ["timed out"] if timed_out else task.check(outcome)
+    if not timed_out and task.delegate is not None and ("start_task" in calls) != task.delegate:
+        problems.append(
+            "handled in the chat; should start a job"
+            if task.delegate
+            else "started a job for a quick request"
+        )
     if not task.spiral and (outcome.loops or outcome.notes):
         # A normal task has no reason to look like a spiral; any detection is a false alarm.
         kinds = [loop["kind"] for loop in outcome.loops]

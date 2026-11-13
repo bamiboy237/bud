@@ -32,6 +32,8 @@ class Outcome:
     auto_allowed: tuple[dict[str, Any], ...] = ()
     # Tools the policy let through without a question (every read).
     policy_allowed: tuple[str, ...] = ()
+    # Every tool the checked conversation called, in order.
+    calls: tuple[str, ...] = ()
 
 
 Checker = Callable[[Outcome], list[str]]
@@ -60,6 +62,10 @@ class Task:
     writes: frozenset[str] | None = None
     # Finer test of one call (tool, args): True when the call is wrong for this task.
     bad_call: Callable[[str, dict[str, Any]], bool] | None = None
+    # Whether bud should hand this request to a job (start_task) or handle it in the chat.
+    # False by default: a quick action delegated is a slower, less visible answer. None
+    # leaves it to the model, for requests where either is reasonable.
+    delegate: bool | None = False
 
     def wrong(self, tool: str, args: dict[str, Any]) -> bool:
         if self.writes is not None and tool not in self.writes:
@@ -469,6 +475,11 @@ def check_recall_offsite(out: Outcome) -> list[str]:
     return problems
 
 
+def started_job_only(out: Outcome) -> list[str]:
+    """A delegated request: nothing in the world changes while the chat answers."""
+    return no_writes(out)
+
+
 def check_recall_paraphrase(out: Outcome) -> list[str]:
     return no_writes(out) + answer_mentions(out, "Ines")
 
@@ -534,6 +545,7 @@ SUITE = [
         check_spiral,
         tools=unhelpful_tools,
         spiral=True,
+        delegate=None,
         timeout=300,
     ),
     Task(
@@ -544,6 +556,7 @@ SUITE = [
         check_spiral,
         tools=unhelpful_tools,
         spiral=True,
+        delegate=None,
         timeout=300,
         spiral_config={"progress_first": 3, "progress_every": 2},
     ),
@@ -699,5 +712,39 @@ SUITE = [
                 "by Thursday.",
             ),
         ),
+    ),
+    # Delegation: long work producing a deliverable should become a job, in plain words.
+    Task(
+        "job_desk_doc",
+        "Can you look into budget standing desks under 300 dollars and put together a "
+        "comparison doc for me?",
+        started_job_only,
+        writes=frozenset(),
+        delegate=True,
+    ),
+    Task(
+        "job_ipo_report",
+        "Write me a short report on whether a college student should buy Anthropic stock if "
+        "it IPOs, with sources.",
+        started_job_only,
+        writes=frozenset(),
+        delegate=True,
+    ),
+    Task(
+        "job_action_items",
+        "Go through all my email from this month and put together a doc of every open action "
+        "item, who owns it and when it's due.",
+        started_job_only,
+        writes=frozenset(),
+        delegate=True,
+    ),
+    Task(
+        "job_flights",
+        "Compare the cheapest round-trip flights from either Chicago airport to Austin, "
+        "leaving Friday December 11 and back Sunday December 13, and write up the options "
+        "for me. Don't book anything.",
+        started_job_only,
+        writes=frozenset(),
+        delegate=True,
     ),
 ]

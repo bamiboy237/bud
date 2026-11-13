@@ -63,7 +63,10 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
         limit: int = 10,
         include_archived: bool = False,
     ) -> Any:
-        """Search the mailbox, newest first. Results include thread ids and short snippets.
+        """Search the mailbox, newest first.
+
+        Returns the filters that were used, a count, and the matching messages (thread ids
+        and short snippets). A count of 0 means nothing matches those filters.
 
         Archived threads are hidden unless include_archived is true.
 
@@ -74,9 +77,18 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
             limit: Maximum results, up to 25.
             include_archived: Also search threads that were archived.
         """
-        return _safely(
-            lambda: world.search_email(query, sender, unread_only, limit, include_archived)
-        )
+
+        def searched() -> dict[str, Any]:
+            found = world.search_email(query, sender, unread_only, limit, include_archived)
+            filters = {
+                "query": query,
+                "sender": sender,
+                "unread_only": unread_only,
+                "include_archived": include_archived,
+            }
+            return {"searched": filters, "count": len(found), "messages": found}
+
+        return _safely(searched)
 
     def read_thread(thread_id: str) -> Any:
         """Read every message in a thread without changing its unread state.
@@ -157,8 +169,9 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
 
         Resolve unclear dates or timezone with the user first. Times need explicit
         offsets consistent with timezone; DST folds require choosing the intended offset.
-        Results include ids, local/UTC times, attendees, organizer, rsvp state, description,
-        and protected status.
+        Returns the range and timezone that were searched, a count, and the events (ids,
+        local/UTC times, attendees, organizer, rsvp state, description, protected status).
+        A count of 0 means that whole range is free.
 
         Args:
             start: Range start, for example 2026-11-02T00:00:00-06:00.
@@ -166,7 +179,13 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
             timezone: IANA zone matching the input offsets; defaults to America/Chicago.
                 For Z or +00:00 inputs use UTC.
         """
-        return _safely(lambda: world.list_events(start, end, timezone))
+
+        def covered() -> dict[str, Any]:
+            events = world.list_events(start, end, timezone)
+            searched = {"start": start, "end": end, "timezone": timezone or world.info["timezone"]}
+            return {"searched": searched, "count": len(events), "events": events}
+
+        return _safely(covered)
 
     def read_event(event_id: str) -> Any:
         """Read the persisted event to verify an approved calendar write.
