@@ -56,15 +56,11 @@ private struct PetButton: View {
 
     var body: some View {
         Button(action: action) {
-            // Placeholder art until the pet sprites land (THE-180).
-            Image(systemName: "pawprint.fill")
-                .font(.system(size: 24, weight: .medium))
-                .foregroundStyle(.primary)
-                .frame(width: 56, height: 56)
-                .surface(Circle(), material: .hudWindow)
-                .overlay(StatusRing(status: companion.status, link: companion.link))
-                .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
-                .contentShape(Circle())
+            if let sprite = PetSprite.named(companion.petID) {
+                pet(sprite)
+            } else {
+                paw
+            }
         }
         .buttonStyle(PressScale())
         .accessibilityLabel("bud")
@@ -76,6 +72,40 @@ private struct PetButton: View {
                 companion.bubbleOpen.toggle()
             }
         }
+    }
+
+    private var connected: Bool { companion.link == .connected }
+
+    /// The pet acts out the status; colour appears only when bud needs you.
+    private func pet(_ sprite: PetSprite) -> some View {
+        AnimatedPet(sprite: sprite, status: companion.status, since: companion.statusSince)
+            // Away from bud: greyed and faded, so a stale pet never looks like a working one.
+            .saturation(connected ? 1 : 0)
+            .opacity(connected ? 1 : 0.55)
+            .overlay(alignment: .topTrailing) {
+                if companion.status == .needsYou && connected {
+                    Circle().fill(.orange)
+                        .frame(width: 12, height: 12)
+                        .overlay(Circle().strokeBorder(.white.opacity(0.9), lineWidth: 1.5))
+                        .padding(10)
+                        .transition(.scale.combined(with: .opacity))
+                }
+            }
+            .shadow(color: .black.opacity(0.22), radius: 5, y: 3)
+            .contentShape(Rectangle())
+            .animation(.easeOut(duration: 0.2), value: connected)
+    }
+
+    /// Fallback when no pet art is installed.
+    private var paw: some View {
+            Image(systemName: "pawprint.fill")
+                .font(.system(size: 24, weight: .medium))
+                .foregroundStyle(.primary)
+                .frame(width: 56, height: 56)
+                .surface(Circle(), material: .hudWindow)
+                .overlay(StatusRing(status: companion.status, link: companion.link))
+                .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+                .contentShape(Circle())
     }
 
     private var statusText: String {

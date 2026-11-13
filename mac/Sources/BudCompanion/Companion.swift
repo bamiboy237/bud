@@ -31,7 +31,13 @@ final class Companion {
     static let shared = Companion()
 
     var link: Link = .connecting
-    var status: PetStatus = .idle
+    var status: PetStatus = .idle {
+        didSet { if status != oldValue { statusSince = .now } }
+    }
+    /// When the status last changed: each state's animation starts at its first frame.
+    var statusSince = Date.now
+    /// Which pet to show; a missing pet falls back to the paw.
+    let petID = UserDefaults.standard.string(forKey: "pet") ?? "dog"
     var reply = ""
     var bubbleOpen = false
     var bubbleHovered = false
