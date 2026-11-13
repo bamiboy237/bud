@@ -420,8 +420,23 @@ def model_history(events: list[Event]) -> list[ModelMessage]:
     tools_ran: list[str] = []
     calls: dict[str, str] = {}
     permitted: set[str] = set()
+    # Job updates enter the history where they happened, as fixed notes: the cached prefix never
+    # changes and the owner's newest message stays last. One arriving mid-run waits for the run
+    # to end, so it never splits a tool call from its result or lands in front of a resume.
+    running = False
+    held: list[ModelMessage] = []
     for event in events:
         match event.type:
+            case "run.started" | "run.recovered":
+                running = True
+            case (
+                "task.completed"
+                | "task.failed"
+                | "task.paused"
+                | "task.cancelled"
+                | "task.approval"
+            ):
+                (held if running else history).append(_job_note(event))
             case "user.message":
                 user_text = event.data["text"]
             case "run.queued":
@@ -439,8 +454,9 @@ def model_history(events: list[Event]) -> list[ModelMessage]:
                 unfinished.extend(ModelMessagesTypeAdapter.validate_python(event.data["messages"]))
             case "run.completed":
                 unfinished.extend(ModelMessagesTypeAdapter.validate_python(event.data["messages"]))
-                history += unfinished
+                history += unfinished + held
                 unfinished, tools_ran, user_text, calls, permitted = [], [], None, {}, set()
+                running, held = False, []
             case "run.failed" | "run.cancelled":
                 history.append(
                     _failure_note(
@@ -450,8 +466,28 @@ def model_history(events: list[Event]) -> list[ModelMessage]:
                         [value for key, value in calls.items() if key in permitted],
                     )
                 )
+                history += held
                 unfinished, tools_ran, user_text, calls, permitted = [], [], None, {}, set()
+                running, held = False, []
     return history + unfinished
+
+
+JOB_NOTE_CHARS = 1000
+
+
+def _job_note(event: Event) -> ModelRequest:
+    """A job update, labeled so the model doesn't take it for something the owner said."""
+    data = event.data
+    job = f"Job {data['task_id']} ({data.get('title', '')})"
+    if event.type == "task.approval":
+        what = f"is waiting for the owner to approve {data.get('tool', 'an action')}"
+        if data.get("reference"):
+            what += f" (reference {data['reference']})"
+    else:
+        state = event.type.removeprefix("task.")
+        what = f"{state}: {data.get('text', '')}"
+    note = f"[bud system note: a job update, not a message from the owner] {job} {what}"
+    return ModelRequest(parts=[UserPromptPart(note[:JOB_NOTE_CHARS])])
 
 
 def _failure_note(

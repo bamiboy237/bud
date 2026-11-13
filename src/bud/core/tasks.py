@@ -3,14 +3,14 @@
 import json
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Annotated
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pydantic import BaseModel, Field
 from pydantic_ai import DeferredToolRequests, ModelRetry, RunContext, ToolOutput
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import ModelRequest, ToolCallPart, UserPromptPart
+from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
@@ -599,35 +599,10 @@ class TaskFlow(AbstractCapability[None]):
     ) -> ModelRequestContext:
         if (ctx.metadata or {}).get("bud_revision_pending"):
             return work_tools_off(request_context)
-        if self._worker(ctx):
-            return request_context
-        jobs = self.store.views(self._feed(ctx))
-        active = [job for job in jobs if job.status not in FINISHED]
-        recent = [job for job in jobs if job.status in FINISHED][-5:]
-        if not active and not recent:
-            return request_context
-        context = [
-            {
-                "task_id": job.task_id,
-                "title": job.title,
-                "status": job.status,
-                "outcome": job.outcome,
-                "approvals": [a.reference for a in job.pending_approvals],
-                "result": job.result[:1000] if job.result else None,
-            }
-            for job in [*active, *recent]
-        ]
-        return replace(
-            request_context,
-            messages=[
-                *request_context.messages,
-                ModelRequest(
-                    parts=[
-                        UserPromptPart("Current jobs in this conversation:\n" + json.dumps(context))
-                    ]
-                ),
-            ],
-        )
+        # Job updates reach the main chat as notes in its history (projection.model_history),
+        # never appended here: a list added after the newest message reads as the owner's
+        # latest words, and the model answered it instead of the owner's question.
+        return request_context
 
     @staticmethod
     def _caller(ctx: RunContext[None]) -> int | None:
