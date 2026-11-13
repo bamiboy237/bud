@@ -1,0 +1,7 @@
+#!/bin/sh
+# Runs in each new local managed checkout before the agent starts.
+# Adopted checkouts skip it. Windows runs it through Git Bash.
+set -eu
+
+# --locked matches CI: a stale uv.lock fails here instead of drifting silently.
+uv sync --locked
