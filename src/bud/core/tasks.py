@@ -4,13 +4,13 @@ import json
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from typing import Annotated, Literal
+from typing import Annotated
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pydantic import BaseModel, Field
 from pydantic_ai import DeferredToolRequests, ModelRetry, RunContext, ToolOutput
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import ModelRequest, UserPromptPart
+from pydantic_ai.messages import ModelRequest, ToolCallPart, UserPromptPart
 from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
@@ -31,6 +31,7 @@ from bud.core.projection import (
 )
 from bud.harness.actions import Policy
 from bud.harness.spiral import work_tools_off
+from bud.harness.verify import JobVerifier
 from bud.limits import MAX_MESSAGE_CHARS, MAX_OPEN_TASKS
 
 # A job reads its queue between steps; more waiting updates than this is a flood.
@@ -40,46 +41,82 @@ CONTROL_TOOLS = {"start_task", "update_task", "inspect_task", "stop_task", "with
 FINISHED = {"completed", "failed", "cancelled"}
 
 
-def finish_job(
-    ctx: RunContext[None],
-    outcome: Literal["delivered", "partly_delivered", "not_delivered"],
-    summary: str,
-    missing: list[str] | None = None,
-) -> JobReport:
-    """End this job with a report for the owner. This is the only way a job finishes.
+def job_output(verifier: JobVerifier | None) -> list:
+    """The ways a job run may end: finish_job, or waiting on an approval.
 
-    Args:
-        outcome: Judged against the brief's expected result. delivered: every requested
-            item exists and is confirmed. partly_delivered: some of it exists. not_delivered:
-            none of it does, for example only a note saying it could not be done.
-        summary: What the job produced or found, in a few plain sentences for the owner.
-        missing: Each requested item that does not exist or is unconfirmed, and why.
+    The job never picks its own label. finish_job runs two gates and code counts the result:
+    every expected item present is delivered, some is partly delivered, none is not delivered.
     """
-    missing = [item for item in (missing or []) if item.strip()]
-    if outcome == "delivered" and missing:
-        raise ModelRetry(
-            "A delivered job has nothing missing. Report partly_delivered with those items, "
-            "or leave missing empty if they are actually done."
+
+    async def finish_job(
+        ctx: RunContext[None], summary: str, missing: list[str] | None = None
+    ) -> JobReport:
+        """End this job with a report for the owner. This is the only way a job finishes.
+
+        The system checks what you delivered against the brief's expected items and sets the
+        outcome itself.
+
+        Args:
+            summary: What the job produced or found, in a few plain sentences for the owner.
+                For a job without a saved file, put the answer itself here.
+            missing: Each requested item you could not deliver, and why.
+        """
+        brief = TaskBrief.model_validate((ctx.metadata or {})["bud_brief"])
+        notes = [note for note in (missing or []) if note.strip()]
+        files = saved_files(ctx)
+        written = {path: text for path, text in files.items() if text.strip()}
+        report = {"summary": summary, "notes": notes, "saved": list(files)}
+        # Gate 1, code: a requested file must exist and have content.
+        if brief.deliver_file and not written:
+            if not notes:
+                raise ModelRetry(
+                    "The brief asks for a saved file, but this job saved none with content. "
+                    "Save it, or call finish_job with missing saying why it could not be saved."
+                )
+            return JobReport(outcome="not_delivered", missing=brief.items(), checked=True, **report)
+        # Gate 2: a separate checker sees only the expected items and the delivered text.
+        deliverable = "\n\n".join(f"File {path}:\n{text}" for path, text in written.items())
+        if not brief.deliver_file:
+            deliverable = f"{summary}\n\n{deliverable}".strip()
+        answers = await verifier.check(brief.items(), deliverable) if verifier else None
+        if answers is None:
+            # Unchecked: keep the job's own account, and say so in the report.
+            outcome = "partly_delivered" if notes else "delivered"
+            return JobReport(outcome=outcome, missing=[], checked=False, **report)
+        absent = [item for item, present in answers.items() if not present]
+        outcome = (
+            "delivered"
+            if not absent
+            else "not_delivered"
+            if len(absent) == len(answers)
+            else "partly_delivered"
         )
-    if outcome != "delivered" and not missing:
-        raise ModelRetry(f"Outcome {outcome} needs missing: name what is not done and why.")
-    return JobReport(outcome=outcome, summary=summary, missing=missing, saved=saved_paths(ctx))
+        return JobReport(outcome=outcome, missing=absent, checked=True, **report)
+
+    # Gate 1 can send the job back; allow a few tries before the run fails.
+    return [ToolOutput(finish_job, name="finish_job", max_retries=3), DeferredToolRequests]
 
 
-def saved_paths(ctx: RunContext[None]) -> list[str]:
-    """Workspace files this job saved, read from tool return metadata the model never sees."""
-    paths: dict[str, None] = {}
+def saved_files(ctx: RunContext[None]) -> dict[str, str]:
+    """Each workspace file this job saved, with the text it last wrote there.
+
+    A save is known from tool return metadata the model never sees; its text comes from
+    the call that produced that return.
+    """
+    calls: dict[str, dict] = {}
+    files: dict[str, str] = {}
     for message in ctx.messages:
         for part in getattr(message, "parts", []):
+            if isinstance(part, ToolCallPart):
+                calls[part.tool_call_id] = part.args_as_dict()
+                continue
             metadata = getattr(part, "metadata", None)
             artifact = metadata.get("artifact") if isinstance(metadata, dict) else None
             if isinstance(artifact, dict) and isinstance(artifact.get("path"), str):
-                paths[artifact["path"]] = None
-    return list(paths)
-
-
-# Job runs end only through finish_job (or wait on an approval); free text is not an ending.
-JOB_OUTPUT = [ToolOutput(finish_job, name="finish_job"), DeferredToolRequests]
+                args = calls.get(getattr(part, "tool_call_id", ""), {})
+                content = args.get("content")
+                files[artifact["path"]] = content if isinstance(content, str) else ""
+    return files
 
 
 class TaskBrief(BaseModel):
@@ -97,12 +134,30 @@ class TaskBrief(BaseModel):
         max_length=4000,
         description="The requested answer or deliverable.",
     )
+    # Older briefs have neither field; items() falls back to expected_result.
+    expected_items: list[Annotated[str, Field(min_length=1, max_length=300)]] = Field(
+        default_factory=list,
+        max_length=12,
+        description="Each separate piece of content the person asked to receive, as a short "
+        "checkable item, for example 'renewal date' or 'booking links'. Not steps (searching, "
+        "reading) and not the format (a saved file is checked separately). The finished job "
+        "is checked against these.",
+    )
+    deliver_file: bool = Field(
+        default=False,
+        description="True when the person asked for a saved document or file.",
+    )
+
+    def items(self) -> list[str]:
+        return self.expected_items or [self.expected_result]
 
     def text(self) -> str:
         return (
             f"Goal: {self.goal}\nInputs:\n"
             + "\n".join(f"- {value}" for value in self.inputs)
-            + f"\nExpected result: {self.expected_result}"
+            + f"\nExpected result: {self.expected_result}\nChecklist:\n"
+            + "\n".join(f"- {item}" for item in self.items())
+            + ("\nSave the result as a workspace file." if self.deliver_file else "")
         )
 
 

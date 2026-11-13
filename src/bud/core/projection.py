@@ -62,13 +62,18 @@ class RunView(BaseModel):
 
 
 class JobReport(BaseModel):
-    """How a job ended. The job files it with finish_job; the harness fills `saved`."""
+    """How a job ended. The job writes the summary and notes; code sets everything else."""
 
     outcome: Literal["delivered", "partly_delivered", "not_delivered"]
     summary: str
+    # Expected items the checker found absent, never the job's own claim.
     missing: list[str] = Field(default_factory=list)
+    # The job's own account of what it could not do, and why.
+    notes: list[str] = Field(default_factory=list)
     # Workspace files this job actually saved, from tool metadata, never from the model.
     saved: list[str] = Field(default_factory=list)
+    # False when no separate check ran: the outcome is then the job's own account.
+    checked: bool = False
 
 
 OUTCOME_WORDS = {
@@ -80,9 +85,12 @@ OUTCOME_WORDS = {
 
 def report_text(report: dict) -> str:
     job = JobReport.model_validate(report)
-    lines = [f"{OUTCOME_WORDS[job.outcome]}. {job.summary}"]
+    label = OUTCOME_WORDS[job.outcome] + ("" if job.checked else " (job's own report, not checked)")
+    lines = [f"{label}. {job.summary}"]
     if job.missing:
         lines.append("Missing: " + "; ".join(job.missing))
+    if job.notes:
+        lines.append("Job notes: " + "; ".join(job.notes))
     if job.saved:
         lines.append("Saved: " + ", ".join(job.saved))
     return "\n".join(lines)

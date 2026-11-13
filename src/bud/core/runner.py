@@ -58,7 +58,7 @@ from bud.core.projection import (
     waiting_batch,
 )
 from bud.core.runtime import replay_version
-from bud.core.tasks import CONTROL_TOOLS, FINISHED, JOB_OUTPUT, TaskFlow, WorkItems
+from bud.core.tasks import CONTROL_TOOLS, FINISHED, TaskFlow, WorkItems, job_output
 from bud.gateway import Gateway
 from bud.gateway.errors import NEXT_STEP, error_summary, failure
 from bud.gateway.registry import Tier
@@ -69,6 +69,7 @@ from bud.harness.context import BackgroundCompaction
 from bud.harness.learning import Learner
 from bud.harness.recall import Recall, render
 from bud.harness.spiral import paused_in
+from bud.harness.verify import build_verifier
 from bud.limits import MAX_MESSAGE_CHARS
 
 RESULTS = TypeAdapter(DeferredToolResults)
@@ -122,6 +123,9 @@ class Runner(DBOSConfiguredInstance):
         self._current: ContextVar[dict] = ContextVar("bud_run")
         self.session_models: dict[str, str] = {}
         self.work_items = WorkItems(hub) if jobs else None
+        # Checks each finished job's deliverable; without it, reports say "not checked".
+        self.verifier = build_verifier() if jobs else None
+        self.job_output = job_output(self.verifier)
         self.learner = learner
         self.recall = recall
         self._learning: set[asyncio.Task] = set()
@@ -492,6 +496,12 @@ class Runner(DBOSConfiguredInstance):
         self._resume_if_ready(session_id)
         return True
 
+    def _brief(self, run: dict) -> dict | None:
+        if run.get("task_id") is None or self.work_items is None:
+            return None
+        item = self.work_items.for_session(run["session_id"])
+        return item.brief.model_dump() if item is not None else None
+
     def _withdraw(self, session_id: str, approval_id: str, reason: str) -> None:
         """bud retires a parked request of its own; the owner's decision can no longer apply."""
         events = self.hub.log.read(session_id)
@@ -839,6 +849,8 @@ class Runner(DBOSConfiguredInstance):
         await self.context.close()
         if self.harness.reviewer is not None:
             await self.harness.reviewer.close()
+        if self.verifier is not None:
+            await self.verifier.close()
 
     @DBOS.workflow(name="bud.run", max_recovery_attempts=5)
     async def _workflow(self, run: dict) -> None:
@@ -931,6 +943,8 @@ class Runner(DBOSConfiguredInstance):
                     "bud_skills": run.get("skills", {}),
                     "bud_session_id": run["session_id"],
                     "bud_task_id": run.get("task_id"),
+                    # What the job's result is checked against when it calls finish_job.
+                    "bud_brief": self._brief(run),
                     "bud_origin": run.get("origin"),
                     "bud_request": run.get("request"),
                     "bud_revision_pending": bool(run.get("quiet")),
@@ -942,7 +956,7 @@ class Runner(DBOSConfiguredInstance):
                 # total, which fails every message once a long-lived thread passes 50.
                 usage_limits=UsageLimits(request_limit=None),
                 # A job ends only by filing a typed report; chat ends in text.
-                output_type=JOB_OUTPUT if run.get("task_id") is not None else None,
+                output_type=self.job_output if run.get("task_id") is not None else None,
                 event_stream_handler=None if self.durable else self._stream,
             )
             data = {
