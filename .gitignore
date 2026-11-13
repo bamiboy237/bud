@@ -30,8 +30,13 @@ data/
 .vscode/
 .idea/
 
-# Local agent tooling
-.agents/
+# Local agent tooling. Delta imports only files Git does not ignore, so the
+# shared setup files are tracked and everything else in .agents/ stays local.
+.agents/*
+!.agents/prepare
+!.agents/linked
+!.agents/setup
+!.agents/skills/
 .claude/
 .vibe/
 skills-lock.json

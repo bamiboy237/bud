@@ -1,0 +1,3 @@
+# Ignored, repository-relative paths to link into local managed checkouts
+# instead of copying. Secrets and machine-local state belong here.
+.env

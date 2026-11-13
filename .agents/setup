@@ -1,0 +1,5 @@
+#!/bin/sh
+# Cloud Runner setup. Runs on the runner, not in local checkouts.
+set -eu
+
+uv sync --locked
