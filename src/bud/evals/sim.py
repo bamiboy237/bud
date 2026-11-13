@@ -69,7 +69,7 @@ def start(data: Path, port: int) -> None:
     code = (
         "import uvicorn; from bud.core.server import create_app; "
         f"uvicorn.run(create_app(simulate=True), host='127.0.0.1', port={port}, "
-        "log_level='warning')"
+        "log_level='warning', timeout_graceful_shutdown=3)"
     )
     process = subprocess.Popen(
         [sys.executable, "-c", code], env=env, stdout=log, stderr=log, start_new_session=True
@@ -95,6 +95,13 @@ def stop(data: Path) -> None:
     if pid:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(pid, signal.SIGTERM)
+            # Return only once the server is gone: it holds bud.lock until shutdown ends, so an
+            # immediate `start` would otherwise fail with "Another bud server is already using".
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                os.killpg(pid, 0)  # raises ProcessLookupError once the group has exited
+                time.sleep(0.2)
+            os.killpg(pid, signal.SIGKILL)
     print("stopped")
 
 
