@@ -25,6 +25,7 @@ EventType = Literal[
     "tool.call",
     "action.decided",
     "tool.result",
+    "run.note",
     "context.preparing",
     "context.ready",
     "context.failed",

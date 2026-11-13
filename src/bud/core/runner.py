@@ -29,6 +29,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelResponse,
     PartDeltaEvent,
+    PartEndEvent,
     PartStartEvent,
     RetryPromptPart,
     TextPart,
@@ -1103,6 +1104,18 @@ class Runner(DBOSConfiguredInstance):
                         "text.delta",
                         {**data, "block": f"{request}:{index}", "text": text},
                     )
+                case PartEndEvent(index=index, part=TextPart(content=text)) if (
+                    text.strip() and run.get("task_id") is not None
+                ):
+                    # A job can only end through finish_job, so any text it writes is a
+                    # progress note. Saved as it is written, so status can read it mid-job;
+                    # history never reads run.note (run.completed holds the full messages).
+                    self.hub.publish_once(
+                        run["session_id"],
+                        "run.note",
+                        {**data, "text": text.strip()[:NOTE_CHARS]},
+                        key=f"{request}:note:{index}",
+                    )
                 case FunctionToolCallEvent(part=part):
                     self.hub.publish_once(
                         run["session_id"],
@@ -1132,6 +1145,9 @@ class Runner(DBOSConfiguredInstance):
                         },
                         key=f"{run['run_id']}:result:{result.tool_call_id}",
                     )
+
+
+NOTE_CHARS = 300
 
 
 def _failure(error: BaseException) -> dict[str, str]:
