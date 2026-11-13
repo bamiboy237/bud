@@ -462,8 +462,8 @@ impl App {
         {
             hi += 1;
         }
-        for i in lo..=hi {
-            if let crate::app::Entry::Tool(t) = &mut self.entries[i] {
+        for entry in &mut self.entries[lo..=hi] {
+            if let crate::app::Entry::Tool(t) = entry {
                 t.expanded = target;
             }
         }
