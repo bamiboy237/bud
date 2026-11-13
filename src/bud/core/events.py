@@ -59,7 +59,7 @@ RUN_END_EVENTS = ("run.waiting", "run.completed", "run.failed", "run.cancelled")
 class MessageOrigin(BaseModel):
     """Reply routing metadata, not identity or permission to execute an action."""
 
-    channel: Literal["api", "terminal", "web", "imessage"] = "api"
+    channel: Literal["api", "terminal", "web", "imessage", "desktop"] = "api"
     client_id: str = Field(
         default="default", min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"
     )

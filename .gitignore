@@ -59,3 +59,7 @@ worktrees/
 
 # Local backup of the retired Python TUI (history keeps it)
 archive/
+
+# macOS companion build output
+mac/.build/
+mac/build/
