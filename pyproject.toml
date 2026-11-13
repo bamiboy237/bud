@@ -37,7 +37,7 @@ select = ["E", "F", "I", "B", "UP", "SIM"]
 
 [dependency-groups]
 dev = [
-    "ruff>=0.17.2",
+    "ruff>=0.17.4",
     "ty>=0.0.101",
 ]
 
