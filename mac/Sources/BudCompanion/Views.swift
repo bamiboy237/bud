@@ -210,11 +210,12 @@ private struct Bubble: View {
                 // Measured, because a ScrollView (or ViewThatFits) takes every point it's offered.
                 let overflows = companion.replyHeight > Self.maxReply
                 ScrollView {
+                    // Measured before the padding, so adding it can't flip `overflows` back.
                     reply
-                        .padding(.bottom, overflows ? 12 : 0)
                         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
                             companion.replyHeight = $0
                         }
+                        .padding(.bottom, overflows ? 12 : 0)
                 }
                 .scrollBounceBehavior(.basedOnSize)
                 .defaultScrollAnchor(.bottom)

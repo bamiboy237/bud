@@ -29,6 +29,9 @@ enum StreamSignal: Sendable {
     case fatal(Int)
 }
 
+/// No cookies, cache or credential store: the owner token is the only credential, sent per request.
+let budSession = URLSession(configuration: .ephemeral)
+
 /// Follows a session's events forever: reconnects after a second, resuming after the last
 /// stored event it saw, so a dropped connection or a server restart loses and repeats nothing.
 func followEvents(
@@ -38,10 +41,11 @@ func followEvents(
     var lastSeq = start
     while !Task.isCancelled {
         var request = connection.request("GET", "sessions/\(session)/events")
-        request.timeoutInterval = .infinity
+        // bud sends a keep-alive every 15 s, so 45 s of silence means a dead connection.
+        request.timeoutInterval = 45
         request.setValue(String(lastSeq), forHTTPHeaderField: "Last-Event-ID")
         do {
-            let (bytes, response) = try await URLSession.shared.bytes(for: request)
+            let (bytes, response) = try await budSession.bytes(for: request)
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             if [401, 404, 409].contains(code) {
                 await deliver(.fatal(code))

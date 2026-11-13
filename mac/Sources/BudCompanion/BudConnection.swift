@@ -130,7 +130,7 @@ struct BudConnection: Sendable {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await URLSession.shared.data(for: request(method, path, json: json))
+            (data, response) = try await budSession.data(for: request(method, path, json: json))
         } catch {
             throw ConnectionError.unreachable
         }
