@@ -61,7 +61,10 @@ def start(data: Path, port: int) -> None:
     if port == LIVE_PORT:
         sys.exit("Port 8420 is the owner's live server; pick another port.")
     data.mkdir(parents=True, exist_ok=True)
-    log = (data / "server.log").open("a")
+    # Owner-only, like Codex and Vibe's log files.
+    log = os.fdopen(
+        os.open(data / "server.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a"
+    )
     env = {**os.environ, "DATA_DIR": str(data), "PYDANTIC_AI_NO_BANNER": "1"}
     code = (
         "import uvicorn; from bud.core.server import create_app; "

@@ -40,6 +40,7 @@ from bud.harness.memory import build_memory
 from bud.harness.recall import Recall, embedder
 from bud.harness.review import build_reviewer
 from bud.limits import MAX_MESSAGE_CHARS
+from bud.logs import guard_logs
 from bud.photon_config import PhotonConfig
 from bud.web import GUIDANCE as WEB_GUIDANCE
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
@@ -309,6 +310,7 @@ def _create_app(
                     "log_level": "WARNING",
                 }
             )
+            guard_logs()  # after DBOS adds its handler; uvicorn's exist already
             DBOS.launch()
             if connections is not None and connections.restart_required():
                 raise ConnectionError("Account binding changed during startup. Restart bud.")
