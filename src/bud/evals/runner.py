@@ -21,6 +21,7 @@ from bud.core.log import EventLog
 from bud.core.profiles import Mode, apply_mode
 from bud.core.projection import snapshot, undecided_approvals
 from bud.core.runner import Runner
+from bud.core.tasks import FINISHED
 from bud.evals.tasks import SUITE, Outcome, Task
 from bud.gateway import Gateway, build_gateway
 from bud.harness.actions import load_policy
@@ -97,6 +98,21 @@ async def converse(
 
 async def drive(runner: Runner, log: EventLog, task: Task, session_id: str) -> list[dict]:
     return await converse(runner, log, session_id, task.instruction, task.approve)
+
+
+async def jobs_settled(runner: Runner, session_id: str) -> None:
+    """Until every job this session started has ended, paused, or waits on the owner."""
+    assert runner.work_items is not None
+    while True:
+        views = runner.work_items.views(session_id)
+        if all(
+            view.status in FINISHED | {"paused", "needs_review"} or view.pending_approvals
+            for view in views
+        ):
+            # The finished-job notice is published right after the job's run ends.
+            await asyncio.sleep(0.5)
+            return
+        await asyncio.sleep(1)
 
 
 async def teach(runner: Runner, log: EventLog, task: Task) -> None:
@@ -198,8 +214,25 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
             approvals, timed_out = [], True
         events = log.read(session_id)
         calls = tuple(e.data["tool"] for e in events if e.type == "tool.call")
+        job_events: list[Event] = []
+        if "start_task" in calls and task.spiral and not timed_out:
+            # A delegated spiral loops inside the job, so the job must run for it to be caught.
+            remaining = timeout - (perf_counter() - started)
+            try:
+                await asyncio.wait_for(jobs_settled(runner, session_id), max(remaining, 1))
+            except TimeoutError:
+                timed_out = True
+            job_events = (
+                [
+                    event
+                    for job in runner.work_items.items(session_id)
+                    for event in log.read(job.session_id)
+                ]
+                if runner.work_items
+                else []
+            )
         if "start_task" in calls:
-            # Only the decision to delegate is scored; stop the job instead of paying for it.
+            # Otherwise only the decision to delegate is scored; stop the job, don't pay for it.
             await runner.stop_session(session_id)
         await runner.stop()
         events = log.read(session_id)
@@ -222,8 +255,8 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
             approvals=approvals,
             failure=failure_reason(events),
             memory=await memory_text(learner),
-            loops=[e.data for e in events if e.type == "run.loop_detected"],
-            notes=loop_notes(events),
+            loops=[e.data for e in [*events, *job_events] if e.type == "run.loop_detected"],
+            notes=loop_notes([*events, *job_events]),
             auto_allowed=tuple(allowed),
             policy_allowed=tuple(
                 e.data["tool"]
