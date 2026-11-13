@@ -658,6 +658,9 @@ def _create_app(
         require_session(session_id)
 
         async def frames() -> AsyncIterator[str]:
+            # The response starts with its first chunk, so send one at once: a client
+            # learns it is connected now, not at the first event or keep-alive.
+            yield ": connected\n\n"
             async for event in hub.subscribe(session_id, after=last_event_id):
                 yield ": keep-alive\n\n" if event is None else sse_frame(event)
 
