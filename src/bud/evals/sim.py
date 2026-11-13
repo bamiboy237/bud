@@ -129,7 +129,8 @@ def _wait(data: Path, client: httpx.Client, session: str, after: int, limit: flo
                 (session, after),
             ).fetchone()
         busy = snapshot["run_active"] or snapshot["queued_messages"]
-        if ended and (snapshot["pending_approvals"] or not busy):
+        # A parked approval stays listed while later runs go on, so wait on the run itself.
+        if ended and (snapshot["status"] == "awaiting_approval" or not busy):
             return snapshot
     return {**snapshot, "timed_out": True}
 
@@ -180,7 +181,12 @@ def decide(data: Path, approval_id: str, approved: bool | None, answer: str | No
             client.post(path, json={"text": answer}).raise_for_status()
         else:
             path = f"/sessions/{session}/approvals/{approval_id}"
-            client.post(path, json={"approved": approved}).raise_for_status()
+            response = client.post(path, json={"approved": approved})
+            response.raise_for_status()
+            if not response.json()["applied"]:
+                # Already decided or withdrawn: nothing will run, so there is no turn to wait for.
+                print(json.dumps({"applied": False, "approval_id": approval_id}))
+                return
         snapshot = _wait(data, client, session, before)
     _report_turn(data, session, before, snapshot)
 

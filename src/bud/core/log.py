@@ -24,6 +24,16 @@ from bud.core.projection import (
 from bud.limits import MAX_QUEUED_MESSAGES
 
 
+def _is_job_session(db, session_id: str) -> bool:
+    try:
+        return (
+            db.execute("SELECT 1 FROM tasks WHERE session_id = ?", (session_id,)).fetchone()
+            is not None
+        )
+    except sqlite3.OperationalError:  # no jobs table yet: no jobs
+        return False
+
+
 class QueueFull(Exception):
     pass
 
@@ -291,13 +301,20 @@ class EventLog:
             return event
 
     def _supersede(self, db, session_id: str, message_id: str, origin: dict | None) -> None:
-        # New conversational input makes unapproved proposals stale. Already
-        # granted permissions are not recalled or changed by this operation.
+        """New input arrived while proposals wait for the owner.
+
+        In the owner's own conversation an action stays open (parked): the waiting run
+        moves on, and the action runs only if the owner approves it later. A question is
+        retired, since the new message usually answers it. In a job's session, steering
+        retires every pending proposal. Granted permissions never change.
+        """
+        park = not _is_job_session(db, session_id)
         for request in undecided_approvals(self._read(db, session_id)):
+            keep = park and request["tool"] != "ask_user"
             self._insert(
                 db,
                 session_id,
-                "approval.denied",
+                "approval.parked" if keep else "approval.denied",
                 {
                     "approval_id": request["approval_id"],
                     "origin": origin,

@@ -345,7 +345,7 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
         recent_runs=recent[-20:],
         pending_approvals=[
             PendingApproval(**{key: request[key] for key in ("approval_id", "tool", "args")})
-            for request in undecided_approvals(events)
+            for request in [*undecided_approvals(events), *parked_approvals(events)]
         ],
         pending_setup=pending_setups(events),
         transcript=transcript,
@@ -376,9 +376,33 @@ def decisions(events: list[Event]) -> dict[str, bool]:
     }
 
 
+def parked_ids(events: list[Event]) -> set[str]:
+    return {event.data["approval_id"] for event in events if event.type == "approval.parked"}
+
+
 def undecided_approvals(events: list[Event]) -> list[dict[str, Any]]:
-    decided = decisions(events)
-    return [req for req in waiting_batch(events) if req["approval_id"] not in decided]
+    """Requests the latest waiting run still needs an answer for before it can resume.
+
+    A parked request is not one of them: its run moved on, and it waits on its own."""
+    decided, parked = decisions(events), parked_ids(events)
+    return [
+        req
+        for req in waiting_batch(events)
+        if req["approval_id"] not in decided and req["approval_id"] not in parked
+    ]
+
+
+def parked_approvals(events: list[Event]) -> list[dict[str, Any]]:
+    """Requests set aside when the owner sent another message first. Each stays open and
+    approvable until the owner decides it or bud withdraws it (THE-169)."""
+    decided, parked = decisions(events), parked_ids(events)
+    return [
+        event.data
+        for event in events
+        if event.type == "approval.requested"
+        and event.data["approval_id"] in parked
+        and event.data["approval_id"] not in decided
+    ]
 
 
 def model_history(events: list[Event]) -> list[ModelMessage]:

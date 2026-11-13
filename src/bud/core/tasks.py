@@ -36,7 +36,7 @@ from bud.limits import MAX_MESSAGE_CHARS, MAX_OPEN_TASKS
 # A job reads its queue between steps; more waiting updates than this is a flood.
 MAX_PENDING_UPDATES = 3
 
-CONTROL_TOOLS = {"start_task", "update_task", "inspect_task", "stop_task"}
+CONTROL_TOOLS = {"start_task", "update_task", "inspect_task", "stop_task", "withdraw_request"}
 FINISHED = {"completed", "failed", "cancelled"}
 
 
@@ -427,6 +427,7 @@ class TaskFlow(AbstractCapability[None]):
     policy: Policy
     kick: Callable[[str], None]
     stop: Callable[[str], Awaitable[dict]]
+    withdraw: Callable[[str, str, str], None]
     id: str | None = "bud_feed_jobs"
 
     @staticmethod
@@ -457,6 +458,7 @@ class TaskFlow(AbstractCapability[None]):
         return FunctionToolset(
             [
                 self.start_task,
+                self.withdraw_request,
                 self.update_task,
                 self.inspect_task,
                 self.stop_task,
@@ -580,6 +582,15 @@ class TaskFlow(AbstractCapability[None]):
         """Read a job's brief, current status, pending decisions and saved results."""
         item = self.store.get(self._feed(ctx), task_id)
         return {"brief": item.brief.model_dump(), **self.store.view(item).model_dump()}
+
+    def withdraw_request(self, ctx: RunContext[None], approval_id: str, reason: str) -> str:
+        """Withdraw one of your own requests that is still open for the owner's approval.
+
+        Use it when the owner's later message changes or cancels that request; then, for a
+        change, propose the corrected action. A withdrawn request can never run.
+        """
+        self.withdraw(self._feed(ctx), approval_id, reason)
+        return f"Withdrawn: approval {approval_id} can no longer run."
 
     async def stop_task(self, ctx: RunContext[None], task_id: int) -> dict:
         """Stop a named job and retire its pending approvals."""

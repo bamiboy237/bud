@@ -17,6 +17,7 @@ from pydantic_ai import (
     ConversationTypeAdapter,
     DeferredToolRequests,
     DeferredToolResults,
+    ModelRetry,
     RunContext,
     ToolApproved,
     ToolDenied,
@@ -26,11 +27,13 @@ from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
     ModelMessage,
+    ModelResponse,
     PartDeltaEvent,
     PartStartEvent,
     RetryPromptPart,
     TextPart,
     TextPartDelta,
+    ToolCallPart,
     ToolReturnPart,
 )
 from pydantic_ai.models import Model
@@ -45,6 +48,8 @@ from bud.core.projection import (
     decisions,
     message_batch,
     model_history,
+    parked_approvals,
+    parked_ids,
     queue_paused,
     reply_text,
     runs,
@@ -176,6 +181,7 @@ class Runner(DBOSConfiguredInstance):
                     policy=harness.policy,
                     kick=self._kick,
                     stop=self._stop_task,
+                    withdraw=self._withdraw,
                 ),
             )
             if self.work_items is not None
@@ -361,6 +367,9 @@ class Runner(DBOSConfiguredInstance):
                 self.hub.wake(session_id)
             self._resume_if_ready(session_id)
             return
+        # A parked action the owner approved while another run was busy runs first.
+        if self._run_late_approval(session_id, events):
+            return
         pending = message_batch(events)
         if queue_paused(events) or not pending:
             return
@@ -415,6 +424,10 @@ class Runner(DBOSConfiguredInstance):
             return False
         batch = waiting_batch(events)
         request = next((r for r in batch if r["approval_id"] == approval_id), None)
+        if request is None:
+            request = next(
+                (r for r in parked_approvals(events) if r["approval_id"] == approval_id), None
+            )
         if request is None:
             raise UnknownApproval(approval_id)
         if request.get("tool") == "ask_user":
@@ -479,17 +492,92 @@ class Runner(DBOSConfiguredInstance):
         self._resume_if_ready(session_id)
         return True
 
+    def _withdraw(self, session_id: str, approval_id: str, reason: str) -> None:
+        """bud retires a parked request of its own; the owner's decision can no longer apply."""
+        events = self.hub.log.read(session_id)
+        if approval_id not in {r["approval_id"] for r in parked_approvals(events)}:
+            raise ModelRetry(
+                f"{approval_id} is not an open request in this conversation: it was already "
+                "decided or withdrawn, or the id is wrong."
+            )
+        self.hub.publish_once(
+            session_id,
+            "approval.denied",
+            {"approval_id": approval_id, "reason": f"Withdrawn by bud: {reason[:300]}"},
+        )
+
+    def _run_late_approval(self, session_id: str, events: list[Event]) -> bool:
+        """Run one parked action the owner approved after the conversation moved on.
+
+        The history gets the exact call the model proposed (same tool and arguments) and the
+        run resumes it with the owner's approval, as an ordinary approval would. The model
+        does not re-propose anything, and the approval id keeps the write idempotent.
+        """
+        started = {
+            event.data["late_call"]["approval_id"]
+            for event in events
+            if event.type == "run.queued" and event.data.get("late_call")
+        }
+        granted = {e.data["approval_id"] for e in events if e.type == "approval.granted"}
+        ready = (parked_ids(events) & granted) - started
+        request = next(
+            (
+                event.data
+                for event in events
+                if event.type == "approval.requested" and event.data["approval_id"] in ready
+            ),
+            None,
+        )
+        if request is None:
+            return False
+        call_id = f"{request['call_id']}-approved"
+        results = DeferredToolResults(
+            approvals={call_id: ToolApproved()},
+            metadata={call_id: {"approval_id": request["approval_id"]}},
+        )
+        run = self._inputs(session_id, None, results)
+        queued = next(
+            event.data
+            for event in events
+            if event.type == "run.queued" and event.data["run_id"] == request["run_id"]
+        )
+        run |= {
+            # Rebuild history from the log, then append the approved call to it.
+            "conversation_run": None,
+            "history_seq": events[-1].seq,
+            "late_call": {
+                "approval_id": request["approval_id"],
+                "tool": request["tool"],
+                "args": request["args"],
+                "call_id": call_id,
+            },
+            "skills": queued.get("skills", run["skills"]),
+            "request": queued.get("request"),
+        }
+        self.hub.publish_once(
+            session_id, "run.queued", run, key=f"late:{request['approval_id']}:queued"
+        )
+        self._launch(run)
+        return True
+
     def _resume_if_ready(self, session_id: str) -> None:
         events = self.hub.log.read(session_id)
+        if (
+            not self._busy(session_id)
+            and not waiting_batch(events)
+            and self._run_late_approval(session_id, events)
+        ):
+            return
         batch = waiting_batch(events)
         if not batch or undecided_approvals(events) or self._busy(session_id):
             return
         decided = decisions(events)
+        parked = parked_ids(events)
         revised = {
             event.data["approval_id"]
             for event in events
             if event.type == "approval.denied" and event.data.get("revision_message_id")
-        }
+        } | parked
         answers = {
             event.data["approval_id"]: event.data["text"]
             for event in events
@@ -498,7 +586,9 @@ class Runner(DBOSConfiguredInstance):
         results = DeferredToolResults(
             approvals={
                 request["call_id"]: ToolApproved()
-                if decided[request["approval_id"]]
+                if decided.get(request["approval_id"])
+                else ToolDenied(_parked_note(request["approval_id"]))
+                if request["approval_id"] in parked
                 else ToolDenied(
                     "The owner sent another message before answering this. If it corrects or "
                     "replaces this request, follow it. If it is about something else, handle it, "
@@ -561,7 +651,7 @@ class Runner(DBOSConfiguredInstance):
             None,
         )
         run["quiet"] = any(request["approval_id"] in revised for request in batch) and not any(
-            decided[request["approval_id"]] for request in batch
+            decided.get(request["approval_id"]) for request in batch
         )
         self.hub.publish_once(session_id, "run.queued", run, key=f"{run['run_id']}:queued")
         self._launch(run)
@@ -786,6 +876,9 @@ class Runner(DBOSConfiguredInstance):
             await self._step("bud.started", self._started, run)
 
             conversation, history = self._history(run)
+            if late := run.get("late_call"):
+                call = ToolCallPart(late["tool"], late["args"], tool_call_id=late["call_id"])
+                history = [*history, ModelResponse(parts=[call])]
             if conversation is not None and conversation.conversation_id != run["session_id"]:
                 raise RecoveryRefused("Conversation does not belong to this session.")
             model_override = self.session_models.get(run["session_id"])
@@ -1031,6 +1124,15 @@ def _failure(error: BaseException) -> dict[str, str]:
     if isinstance(error, RecoveryRefused):
         return {"reason": str(error), "kind": "recovery", "next": NEXT_STEP["recovery"]}
     return failure(error)
+
+
+def _parked_note(approval_id: str) -> str:
+    return (
+        "Not run yet. The owner sent another message before deciding, so this request stays "
+        f"open as approval {approval_id}: it runs only if they approve it, and you will be "
+        "told. Do not propose it again. If their new message changes or cancels this request, "
+        f"call withdraw_request('{approval_id}') and, for a change, propose the corrected action."
+    )
 
 
 def superseded_note(events: list[Event], run: dict) -> str:
