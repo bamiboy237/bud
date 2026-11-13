@@ -431,8 +431,10 @@ class TaskFlow(AbstractCapability[None]):
 
     @staticmethod
     def _worker(ctx: RunContext[None]) -> bool:
-        metadata = ctx.metadata or {}
-        return metadata.get("bud_task_id") is not None or bool(metadata.get("bud_inline_approval"))
+        # Only a job's own runs are workers. A main-conversation run resumed after the owner
+        # answers a question or an approval is still the main bud: it keeps its instructions
+        # and the job controls, so it can, for example, pass the answer on with update_task.
+        return (ctx.metadata or {}).get("bud_task_id") is not None
 
     def get_instructions(self):
         def instructions(ctx: RunContext[None]) -> str:
