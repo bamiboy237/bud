@@ -24,9 +24,18 @@ for pet in "$pets"/*/pet.json(N); do
   cp "$dir/$sheet" "$app/Contents/Resources/pets/$name/"
   echo "pet: $name"
 done
-# Ad-hoc signature: enough to run locally. A stable identity, so macOS keeps the microphone
-# permission across rebuilds, arrives with hold-to-talk (THE-177).
-codesign --force --sign - "$app"
+# macOS remembers permissions such as the microphone per signing identity. An ad-hoc
+# signature changes with every build, so each rebuild would ask again. With a local
+# code-signing identity in the keychain (any name; set BUD_SIGN_ID), the app keeps one.
+# Make one in Keychain Access: Certificate Assistant > Create a Certificate, type Code Signing.
+identity=${BUD_SIGN_ID:-bud companion (local)}
+if security find-identity -p codesigning | grep -qF "\"$identity\""; then
+  codesign --force --sign "$identity" "$app"
+  echo "signed: $identity"
+else
+  codesign --force --sign - "$app"
+  echo "signed ad hoc: no \"$identity\" identity, so permissions reset each build"
+fi
 echo "built $app"
 
 if [[ ${1:-} == --run ]]; then
