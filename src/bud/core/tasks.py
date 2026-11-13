@@ -46,6 +46,7 @@ def job_output(verifier: JobVerifier | None) -> list:
 
     The job never picks its own label. finish_job runs two gates and code counts the result:
     every expected item present is delivered, some is partly delivered, none is not delivered.
+    A gap the job reports itself makes an otherwise complete result partly delivered.
     """
 
     async def finish_job(
@@ -87,7 +88,8 @@ def job_output(verifier: JobVerifier | None) -> list:
             return JobReport(outcome=outcome, missing=[], checked=False, **report)
         absent = [item for item, present in answers.items() if not present]
         outcome = (
-            "delivered"
+            # The job's own account of a gap stands even when the checker found every item.
+            ("partly_delivered" if notes else "delivered")
             if not absent
             else "not_delivered"
             if len(absent) == len(answers)
@@ -143,7 +145,8 @@ class TaskBrief(BaseModel):
         description="Each separate piece of content the person asked to receive, as a short "
         "checkable item, for example 'renewal date' or 'booking links'. Not steps (searching, "
         "reading) and not the format (a saved file is checked separately). The finished job "
-        "is checked against these.",
+        "is checked against these. When the person asked to hear once something happens, the "
+        "item is that it happened, for example 'report R-2291 is ready', not its status.",
     )
     deliver_file: bool = Field(
         default=False,
