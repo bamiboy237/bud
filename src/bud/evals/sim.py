@@ -91,9 +91,11 @@ def start(data: Path, port: int) -> None:
 
 
 def stop(data: Path) -> None:
-    pid = _state(data).get("pid")
+    state = _state(data)
+    pid = state.get("pid")
     if pid:
-        with contextlib.suppress(ProcessLookupError):
+        # PermissionError: the id now belongs to another user's process, so ours is gone.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(pid, signal.SIGTERM)
             # Return only once the server is gone: it holds bud.lock until shutdown ends, so an
             # immediate `start` would otherwise fail with "Another bud server is already using".
@@ -102,6 +104,9 @@ def stop(data: Path) -> None:
                 os.killpg(pid, 0)  # raises ProcessLookupError once the group has exited
                 time.sleep(0.2)
             os.killpg(pid, signal.SIGKILL)
+        # Forget the id: once it is free, the system can give it to an unrelated process,
+        # and a second `stop` must not signal that one.
+        _save(data, {key: value for key, value in state.items() if key != "pid"})
     print("stopped")
 
 

@@ -699,7 +699,16 @@ class Runner(DBOSConfiguredInstance):
     async def _wait_durable(self, run: dict, recovering: bool) -> None:
         await asyncio.to_thread(self._handle, run, recovering)
         handle = await DBOS.retrieve_workflow_async(run["run_id"])
-        await handle.get_result()
+        try:
+            await handle.get_result()
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise  # this monitor was cancelled; the workflow itself goes on
+            # The workflow's recorded outcome is a cancellation: DBOS stores one as an error
+            # when its loop stops mid-run, and an error is final. Reported as a cancelled
+            # monitor, it would leave the run "running" forever, so it fails instead.
+            raise RuntimeError("Interrupted by a server shutdown and could not resume.") from None
 
     def _busy(self, session_id: str) -> bool:
         states = runs(self.hub.log.read(session_id))
