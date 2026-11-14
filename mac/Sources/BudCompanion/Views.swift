@@ -240,14 +240,16 @@ private struct Bubble: View {
 
     private var shape: RoundedRectangle { RoundedRectangle(cornerRadius: 14, style: .continuous) }
 
+    @ViewBuilder
     private var reply: some View {
-        Text(companion.reply.isEmpty ? AttributedString("Working…") : markdown(companion.reply))
-            .font(.body)
-            .lineSpacing(2)
-            .foregroundStyle(companion.reply.isEmpty ? .secondary : .primary)
-            .textSelection(.enabled)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        if companion.reply.isEmpty {
+            Text("Working…")
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            MarkdownView(companion.reply)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 
     /// Shown only on hover: less chrome on a surface that floats over your work.
@@ -278,24 +280,6 @@ private struct Bubble: View {
         case .failed: return ("Something went wrong", "exclamationmark.triangle", .red)
         default: return nil
         }
-    }
-
-    private func markdown(_ text: String) -> AttributedString {
-        // Inline markdown only (block parsing drops line breaks in Text); list markers become bullets.
-        let text = text
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map { line -> String in
-                let trimmed = line.drop(while: { $0 == " " })
-                let indent = String(repeating: " ", count: line.count - trimmed.count)
-                for marker in ["- ", "* ", "+ "] where trimmed.hasPrefix(marker) {
-                    return indent + "• " + trimmed.dropFirst(2)
-                }
-                return String(line)
-            }
-            .joined(separator: "\n")
-        let options = AttributedString.MarkdownParsingOptions(
-            interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        return (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
     }
 }
 
