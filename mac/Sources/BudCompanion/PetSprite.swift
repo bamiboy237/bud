@@ -19,6 +19,11 @@ struct PetRow: Sendable {
 
     // Row order and timings from the Codex pet contract (openai/codex#20863).
     static let idle = PetRow(index: 0, frames: 6, frameMs: 140, lastMs: 320)
+    /// Walking, for while the pet is carried: a steady stride, no beat at the end.
+    static let walkRight = PetRow(index: 1, frames: 8, frameMs: 95, lastMs: 95)
+    static let walkLeft = PetRow(index: 2, frames: 8, frameMs: 95, lastMs: 95)
+    /// A hop, played once for a finished run or a decision that went through.
+    static let jumping = PetRow(index: 4, frames: 5, frameMs: 110, lastMs: 180)
     static let waving = PetRow(index: 3, frames: 4, frameMs: 140, lastMs: 280)
     static let failed = PetRow(index: 5, frames: 8, frameMs: 140, lastMs: 240)
     static let waiting = PetRow(index: 6, frames: 6, frameMs: 150, lastMs: 260)
@@ -69,6 +74,13 @@ final class PetSprite {
         return image
     }
 
+    /// The idle pose as a small still, for places like the menu bar.
+    func icon(height: CGFloat) -> NSImage? {
+        let rect = CGRect(origin: .zero, size: Self.cell)
+        guard let cut = sheet.cropping(to: rect) else { return nil }
+        return NSImage(cgImage: cut, size: NSSize(width: height * rect.width / rect.height, height: height))
+    }
+
     private static func folders(_ id: String) -> [URL] {
         var found: [URL] = []
         if let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
@@ -95,17 +107,17 @@ final class PetSprite {
     }
 }
 
-/// The pet, playing the row for bud's status. The frame comes from the clock and the time the
-/// status began, so the view keeps no animation state of its own.
+/// The pet, playing whichever row `pose` picks for the moment. The frame comes from the clock
+/// and the time that row began, so the view keeps no animation state of its own, and a
+/// reaction that ends simply hands back to the status row on the next frame.
 struct AnimatedPet: View {
     let sprite: PetSprite
-    let status: PetStatus
-    let since: Date
+    let pose: (Date) -> (row: PetRow, since: Date)
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let row = PetRow.of(status)
         TimelineView(.animation(minimumInterval: 0.04, paused: reduceMotion)) { context in
+            let (row, since) = pose(context.date)
             let ms = max(0, Int(context.date.timeIntervalSince(since) * 1000))
             if let image = sprite.image(row: row, frame: reduceMotion ? 0 : row.frame(at: ms)) {
                 Image(nsImage: image)
