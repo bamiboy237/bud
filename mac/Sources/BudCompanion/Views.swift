@@ -279,6 +279,12 @@ private struct Bubble: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
+            if companion.status == .working, companion.stepsLayout == .checklist, !companion.steps.isEmpty {
+                StepList(steps: companion.steps, live: true)
+            }
+            if companion.showStepsAfter, companion.status != .working, !companion.lastSteps.isEmpty {
+                StepsSummary(companion: companion)
+            }
             ForEach(companion.notices, id: \.self) { notice in
                 Label(notice, systemImage: "arrow.turn.down.right")
                     .font(.callout)
@@ -355,7 +361,7 @@ private struct Bubble: View {
 
     private var compact: Bool {
         companion.shown.isEmpty && companion.notices.isEmpty && companion.approvals.isEmpty
-            && companion.receipt == nil
+            && companion.receipt == nil && companion.steps.isEmpty
     }
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -381,13 +387,30 @@ private struct Bubble: View {
                 Text(state.text)
                     .font(.system(size: 12))
                     .foregroundStyle(state.tint)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                     .shimmer(active: state.busy)
                     .contentTransition(.opacity)
+                    .id(state.text)
+                    .transition(.opacity)
             }
             Spacer(minLength: compact ? 6 : 0)
+            if let count = stepCount {
+                Text(count)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .contentTransition(.numericText())
+            }
             close
         }
         .animation(.easeOut(duration: 0.15), value: state?.text)
+    }
+
+    /// "step 3", for the counted layout while bud works.
+    private var stepCount: String? {
+        guard companion.stepsLayout == .counted, companion.status == .working,
+              !companion.steps.isEmpty else { return nil }
+        return "step \(companion.steps.count)"
     }
 
     /// Shown only on hover: less chrome on a surface that floats over your work.
@@ -413,7 +436,12 @@ private struct Bubble: View {
             return (detail, .secondary, false)
         }
         switch companion.status {
-        case .working: return ("Working on it", .secondary, true)
+        case .working:
+            // The live line: the step bud is on, unless the checklist below already shows it.
+            if companion.stepsLayout != .checklist, let step = companion.steps.last {
+                return (step.text, .secondary, true)
+            }
+            return ("Working on it", .secondary, true)
         case .needsYou:
             let asking = companion.approvals.first?.isQuestion == true
             return (asking ? "Has a question" : "Needs your OK", .orange, false)
@@ -421,6 +449,134 @@ private struct Bubble: View {
         case .done: return ("Done", .secondary, false)
         case .idle: return nil
         }
+    }
+}
+
+// MARK: Steps
+
+/// bud's steps as rows: ticked when done, the current one shimmering. Long runs show the
+/// latest few, with a count of the earlier ones, so the bubble doesn't grow without end.
+private struct StepList: View {
+    let steps: [Step]
+    /// While the run is going, the last unfinished step is the live one.
+    let live: Bool
+    /// How many rows to show; the rest are counted. Nil shows every step.
+    var limit: Int? = 5
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            if let limit, steps.count > limit {
+                Text("\(steps.count - limit) earlier \(steps.count - limit == 1 ? "step" : "steps")")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .padding(.leading, 22)
+            }
+            ForEach(steps.suffix(limit ?? steps.count)) { step in
+                // Every unfinished step is in flight: bud runs a call's functions together.
+                StepRow(step: step, live: live && !step.done)
+                    .transition(.opacity.combined(with: .offset(y: 4)))
+            }
+        }
+        .animation(.spring(duration: 0.3, bounce: 0), value: steps.map(\.id))
+    }
+}
+
+/// One step, checked off the moment it finishes: the circle fills, a tick draws itself
+/// inside it, and a line crosses the words out, left to right. Steps from the same call
+/// finish together, so each ticks 70 ms after the one above it and they read as a run of
+/// ticks, not one blink. Rows that arrive already done (the list after a reply) don't play it.
+private struct StepRow: View {
+    let step: Step
+    let live: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// The step's place within its call, from its id ("call:2").
+    private var order: Int { Int(step.id.split(separator: ":").last ?? "") ?? 0 }
+
+    private var check: Animation {
+        // Reduced motion keeps the state change as a fade; nothing draws or grows.
+        reduceMotion ? .easeOut(duration: 0.2) : .spring(duration: 0.28, bounce: 0).delay(Double(min(order, 4)) * 0.07)
+    }
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            ZStack {
+                Circle()
+                    .strokeBorder(Paper.ink.opacity(0.25), lineWidth: 1)
+                    .opacity(step.done ? 0 : 1)
+                Circle()
+                    .fill(Paper.ink.opacity(0.8))
+                    .scaleEffect(step.done || reduceMotion ? 1 : 0.6)
+                    .opacity(step.done ? 1 : 0)
+                Tick()
+                    .trim(from: 0, to: step.done || reduceMotion ? 1 : 0)
+                    .stroke(Paper.surface, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+                    .opacity(step.done ? 1 : 0)
+                    .padding(3)
+            }
+            .frame(width: 12, height: 12)
+            .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
+            .animation(check, value: step.done)
+
+            Text(step.text)
+                .font(.callout)
+                .foregroundStyle(live ? .primary : .secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .shimmer(active: live)
+                .overlay(alignment: .leading) {
+                    Rectangle()
+                        .fill(Paper.ink.opacity(0.35))
+                        .frame(height: 1)
+                        .scaleEffect(x: step.done || reduceMotion ? 1 : 0, anchor: .leading)
+                        .opacity(step.done ? 1 : 0)
+                        // The line follows the tick, so the eye goes circle, then words.
+                        .animation(reduceMotion ? check : check.delay(0.1), value: step.done)
+                }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(step.done ? "done" : live ? "in progress" : "")
+    }
+}
+
+/// A tick, drawn from its short arm to the end of its long arm, so trimming it reads as a pen.
+private struct Tick: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.midY + rect.height * 0.05))
+        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.38, y: rect.maxY - rect.height * 0.12))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + rect.height * 0.15))
+        return path
+    }
+}
+
+/// "4 steps", above a finished reply: a closed line that opens into the list.
+private struct StepsSummary: View {
+    let companion: Companion
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                companion.stepsExpanded.toggle()
+            } label: {
+                HStack(spacing: 4) {
+                    Text("\(companion.lastSteps.count) \(companion.lastSteps.count == 1 ? "step" : "steps")")
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .bold))
+                        .rotationEffect(.degrees(companion.stepsExpanded ? 90 : 0))
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(companion.stepsExpanded ? "Hide bud's steps" : "Show bud's steps")
+            if companion.stepsExpanded {
+                StepList(steps: companion.lastSteps, live: false, limit: nil)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.spring(duration: 0.25, bounce: 0), value: companion.stepsExpanded)
     }
 }
 
@@ -741,8 +897,10 @@ private struct Shimmer: ViewModifier {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     func body(content: Content) -> some View {
-        if active && !reduceMotion {
-            content.overlay {
+        // One structure whether on or off, so the text keeps its identity when the shimmer
+        // stops and anything animating on it (a step's cross-out line) plays through.
+        content.overlay {
+            if active && !reduceMotion {
                 TimelineView(.animation) { context in
                     // One sweep every 1.6 s, linear: it's ambient, not an event.
                     let phase = context.date.timeIntervalSinceReferenceDate
@@ -757,8 +915,6 @@ private struct Shimmer: ViewModifier {
                 .mask(content)
                 .allowsHitTesting(false)
             }
-        } else {
-            content
         }
     }
 }

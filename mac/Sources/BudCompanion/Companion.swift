@@ -34,6 +34,32 @@ enum InputPurpose: Equatable {
     }
 }
 
+/// One thing bud did on the way to its reply, in plain words.
+struct Step: Identifiable, Equatable {
+    /// The tool call it came from, and its place among that call's steps.
+    let id: String
+    let text: String
+    var done = false
+}
+
+/// How the bubble shows bud's steps while it works.
+enum StepsLayout: String, CaseIterable {
+    /// The status beside bud's name names the current step.
+    case line
+    /// Every step stays as a row; finished ones are ticked.
+    case checklist
+    /// The current step, with a faint count of how many so far.
+    case counted
+
+    var title: String {
+        switch self {
+        case .line: "Live line"
+        case .checklist: "Checklist"
+        case .counted: "Line and count"
+        }
+    }
+}
+
 struct ReplyMore: Equatable {
     var above = false
     var below = false
@@ -75,6 +101,18 @@ final class Companion {
     }
     /// When the status last changed: each state's animation starts at its first frame.
     var statusSince = Date.now
+    /// What bud has done so far in the current run, oldest first.
+    private(set) var steps: [Step] = []
+    /// The finished run's steps, for the summary above its reply (when that's turned on).
+    private(set) var lastSteps: [Step] = []
+    var stepsExpanded = false
+    var stepsLayout = StepsLayout(rawValue: UserDefaults.standard.string(forKey: "stepsLayout") ?? "") ?? .line {
+        didSet { UserDefaults.standard.set(stepsLayout.rawValue, forKey: "stepsLayout") }
+    }
+    /// Off by default: the reply is what matters, and the steps were the means to it.
+    var showStepsAfter = UserDefaults.standard.bool(forKey: "showStepsAfter") {
+        didSet { UserDefaults.standard.set(showStepsAfter, forKey: "showStepsAfter") }
+    }
     /// Counts new things needing you, so the pet can signal each arrival once.
     private(set) var arrivals = 0
     /// The line that stands in for a card once it's decided: "Sent", "Answered “Thursday”".
@@ -496,6 +534,9 @@ final class Companion {
             reply = ""
             // Job milestones belong to the turn they happened in.
             notices = []
+            steps = []
+            lastSteps = []
+            stepsExpanded = false
             activity = .working
             bubbleOpen = true
         case "run.started", "run.recovered":
@@ -507,10 +548,17 @@ final class Companion {
                 blocks.removeAll { $0.id.hasPrefix(request + ":") }
                 reply = blocks.map(\.text).joined(separator: "\n\n")
             }
+        case "tool.call":
+            addSteps(call: event.string("call_id"), tool: event.string("tool"),
+                     args: event.data["args"] as? [String: Any] ?? [:])
+        case "tool.result":
+            let call = event.string("call_id") + ":"
+            for index in steps.indices where steps[index].id.hasPrefix(call) { steps[index].done = true }
         case "text.delta":
             appendDelta(block: event.string("block"), text: event.string("text"))
         case "run.completed":
             finish(with: Self.replyText(event.data))
+            closeSteps()
             activity = .done
             react(.jumping)
             settleToIdle()
@@ -518,6 +566,7 @@ final class Companion {
         case "run.waiting":
             // The run is parked on the owner; the open approvals make the pet say so.
             finish(with: Self.replyText(event.data))
+            closeSteps()
             activity = .idle
             bubbleOpen = true
         case "approval.requested", "task.approval":
@@ -550,12 +599,14 @@ final class Companion {
             refreshApprovals()
         case "run.failed":
             let reason = event.string("reason")
+            closeSteps()
             reply = reason.isEmpty ? "The run failed." : "The run failed: \(reason)"
             showWhole()
             activity = .failed
             bubbleOpen = true
             refreshApprovals()
         case "run.cancelled":
+            closeSteps()
             activity = .idle
             refreshApprovals()
         case "task.created", "task.completed", "task.failed", "task.cancelled", "task.paused":
@@ -564,6 +615,22 @@ final class Companion {
         default:
             break
         }
+    }
+
+    /// A tool call's steps join the list. A step that repeats the one before (bud reading a
+    /// second email) doesn't add a row: the line already says it, and the run's end ticks it.
+    private func addSteps(call: String, tool: String, args: [String: Any]) {
+        for (index, text) in Activity.steps(tool: tool, args: args).enumerated() {
+            if steps.last?.text == text { continue }
+            steps.append(Step(id: "\(call):\(index)", text: text))
+        }
+    }
+
+    /// The run is over: its steps all count as done, and they move to the summary.
+    private func closeSteps() {
+        guard !steps.isEmpty else { return }
+        lastSteps = steps.map { Step(id: $0.id, text: $0.text, done: true) }
+        steps = []
     }
 
     private func appendDelta(block: String, text: String) {

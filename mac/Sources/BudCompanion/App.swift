@@ -31,6 +31,12 @@ private struct MenuContent: View {
             .keyboardShortcut("k")
         Button(delegate.petVisible ? "Hide pet" : "Show pet") { delegate.togglePet() }
         if companion.status == .working { Button("Stop", action: companion.stop) }
+        Divider()
+        Picker("Steps", selection: $companion.stepsLayout) {
+            ForEach(StepsLayout.allCases, id: \.self) { Text($0.title).tag($0) }
+        }
+        Toggle("Show bud's steps after replies", isOn: $companion.showStepsAfter)
+        Divider()
         Button("Reconnect") { companion.start() }
         SettingsLink { Text("Settings…") }
         Divider()
