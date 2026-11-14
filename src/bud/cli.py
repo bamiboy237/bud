@@ -27,6 +27,7 @@ from bud.world.store import World
 
 HOST = "127.0.0.1"
 PORT = 8420
+SHUTDOWN_SECONDS = 3
 DEFAULT_URL = f"http://{HOST}:{PORT}"
 
 
@@ -239,7 +240,9 @@ def _main(argv: list[str] | None = None) -> None:
         mode = "simulated tools" if args.simulate else "real accounts"
         print(f"Starting bud with {mode} at {DEFAULT_URL}.", flush=True)
         app = create_app(simulate=args.simulate, model_id=args.model)
-        uvicorn.run(app, host=HOST, port=PORT)
+        # Event streams never end on their own; without a limit, one connected client (TUI, Mac
+        # app) keeps a stopped server alive forever, holding bud.lock. Clients resume by seq.
+        uvicorn.run(app, host=HOST, port=PORT, timeout_graceful_shutdown=SHUTDOWN_SECONDS)
     elif args.command == "chat":
         if args.new and args.session:
             parser.error("Use either a session ID or --new, not both.")

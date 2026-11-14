@@ -274,6 +274,13 @@ def check_spiral(out: Outcome) -> list[str]:
     The pause is the strong outcome. A note that makes the model wrap up on its own, before
     any pause was needed, is the ladder working as designed, so it passes too.
     """
+    if re.match(r"Task \d+: ", out.answer):
+        # Delegated: the loop ran inside the job, and the job's report is the handoff. The
+        # work can't finish (the report never becomes ready), so "Delivered" would be false.
+        problems = [] if out.loops or out.notes else ["finished without any loop detection firing"]
+        if re.match(r"Task \d+: Delivered\b", out.answer):
+            problems.append(f"job claimed delivered for unfinishable work: {out.answer[:160]!r}")
+        return problems + no_writes(out) + no_approvals(out)
     if out.loops:
         handoff = out.answer.lower()
         problems = []
