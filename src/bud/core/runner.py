@@ -928,8 +928,11 @@ class Runner(DBOSConfiguredInstance):
             gap = time_gap_note(history_events, run)
             still_open = superseded_note(history_events, run)
             jobs = job_updates_note(history_events, run)
+            surface = surface_note(run)
             result = await self.agent.run(
-                (run["text"] + recalled + gap + still_open + jobs) if run["text"] else run["text"],
+                (run["text"] + recalled + gap + still_open + jobs + surface)
+                if run["text"]
+                else run["text"],
                 model=(
                     # Durable runs resolve pre-registered keys; local runs take the instance.
                     model_override
@@ -1271,6 +1274,18 @@ def superseded_note(events: list[Event], run: dict) -> str:
         + "\nIf this message replaces or cancels that, follow it. Otherwise handle this message "
         "and then return to the earlier request in the same reply.</still_open>"
     )
+
+
+# Channels whose screen changes how a reply should be written; the system prompt says how.
+STYLED_SURFACES = ("desktop", "imessage")
+
+
+def surface_note(run: dict) -> str:
+    """Names the screen the reply lands on, last in the prompt like the other notes."""
+    channel = (run.get("origin") or {}).get("channel")
+    if run.get("trigger") != "message" or channel not in STYLED_SURFACES:
+        return ""
+    return f"\n\n<surface>{channel}</surface>"
 
 
 def time_gap_note(events: list[Event], run: dict) -> str:

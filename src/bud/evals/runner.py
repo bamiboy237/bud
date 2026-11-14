@@ -71,6 +71,8 @@ class Attempt:
     held: list[dict] = field(default_factory=list)
     # Every review the model made. Calls settled by a session grant skip the model.
     scored: list[dict] = field(default_factory=list)
+    # bud's last reply, saved so a failure can be read without rerunning the task.
+    answer: str = ""
 
 
 def failure_reason(events: list[Event]) -> str | None:
@@ -284,6 +286,7 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
         task=task.id,
         passed=not problems,
         problems=problems,
+        answer=outcome.answer,
         seconds=perf_counter() - started,
         cost_usd=cost,
         tokens=tokens,
