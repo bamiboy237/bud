@@ -6,8 +6,15 @@ struct BudCompanionApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
-        MenuBarExtra("bud", systemImage: "pawprint") {
+        MenuBarExtra {
             MenuContent(delegate: delegate)
+        } label: {
+            // The pet itself, so bud is one character everywhere; the paw when none is installed.
+            if let icon = PetSprite.named(Companion.shared.petID)?.icon(height: 18) {
+                Image(nsImage: icon)
+            } else {
+                Image(systemName: "pawprint")
+            }
         }
         Settings { SettingsView() }
     }
@@ -51,7 +58,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let companion = Companion.shared
-        let panel = PetPanel(root: PetView(companion: companion) { [weak self] in self?.focusPanel() })
+        let panel = PetPanel(root: PetView(companion: companion) { [weak self] in self?.focusPanel() }) {
+            companion.anchor = $0
+        }
         panel.orderFrontRegardless()
         self.panel = panel
         companion.start()

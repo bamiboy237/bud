@@ -1,29 +1,30 @@
 import AppKit
 import SwiftUI
 
-/// macOS vibrancy that stays vibrant. SwiftUI's materials follow the window's key state, and a
-/// floating panel is almost never key, so they fall back to a flat grey. This pins the material
-/// to its active look.
-struct Vibrancy: NSViewRepresentable {
-    var material: NSVisualEffectView.Material = .popover
+/// bud's surfaces are paper, not glass: a warm off-white with near-black ink, and the reverse in
+/// dark mode. Colour is left to the pet, so the interface itself stays quiet.
+enum Paper {
+    static let surface = dynamic(light: 0xFBFAF7, dark: 0x22211F)
+    static let ink = dynamic(light: 0x1C1B1B, dark: 0xEDEBE6)
+    static let hairline = ink.opacity(0.12)
 
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material = material
-        view.blendingMode = .behindWindow
-        view.state = .active
-        return view
-    }
-
-    func updateNSView(_ view: NSVisualEffectView, context: Context) {
-        view.material = material
+    private static func dynamic(light: UInt32, dark: UInt32) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let hex = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
+            return NSColor(
+                srgbRed: CGFloat(hex >> 16 & 0xFF) / 255, green: CGFloat(hex >> 8 & 0xFF) / 255,
+                blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
+        })
     }
 }
 
 extension View {
-    /// A vibrant surface with a hairline edge, clipped to `shape`.
-    func surface<S: InsettableShape>(_ shape: S, material: NSVisualEffectView.Material = .popover) -> some View {
-        background(Vibrancy(material: material).clipShape(shape))
-            .overlay(shape.strokeBorder(.primary.opacity(0.1), lineWidth: 0.5))
+    /// A paper surface with a hairline edge and a soft lift, shaped by `shape`. The lift is what
+    /// separates a surface floating over other apps from whatever is behind it.
+    func surface<S: Shape>(_ shape: S, lift: CGFloat = 1) -> some View {
+        background(shape.fill(Paper.surface))
+            .overlay(shape.stroke(Paper.hairline, lineWidth: 0.5))
+            .shadow(color: .black.opacity(0.05 * lift), radius: 1, y: 0.5)
+            .shadow(color: .black.opacity(0.10 * lift), radius: 16 * lift, y: 6 * lift)
     }
 }

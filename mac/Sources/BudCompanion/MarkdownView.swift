@@ -44,7 +44,8 @@ private struct Block: View {
     var body: some View {
         switch markup {
         case let heading as Heading:
-            prose(inline(heading), font: heading.level <= 2 ? .headline : .subheadline.weight(.semibold))
+            // Headings share bud's name typeface, so its voice reads as one hand.
+            prose(inline(heading), font: .system(size: heading.level <= 2 ? 15 : 13.5, weight: .semibold, design: .serif))
                 .padding(.top, 2)
         case let paragraph as Paragraph:
             prose(inline(paragraph))
@@ -93,11 +94,20 @@ private struct ListBlock: View {
                 // The marker sits in its own column, so wrapped lines align with the text.
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
                     marker(index, item)
-                        .frame(width: Metrics.marker, alignment: start == nil ? .center : .trailing)
+                        .fixedSize()
+                        .frame(width: markerWidth, alignment: start == nil ? .center : .trailing)
                     Blocks(blocks: Array(item.children), spacing: Metrics.item)
                 }
             }
         }
+    }
+
+    /// Wide enough for the longest number in the list ("12."), so every marker fits on one
+    /// line and the items stay aligned. Body digits are about 7.5 pt; the period about 4.
+    private var markerWidth: CGFloat {
+        guard let start else { return Metrics.marker }
+        let digits = String(start + max(items.count - 1, 0)).count
+        return max(Metrics.marker, CGFloat(digits) * 7.5 + 5)
     }
 
     @ViewBuilder

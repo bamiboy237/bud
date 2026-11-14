@@ -17,6 +17,35 @@ enum PetStatus: String {
     }
 }
 
+/// What the text you type is for: a new message, or a reply to something bud is waiting on.
+enum InputPurpose: Equatable {
+    case ask
+    /// Your own answer to a question, when none of its options fit.
+    case answer(String)
+    /// Instead of approving an action: what bud should change before trying again.
+    case revise(String)
+
+    var prompt: String {
+        switch self {
+        case .ask: "Ask bud…"
+        case .answer: "Your answer…"
+        case .revise: "What should change?"
+        }
+    }
+}
+
+struct ReplyMore: Equatable {
+    var above = false
+    var below = false
+}
+
+/// What a decided card leaves behind for a moment, so a decision never vanishes unconfirmed.
+struct Receipt: Equatable {
+    let id = UUID()
+    let text: String
+    let symbol: String
+}
+
 enum Link: Equatable {
     case connecting
     case connected
@@ -46,13 +75,36 @@ final class Companion {
     }
     /// When the status last changed: each state's animation starts at its first frame.
     var statusSince = Date.now
+    /// Counts new things needing you, so the pet can signal each arrival once.
+    private(set) var arrivals = 0
+    /// The line that stands in for a card once it's decided: "Sent", "Answered “Thursday”".
+    private(set) var receipt: Receipt?
     /// Which pet to show; a missing pet falls back to the paw.
     let petID = UserDefaults.standard.string(forKey: "pet") ?? "dog"
-    var reply = ""
+    /// The reply as received so far. The bubble shows `shown`, which follows it at a reading
+    /// pace: the stream arrives in bursts, and a burst dumped at once can't be read.
+    var reply = "" {
+        didSet { pace() }
+    }
+    private(set) var shown = ""
+    /// What's waiting on the owner, oldest first, with enough detail to decide in the bubble.
+    private(set) var approvals: [Approval] = []
+    /// Decisions sent and not yet confirmed: their buttons stay disabled, so one click is one call.
+    private(set) var deciding: Set<String> = []
+    /// Why the last decision didn't go through, shown on the card.
+    private(set) var decisionProblem: String?
+    /// The approval whose full text is open on the card; others show a short preview.
+    var expandedApproval: String?
+    /// What the input field's text is for.
+    var inputPurpose: InputPurpose = .ask
+    /// Which side of the pet the bubble opens on, set by the panel as the pet is moved.
+    var anchor = Anchor()
     var bubbleOpen = false
     var bubbleHovered = false
     /// The reply text's laid-out height, so the bubble can hug it.
     var replyHeight: CGFloat = 0
+    /// Whether a scrolled reply has more text above or below what's visible.
+    var replyMore: ReplyMore = .init()
     var inputOpen = false
     var draft = ""
     /// Short job milestones (started, needs you, finished). Progress notes never come here.
@@ -79,6 +131,14 @@ final class Companion {
     @ObservationIgnored private var retryDelay: Duration = .seconds(1)
     @ObservationIgnored private var sentAt: ContinuousClock.Instant?
     @ObservationIgnored private var settle: Task<Void, Never>?
+    @ObservationIgnored private var pacer: Task<Void, Never>?
+    /// True while the pet is being dragged, so letting go doesn't count as a click.
+    @ObservationIgnored var dragging = false
+    /// Which way the pet walks while you carry it; nil when it isn't moving.
+    private(set) var walk: (row: PetRow, since: Date)?
+    @ObservationIgnored private var lastPointerX: CGFloat?
+    /// A short gesture the pet plays over its status (a wave, a hop), then drops.
+    @ObservationIgnored private var reaction: (row: PetRow, since: Date)?
 
     /// Connect (or reconnect after a settings change): handshake, primary session, snapshot, stream.
     func start() {
@@ -144,6 +204,36 @@ final class Companion {
         } else {
             reply = ""
         }
+        // An old reply isn't news: it appears whole.
+        showWhole()
+        // Something already waiting on you is shown, not left behind the dot.
+        if !approvals.isEmpty { bubbleOpen = true }
+    }
+
+    /// Moves `shown` toward `reply`. The step grows with the backlog, so a long burst eases in
+    /// over about a second instead of landing at once, and a slow stream is shown as it comes.
+    private func pace() {
+        if !reply.hasPrefix(shown) {
+            // The reply was replaced (a new turn, a replayed step): keep only what still holds.
+            shown = String(reply.commonPrefix(with: shown))
+        }
+        guard pacer == nil, shown.count < reply.count else { return }
+        pacer = Task {
+            while !Task.isCancelled {
+                let backlog = reply.count - shown.count
+                if backlog <= 0 { break }
+                shown = String(reply.prefix(shown.count + max(3, backlog / 30)))
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+            // A cancelled pacer was already replaced; only a finished one clears its slot.
+            if !Task.isCancelled { pacer = nil }
+        }
+    }
+
+    private func showWhole() {
+        pacer?.cancel()
+        pacer = nil
+        shown = reply
     }
 
     private func showStatus() {
@@ -157,7 +247,16 @@ final class Companion {
         guard at >= seenSeq else { return }
         seenSeq = at
         let pending = snapshot["pending_approvals"] as? [[String: Any]] ?? []
-        openApprovals = Set(pending.compactMap { $0["approval_id"] as? String })
+        var jobs: [Int: String] = [:]
+        for task in snapshot["tasks"] as? [[String: Any]] ?? [] {
+            if let id = task["task_id"] as? Int { jobs[id] = task["title"] as? String }
+        }
+        approvals = pending.compactMap { Approval($0, jobs: jobs) }
+        closeStaleInput()
+        if !Set(approvals.map(\.id)).isSubset(of: openApprovals) { arrivals += 1 }
+        openApprovals = Set(approvals.map(\.id))
+        deciding.formIntersection(openApprovals)
+        if approvals.isEmpty { decisionProblem = nil }
         approvalPoll?.cancel()
         // A job approval answered in another interface sends nothing to this stream, so
         // check again while one is open.
@@ -185,6 +284,18 @@ final class Companion {
     func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, let connection else { return }
+        switch inputPurpose {
+        case .answer(let id):
+            respond(to: id, path: "answer", body: ["text": text])
+            return
+        case .revise(let id):
+            respond(to: id, path: "revise", body: [
+                "text": text, "message_id": UUID().uuidString.replacingOccurrences(of: "-", with: ""),
+            ])
+            return
+        case .ask:
+            break
+        }
         draft = ""
         inputOpen = false
         reply = ""
@@ -209,6 +320,7 @@ final class Companion {
                 // bud runs it at most once.
                 activity = .failed
                 reply = "Couldn't send: \(error)"
+                showWhole()
                 if draft.isEmpty {
                     draft = text
                     unsent = (text, messageID)
@@ -221,6 +333,136 @@ final class Companion {
     func stop() {
         guard let connection else { return }
         Task { _ = try? await connection.send("POST", "sessions/\(session)/stop", json: [:]) }
+    }
+
+    // MARK: The pet's body language
+
+    /// The row to play right now: carried, then a gesture in progress, then the status.
+    func pose(at now: Date) -> (row: PetRow, since: Date) {
+        if let walk { return walk }
+        if let reaction, now < reaction.since + Double(reaction.row.loopMs) / 1000 {
+            return reaction
+        }
+        return (PetRow.of(status), statusSince)
+    }
+
+    /// Plays `row` once over the status, unless the pet is busy being carried.
+    func react(_ row: PetRow) {
+        guard walk == nil else { return }
+        reaction = (row, .now)
+    }
+
+    /// A wave when you point at the pet, but only when it has nothing else to show.
+    func greet() {
+        guard status == .idle || status == .done else { return }
+        if let reaction, Date.now < reaction.since + 2 { return }
+        react(.waving)
+    }
+
+    /// The pet walks the way it's being carried. Direction changes need a few points of
+    /// movement, so a wobbly hand doesn't make it flip back and forth.
+    func carry(pointerX: CGFloat) {
+        guard let last = lastPointerX else {
+            lastPointerX = pointerX
+            return
+        }
+        let dx = pointerX - last
+        guard abs(dx) >= 3 else { return }
+        lastPointerX = pointerX
+        let row: PetRow = dx > 0 ? .walkRight : .walkLeft
+        if walk?.row.index != row.index { walk = (row, .now) }
+    }
+
+    func setDown() {
+        walk = nil
+        lastPointerX = nil
+    }
+
+    /// Yes or no on an action. A job's approval goes through this session too: bud finds the job.
+    func decide(_ id: String, approved: Bool) {
+        respond(to: id, path: nil, body: ["approved": approved])
+    }
+
+    /// Opens the field to answer a question in your own words, or to say what should change.
+    func write(_ purpose: InputPurpose) {
+        inputPurpose = purpose
+        draft = ""
+        inputOpen = true
+    }
+
+    /// Choosing one of a question's options sends it as the answer, word for word.
+    func choose(_ choice: String, for id: String) {
+        respond(to: id, path: "answer", body: ["text": choice])
+    }
+
+    /// A field opened to answer or revise something that's since been settled (in another
+    /// interface, say) has nothing left to reply to.
+    private func closeStaleInput() {
+        let target: String? = switch inputPurpose {
+        case .answer(let id), .revise(let id): id
+        case .ask: nil
+        }
+        guard let target, !approvals.contains(where: { $0.id == target }) else { return }
+        inputPurpose = .ask
+        inputOpen = false
+        draft = ""
+    }
+
+    private func showReceipt(for approval: Approval, path: String?, approved: Bool?, answer: String) {
+        let receipt: Receipt
+        switch (path, approved) {
+        case ("answer", _):
+            receipt = Receipt(text: "Answered “\(answer.prefix(60))”", symbol: "checkmark")
+        case ("revise", _):
+            receipt = Receipt(text: "Sent back with your changes", symbol: "arrow.uturn.backward")
+        case (_, true):
+            receipt = Receipt(text: approval.done, symbol: "checkmark")
+        default:
+            receipt = Receipt(text: "Denied. Nothing was done", symbol: "xmark")
+        }
+        self.receipt = receipt
+        if receipt.symbol == "checkmark" { react(.jumping) }
+        Task {
+            try? await Task.sleep(for: .seconds(1.8))
+            if self.receipt == receipt { self.receipt = nil }
+        }
+    }
+
+    private func respond(to id: String, path: String?, body: [String: any Sendable]) {
+        guard let connection, !deciding.contains(id) else { return }
+        deciding.insert(id)
+        decisionProblem = nil
+        let route = "sessions/\(session)/approvals/\(id)" + (path.map { "/\($0)" } ?? "")
+        // Typed in the field (an answer or a change), as opposed to a button or an option.
+        let typed = inputPurpose == .ask ? "" : draft
+        if inputPurpose != .ask {
+            draft = ""
+            inputOpen = false
+            inputPurpose = .ask
+        }
+        let approval = approvals.first { $0.id == id }
+        let answer = (body["text"] as? String) ?? typed
+        Task {
+            do {
+                _ = try await connection.send("POST", route, json: Self.payload(body))
+                if let approval {
+                    showReceipt(for: approval, path: path, approved: body["approved"] as? Bool, answer: answer)
+                }
+                // Gone from the card at once; the snapshot confirms and brings the next one.
+                approvals.removeAll { $0.id == id }
+                openApprovals.remove(id)
+            } catch {
+                decisionProblem = "That didn't go through: \(error)"
+                if !typed.isEmpty {
+                    // Keep what was typed, so trying again is one Return.
+                    inputPurpose = path == "answer" ? .answer(id) : .revise(id)
+                    draft = typed
+                    inputOpen = true
+                }
+            }
+            deciding.remove(id)
+            refreshApprovals()
+        }
     }
 
     // MARK: Events
@@ -252,6 +494,8 @@ final class Companion {
             blocks = []
             seenRequests = []
             reply = ""
+            // Job milestones belong to the turn they happened in.
+            notices = []
             activity = .working
             bubbleOpen = true
         case "run.started", "run.recovered":
@@ -268,6 +512,7 @@ final class Companion {
         case "run.completed":
             finish(with: Self.replyText(event.data))
             activity = .done
+            react(.jumping)
             settleToIdle()
             refreshApprovals()
         case "run.waiting":
@@ -276,16 +521,37 @@ final class Companion {
             activity = .idle
             bubbleOpen = true
         case "approval.requested", "task.approval":
-            // Only the id: a job's approval must not touch the main chat's reply.
-            let id = event.string("approval_id")
-            if !id.isEmpty { openApprovals.insert(id) }
+            // Onto the card at once, from the event itself; the snapshot then confirms it. A
+            // job's approval goes on the card too, but never touches the main chat's reply.
+            let jobs = (event.data["task_id"] as? Int).map { [$0: event.string("title")] } ?? [:]
+            if let approval = Approval(event.data, jobs: jobs),
+               !approvals.contains(where: { $0.id == approval.id })
+            {
+                approvals.append(approval)
+                openApprovals.insert(approval.id)
+                arrivals += 1
+            }
             bubbleOpen = true
-            if event.type == "task.approval" { refreshApprovals() }
+            refreshApprovals()
         case "approval.granted", "approval.denied", "approval.parked", "question.answered":
+            // Decided somewhere else (the terminal, another device): the card still closes
+            // with a receipt. A decision made here is in `deciding`, and `respond` shows it.
+            let id = event.string("approval_id")
+            if event.type != "approval.parked", !deciding.contains(id),
+               let approval = approvals.first(where: { $0.id == id })
+            {
+                showReceipt(
+                    for: approval, path: event.type == "question.answered" ? "answer" : nil,
+                    approved: event.type == "approval.granted", answer: event.string("text"))
+                approvals.removeAll { $0.id == id }
+                openApprovals.remove(id)
+                closeStaleInput()
+            }
             refreshApprovals()
         case "run.failed":
             let reason = event.string("reason")
             reply = reason.isEmpty ? "The run failed." : "The run failed: \(reason)"
+            showWhole()
             activity = .failed
             bubbleOpen = true
             refreshApprovals()
@@ -323,7 +589,20 @@ final class Companion {
     }
 
     private func notice(_ event: BudEvent) {
-        let text = event.string("text").isEmpty ? event.string("title") : event.string("text")
+        // A job's own words when it sent some; otherwise what happened to it, by name.
+        var text = event.string("text")
+        let title = event.string("title")
+        if text.isEmpty, !title.isEmpty {
+            let happened = switch event.type {
+            case "task.created": "Started"
+            case "task.completed": "Finished"
+            case "task.failed": "Couldn't finish"
+            case "task.cancelled": "Stopped"
+            case "task.paused": "Paused"
+            default: "Job"
+            }
+            text = "\(happened) “\(title)”"
+        }
         guard !text.isEmpty else { return }
         notices.append(String(text.prefix(160)))
         notices = Array(notices.suffix(3))
@@ -336,6 +615,14 @@ final class Companion {
             try? await Task.sleep(for: .seconds(6))
             if !Task.isCancelled, activity == .done { activity = .idle }
         }
+    }
+
+    /// A decision's body, with the origin bud records for it. Built outside the main actor, so
+    /// the dictionary is free to hand to the connection under Swift 6 checking.
+    nonisolated private static func payload(_ body: [String: any Sendable]) -> [String: Any] {
+        var json: [String: Any] = body.mapValues { $0 as Any }
+        json["origin"] = BudConnection.origin
+        return json
     }
 
     /// The assistant's text from a stored run end, the same rule the TUI uses.
