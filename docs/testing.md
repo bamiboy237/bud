@@ -2,8 +2,8 @@
 
 Bud has two kinds of tests, kept apart on purpose:
 
-- **Behavior tests** in `tests/`. Offline, deterministic, and free. CI runs them on every push
-  and pull request.
+- **Behavior tests** in `tests/`. Offline, deterministic, and free. CI runs them on every pull
+  request and on pushes to `master`.
 - **Real-model evals** in `src/bud/evals/`. They call real models, cost money, and run only when
   a developer starts them by hand.
 
@@ -47,8 +47,28 @@ against the same data directory. They use a real DBOS runtime and SQLite, not mo
 Concurrent agents and concurrent tests must not share writable state or ports.
 
 - **State.** `DATA_DIR` is the only writable root. A fixture points it at a per-test temporary
-  directory before the app is built. `bud.db`, `runtime.db`, `*.lock`, and `approval-mode.json`
-  all live under it.
+  directory before the app is built. The app creates `bud.db`, `runtime.db`, `bud.lock`,
+  `world.db`, `world-recall.db`, `auth/`, `skills/`, and `workspace/` under it.
+- **Resolve the path.** `create_app` refuses symlinked path components. On macOS `/tmp` and
+  `/var` are symlinks, so pass `tmp_path.resolve()`; a raw temp path fails with
+  `NotADirectoryError`.
+- **Model config.** `create_app` needs a model for the `fast` tier and raises
+  `NoModelAvailable` without one. Point `MODELS_FILE` at a local stub so no key is needed:
+
+  ```toml
+  [[models]]
+  provider = "local"
+  name = "stub"
+  tier = "fast"
+  billing = "local"
+  base_url = "http://127.0.0.1:9/v1"
+  protocol = "chat"
+  supports_tools = true
+  ```
+
+- **Owner token.** The app writes `DATA_DIR/auth/owner.token` (0600, in a 0700 directory).
+  API tests send it as a bearer token, or set `OWNER_TOKEN` to their own base64url secret of
+  43 to 256 characters.
 - **Settings cache.** `get_settings()` is `lru_cache`d. Clear the cache after changing the
   environment, or the first settings object wins for the rest of the process.
 - **Ports.** `bud serve` binds a fixed `127.0.0.1:8420`. Tests bind port 0 to get a free port from
@@ -62,8 +82,9 @@ Concurrent agents and concurrent tests must not share writable state or ports.
 pytest configuration lives in `[tool.pytest.ini_options]` in `pyproject.toml`:
 
 - `asyncio_mode = "auto"`: plain `async def` tests run without a marker.
-- `timeout = 120`: a hung test fails by name instead of holding the CI job. Override with
-  `uv run pytest --timeout=300` for a slow local run.
+- `timeout = 120`: a hung test fails by name instead of holding the CI job. The default
+  `signal` method raises inside the test, so `try/finally` cleanup still runs and child
+  processes are killed. Override with `uv run pytest --timeout=300` for a slow local run.
 - `--strict-markers` and `--strict-config`: a typo in a marker or an ini key fails the run.
   Register a new marker under `markers` in `pyproject.toml` before using it.
 
@@ -93,8 +114,10 @@ CI has no model keys. Every job must pass without one.
 
 ## Real-model evals
 
-Evals check judgment and tool use against the simulated world. They use the real gateway, so
-every request is billed to your key or subscription and recorded in `bud costs`.
+Evals check judgment and tool use against the simulated world. Model requests use the real
+gateway, so they are billed to your key or subscription and recorded in `bud costs`. Web reads
+replay from `data/evals/web-cassette.json`; a cache miss calls Exa live and needs
+`EXA_API_KEY`.
 
 ```sh
 uv run bud eval --trials 1 --task move_dana
@@ -102,15 +125,15 @@ uv run bud eval --trials 3
 uv run bud eval --probe --trials 5
 ```
 
-- `--trials` defaults to 3 over all 33 tasks, so one command can make about 99 attempts.
+- `--trials` defaults to 3 over all 33 tasks, so one command can make 99 attempts.
 - `--task <id>` limits the run to one task. `--mode strict` is the default; `--mode auto` also
   exercises the approval reviewer.
 - `--probe` tests the approval reviewer on hand-written calls instead of the task suite.
 
 **There is no spend-cap flag.** Bound the cost by choosing `--trials` and `--task`, and check
 `uv run bud costs` before and after. Each attempt stops after 180 seconds, and at most 4 attempts
-run at once, so a run cannot hang forever; it can still cost more than you expect on a large
-suite. Evals never run in CI, and no scheduled job runs them.
+run at once. A large suite can still cost more than you expect. Evals never run in CI, and no
+scheduled job runs them.
 
-Evals need `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, or a ChatGPT login. See `.env.example` for the
-variable names and `docs/accounts.md` for account setup.
+Evals need `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `MUSE_API_KEY`, `MISTRAL_API_KEY`, or a ChatGPT
+login. See `.env.example` for the variable names and `docs/accounts.md` for account setup.
