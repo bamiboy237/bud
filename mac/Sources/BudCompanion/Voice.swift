@@ -113,6 +113,11 @@ final class Voice {
     private func press() {
         switch state {
         case .ready:
+            // One held recording at a time: a second can't replace words not yet sent.
+            guard Companion.shared.unsentSpeech == nil else {
+                Companion.shared.nudge("Send or clear the words bud is holding first.")
+                return
+            }
             begin()
         case .off, .failed:
             Companion.shared.nudge("Voice isn't set up yet. Choose Set up voice… in the menu bar.")
