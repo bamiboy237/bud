@@ -33,28 +33,38 @@ with `uv add` or `uv add --dev` and commit the updated lock.
 
 | Area | What it proves |
 | :--- | :--- |
-| Runner and API | Events, projections, approvals, and HTTP routes behave as specified |
-| Gateway and reviewer | Routing, fallback, and approval-review decisions |
-| Workspace | Path rules, revisions, and claim replay |
-| Recovery | A real server process restarts and resumes durable state |
+| Runner and API | Denied, stale, wrong-session, and duplicate approvals; revisions; cancellation; authentication and input limits |
+| Gateway and reviewer | Availability fallback, pinned and local routes, malformed reviews, refusals, and timeouts |
+| Workspace | Traversal and symlink refusal, revision conflicts, and exact-argument claim replay |
+| Recovery | Pending approvals survive restart; interrupted workspace writes resume or report failure without a second write |
 | Packaging | The wheel and sdist install with locked deps and load their resources |
 
 Recovery tests start a real `create_app` server in a child process, kill it, and start it again
-against the same data directory. They use a real DBOS runtime and SQLite, not mocks.
+against the same data directory. They use real DBOS, SQLite, and workspace tools with a
+scripted model. The three crash checkpoints assert these outcomes:
+
+| Crash point | Expected result after restart |
+| :--- | :--- |
+| Before the dispatch claim | The approved file is saved with one claim |
+| After the claim is fsynced, before the file is saved | The file stays absent and the job reports not delivered |
+| After the file is saved, before the tool returns | The saved file is recovered without changing its inode or modification time |
+
+These checkpoints test workspace recovery. They do not establish delivery guarantees for
+external email or calendar services.
 
 ## Isolation
 
 Concurrent agents and concurrent tests must not share writable state or ports.
 
-- **State.** `DATA_DIR` is the only writable root. A fixture points it at a per-test temporary
-  directory before the app is built. The app creates `bud.db`, `runtime.db`, `bud.lock`,
-  `world.db`, `world-recall.db`, `auth/`, `skills/`, and `workspace/` under it.
+- **State.** Each server gets its own temporary `DATA_DIR`. Direct runner and tool tests also
+  use temporary databases and workspaces. The fixture clears inherited settings and changes
+  the working directory so the developer's `.env` is not loaded.
 - **Resolve the path.** `create_app` refuses symlinked path components. On macOS `/tmp` and
   `/var` are symlinks, so pass `tmp_path.resolve()`; a raw temp path fails with
   `NotADirectoryError`.
 - **Model config.** `create_app` needs a model for the `fast` tier and raises
   `NoModelAvailable` without one. Tests patch the gateway with a pydantic-ai `FunctionModel`, so
-  no key is configured and no request leaves the process.
+  no model-provider request leaves the test environment.
 - **Owner token.** The app writes `DATA_DIR/auth/owner.token` (0600, in a 0700 directory).
   API tests send it as a bearer token, or set `OWNER_TOKEN` to their own base64url secret of
   43 to 256 characters.
@@ -64,9 +74,9 @@ Concurrent agents and concurrent tests must not share writable state or ports.
   the OS, then pass the socket to uvicorn. Two agents can then run the suite at the same time.
 - **Child processes.** Kill every child in a `finally` block. A leaked server holds
   `live-server.lock` in its data directory and blocks the next start.
-- **Offline.** No test reaches a model, Composio, Photon, or Exa API. `ALLOW_MODEL_REQUESTS` is
-  `False` for the suite and the approval reviewer stays off, so a test that tries to call a model
-  fails instead of spending money.
+- **Offline.** `tests/offline.py` disables paid model requests and blocks external TCP, DNS,
+  and UDP traffic. Both pytest and child servers use this guard. Reviewer tests use fake HTTP
+  responses. Other app tests disable the live reviewer.
 
 pytest configuration lives in `[tool.pytest.ini_options]` in `pyproject.toml`:
 
@@ -89,9 +99,9 @@ pytest configuration lives in `[tool.pytest.ini_options]` in `pyproject.toml`:
 | `tui` | Rust format, clippy, and tests, when `tui/Cargo.toml` exists |
 | `mac` | Swift tests and the packaged app, on macOS |
 
-The `package` job catches a missing package file, an undeclared runtime dependency, or a
-resource that only exists in the checkout. It installs from `$RUNNER_TEMP`, outside the
-checkout, with the versions `uv export` takes from the lock. Run it locally with:
+The `package` job checks installation and loads the bundled prompt, policy, model registry,
+and world seed. It runs outside the checkout with locked runtime dependencies. For a
+wheel-only smoke check:
 
 ```sh
 uv build --out-dir dist
@@ -118,7 +128,7 @@ uv run bud eval --trials 3
 uv run bud eval --probe --trials 5
 ```
 
-- `--trials` defaults to 3 over all 33 tasks, so one command can make 99 attempts.
+- `--trials` defaults to 3 attempts per task.
 - `--task <id>` limits the run to one task. `--mode strict` is the default; `--mode auto` also
   exercises the approval reviewer.
 - `--probe` tests the approval reviewer on hand-written calls instead of the task suite.
@@ -128,7 +138,6 @@ uv run bud eval --probe --trials 5
 default, and at most 4 attempts run at once. A large suite can still cost more than you expect.
 Evals never run in CI, and no scheduled job runs them.
 
-Evals need `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `MUSE_API_KEY`, `MISTRAL_API_KEY`, or a ChatGPT
-login, plus `EXA_API_KEY` for a web-cache miss. `.env.example` lists `OPENAI_API_KEY`,
-`DEEPSEEK_API_KEY`, and `MISTRAL_API_KEY`; set `MUSE_API_KEY` and `EXA_API_KEY` in your own
-`.env` when you use them. See `docs/accounts.md` for account setup.
+Supply model credentials through environment variables, an ignored `.env`, or ChatGPT login.
+Auto-mode evals and `--probe` also need `OPENAI_API_KEY` and approval review enabled.
+Web-cache misses need `EXA_API_KEY`. See `docs/accounts.md` for account setup.

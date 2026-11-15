@@ -37,8 +37,9 @@ Procedure, the Rust and macOS commands, and the `ty` baseline policy are in
 
 ## Tests
 
-Behavior tests live in `tests/` and run offline: no model, account, or network
-calls. Real-model evals are manual and cost money; they never run in CI.
+Behavior tests live in `tests/` and run offline: no real model or account calls,
+and only loopback network access. Real-model evals are manual and cost money;
+they never run in CI.
 
 Isolate each test: point `DATA_DIR` at a temp directory and bind port 0. `bud serve`
 binds a fixed `127.0.0.1:8420`, so tests start their own server instead.
