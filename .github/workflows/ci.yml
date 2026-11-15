@@ -139,41 +139,22 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
 
-  # swift-markdown requires Swift 6.2 (Xcode 26). Tests and the packaged app build in
-  # parallel: each compiles the same dependencies, and running them one after another
-  # made the job wait for two full release builds. The cache restores package checkouts
-  # and binary artifacts, keyed on the resolved dependency set.
-  mac-test:
+  # swift-markdown requires Swift 6.2 (Xcode 26). The release build compiles the
+  # dependencies once and the tests reuse them, so tests and packaging share one job.
+  # Pull requests run the tests; pushes to master also assemble and sign the app, which
+  # is the slow second build. Splitting the job made both halves compile every
+  # dependency from scratch, so it stays together.
+  mac:
     runs-on: macos-26
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            mac/.build/checkouts
-            mac/.build/artifacts
-            ~/Library/Caches/org.swift.swiftpm
-          key: spm-macos26-${{ hashFiles('mac/Package.resolved') }}
-          restore-keys: spm-macos26-
       - run: swift --version
       - run: swift test -c release --package-path mac
-
-  mac-package:
-    runs-on: macos-26
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            mac/.build/checkouts
-            mac/.build/artifacts
-            ~/Library/Caches/org.swift.swiftpm
-          key: spm-macos26-${{ hashFiles('mac/Package.resolved') }}
-          restore-keys: spm-macos26-
-      - run: ./mac/build.sh
+      - if: github.event_name == 'push'
+        run: ./mac/build.sh
       - name: Verify bundled dog
+        if: github.event_name == 'push'
         run: |
           for source in mac/Resources/pets/dog/*; do
             cmp "$source" "mac/build/bud.app/Contents/Resources/pets/dog/${source##*/}"
