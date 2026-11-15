@@ -41,10 +41,6 @@ struct ApprovalLayoutTests {
         #expect(host.fittingSize.height <= PetPanel.size.height)
         if let directory = ProcessInfo.processInfo.environment["BUD_APPROVAL_SNAPSHOTS"] {
             try snapshot(host, to: URL(filePath: directory).appending(path: "approval-long.png"))
-            host.layoutSubtreeIfNeeded()
-            try await Task.sleep(for: .milliseconds(150))
-            host.layoutSubtreeIfNeeded()
-            try snapshot(host, to: URL(filePath: directory).appending(path: "approval-archive.png"))
             host.appearance = NSAppearance(named: .darkAqua)
             host.layoutSubtreeIfNeeded()
             try await Task.sleep(for: .milliseconds(150))

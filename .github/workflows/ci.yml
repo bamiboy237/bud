@@ -49,7 +49,7 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked
-      # The JUnit file is the failure artifact; the test selection is unchanged.
+      # The JUnit file is the failure artifact; the test selection matches `uv run pytest`.
       - run: uv run pytest --junitxml=test-results/junit.xml
       - name: Upload test results
         if: failure()
