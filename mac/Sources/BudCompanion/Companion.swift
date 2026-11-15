@@ -413,7 +413,8 @@ final class Companion {
         lastFirstText = nil
         let messageID = heldID ?? (unsent?.text == text
             ? unsent!.id : UUID().uuidString.replacingOccurrences(of: "-", with: ""))
-        unsent = nil
+        // A typed message waiting for its retry keeps its id; speech never clears it.
+        if spoken == nil { unsent = nil }
         Task {
             do {
                 // Built here: a [String: Any] can't cross into the task under Swift 6 checking.
