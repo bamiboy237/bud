@@ -177,7 +177,12 @@ def _create_app(
         else "not_configured"
     }
     if not simulate:
-        from bud.composio.tools import PROFILE, READ_TOOLS, build_toolset, policy
+        from bud.composio.tools import (
+            PROFILE,
+            READ_TOOLS,
+            build_composio_toolset,
+            policy,
+        )
 
         connections = Connections(settings)
         binding = connections.capture_binding()
@@ -202,7 +207,7 @@ def _create_app(
         def account_toolset() -> CombinedToolset[None]:
             return CombinedToolset(
                 [
-                    build_toolset(connections, connections.accounts(), session_dir),
+                    build_composio_toolset(connections, connections.accounts(), session_dir),
                     build_web_tools(settings),
                     workspace_tools(session_dir),
                     build_setup_toolset(setup, setup_journal, refresh=refresh_tools),

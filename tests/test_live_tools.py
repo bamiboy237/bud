@@ -1,10 +1,11 @@
 """Tools can be replaced between runs without rebuilding the agent."""
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, Tool
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.toolsets import FunctionToolset
 
+from bud.composio.tools import compose_tools
 from bud.gateway.registry import ModelSpec, Registry
 from bud.harness.actions import Policy
 from bud.harness.agent import Harness
@@ -34,6 +35,28 @@ def tool(name: str):
 
     run.__name__ = name
     return run
+
+
+async def test_app_tools_are_deferred_and_bud_tools_stay_visible():
+    seen: list[list[str]] = []
+
+    def respond(messages, info):
+        seen.append(sorted(definition.name for definition in info.function_tools))
+        return ModelResponse(parts=[TextPart("ok")])
+
+    agent = Agent(
+        FunctionModel(respond),
+        toolsets=[
+            compose_tools(
+                FunctionToolset[None]([tool("slack_send")]),
+                [Tool(tool("ask_user"))],
+            )
+        ],
+    )
+    await agent.run("hi")
+    # The app's tool waits behind tool search; bud's own tool is always offered.
+    assert "ask_user" in seen[-1]
+    assert "slack_send" not in seen[-1]
 
 
 async def test_agent_sees_a_tool_added_after_it_was_built(tmp_path):

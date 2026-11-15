@@ -151,7 +151,7 @@ def connections() -> None:
     print("Account tool changes require a full bud serve restart and a new chat.")
 
 
-def grants(action: str, tool: str | None) -> None:
+def grants(action: str, tool: str | None, url: str = DEFAULT_URL) -> None:
     """List or revoke standing tool permissions, through the running server when it answers."""
     import httpx
 
@@ -167,7 +167,7 @@ def grants(action: str, tool: str | None) -> None:
         headers["Authorization"] = f"Bearer {owner_token(settings).get_secret_value()}"
     except OwnerAuthError:
         headers = {}
-    url = f"{DEFAULT_URL}/grants" + (f"/{tool}" if action == "revoke" else "")
+    url = f"{url}/grants" + (f"/{tool}" if action == "revoke" else "")
     data: dict[str, object]
     try:
         with httpx.Client(timeout=5) as client:
@@ -233,6 +233,7 @@ def _main(argv: list[str] | None = None) -> None:
     )
     grants_parser.add_argument("action", nargs="?", choices=["list", "revoke"], default="list")
     grants_parser.add_argument("tool", nargs="?", help="tool name to revoke")
+    grants_parser.add_argument("--url", default=DEFAULT_URL)
     eval_parser = commands.add_parser("eval", help="run the task suite on the simulated world")
     eval_parser.add_argument("--trials", type=int, default=3)
     eval_parser.add_argument("--task", help="run one task by id")
@@ -279,7 +280,7 @@ def _main(argv: list[str] | None = None) -> None:
     elif args.command == "connections":
         connections()
     elif args.command == "grants":
-        grants(args.action, args.tool)
+        grants(args.action, args.tool, args.url)
     elif args.command == "eval":
         if args.probe:
             from bud.evals.probe import probe

@@ -17,7 +17,14 @@ from typing import Any, Self
 from composio import SESSION_PRESET_DIRECT_TOOLS
 from pydantic_ai import RunContext, Tool
 from pydantic_ai.mcp import MCPToolset
-from pydantic_ai.toolsets import CombinedToolset, FunctionToolset, ToolsetTool, WrapperToolset
+from pydantic_ai.toolsets import (
+    AbstractToolset,
+    CombinedToolset,
+    DeferredLoadingToolset,
+    FunctionToolset,
+    ToolsetTool,
+    WrapperToolset,
+)
 
 from bud.composio.binding import AccountBinding
 from bud.composio.calendar import CREATE as CALENDAR_CREATE
@@ -410,6 +417,22 @@ class ComposioTools(WrapperToolset[None]):
             return await self._dispatch(name, tool_args, ctx, tool)
 
 
+def compose_tools(remote: AbstractToolset[None], base: list[Tool[None]]) -> CombinedToolset[None]:
+    """Bud's own tools stay visible; an app's large tool list loads on demand."""
+    return CombinedToolset([DeferredLoadingToolset(remote), FunctionToolset(base)])
+
+
+def build_composio_toolset(
+    connections: Connections, accounts: dict[str, str], session_dir: Path
+) -> AbstractToolset[None]:
+    """The one place the Composio branch is built.
+
+    Wrap this result (for example in a deferred-loading toolset) rather than wrapping the
+    call sites: the live swap rebuilds the branch through here too.
+    """
+    return build_toolset(connections, accounts, session_dir)
+
+
 def build_toolset(
     connections: Connections, accounts: dict[str, str], session_dir: Path
 ) -> CombinedToolset[None]:
@@ -449,15 +472,13 @@ def build_toolset(
             include_instructions=False,
             prefer_tasks=False,
         )
-    return CombinedToolset(
-        [
-            ComposioTools(
-                remote,
-                dispatch_path=session_dir / "dispatches.db",
-                allowed_tools=frozenset(name for names in enabled.values() for name in names),
-                connections=connections,
-                binding=binding,
-            ),
-            FunctionToolset(base),
-        ]
+    return compose_tools(
+        ComposioTools(
+            remote,
+            dispatch_path=session_dir / "dispatches.db",
+            allowed_tools=frozenset(name for names in enabled.values() for name in names),
+            connections=connections,
+            binding=binding,
+        ),
+        base,
     )

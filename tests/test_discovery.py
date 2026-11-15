@@ -82,6 +82,26 @@ def test_tool_returns_candidates_as_plain_data():
     assert result["candidates"][0]["name"] == "Slack"
 
 
+def test_phrase_falls_back_to_its_longest_word():
+    class PhraseFails(FakeConnections):
+        def client(self):
+            outer = self
+
+            class Toolkits:
+                def list(self, *, search, limit):
+                    outer.queries.append(search)
+                    items = [] if " " in search else [item("slack", "Slack")]
+                    return SimpleNamespace(items=items)
+
+            return SimpleNamespace(client=SimpleNamespace(toolkits=Toolkits()))
+
+    connections = PhraseFails([])
+    found = search(cast(Connections, connections), "send messages in slack")
+    assert [candidate.toolkit for candidate in found] == ["slack"]
+    assert connections.queries[0] == "send messages in slack"
+    assert connections.queries[1] == "messages"
+
+
 @pytest.mark.parametrize(
     "slug, ok",
     [("slack", True), ("google_calendar", True), ("Bad", False), ("../x", False), ("", False)],

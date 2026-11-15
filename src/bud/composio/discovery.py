@@ -37,12 +37,21 @@ def search(connections: Connections, query: str) -> list[Candidate]:
         raise ValueError(f"Describe what you need in 1 to {MAX_QUERY} characters.")
     connected = set(connections.accounts())
     with safe_errors("Could not search Composio's catalog. Check your key and connection."):
-        found = connections.client().client.toolkits.list(search=query, limit=MAX_CANDIDATES)
-    candidates = []
-    for item in found.items:
+        client = connections.client()
+        items = _lookup(client, query)
+        if not items:
+            # The catalog matches words, not sentences: retry with the longest words.
+            for word in _words(query)[:3]:
+                items = _lookup(client, word)
+                if items:
+                    break
+    candidates: list[Candidate] = []
+    seen: set[str] = set()
+    for item in items:
         slug = getattr(item, "slug", "")
-        if not valid_toolkit(slug):
+        if not valid_toolkit(slug) or slug in seen:
             continue
+        seen.add(slug)
         meta = getattr(item, "meta", None)
         candidates.append(
             Candidate(
@@ -53,4 +62,18 @@ def search(connections: Connections, query: str) -> list[Candidate]:
                 connected=slug in connected,
             )
         )
+        if len(candidates) == MAX_CANDIDATES:
+            break
     return candidates
+
+
+def _lookup(client, text: str):
+    return client.client.toolkits.list(search=text, limit=MAX_CANDIDATES).items
+
+
+def _words(query: str) -> list[str]:
+    return sorted(
+        {word for word in re.findall(r"[a-z0-9]+", query.lower()) if len(word) > 2},
+        key=len,
+        reverse=True,
+    )
