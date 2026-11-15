@@ -368,12 +368,14 @@ class WorkItems:
             ).fetchone()
             task_id = row[0]
             self.log._insert(db, session_id, "session.created", {})
-            self.log._accept_message(db, session_id, brief.text(), source_id, origin)
+            self.log._accept_message(
+                db, session_id, brief.text(), source_id, origin, source_run=source_run
+            )
             self.log._insert(
                 db,
                 feed_id,
                 "task.created",
-                {"task_id": task_id, "title": title, "origin": origin},
+                {"task_id": task_id, "title": title, "origin": origin, "source_run": source_run},
             )
         self.hub.wake(feed_id)
         return self.get(feed_id, task_id)
@@ -393,7 +395,9 @@ class WorkItems:
             db.execute("BEGIN IMMEDIATE")
             if source_run is not None and self.log._stopped(db, source_run):
                 raise ModelRetry("The conversation was stopped.")
-            event = self.log._accept_message(db, item.session_id, text, source_id, origin)
+            event = self.log._accept_message(
+                db, item.session_id, text, source_id, origin, source_run=source_run
+            )
             if event is not None and owner_words:
                 # A steering message from the owner joins what the job was asked for.
                 db.execute(

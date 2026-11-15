@@ -15,9 +15,27 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  check:
+  # Lint and type-check once: ruff and ty do not depend on the interpreter
+  # version, and the test matrix below already covers both ends of the range.
+  lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff check src tests
+      - run: uv run ruff format --check src tests
+      # Diagnostics already in .ty/baseline.json are suppressed; new ones fail.
+      - run: uv run ty check
+
+  # Behavior tests are offline and deterministic: no model, account, or network
+  # calls. Real-model evals run manually (`bud eval`), never in CI.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -31,10 +49,62 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked
-      - run: uv run ruff check src
-      - run: uv run ruff format --check src
-      # Diagnostics already in .ty/baseline.json are suppressed; new ones fail.
-      - run: uv run ty check
+      # The JUnit file is the failure artifact; the test selection matches `uv run pytest`.
+      - run: uv run pytest --junitxml=test-results/junit.xml
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pytest-${{ matrix.python-version }}
+          path: test-results/junit.xml
+          if-no-files-found: ignore
+
+  # The wheel and sdist must work outside the checkout, with the same runtime
+  # dependency versions the lock pins and without the dev group. A fresh venv
+  # catches missing package data and undeclared runtime deps.
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+      - run: uv build --out-dir dist
+      - name: Install and smoke the wheel and sdist outside the checkout
+        run: |
+          set -eu
+          uv export --locked --no-dev --no-emit-project -q -o "$RUNNER_TEMP/constraints.txt"
+          cd "$RUNNER_TEMP"
+          cat > smoke.py <<'PY'
+          import bud
+          from bud.gateway.registry import load_registry
+          from bud.harness.actions import load_policy
+          from bud.harness.agent import load_system_prompt
+          from bud.world.store import load_seed
+
+          assert bud.__version__, "package version missing"
+          assert load_system_prompt().strip(), "system prompt resource missing"
+          assert load_policy().tools, "policy resource missing"
+          assert load_registry().models, "model registry resource missing"
+          assert load_seed()["world"], "world seed resource missing"
+          print("resources ok", bud.__version__)
+          PY
+          for artifact in "$GITHUB_WORKSPACE"/dist/*.whl "$GITHUB_WORKSPACE"/dist/*.tar.gz; do
+            name=$(basename "$artifact")
+            case "$name" in
+              *.whl) kind=wheel ;;
+              *) kind=sdist ;;
+            esac
+            venv="$RUNNER_TEMP/venv-$kind"
+            echo "::group::Smoke $name"
+            uv venv --python 3.12 "$venv"
+            uv pip install --python "$venv/bin/python" \
+              --constraint "$RUNNER_TEMP/constraints.txt" "$artifact"
+            "$venv/bin/python" smoke.py
+            "$venv/bin/bud" --help
+            echo "::endgroup::"
+          done
 
   # The Rust terminal client in tui/ only exists on branches that carry it;
   # skip the job entirely where there is no crate to check.
@@ -69,7 +139,11 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
 
-  # swift-markdown requires Swift 6.2 (Xcode 26).
+  # swift-markdown requires Swift 6.2 (Xcode 26). The release build compiles the
+  # dependencies once and the tests reuse them, so tests and packaging share one job.
+  # Pull requests run the tests; pushes to master also assemble and sign the app, which
+  # is the slow second build. Splitting the job made both halves compile every
+  # dependency from scratch, so it stays together.
   mac:
     runs-on: macos-26
     timeout-minutes: 30
@@ -77,8 +151,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: swift --version
       - run: swift test -c release --package-path mac
-      - run: ./mac/build.sh
+      - if: github.event_name == 'push'
+        run: ./mac/build.sh
       - name: Verify bundled dog
+        if: github.event_name == 'push'
         run: |
           for source in mac/Resources/pets/dog/*; do
             cmp "$source" "mac/build/bud.app/Contents/Resources/pets/dog/${source##*/}"

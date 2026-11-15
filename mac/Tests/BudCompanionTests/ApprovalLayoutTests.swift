@@ -1,0 +1,92 @@
+import AppKit
+import SwiftUI
+import Testing
+@testable import BudCompanion
+
+@MainActor
+struct ApprovalLayoutTests {
+    @Test
+    func longEmailFitsThePetPanelWithActionsVisible() async throws {
+        _ = NSApplication.shared
+        let companion = Companion()
+        let body = (1...35).map { "Paragraph \($0). Please check this part of the email before sending." }
+            .joined(separator: "\n\n") + "\n\n> Dana's original message\n> Can we move Thursday's sync?"
+        let actions: [[String: Any]] = [
+            ["approval_id": "send", "run_id": "request", "tool": "send_email",
+             "args": ["to": ["dana@brightpath.example"], "subject": "Re: Can we move our Thursday sync?", "body": body]],
+            ["approval_id": "archive", "run_id": "request", "tool": "archive_email",
+             "args": ["thread_id": "invoice"],
+             "preview": ["kind": "email", "status": "available", "subject": "CloudHost invoice",
+                         "messages": [["sender": "billing@cloudhost.example", "to": ["alex@example.test"],
+                                       "body": "Your invoice is ready.\n\nTotal: $29", "body_format": "plain"],
+                                      ["sender": "alex@example.test", "to": ["billing@cloudhost.example"],
+                                       "body": "Thanks, received.", "body_format": "plain"]]]],
+        ]
+        companion.apply(snapshot: [
+            "last_seq": 1, "pending_approvals": actions,
+            "transcript": [["role": "user", "text": "Reply to Dana, then archive the CloudHost invoice."]],
+        ])
+        companion.link = .connected
+        let host = NSHostingView(rootView: PetView(companion: companion, focusPanel: {})
+            .transaction { $0.disablesAnimations = true })
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: PetPanel.size),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.close() }
+        host.frame = NSRect(origin: .zero, size: PetPanel.size)
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(150))
+        host.layoutSubtreeIfNeeded()
+        #expect(host.fittingSize.height <= PetPanel.size.height)
+        if let directory = ProcessInfo.processInfo.environment["BUD_APPROVAL_SNAPSHOTS"] {
+            try snapshot(host, to: URL(filePath: directory).appending(path: "approval-long.png"))
+            host.appearance = NSAppearance(named: .darkAqua)
+            host.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(150))
+            try snapshot(host, to: URL(filePath: directory).appending(path: "approval-dark.png"))
+            host.appearance = NSAppearance(named: .aqua)
+            companion.inputOpen = true
+            host.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(150))
+            host.layoutSubtreeIfNeeded()
+            #expect(host.fittingSize.height <= PetPanel.size.height)
+            try snapshot(host, to: URL(filePath: directory).appending(path: "approval-input.png"))
+            companion.inputOpen = false
+            companion.completeBatch(.init(approved: ["send"], failures: ["archive": "Could not connect. Try again."]),
+                                    ids: ["send", "archive"])
+            host.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(150))
+            host.layoutSubtreeIfNeeded()
+            try snapshot(host, to: URL(filePath: directory).appending(path: "approval-retry.png"))
+        }
+        companion.apply(snapshot: ["last_seq": 2, "pending_approvals": actions])
+        companion.inputOpen = false
+        let collapsed = NSHostingView(rootView: ApprovalDeck(companion: companion).frame(width: 288)
+            .transaction { $0.disablesAnimations = true })
+        window.contentView = collapsed
+        collapsed.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(150))
+        collapsed.layoutSubtreeIfNeeded()
+        // Two waiting actions start as two closed rows, not one tall card.
+        #expect(collapsed.fittingSize.height < 220)
+
+        // One waiting action opens by itself, and the long email still fits the panel.
+        companion.apply(snapshot: ["last_seq": 3, "pending_approvals": [actions[0]]])
+        let deck = NSHostingView(rootView: ApprovalDeck(companion: companion).frame(width: 288)
+            .transaction { $0.disablesAnimations = true })
+        window.contentView = deck
+        deck.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(150))
+        deck.layoutSubtreeIfNeeded()
+        #expect(deck.fittingSize.height > 300)
+        #expect(deck.fittingSize.height <= 430)
+    }
+
+    private func snapshot(_ view: NSView, to url: URL) throws {
+        let bitmap = try #require(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: bitmap)
+        let data = try #require(bitmap.representation(using: .png, properties: [:]))
+        try data.write(to: url)
+    }
+}

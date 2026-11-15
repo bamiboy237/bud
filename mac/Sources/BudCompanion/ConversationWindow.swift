@@ -183,11 +183,8 @@ private struct ConversationView: View {
             if !companion.shown.isEmpty {
                 Reply(text: companion.shown, companion: companion, finished: companion.status != .working)
             }
-            if let approval = companion.approvals.first {
-                ApprovalCard(
-                    companion: companion, approval: approval,
-                    position: companion.approvals.count > 1 ? "1 of \(companion.approvals.count)" : nil)
-                    .id(approval.id)
+            if !companion.approvals.isEmpty {
+                ApprovalDeck(companion: companion)
                     .frame(maxWidth: 420, alignment: .leading)
                     .padding(14)
                     .surface(RoundedRectangle(cornerRadius: 14, style: .continuous))

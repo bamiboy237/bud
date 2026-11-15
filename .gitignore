@@ -16,6 +16,7 @@ build/
 .ruff_cache/
 .coverage
 htmlcov/
+test-results/
 live_audit_test.py
 run_live_audit.py
 
@@ -42,7 +43,6 @@ data/
 skills-lock.json
 
 # Private course material and working notes
-AGENTS.md
 CLAUDE.md
 COURSE.md
 PROGRESS.md

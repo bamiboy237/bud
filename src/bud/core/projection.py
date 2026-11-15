@@ -12,6 +12,7 @@ from pydantic_ai.messages import (
 )
 
 from bud.core.events import Event, MessageOrigin
+from bud.harness.email_preview import EmailPreview
 from bud.limits import MAX_MESSAGE_CHARS
 
 
@@ -25,6 +26,9 @@ class PendingApproval(BaseModel):
     approval_id: str
     tool: str
     args: dict[str, Any]
+    run_id: str | None = None
+    request_id: str | None = None
+    preview: EmailPreview | None = None
     task_id: int | None = None
     reference: str | None = None
 
@@ -343,6 +347,7 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
         "needs_review",
     ):
         state = "paused"
+    groups = request_groups(events)
     return Snapshot(
         session_id=session_id,
         last_seq=events[-1].seq if events else 0,
@@ -352,12 +357,47 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
         queued_messages=queued_messages(events),
         recent_runs=recent[-20:],
         pending_approvals=[
-            PendingApproval(**{key: request[key] for key in ("approval_id", "tool", "args")})
+            PendingApproval.model_validate(
+                {
+                    **request,
+                    "request_id": request.get("request_id") or groups.get(request.get("run_id")),
+                }
+            )
             for request in [*undecided_approvals(events), *parked_approvals(events)]
         ],
         pending_setup=pending_setups(events),
         transcript=transcript,
     )
+
+
+def request_groups(events: list[Event]) -> dict[str, str]:
+    """Group only recorded source runs; a new or edited message starts a new group."""
+    sources: dict[str, str | None] = {}
+    groups: dict[str, str] = {}
+    approvals: dict[str, str] = {}
+    previous: str | None = None
+    for event in events:
+        data = event.data
+        if event.type == "message.queued":
+            sources[data["message_id"]] = data.get("source_run")
+        elif event.type == "message.edited":
+            sources[data["message_id"]] = None
+        elif event.type == "approval.requested" and data.get("run_id") in groups:
+            approvals[data["approval_id"]] = groups[data["run_id"]]
+        elif event.type == "run.queued":
+            run_id = data["run_id"]
+            group = run_id
+            ids = data.get("message_ids") or [data.get("message_id")]
+            source_runs = {sources.get(message_id) for message_id in ids}
+            source = next(iter(source_runs)) if len(source_runs) == 1 else None
+            if source is not None:
+                group = source
+            elif data.get("trigger") == "approval":
+                late = data.get("late_call")
+                group = approvals.get(late["approval_id"], run_id) if late else previous or run_id
+            groups[run_id] = group
+            previous = group
+    return groups
 
 
 def waiting_batch(events: list[Event]) -> list[dict[str, Any]]:
