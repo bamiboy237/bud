@@ -53,9 +53,9 @@ struct PetPose {
     var reactionAtStatusStart: (move: PetMove, since: Date)?
 }
 
-/// A pet's art, cut from its sheet as needed. Pets are private art, so none ships in the
-/// repository: the build copies local ones into the app, and users can drop one into
-/// ~/Library/Application Support/bud/pets/<id>/. Without one, the companion shows a paw.
+/// A pet's art, cut from its sheet as needed. The app bundles the default dog.
+/// Users can override a pet in ~/Library/Application Support/bud/pets/<id>/.
+/// Missing art falls back to a paw.
 ///
 /// Two formats load:
 /// - the Codex pet format: `pet.json` and an 8 by 9 sheet of 192 by 208 px cells, with the
