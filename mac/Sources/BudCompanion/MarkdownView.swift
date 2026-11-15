@@ -19,6 +19,24 @@ struct MarkdownView: View {
     }
 }
 
+/// The typeface replies are set in. The bubble keeps the system font for a quick glance; the
+/// conversation window sets a serif, so a long reply reads like a page.
+struct ReplyType {
+    var body: Font = .body
+    var lineSpacing: CGFloat = 2
+}
+
+private struct ReplyTypeKey: EnvironmentKey {
+    static let defaultValue = ReplyType()
+}
+
+extension EnvironmentValues {
+    var replyType: ReplyType {
+        get { self[ReplyTypeKey.self] }
+        set { self[ReplyTypeKey.self] = newValue }
+    }
+}
+
 private enum Metrics {
     static let paragraph: CGFloat = 8
     static let item: CGFloat = 3
@@ -43,12 +61,20 @@ private struct Block: View {
 
     var body: some View {
         switch markup {
-        case let heading as Heading:
-            // Headings share bud's name typeface, so its voice reads as one hand.
-            prose(inline(heading), font: .system(size: heading.level <= 2 ? 15 : 13.5, weight: .semibold, design: .serif))
+        case let heading as Heading where heading.level <= 2:
+            // Top headings share bud's name typeface, so its voice reads as one hand.
+            prose(inline(heading), font: .system(size: 15, weight: .semibold, design: .serif))
                 .padding(.top, 2)
+        case let heading as Heading:
+            // Section labels: small spaced capitals, quieter than the text they introduce.
+            Text(String(inline(heading).characters).uppercased())
+                .font(.system(size: 11, weight: .semibold))
+                .tracking(0.6)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 4)
         case let paragraph as Paragraph:
-            prose(inline(paragraph))
+            Prose(text: inline(paragraph))
         case let list as UnorderedList:
             ListBlock(items: Array(list.listItems), start: nil)
         case let list as OrderedList:
@@ -68,19 +94,34 @@ private struct Block: View {
             Divider().padding(.vertical, 2)
         default:
             // HTML and anything newer than this renderer: show the source rather than drop it.
-            prose(AttributedString(markup.format()))
+            Prose(text: AttributedString(markup.format()))
         }
     }
 }
 
 /// Body text, wrapped to the bubble's width and selectable.
-private func prose(_ text: AttributedString, font: Font = .body) -> some View {
+private func prose(_ text: AttributedString, font: Font) -> some View {
     Text(text)
         .font(font)
         .lineSpacing(2)
         .textSelection(.enabled)
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: .infinity, alignment: .leading)
+}
+
+/// Body text in the reply typeface.
+private struct Prose: View {
+    let text: AttributedString
+    @Environment(\.replyType) private var type
+
+    var body: some View {
+        Text(text)
+            .font(type.body)
+            .lineSpacing(type.lineSpacing)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
 }
 
 private struct ListBlock: View {

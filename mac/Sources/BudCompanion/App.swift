@@ -73,6 +73,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func ask() {
+        // With the window open, that's where you type.
+        if Companion.shared.windowOpen {
+            ConversationWindow.shared.show()
+            return
+        }
         if !petVisible { togglePet() }
         Companion.shared.inputOpen = true
         focusPanel()
