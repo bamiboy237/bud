@@ -668,6 +668,9 @@ private struct StepsSummary: View {
 struct ApprovalCard: View {
     let companion: Companion
     let approval: Approval
+    /// Inside a collapsible row: the row draws the surface, so the card draws only its content.
+    var nested = false
+    var showsHeading = true
     @StateObject private var layout = ApprovalLayout()
 
     private var busy: Bool {
@@ -680,8 +683,26 @@ struct ApprovalCard: View {
     }
 
     var body: some View {
+        Group {
+            if nested {
+                content
+            } else {
+                content
+                    .padding(12)
+                    .background(Paper.ink.opacity(0.035),
+                                in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(Paper.hairline, lineWidth: 0.5))
+            }
+        }
+        .disabled(busy)
+        .opacity(busy ? 0.55 : 1)
+        .animation(.easeOut(duration: 0.12), value: busy)
+    }
+
+    private var content: some View {
         VStack(alignment: .leading, spacing: 10) {
-            heading
+            if showsHeading { heading }
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     if approval.isQuestion {
@@ -724,12 +745,6 @@ struct ApprovalCard: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(12)
-        .background(Paper.ink.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Paper.hairline, lineWidth: 0.5))
-        .disabled(busy)
-        .opacity(busy ? 0.55 : 1)
-        .animation(.easeOut(duration: 0.12), value: busy)
     }
 
     private var heading: some View {

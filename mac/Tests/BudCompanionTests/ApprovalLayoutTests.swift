@@ -66,8 +66,18 @@ struct ApprovalLayoutTests {
             try snapshot(host, to: URL(filePath: directory).appending(path: "approval-retry.png"))
         }
         companion.apply(snapshot: ["last_seq": 2, "pending_approvals": actions])
-        companion.selectedApprovalID = "send"
         companion.inputOpen = false
+        let collapsed = NSHostingView(rootView: ApprovalDeck(companion: companion).frame(width: 288)
+            .transaction { $0.disablesAnimations = true })
+        window.contentView = collapsed
+        collapsed.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(150))
+        collapsed.layoutSubtreeIfNeeded()
+        // Two waiting actions start as two closed rows, not one tall card.
+        #expect(collapsed.fittingSize.height < 220)
+
+        // One waiting action opens by itself, and the long email still fits the panel.
+        companion.apply(snapshot: ["last_seq": 3, "pending_approvals": [actions[0]]])
         let deck = NSHostingView(rootView: ApprovalDeck(companion: companion).frame(width: 288)
             .transaction { $0.disablesAnimations = true })
         window.contentView = deck
