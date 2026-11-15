@@ -16,6 +16,7 @@ from bud.gateway.registry import Registry
 from bud.harness.actions import GuardTools, Policy, RecordDecision
 from bud.harness.code import CODE_GUIDANCE, build_code_mode
 from bud.harness.context import BackgroundCompaction
+from bud.harness.live import LiveState, LiveTools
 from bud.harness.memory import MEMORY_RULES
 from bud.harness.results import SqliteResultStore, build_output_limits
 from bud.harness.review import Describer, SessionGrants, ToolReviewer
@@ -46,6 +47,8 @@ class Harness:
         self.toolset = tools if isinstance(tools, AbstractToolset) else FunctionToolset[None](tools)
         self.skills = SkillStore(state_dir / "skills")
         self.toolset = CombinedToolset([self.toolset, FunctionToolset[None](self.skills.tools())])
+        # The agent holds this wrapper, so tools can be replaced between runs.
+        self.live = LiveTools(state=LiveState(current=self.toolset))
         self.memory = memory
         tools_policy = policy.tools | MEMORY_RULES if memory else policy.tools
         self.policy = Policy(
@@ -92,6 +95,10 @@ class Harness:
         self.prompt_version = sha256(prompt.encode()).hexdigest()[:12]
         self.spiral = SpiralConfig.from_settings()
 
+    def swap_tools(self, toolset: AbstractToolset[None]) -> None:
+        """Replace the tools the next run sees; the running step keeps the ones it started with."""
+        self.live.swap(toolset)
+
     def _today(self) -> str:
         # Day granularity: instructions lead the prompt, so a per-minute clock here
         # would invalidate the cached conversation on every turn.
@@ -116,7 +123,7 @@ class Harness:
             name="bud",
             deps_type=type(None),
             instructions=[self.system_prompt, *self.live_instructions],
-            toolsets=[self.toolset],
+            toolsets=[self.live],
             output_type=[str, DeferredToolRequests],
             capabilities=[
                 GuardTools(

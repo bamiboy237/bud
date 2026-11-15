@@ -295,6 +295,21 @@ def test_denied_workspace_write_does_not_dispatch(tmp_path):
         ]
 
 
+def test_always_allow_records_a_grant_and_revoke_restores_asking(tmp_path):
+    with running(tmp_path) as server:
+        session, approval = start_report(server)
+        assert approval["grantable"] is True
+        assert server.request(
+            "POST",
+            f"/sessions/{session}/approvals/{approval['approval_id']}",
+            json={"approved": True, "remember": True},
+        ) == {"applied": True}
+        assert server.request("GET", "/grants") == {"tools": ["workspace_create"]}
+        server.settled(session)
+        assert server.request("DELETE", "/grants/workspace_create") == {"removed": True}
+        assert server.request("GET", "/grants") == {"tools": []}
+
+
 def test_revised_workspace_approval_survives_process_restart(tmp_path):
     with running(tmp_path) as server:
         session, original = start_report(server)

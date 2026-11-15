@@ -5,7 +5,13 @@ from contextlib import contextmanager
 
 from composio import SESSION_PRESET_DIRECT_TOOLS, Composio
 
-from bud.composio.binding import TOOLKITS, AccountBinding, BindingStore, ConnectionError
+from bud.composio.binding import (
+    TOOLKITS,
+    AccountBinding,
+    BindingStore,
+    ConnectionError,
+    valid_toolkit,
+)
 from bud.config import Settings
 
 
@@ -44,8 +50,8 @@ class Connections:
         return self.store.snapshot()[0].accounts
 
     def connect(self, toolkit: str) -> str:
-        if toolkit not in TOOLKITS:
-            raise ConnectionError("Unsupported toolkit. Use gmail or calendar.")
+        if not valid_toolkit(toolkit):
+            raise ConnectionError("Unsupported toolkit name.")
         with safe_errors("Could not start Composio sign-in. Check your key and connection."):
             attempt = self.store.begin_connect(toolkit)
             client = self.client()
@@ -97,7 +103,7 @@ class Connections:
         with safe_errors("Could not verify connections. No account tools were refreshed."):
             previous, pending = self.store.snapshot()
             references = previous.accounts | {k: v for k, v in pending.items() if v is not None}
-            statuses = dict.fromkeys(TOOLKITS, "NOT_CONNECTED")
+            statuses = dict.fromkeys(set(TOOLKITS) | set(references), "NOT_CONNECTED")
             try:
                 if references:
                     client = self.client()

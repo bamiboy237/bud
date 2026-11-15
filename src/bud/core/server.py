@@ -7,7 +7,7 @@ import asyncio
 import fcntl
 import hashlib
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -35,6 +35,7 @@ from bud.core.setup import SetupJournal, build_setup_toolset, setup_registry
 from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
+from bud.harness.grants import Grants
 from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
 from bud.harness.recall import Recall, embedder
@@ -55,6 +56,10 @@ from bud.world.tools import READ_TOOLS as WORLD_READ_TOOLS
 from bud.world.tools import build_tools
 
 logger = logging.getLogger(__name__)
+
+
+def _noop() -> None:
+    return None
 
 
 class ModeRequest(BaseModel):
@@ -81,6 +86,8 @@ class EditMessage(BaseModel):
 class Decision(BaseModel):
     approved: bool
     origin: MessageOrigin = Field(default_factory=MessageOrigin)
+    # Also record a standing permission for this tool, so later calls do not ask.
+    remember: bool = False
 
 
 class Answer(BaseModel):
@@ -144,6 +151,10 @@ def _create_app(
     photon = None
     setup_journal = None
     world: World | None = None
+
+    # Set by the account branch: reloads the tool list after a new app connects.
+    refresh_tools: Callable[[], None] = _noop
+
     # The approval mode applies to the harness policy after composition (the
     # Harness unions memory/skill rules in), one seam for every tool class.
     profile_store = ProfileStore(settings.data_dir / "approval-mode.json")
@@ -186,27 +197,39 @@ def _create_app(
         setup = setup_registry(connections)
         setup_journal = SetupJournal()
         tools_policy.tools.update(dict.fromkeys(WORKSPACE_WRITE_TOOLS, "ask"))
-        harness = Harness(
-            CombinedToolset(
+        loaded = {"accounts": frozenset(accounts)}
+
+        def account_toolset() -> CombinedToolset[None]:
+            return CombinedToolset(
                 [
-                    build_toolset(connections, accounts, session_dir),
+                    build_toolset(connections, connections.accounts(), session_dir),
                     build_web_tools(settings),
                     workspace_tools(session_dir),
-                    build_setup_toolset(setup, setup_journal),
+                    build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
                 ]
-            ),
+            )
+
+        def refresh_account_tools() -> None:
+            """Swap in the tools of a newly connected app; the next message sees them."""
+            current = frozenset(connections.accounts())
+            if current == loaded["accounts"]:
+                return
+            loaded["accounts"] = current
+            harness.swap_tools(account_toolset())
+
+        refresh_tools = refresh_account_tools
+        harness = Harness(
+            account_toolset(),
             tools_policy,
             gateway.registry,
             PROFILE
             + "\nConnected apps: "
             + (", ".join(sorted(accounts)) or "none")
-            + "\nFor a missing or disconnected app, call setup_capability('gmail'|'calendar'): "
-            "it surfaces an actionable setup card with the sign-in link in the person's chat, "
-            "and the person authorizes in their browser. Never send the person to a command "
-            "line (/connect remains a manual fallback). A connected account loads its tools "
-            "only after /refresh and a full bud serve restart with a new conversation; say so."
-            + WEB_GUIDANCE
-            + WORKSPACE_GUIDANCE,
+            + "\nFor a missing or disconnected app, call discover_tools to find one, then "
+            "setup_capability with its slug: the person gets a sign-in card in chat and "
+            "authorizes in their browser. Never send the person to a command line "
+            "(/connect remains a manual fallback). A connected app's tools load for the "
+            "next message; no restart is needed." + WEB_GUIDANCE + WORKSPACE_GUIDANCE,
             memory=build_memory(session_dir / "memory.db", namespace="owner"),
             state_dir=session_dir,
             result_path=db_path,
@@ -245,6 +268,10 @@ def _create_app(
     # Auto mode reviews each write when a reviewer exists (an OpenAI key, review not turned
     # off). Set before the Runner builds its agent, which captures the reviewer.
     harness.reviewer = build_reviewer()
+    # Standing permissions the owner granted from an approval card. The policy reads them on
+    # every call, so a new grant or a revoke applies without a restart.
+    grants = Grants(settings.data_dir / "grants.json")
+    harness.policy.grants = grants.tools
     if world is not None:
         harness.describers = build_describers(world)
         harness.notifies_others = build_notifies_others(world)
@@ -427,6 +454,8 @@ def _create_app(
             restart_required = current.restart_required()
         except ConnectionError as exc:
             raise HTTPException(503, str(exc)) from None
+        # A sign-in finished since the last check: load the new app's tools now.
+        refresh_tools()
         return JSONResponse(
             {
                 "statuses": {"gmail": statuses["gmail"], "calendar": statuses["googlecalendar"]},
@@ -601,6 +630,21 @@ def _create_app(
         require_session(session_id)
         if decision.approved:
             require_current_binding()
+        if decision.remember:
+            tool = next(
+                (
+                    request.tool
+                    for request in runner.snapshot(session_id).pending_approvals
+                    if request.approval_id == approval_id
+                ),
+                None,
+            )
+            if tool is None:
+                raise HTTPException(404, "unknown approval")
+            if not runner.harness.policy.grantable(tool):
+                raise HTTPException(409, "This action can never run without asking.")
+            if grants.add(tool):
+                runner.harness.policy.grants = grants.tools
         try:
             return {
                 "applied": runner.decide(
@@ -611,6 +655,18 @@ def _create_app(
             raise HTTPException(404, "unknown approval") from None
         except DecisionRejected as exc:
             raise HTTPException(409, str(exc)) from None
+
+    @app.get("/grants")
+    def list_grants() -> dict[str, list[str]]:
+        """Tools the owner allowed to run without asking again."""
+        return {"tools": sorted(grants.tools)}
+
+    @app.delete("/grants/{tool}")
+    def revoke_grant(tool: str) -> dict[str, bool]:
+        """Revoke one standing permission; the tool asks again from the next call."""
+        removed = grants.remove(tool)
+        runner.harness.policy.grants = grants.tools
+        return {"removed": removed}
 
     @app.post("/sessions/{session_id}/approvals/{approval_id}/revise")
     async def revise(session_id: str, approval_id: str, message: NewMessage) -> dict[str, bool]:

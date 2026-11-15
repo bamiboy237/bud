@@ -1,6 +1,7 @@
 """Local single-owner account generations; no credentials or remote operations."""
 
 import json
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
@@ -10,6 +11,13 @@ from pathlib import Path
 from uuid import uuid4
 
 TOOLKITS = ("gmail", "googlecalendar")
+# Any app Composio offers uses a slug of this shape. The two above are the ones bud ships
+# guidance for; a discovered app is accepted by the same rules.
+TOOLKIT_SLUG = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+
+
+def valid_toolkit(slug: str) -> bool:
+    return bool(TOOLKIT_SLUG.fullmatch(slug))
 
 
 class ConnectionError(Exception):
@@ -99,13 +107,13 @@ class BindingStore:
         accounts = tuple(db.execute("SELECT toolkit, account_id FROM accounts ORDER BY toolkit"))
         pending = dict(db.execute("SELECT toolkit, account_id FROM pending_accounts"))
         if any(
-            toolkit not in TOOLKITS or not isinstance(account, str) or not account.strip()
+            not valid_toolkit(toolkit) or not isinstance(account, str) or not account.strip()
             for toolkit, account in accounts
         ):
             raise ConnectionError(
                 "Invalid local account mapping. Restore the original owner state."
             )
-        if set(pending) - set(TOOLKITS) or any(
+        if any(not valid_toolkit(toolkit) for toolkit in pending) or any(
             account is not None and (not isinstance(account, str) or not account.strip())
             for account in pending.values()
         ):
@@ -118,8 +126,8 @@ class BindingStore:
             return self._read(db)
 
     def begin_connect(self, toolkit: str) -> AccountBinding:
-        if toolkit not in TOOLKITS:
-            raise ConnectionError("Unsupported toolkit. Use gmail or calendar.")
+        if not valid_toolkit(toolkit):
+            raise ConnectionError("Unsupported toolkit name.")
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             self._read(db)

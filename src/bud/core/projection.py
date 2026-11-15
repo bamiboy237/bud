@@ -29,6 +29,8 @@ class PendingApproval(BaseModel):
     run_id: str | None = None
     request_id: str | None = None
     preview: EmailPreview | None = None
+    # True when the owner may grant this tool standing permission from the card.
+    grantable: bool = False
     task_id: int | None = None
     reference: str | None = None
 

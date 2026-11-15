@@ -41,13 +41,24 @@ RecordDecision = Callable[[dict[str, Any]], None]
 class Policy(BaseModel):
     """What each tool may do. "review" means the approval reviewer judges the call: if it is
     safe and clearly requested the call runs, otherwise the owner is asked. Only auto mode
-    sets it (bud.core.profiles)."""
+    sets it (bud.core.profiles). A standing grant from the owner turns that tool's "ask" or
+    "review" into "allow"; hard rules can never be granted."""
 
     tools: dict[str, Action]
+    grants: frozenset[str] = frozenset()
 
     def decide(self, tool: str) -> Action:
         """Fails closed: a tool nobody classified is denied."""
-        return self.tools.get(tool, "deny")
+        action = self.tools.get(tool)
+        if action is None:
+            return "deny"
+        if tool in self.grants and not never_reviewed(tool):
+            return "allow"
+        return action
+
+    def grantable(self, tool: str) -> bool:
+        """True when the owner may make this tool run without asking again."""
+        return self.tools.get(tool) in ("ask", "review") and not never_reviewed(tool)
 
 
 def load_policy(path: Path | None = None) -> Policy:

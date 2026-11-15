@@ -787,18 +787,31 @@ struct ApprovalCard: View {
     }
 
     private var buttons: some View {
-        HStack(spacing: 6) {
-            Button("Change…") { companion.write(.revise(approval.id)) }
-                .buttonStyle(CardButton(kind: .quiet))
-                .help("Tell bud what to do differently")
-            Spacer(minLength: 0)
-            Button("Deny") { companion.decide(approval.id, approved: false) }
-                .buttonStyle(CardButton(kind: .secondary))
-            Button(companion.approvalFailures[approval.id] == nil ? approval.verb : "Retry") {
-                companion.decide(approval.id, approved: true)
+        VStack(alignment: .trailing, spacing: 6) {
+            HStack(spacing: 6) {
+                Button("Change…") { companion.write(.revise(approval.id)) }
+                    .buttonStyle(CardButton(kind: .quiet))
+                    .help("Tell bud what to do differently")
+                Spacer(minLength: 0)
+                Button("Deny") { companion.decide(approval.id, approved: false) }
+                    .buttonStyle(CardButton(kind: .secondary))
+                Button(companion.approvalFailures[approval.id] == nil ? approval.verb : "Retry") {
+                    companion.decide(approval.id, approved: true)
+                }
+                    .buttonStyle(CardButton(kind: .primary))
             }
-                .buttonStyle(CardButton(kind: .primary))
+            if approval.grantable { alwaysAllow }
         }
+    }
+
+    /// Under the decision, not beside it: three capsules in one row overrun the bubble, and a
+    /// truncated "Always al…" would hide what the click gives away.
+    private var alwaysAllow: some View {
+        Button("Always allow") { companion.alwaysAllow(approval) }
+            .buttonStyle(CardButton(kind: .secondary))
+            .help(approval.alwaysAllowHelp)
+            .accessibilityLabel("Always allow")
+            .accessibilityHint(approval.alwaysAllowHelp)
     }
 
     private var choices: some View {

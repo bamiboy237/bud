@@ -7,14 +7,15 @@ import asyncio
 import json
 import re
 import sqlite3
-from dataclasses import dataclass, field, replace
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from email.utils import getaddresses
 from pathlib import Path
 from typing import Any, Self
 
 from composio import SESSION_PRESET_DIRECT_TOOLS
-from pydantic_ai import RunContext
+from pydantic_ai import RunContext, Tool
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.toolsets import CombinedToolset, FunctionToolset, ToolsetTool, WrapperToolset
 
@@ -23,6 +24,7 @@ from bud.composio.calendar import CREATE as CALENDAR_CREATE
 from bud.composio.calendar import PATCH as CALENDAR_PATCH
 from bud.composio.calendar import execute_calendar, operation_schema
 from bud.composio.connection import ConnectionError, Connections, safe_errors
+from bud.composio.discovery import search
 from bud.composio.drafts import verify_reply_body
 from bud.harness.actions import Policy
 
@@ -128,11 +130,31 @@ def single_recipient(value: str) -> str | None:
 def policy() -> Policy:
     return Policy(
         tools={
-            **dict.fromkeys(READ_TOOLS | {"current_time"}, "allow"),
+            **dict.fromkeys(READ_TOOLS | {"current_time", "discover_tools"}, "allow"),
             **dict.fromkeys(WRITE_TOOLS, "ask"),
             "ask_user": "ask",
         }
     )
+
+
+def discovery_tool(connections: Connections) -> Callable[..., dict[str, Any]]:
+    def discover_tools(query: str) -> dict[str, Any]:
+        """Find an app bud could connect for this request, without connecting it.
+
+        Use it when the person asks for something no available tool can do. Returns
+        candidate apps with a short description and a tool count. Offer the best one and
+        call setup_capability with its slug; the person authorizes in their browser.
+
+        Args:
+            query: What the person needs, in a few words, such as "slack messages".
+        """
+        try:
+            found = search(connections, query)
+        except (ValueError, ConnectionError) as exc:
+            return {"error": str(exc)}
+        return {"candidates": [asdict(candidate) for candidate in found]}
+
+    return discover_tools
 
 
 @dataclass
@@ -391,8 +413,13 @@ class ComposioTools(WrapperToolset[None]):
 def build_toolset(
     connections: Connections, accounts: dict[str, str], session_dir: Path
 ) -> CombinedToolset[None]:
+    discovery = (
+        [discovery_tool(connections)] if connections.settings.composio_api_key is not None else []
+    )
+    base: list[Tool[None]] = [Tool(current_time), Tool(ask_user)]
+    base.extend(Tool(find) for find in discovery)
     if not accounts:
-        return CombinedToolset([FunctionToolset([current_time, ask_user])])
+        return CombinedToolset([FunctionToolset(base)])
     binding = connections.binding
     if binding is None or binding.accounts != accounts:
         raise ConnectionError("Capture the verified account binding before constructing tools.")
@@ -431,6 +458,6 @@ def build_toolset(
                 connections=connections,
                 binding=binding,
             ),
-            FunctionToolset([current_time, ask_user]),
+            FunctionToolset(base),
         ]
     )
