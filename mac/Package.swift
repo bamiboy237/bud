@@ -21,6 +21,7 @@ let package = Package(
                 .product(name: "FluidAudio", package: "FluidAudio"),
             ],
             path: "Sources/BudCompanion"
-        )
+        ),
+        .testTarget(name: "BudCompanionTests", dependencies: ["BudCompanion"]),
     ]
 )

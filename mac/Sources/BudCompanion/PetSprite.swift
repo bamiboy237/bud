@@ -50,6 +50,7 @@ struct PetPose {
     var walk: (move: PetMove, since: Date)?
     var listeningSince: Date?
     var reaction: (move: PetMove, since: Date)?
+    var reactionAtStatusStart: (move: PetMove, since: Date)?
 }
 
 /// A pet's art, cut from its sheet as needed. Pets are private art, so none ships in the
@@ -64,7 +65,7 @@ struct PetPose {
 ///   from bud's statuses to actions.
 @MainActor
 final class PetSprite {
-    /// A frame's size in pixels; it's shown at half that in points, sharp on a 2x display.
+    /// A frame's source size in pixels. Rendering fits the panel's fixed pet box.
     let cell: CGSize
     private let sheet: CGImage
     private let actions: [PetMove: PetAction]
@@ -84,7 +85,7 @@ final class PetSprite {
         return sprite
     }
 
-    var displaySize: CGSize { CGSize(width: cell.width / 2, height: cell.height / 2) }
+    var displaySize: CGSize { PetPanel.pet }
 
     // MARK: Choosing the frame
 
@@ -110,10 +111,9 @@ final class PetSprite {
         guard let status = actions[pose.status] else { return nil }
         if status.loop { return status.frame(at: ms(since: pose.statusSince)) }
         var start = pose.statusSince
-        if let reaction = pose.reaction, let action = actions[reaction.move] {
+        if let reaction = pose.reactionAtStatusStart ?? pose.reaction, let action = actions[reaction.move] {
             let reactionEnd = reaction.since.addingTimeInterval(Double(action.totalMs) / 1000)
-            let statusEnd = pose.statusSince.addingTimeInterval(Double(status.totalMs) / 1000)
-            if reaction.since < statusEnd, reactionEnd > pose.statusSince { start = max(start, reactionEnd) }
+            if reaction.since <= pose.statusSince, reactionEnd > pose.statusSince { start = reactionEnd }
         }
         return status.frame(at: ms(since: start))
     }
@@ -197,7 +197,7 @@ final class PetSprite {
     }
 
     /// The manifest format: named actions, and a map from bud's statuses to them.
-    private static func loadManifest(_ folder: URL) -> PetSprite? {
+    static func loadManifest(_ folder: URL) -> PetSprite? {
         let candidates = [folder.appending(path: "manifest.json"), folder.appending(path: "assets/manifest.json")]
         guard let (manifest, home) = candidates.lazy.compactMap({ url in json(url).map { ($0, url.deletingLastPathComponent()) } }).first,
               (manifest["version"] as? Int) == 1,
@@ -205,13 +205,14 @@ final class PetSprite {
               let sheet = image(named: atlas, in: home),
               let cellSize = manifest["cell"] as? [Int], cellSize.count == 2,
               cellSize.allSatisfy({ $0 > 0 }),
-              let named = manifest["actions"] as? [String: [String: Any]],
-              let states = manifest["states"] as? [String: String]
+              let named = manifest["actions"] as? [String: Any],
+              let states = manifest["states"] as? [String: Any]
         else { return nil }
         let bounds = CGRect(x: 0, y: 0, width: sheet.width, height: sheet.height)
 
         func action(_ id: String) -> PetAction? {
-            guard let entry = named[id], let frames = entry["frames"] as? [[String: Any]], !frames.isEmpty
+            guard let entry = named[id] as? [String: Any],
+                  let frames = entry["frames"] as? [[String: Any]], !frames.isEmpty
             else { return nil }
             var rects: [CGRect] = []
             var durations: [Int] = []
@@ -238,20 +239,18 @@ final class PetSprite {
             (.idle, "idle"), (.working, "working"), (.needsYou, "needsYou"), (.done, "done"), (.failed, "failed"),
         ]
         for (move, key) in statuses {
-            if let id = states[key], let found = action(id) { actions[move] = found }
+            if let id = states[key] as? String, let found = action(id) { actions[move] = found }
         }
         guard let idle = actions[.idle] else { return nil }
         for (move, _) in statuses where actions[move] == nil {
             actions[move] = idle
         }
-        // Brief modes, by their ids, each with the nearest stand-in until its own art exists.
-        // A missing walk or hop falls back to the status pose, never to nothing.
-        let modes: [(PetMove, [String])] = [
-            (.walkLeft, ["walk-left"]), (.walkRight, ["walk-right"]), (.hop, ["hop"]),
-            (.wave, ["wave", "waiting-small-wave"]), (.listen, ["listen", "waiting-look-for-you"]),
+        let modes: [(PetMove, String)] = [
+            (.walkLeft, "walk-left"), (.walkRight, "walk-right"), (.hop, "hop"),
+            (.wave, "wave"), (.listen, "listen"),
         ]
-        for (move, ids) in modes {
-            if let found = ids.lazy.compactMap(action).first { actions[move] = found }
+        for (move, id) in modes {
+            if let found = action(id) { actions[move] = found }
         }
         return PetSprite(
             sheet: sheet, cell: CGSize(width: cellSize[0], height: cellSize[1]), actions: actions)
@@ -270,11 +269,13 @@ struct AnimatedPet: View {
         TimelineView(.animation(minimumInterval: 0.04, paused: reduceMotion)) { context in
             let pose = pose()
             let moment = reduceMotion ? Date.distantPast : context.date
-            if let rect = sprite.frame(for: still(pose), at: reduceMotion ? moment : context.date),
+            if let rect = sprite.frame(for: still(pose), at: moment),
                let image = sprite.image(rect)
             {
                 Image(nsImage: image)
+                    .resizable()
                     .interpolation(.high)
+                    .scaledToFit()
             }
         }
         .frame(width: sprite.displaySize.width, height: sprite.displaySize.height)

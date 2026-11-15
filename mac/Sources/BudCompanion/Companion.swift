@@ -103,7 +103,12 @@ final class Companion {
     var link: Link = .connecting
     /// What the pet shows: what bud is doing, unless a decision is waiting.
     private(set) var status: PetStatus = .idle {
-        didSet { if status != oldValue { statusSince = .now } }
+        didSet {
+            if status != oldValue {
+                statusSince = .now
+                reactionAtStatusStart = reaction
+            }
+        }
     }
     /// What bud is doing, from run events.
     @ObservationIgnored private var activity: PetStatus = .idle {
@@ -209,6 +214,7 @@ final class Companion {
     @ObservationIgnored private var lastPointerX: CGFloat?
     /// A short gesture the pet plays over its status (a wave, a hop), then drops.
     @ObservationIgnored private var reaction: (move: PetMove, since: Date)?
+    @ObservationIgnored private var reactionAtStatusStart: (move: PetMove, since: Date)?
 
     /// Connect (or reconnect after a settings change): handshake, primary session, snapshot, stream.
     func start() {
@@ -498,7 +504,8 @@ final class Companion {
     var pose: PetPose {
         PetPose(
             status: PetMove.of(status), statusSince: statusSince, walk: walk,
-            listeningSince: hearing ? hearingSince : nil, reaction: reaction)
+            listeningSince: hearing ? hearingSince : nil, reaction: reaction,
+            reactionAtStatusStart: reactionAtStatusStart)
     }
 
     /// Plays `move` once over the status, unless the pet is busy being carried.
@@ -683,8 +690,8 @@ final class Companion {
         case "run.completed":
             finish(with: Self.replyText(event.data))
             closeSteps()
-            activity = .done
             react(.hop)
+            activity = .done
             settleToIdle()
             refreshApprovals()
         case "run.waiting":
