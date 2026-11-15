@@ -49,10 +49,19 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked
-      - run: uv run pytest
+      # The JUnit file is the failure artifact; the test selection is unchanged.
+      - run: uv run pytest --junitxml=test-results/junit.xml
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pytest-${{ matrix.python-version }}
+          path: test-results/junit.xml
+          if-no-files-found: ignore
 
-  # The wheel and sdist must work outside the checkout, without the dev group.
-  # A fresh venv catches missing package data and undeclared runtime deps.
+  # The wheel and sdist must work outside the checkout, with the same runtime
+  # dependency versions the lock pins and without the dev group. A fresh venv
+  # catches missing package data and undeclared runtime deps.
   package:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -62,17 +71,40 @@ jobs:
         with:
           enable-cache: true
       - run: uv build --out-dir dist
-      - name: Install the wheel into a fresh environment
+      - name: Install and smoke the wheel and sdist outside the checkout
         run: |
-          uv venv --python 3.12 /tmp/wheel-venv
-          uv pip install --python /tmp/wheel-venv/bin/python dist/*.whl
-          /tmp/wheel-venv/bin/python -c "import bud; print(bud.__version__)"
-          /tmp/wheel-venv/bin/bud --help
-      - name: Install the sdist into a fresh environment
-        run: |
-          uv venv --python 3.12 /tmp/sdist-venv
-          uv pip install --python /tmp/sdist-venv/bin/python dist/*.tar.gz
-          /tmp/sdist-venv/bin/bud --help
+          set -eu
+          uv export --locked --no-dev --no-emit-project -q -o "$RUNNER_TEMP/constraints.txt"
+          cd "$RUNNER_TEMP"
+          cat > smoke.py <<'PY'
+          import bud
+          from bud.gateway.registry import load_registry
+          from bud.harness.actions import load_policy
+          from bud.harness.agent import load_system_prompt
+          from bud.world.store import load_seed
+
+          assert bud.__version__, "package version missing"
+          assert load_system_prompt().strip(), "system prompt resource missing"
+          assert load_policy().tools, "policy resource missing"
+          assert load_registry().models, "model registry resource missing"
+          assert load_seed()["world"], "world seed resource missing"
+          print("resources ok", bud.__version__)
+          PY
+          for artifact in "$GITHUB_WORKSPACE"/dist/*.whl "$GITHUB_WORKSPACE"/dist/*.tar.gz; do
+            name=$(basename "$artifact")
+            case "$name" in
+              *.whl) kind=wheel ;;
+              *) kind=sdist ;;
+            esac
+            venv="$RUNNER_TEMP/venv-$kind"
+            echo "::group::Smoke $name"
+            uv venv --python 3.12 "$venv"
+            uv pip install --python "$venv/bin/python" \
+              --constraint "$RUNNER_TEMP/constraints.txt" "$artifact"
+            "$venv/bin/python" smoke.py
+            "$venv/bin/bud" --help
+            echo "::endgroup::"
+          done
 
   # The Rust terminal client in tui/ only exists on branches that carry it;
   # skip the job entirely where there is no crate to check.

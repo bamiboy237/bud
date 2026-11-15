@@ -28,6 +28,8 @@ uv run pytest
   reaches a model or account API is a bug. Configuration lives in `[tool.pytest.ini_options]`:
   `asyncio_mode = "auto"`, a 120 s per-test timeout, and strict markers and config.
   Register a new marker in `pyproject.toml` before using it.
+- CI adds `--junitxml=test-results/junit.xml` to `pytest` and uploads that file when a job
+  fails. The test selection is the same as the command above.
 
 ## Rust (tui/)
 

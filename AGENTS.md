@@ -28,8 +28,9 @@ uv run pytest
 ```
 
 CI runs `pytest` on Python 3.12 and 3.14, and a package job that builds the wheel
-and sdist and installs each into a fresh venv without the dev group. The Rust and
-macOS jobs run when `tui/Cargo.toml` and `mac/` exist.
+and sdist, installs each with the locked runtime dependencies, and loads the
+packaged resources. The Rust job runs when `tui/Cargo.toml` exists; the macOS job
+runs on every run.
 
 Procedure, the Rust and macOS commands, and the `ty` baseline policy are in
 `.agents/skills/checks/SKILL.md`.

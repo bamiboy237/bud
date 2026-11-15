@@ -37,7 +37,7 @@ with `uv add` or `uv add --dev` and commit the updated lock.
 | Gateway and reviewer | Routing, fallback, and approval-review decisions |
 | Workspace | Path rules, revisions, and claim replay |
 | Recovery | A real server process restarts and resumes durable state |
-| Packaging | The wheel and sdist install and the CLI starts |
+| Packaging | The wheel and sdist install with locked deps and load their resources |
 
 Recovery tests start a real `create_app` server in a child process, kill it, and start it again
 against the same data directory. They use a real DBOS runtime and SQLite, not mocks.
@@ -53,19 +53,8 @@ Concurrent agents and concurrent tests must not share writable state or ports.
   `/var` are symlinks, so pass `tmp_path.resolve()`; a raw temp path fails with
   `NotADirectoryError`.
 - **Model config.** `create_app` needs a model for the `fast` tier and raises
-  `NoModelAvailable` without one. Point `MODELS_FILE` at a local stub so no key is needed:
-
-  ```toml
-  [[models]]
-  provider = "local"
-  name = "stub"
-  tier = "fast"
-  billing = "local"
-  base_url = "http://127.0.0.1:9/v1"
-  protocol = "chat"
-  supports_tools = true
-  ```
-
+  `NoModelAvailable` without one. Tests patch the gateway with a pydantic-ai `FunctionModel`, so
+  no key is configured and no request leaves the process.
 - **Owner token.** The app writes `DATA_DIR/auth/owner.token` (0600, in a 0700 directory).
   API tests send it as a bearer token, or set `OWNER_TOKEN` to their own base64url secret of
   43 to 256 characters.
@@ -96,21 +85,25 @@ pytest configuration lives in `[tool.pytest.ini_options]` in `pyproject.toml`:
 | :--- | :--- |
 | `lint` | ruff check and format on `src` and `tests`, then `ty check` |
 | `test` | `uv run pytest` on Python 3.12 and 3.14 |
-| `package` | Builds the wheel and sdist, installs each into a fresh venv, runs `bud --help` |
+| `package` | Builds the wheel and sdist, installs each with the locked runtime dependencies, and loads the packaged resources |
 | `tui` | Rust format, clippy, and tests, when `tui/Cargo.toml` exists |
 | `mac` | Swift tests and the packaged app, on macOS |
 
-The `package` job catches a missing package file or an undeclared runtime dependency. Run it
-locally with:
+The `package` job catches a missing package file, an undeclared runtime dependency, or a
+resource that only exists in the checkout. It installs from `$RUNNER_TEMP`, outside the
+checkout, with the versions `uv export` takes from the lock. Run it locally with:
 
 ```sh
 uv build --out-dir dist
+uv export --locked --no-dev --no-emit-project -q -o /tmp/constraints.txt
 uv venv --python 3.12 /tmp/smoke
-uv pip install --python /tmp/smoke/bin/python dist/*.whl
-/tmp/smoke/bin/bud --help
+uv pip install --python /tmp/smoke/bin/python --constraint /tmp/constraints.txt dist/*.whl
+cd /tmp && /tmp/smoke/bin/python -c "from bud.world.store import load_seed; assert load_seed()['world']; print('resources ok')"
 ```
 
-CI has no model keys. Every job must pass without one.
+CI has no model keys. Every job must pass without one. The `test` job adds
+`--junitxml=test-results/junit.xml` and uploads that file when the job fails; the test
+selection is the same as `uv run pytest`.
 
 ## Real-model evals
 
@@ -131,9 +124,11 @@ uv run bud eval --probe --trials 5
 - `--probe` tests the approval reviewer on hand-written calls instead of the task suite.
 
 **There is no spend-cap flag.** Bound the cost by choosing `--trials` and `--task`, and check
-`uv run bud costs` before and after. Each attempt stops after 180 seconds, and at most 4 attempts
-run at once. A large suite can still cost more than you expect. Evals never run in CI, and no
-scheduled job runs them.
+`uv run bud costs` before and after. Each attempt stops after its task timeout, 180 seconds by
+default, and at most 4 attempts run at once. A large suite can still cost more than you expect.
+Evals never run in CI, and no scheduled job runs them.
 
 Evals need `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `MUSE_API_KEY`, `MISTRAL_API_KEY`, or a ChatGPT
-login. See `.env.example` for the variable names and `docs/accounts.md` for account setup.
+login, plus `EXA_API_KEY` for a web-cache miss. `.env.example` lists `OPENAI_API_KEY`,
+`DEEPSEEK_API_KEY`, and `MISTRAL_API_KEY`; set `MUSE_API_KEY` and `EXA_API_KEY` in your own
+`.env` when you use them. See `docs/accounts.md` for account setup.
