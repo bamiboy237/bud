@@ -55,12 +55,16 @@ struct PetView: View {
     private var petRow: some View {
         HStack(spacing: 10) {
             if anchor.left { pet }
-            if companion.status == .working {
+            if Voice.shared.state == .listening || Voice.shared.state == .transcribing {
+                VoicePill(voice: Voice.shared)
+                    .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: anchor.left ? .leading : .trailing)))
+            } else if companion.status == .working {
                 StopButton(action: companion.stop)
                     .transition(.opacity)
             }
             if !anchor.left { pet }
         }
+        .animation(.spring(duration: 0.25, bounce: 0), value: Voice.shared.state)
     }
 
     private var pet: some View {
@@ -276,6 +280,62 @@ private struct StopButton: View {
     }
 }
 
+/// Beside the pet while you talk: bars that follow your voice, so you can see it's hearing
+/// you. While the words are being worked out, a quiet shimmer instead.
+private struct VoicePill: View {
+    let voice: Voice
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// Each bar takes a share of the level, the middle ones most, so it reads as a voice.
+    private let shape: [Float] = [0.45, 0.8, 1, 0.7, 0.4]
+
+    var body: some View {
+        HStack(spacing: 3) {
+            if voice.state == .listening {
+                ForEach(shape.indices, id: \.self) { index in
+                    Capsule()
+                        .fill(Paper.ink.opacity(0.75))
+                        .frame(width: 3, height: 4 + CGFloat(voice.level * shape[index]) * 14)
+                }
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.08), value: voice.level)
+            } else {
+                Text("Writing")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .shimmer(active: true)
+            }
+        }
+        .frame(height: 20)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
+        .surface(Capsule(), lift: 0.6)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(voice.state == .listening ? "Listening. Let go to send, Esc to cancel." : "Writing down what you said")
+    }
+}
+
+/// Words you said that didn't go out, with the choice to send them now or let them go.
+struct UnsentSpeech: View {
+    let companion: Companion
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("“\(companion.unsentSpeech ?? "")”")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(companion.inputPurpose == .ask ? "Send" : "Add to answer") { companion.resendSpeech() }
+                .buttonStyle(CardButton(kind: .secondary))
+            Button { companion.dropSpeech() } label: {
+                Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
+            }
+            .buttonStyle(IconButton(size: 20))
+            .accessibilityLabel("Don't send")
+        }
+    }
+}
+
 // MARK: Bubble
 
 private struct Bubble: View {
@@ -306,6 +366,7 @@ private struct Bubble: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             }
+            if companion.unsentSpeech != nil { UnsentSpeech(companion: companion) }
             if !companion.shown.isEmpty {
                 // The bubble hugs its text up to `maxReply`; longer replies scroll. Reading
                 // starts at the top, so streamed text grows below the fold instead of pulling
@@ -376,7 +437,7 @@ private struct Bubble: View {
 
     private var compact: Bool {
         companion.shown.isEmpty && companion.notices.isEmpty && companion.approvals.isEmpty
-            && companion.receipt == nil && companion.steps.isEmpty
+            && companion.receipt == nil && companion.steps.isEmpty && companion.unsentSpeech == nil
     }
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -788,7 +849,7 @@ struct IconButton: ButtonStyle {
     }
 }
 
-private struct CardButton: ButtonStyle {
+struct CardButton: ButtonStyle {
     enum Kind { case primary, secondary, quiet }
     let kind: Kind
 
@@ -999,7 +1060,7 @@ private struct InputField: View {
             .font(.body)
             .lineLimit(1...5)
             .focused($focused)
-            .onSubmit(companion.send)
+            .onSubmit { companion.send() }
             .onExitCommand {
                 companion.inputOpen = false
                 companion.inputPurpose = .ask

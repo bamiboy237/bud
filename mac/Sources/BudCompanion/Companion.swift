@@ -150,6 +150,11 @@ final class Companion {
     private(set) var lastWork: Work?
     /// A reply (or part of one) you're answering; it's quoted at the top of your message.
     var replyingTo: String?
+    /// While you hold the talk key: the pet waits, listening.
+    var hearing = false {
+        didSet { if hearing != oldValue { hearingSince = .now } }
+    }
+    @ObservationIgnored private var hearingSince = Date.now
     /// While the conversation window is open, it is where bud talks: the bubble stays shut.
     var windowOpen = false
     /// What's waiting on the owner, oldest first, with enough detail to decide in the bubble.
@@ -359,9 +364,25 @@ final class Companion {
 
     // MARK: Actions
 
-    func send() {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, let connection else { return }
+    /// Sends what's in the field, or `spoken` words. Spoken words sent as a message leave the
+    /// field as it was; spoken words answering bud's question are added to the field instead,
+    /// for you to send with Return.
+    /// `messageID` resends a held recording under its first id, so it can't arrive twice.
+    func send(spoken: String? = nil, messageID heldID: String? = nil) {
+        let text = (spoken ?? draft).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        guard let connection else {
+            // Never lose what was said: it waits apart from the field, ready to resend.
+            if spoken != nil { holdSpeech(text, because: "bud isn't connected, so that wasn't sent.") }
+            return
+        }
+        // An answer to bud's question is yours to confirm: spoken words join the field, after
+        // anything already typed, and Return sends them like a typed answer.
+        if spoken != nil, inputPurpose != .ask {
+            draft = draft.isEmpty ? text : draft + " " + text
+            inputOpen = true
+            return
+        }
         switch inputPurpose {
         case .answer(let id):
             respond(to: id, path: "answer", body: ["text": text])
@@ -374,8 +395,10 @@ final class Companion {
         case .ask:
             break
         }
-        draft = ""
-        inputOpen = false
+        if spoken == nil {
+            draft = ""
+            inputOpen = false
+        }
         // The old reply moves into the conversation now, so the bubble clears at once.
         archiveReply()
         reply = ""
@@ -388,9 +411,10 @@ final class Companion {
         // The pet starts working when bud says so (user.message), not on a hopeful send.
         sentAt = .now
         lastFirstText = nil
-        let messageID = unsent?.text == text
-            ? unsent!.id : UUID().uuidString.replacingOccurrences(of: "-", with: "")
-        unsent = nil
+        let messageID = heldID ?? (unsent?.text == text
+            ? unsent!.id : UUID().uuidString.replacingOccurrences(of: "-", with: ""))
+        // A typed message waiting for its retry keeps its id; speech never clears it.
+        if spoken == nil { unsent = nil }
         Task {
             do {
                 // Built here: a [String: Any] can't cross into the task under Swift 6 checking.
@@ -405,13 +429,61 @@ final class Companion {
                 activity = .failed
                 reply = "Couldn't send: \(error)"
                 showWhole()
-                if draft.isEmpty {
+                if spoken != nil {
+                    holdSpeech(text, id: messageID, because: "That didn't send.")
+                } else if draft.isEmpty {
                     draft = text
                     unsent = (text, messageID)
+                    inputOpen = true
                 }
-                inputOpen = true
             }
         }
+    }
+
+    /// Spoken words that couldn't go out, held apart from the field, which keeps what you typed.
+    private(set) var unsentSpeech: String?
+    /// The id a held recording was first sent under, when it got that far.
+    @ObservationIgnored private var unsentSpeechID: String?
+
+    /// Spoken words: sent at once as a message, or added to the field when they answer a
+    /// question of bud's.
+    /// `destination` is what the field was for when you started talking. If a question was
+    /// settled, or one arrived, while you spoke, the words are held rather than sent somewhere
+    /// you didn't mean.
+    func say(_ text: String, meant destination: InputPurpose) {
+        guard destination == inputPurpose else {
+            holdSpeech(text, because: "Things changed while you were talking, so that wasn't sent.")
+            return
+        }
+        send(spoken: text)
+    }
+
+    /// The held line's button: sends the words as a message, or, while bud waits for an
+    /// answer, adds them to the field (the button then says so).
+    func resendSpeech() {
+        guard let text = unsentSpeech else { return }
+        let id = unsentSpeechID
+        unsentSpeech = nil
+        unsentSpeechID = nil
+        send(spoken: text, messageID: id)
+    }
+
+    func dropSpeech() {
+        unsentSpeech = nil
+        unsentSpeechID = nil
+    }
+
+    private func holdSpeech(_ text: String, id: String? = nil, because reason: String) {
+        unsentSpeech = text
+        unsentSpeechID = id
+        nudge(reason)
+    }
+
+    /// A short line in the bubble, for things like "voice isn't set up yet". Cleared with the
+    /// next message, like job notices.
+    func nudge(_ text: String) {
+        if !notices.contains(text) { notices = Array((notices + [text]).suffix(3)) }
+        bubbleOpen = true
     }
 
     func stop() {
@@ -424,6 +496,7 @@ final class Companion {
     /// The row to play right now: carried, then a gesture in progress, then the status.
     func pose(at now: Date) -> (row: PetRow, since: Date) {
         if let walk { return walk }
+        if hearing { return (.waiting, hearingSince) }
         if let reaction, now < reaction.since + Double(reaction.row.loopMs) / 1000 {
             return reaction
         }
