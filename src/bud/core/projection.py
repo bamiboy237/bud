@@ -1,6 +1,8 @@
 """Fold session events into conversation, approval, queue, and run views."""
 
 from contextlib import suppress
+from dataclasses import replace
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
@@ -420,6 +422,9 @@ def model_history(events: list[Event]) -> list[ModelMessage]:
     tools_ran: list[str] = []
     calls: dict[str, str] = {}
     permitted: set[str] = set()
+    # The day the owner's current message was sent, and the last day marked in the history.
+    asked_on: date | None = None
+    marked: date | None = None
     for event in events:
         match event.type:
             case "user.message":
@@ -427,6 +432,7 @@ def model_history(events: list[Event]) -> list[ModelMessage]:
             case "run.queued":
                 if event.data.get("text") is not None:
                     user_text = event.data["text"]
+                    asked_on = _day(event.data.get("clock"))
             case "tool.call":
                 calls[event.data["call_id"]] = f"{event.data['tool']}({event.data['args']})"
             case "action.decided":
@@ -439,6 +445,10 @@ def model_history(events: list[Event]) -> list[ModelMessage]:
                 unfinished.extend(ModelMessagesTypeAdapter.validate_python(event.data["messages"]))
             case "run.completed":
                 unfinished.extend(ModelMessagesTypeAdapter.validate_python(event.data["messages"]))
+                if asked_on is not None and asked_on != marked:
+                    unfinished, dated = _dated(unfinished, asked_on)
+                    if dated:
+                        marked = asked_on
                 history += unfinished
                 unfinished, tools_ran, user_text, calls, permitted = [], [], None, {}, set()
             case "run.failed" | "run.cancelled":
@@ -452,6 +462,37 @@ def model_history(events: list[Event]) -> list[ModelMessage]:
                 )
                 unfinished, tools_ran, user_text, calls, permitted = [], [], None, {}, set()
     return history + unfinished
+
+
+def _day(clock: object) -> date | None:
+    """The calendar day of a run's recorded clock (the simulated clock in sim mode)."""
+    if not isinstance(clock, str):
+        return None
+    with suppress(ValueError):
+        return datetime.fromisoformat(clock).date()
+    return None
+
+
+def _dated(messages: list[ModelMessage], day: date) -> tuple[list[ModelMessage], bool]:
+    """Marks the first owner message of a day with its date, so "yesterday" means something.
+
+    The stored messages carry timestamps, but models never see them; without this, a long
+    conversation reads as one undated stream. Only day changes are marked, and the text is
+    derived from the log alone, so the history is identical on every rebuild and prompt
+    caching still holds.
+    """
+    for index, message in enumerate(messages):
+        if not isinstance(message, ModelRequest):
+            continue
+        for at, part in enumerate(message.parts):
+            if isinstance(part, UserPromptPart) and isinstance(part.content, str):
+                note = f"<time>Sent on {day:%A, %d %B %Y}.</time>\n\n"
+                parts = list(message.parts)
+                parts[at] = replace(part, content=note + part.content)
+                dated = [*messages]
+                dated[index] = replace(message, parts=parts)
+                return dated, True
+    return messages, False
 
 
 def _failure_note(
