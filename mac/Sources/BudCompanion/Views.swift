@@ -669,8 +669,8 @@ struct ApprovalCard: View {
     let companion: Companion
     let approval: Approval
     /// Inside a collapsible row: the row draws the surface, so the card draws only its content.
-    var nested = false
-    var showsHeading = true
+    let nested: Bool
+    let showsHeading: Bool
     @StateObject private var layout = ApprovalLayout()
 
     private var busy: Bool {
