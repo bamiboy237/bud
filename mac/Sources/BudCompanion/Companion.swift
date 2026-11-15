@@ -205,10 +205,10 @@ final class Companion {
     /// True while the pet is being dragged, so letting go doesn't count as a click.
     @ObservationIgnored var dragging = false
     /// Which way the pet walks while you carry it; nil when it isn't moving.
-    private(set) var walk: (row: PetRow, since: Date)?
+    private(set) var walk: (move: PetMove, since: Date)?
     @ObservationIgnored private var lastPointerX: CGFloat?
     /// A short gesture the pet plays over its status (a wave, a hop), then drops.
-    @ObservationIgnored private var reaction: (row: PetRow, since: Date)?
+    @ObservationIgnored private var reaction: (move: PetMove, since: Date)?
 
     /// Connect (or reconnect after a settings change): handshake, primary session, snapshot, stream.
     func start() {
@@ -493,27 +493,25 @@ final class Companion {
 
     // MARK: The pet's body language
 
-    /// The row to play right now: carried, then a gesture in progress, then the status.
-    func pose(at now: Date) -> (row: PetRow, since: Date) {
-        if let walk { return walk }
-        if hearing { return (.waiting, hearingSince) }
-        if let reaction, now < reaction.since + Double(reaction.row.loopMs) / 1000 {
-            return reaction
-        }
-        return (PetRow.of(status), statusSince)
+    /// What the pet is doing, as facts; the sprite turns them into a frame, since only it
+    /// knows how long each animation lasts.
+    var pose: PetPose {
+        PetPose(
+            status: PetMove.of(status), statusSince: statusSince, walk: walk,
+            listeningSince: hearing ? hearingSince : nil, reaction: reaction)
     }
 
-    /// Plays `row` once over the status, unless the pet is busy being carried.
-    func react(_ row: PetRow) {
+    /// Plays `move` once over the status, unless the pet is busy being carried.
+    func react(_ move: PetMove) {
         guard walk == nil else { return }
-        reaction = (row, .now)
+        reaction = (move, .now)
     }
 
     /// A wave when you point at the pet, but only when it has nothing else to show.
     func greet() {
         guard status == .idle || status == .done else { return }
         if let reaction, Date.now < reaction.since + 2 { return }
-        react(.waving)
+        react(.wave)
     }
 
     /// The pet walks the way it's being carried. Direction changes need a few points of
@@ -526,8 +524,8 @@ final class Companion {
         let dx = pointerX - last
         guard abs(dx) >= 3 else { return }
         lastPointerX = pointerX
-        let row: PetRow = dx > 0 ? .walkRight : .walkLeft
-        if walk?.row.index != row.index { walk = (row, .now) }
+        let move: PetMove = dx > 0 ? .walkRight : .walkLeft
+        if walk?.move != move { walk = (move, .now) }
     }
 
     func setDown() {
@@ -578,7 +576,7 @@ final class Companion {
             receipt = Receipt(text: "Denied. Nothing was done", symbol: "xmark")
         }
         self.receipt = receipt
-        if receipt.symbol == "checkmark" { react(.jumping) }
+        if receipt.symbol == "checkmark" { react(.hop) }
         Task {
             try? await Task.sleep(for: .seconds(1.8))
             if self.receipt == receipt { self.receipt = nil }
@@ -686,7 +684,7 @@ final class Companion {
             finish(with: Self.replyText(event.data))
             closeSteps()
             activity = .done
-            react(.jumping)
+            react(.hop)
             settleToIdle()
             refreshApprovals()
         case "run.waiting":

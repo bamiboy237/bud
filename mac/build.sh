@@ -16,13 +16,27 @@ cp "$here/Info.plist" "$app/Contents/Info.plist"
 # Pet art is private and never committed. Local pets (Codex format, one folder each with
 # pet.json and spritesheet.png) go into this build only; without them the app shows a paw.
 pets=${BUD_PETS:-${here:h}/data/pets}
-for pet in "$pets"/*/pet.json(N); do
-  dir=${pet:h}; name=${dir:t}
-  mkdir -p "$app/Contents/Resources/pets/$name"
-  cp "$dir/pet.json" "$app/Contents/Resources/pets/$name/"
-  sheet=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['spritesheetPath'])" "$pet")
-  cp "$dir/$sheet" "$app/Contents/Resources/pets/$name/"
-  echo "pet: $name"
+for dir in "$pets"/*(/N); do
+  name=${dir:t}; out="$app/Contents/Resources/pets/$name"
+  # A manifest pet (manifest.json, at the top or in assets/) needs only the manifest and the
+  # sheet it names; previews and source files stay behind.
+  manifest=""
+  for candidate in "$dir/manifest.json" "$dir/assets/manifest.json"; do
+    [[ -f $candidate ]] && { manifest=$candidate; break; }
+  done
+  if [[ -n $manifest ]]; then
+    mkdir -p "$out"
+    cp "$manifest" "$out/manifest.json"
+    atlas=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['atlas'])" "$manifest")
+    cp "${manifest:h}/$atlas" "$out/"
+    echo "pet: $name (manifest)"
+  elif [[ -f $dir/pet.json ]]; then
+    mkdir -p "$out"
+    cp "$dir/pet.json" "$out/"
+    sheet=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['spritesheetPath'])" "$dir/pet.json")
+    cp "$dir/$sheet" "$out/"
+    echo "pet: $name"
+  fi
 done
 # macOS remembers permissions such as the microphone per signing identity. An ad-hoc
 # signature changes with every build, so each rebuild would ask again. With a local

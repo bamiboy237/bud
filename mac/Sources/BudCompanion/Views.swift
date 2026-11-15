@@ -146,7 +146,7 @@ private struct PetButton: View {
 
     /// The pet acts out the status; colour appears only when bud needs you.
     private func pet(_ sprite: PetSprite) -> some View {
-        AnimatedPet(sprite: sprite, pose: companion.pose(at:))
+        AnimatedPet(sprite: sprite, pose: { companion.pose })
             // Away from bud: greyed and faded, so a stale pet never looks like a working one.
             .saturation(connected ? 1 : 0)
             .opacity(connected ? 1 : 0.55)
