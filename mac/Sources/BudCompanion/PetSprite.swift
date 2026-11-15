@@ -148,8 +148,11 @@ final class PetSprite {
 
     /// A file named by a manifest must sit in the manifest's own folder, never elsewhere.
     private static func image(named name: String, in folder: URL) -> CGImage? {
-        guard !name.contains("/"), !name.hasPrefix("."),
-              let source = CGImageSourceCreateWithURL(folder.appending(path: name) as CFURL, nil)
+        guard !name.isEmpty, !name.contains("/"), !name.hasPrefix(".") else { return nil }
+        let home = folder.resolvingSymlinksInPath().standardizedFileURL
+        let path = home.appending(path: name).resolvingSymlinksInPath().standardizedFileURL
+        guard path.deletingLastPathComponent().path == home.path,
+              let source = CGImageSourceCreateWithURL(path as CFURL, nil)
         else { return nil }
         return CGImageSourceCreateImageAtIndex(source, 0, nil)
     }
@@ -201,6 +204,7 @@ final class PetSprite {
               let atlas = manifest["atlas"] as? String,
               let sheet = image(named: atlas, in: home),
               let cellSize = manifest["cell"] as? [Int], cellSize.count == 2,
+              cellSize.allSatisfy({ $0 > 0 }),
               let named = manifest["actions"] as? [String: [String: Any]],
               let states = manifest["states"] as? [String: String]
         else { return nil }
@@ -211,13 +215,20 @@ final class PetSprite {
             else { return nil }
             var rects: [CGRect] = []
             var durations: [Int] = []
+            var totalDuration = 0
             for frame in frames {
-                guard let r = frame["rect"] as? [Int], r.count == 4 else { return nil }
+                guard let r = frame["rect"] as? [Int], r.count == 4,
+                      r[0] >= 0, r[1] >= 0, r[2] == cellSize[0], r[3] == cellSize[1],
+                      let duration = frame["durationMs"] as? Int, duration > 0
+                else { return nil }
                 let rect = CGRect(x: r[0], y: r[1], width: r[2], height: r[3])
                 // A frame outside the sheet means a broken manifest: skip the whole action.
                 guard bounds.contains(rect) else { return nil }
+                let (nextDuration, overflow) = totalDuration.addingReportingOverflow(duration)
+                guard !overflow else { return nil }
+                totalDuration = nextDuration
                 rects.append(rect)
-                durations.append(max(16, frame["durationMs"] as? Int ?? 120))
+                durations.append(duration)
             }
             return PetAction(frames: rects, durations: durations, loop: entry["loop"] as? Bool ?? true)
         }
@@ -229,7 +240,10 @@ final class PetSprite {
         for (move, key) in statuses {
             if let id = states[key], let found = action(id) { actions[move] = found }
         }
-        guard actions[.idle] != nil else { return nil }
+        guard let idle = actions[.idle] else { return nil }
+        for (move, _) in statuses where actions[move] == nil {
+            actions[move] = idle
+        }
         // Brief modes, by their ids, each with the nearest stand-in until its own art exists.
         // A missing walk or hop falls back to the status pose, never to nothing.
         let modes: [(PetMove, [String])] = [

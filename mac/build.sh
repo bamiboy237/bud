@@ -16,6 +16,23 @@ cp "$here/Info.plist" "$app/Contents/Info.plist"
 # Pet art is private and never committed. Local pets (Codex format, one folder each with
 # pet.json and spritesheet.png) go into this build only; without them the app shows a paw.
 pets=${BUD_PETS:-${here:h}/data/pets}
+pet_sheet() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest = Path(sys.argv[1])
+name = json.loads(manifest.read_text())[sys.argv[2]]
+if not isinstance(name, str) or not name or "/" in name or name.startswith("."):
+    sys.exit(f"Invalid pet image filename in {manifest}")
+source = manifest.parent / name
+if not source.is_file() or source.resolve().parent != manifest.parent.resolve():
+    sys.exit(f"Pet image must be a file inside {manifest.parent}")
+print(name)
+PY
+}
+
 for dir in "$pets"/*(/N); do
   name=${dir:t}; out="$app/Contents/Resources/pets/$name"
   # A manifest pet (manifest.json, at the top or in assets/) needs only the manifest and the
@@ -25,15 +42,15 @@ for dir in "$pets"/*(/N); do
     [[ -f $candidate ]] && { manifest=$candidate; break; }
   done
   if [[ -n $manifest ]]; then
+    atlas=$(pet_sheet "$manifest" atlas)
     mkdir -p "$out"
     cp "$manifest" "$out/manifest.json"
-    atlas=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['atlas'])" "$manifest")
     cp "${manifest:h}/$atlas" "$out/"
     echo "pet: $name (manifest)"
   elif [[ -f $dir/pet.json ]]; then
+    sheet=$(pet_sheet "$dir/pet.json" spritesheetPath)
     mkdir -p "$out"
     cp "$dir/pet.json" "$out/"
-    sheet=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['spritesheetPath'])" "$dir/pet.json")
     cp "$dir/$sheet" "$out/"
     echo "pet: $name"
   fi
