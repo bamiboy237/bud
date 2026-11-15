@@ -13,8 +13,7 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin/BudCompanion" "$app/Contents/MacOS/bud"
 cp "$here/Info.plist" "$app/Contents/Info.plist"
-# Pet art is private and never committed. Local pets (Codex format, one folder each with
-# pet.json and spritesheet.png) go into this build only; without them the app shows a paw.
+# Bundled pets ship by default; local pets can replace a bundled pet with the same ID.
 pets=${BUD_PETS:-${here:h}/data/pets}
 pet_sheet() {
   python3 - "$1" "$2" <<'PY'
@@ -33,8 +32,14 @@ print(name)
 PY
 }
 
-for dir in "$pets"/*(/N); do
-  name=${dir:t}; out="$app/Contents/Resources/pets/$name"
+typeset -A pet_dirs
+for dir in "$here/Resources/pets"/*(/N) "$pets"/*(/N); do
+  if [[ -f "$dir/manifest.json" || -f "$dir/assets/manifest.json" || -f "$dir/pet.json" ]]; then
+    pet_dirs[${dir:t}]=$dir
+  fi
+done
+for name in ${(ok)pet_dirs}; do
+  dir=${pet_dirs[$name]}; out="$app/Contents/Resources/pets/$name"
   # A manifest pet (manifest.json, at the top or in assets/) needs only the manifest and the
   # sheet it names; previews and source files stay behind.
   manifest=""

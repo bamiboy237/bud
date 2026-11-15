@@ -77,3 +77,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: swift --version
       - run: swift test -c release --package-path mac
+      - run: ./mac/build.sh
+      - name: Verify bundled dog
+        run: |
+          for source in mac/Resources/pets/dog/*; do
+            cmp "$source" "mac/build/bud.app/Contents/Resources/pets/dog/${source##*/}"
+          done
+          test "$(find mac/build/bud.app/Contents/Resources/pets/dog -type f | wc -l)" -eq 2
+          codesign --verify --deep --strict mac/build/bud.app

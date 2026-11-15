@@ -1,6 +1,6 @@
 ---
 name: checks
-description: 'Run the checks CI enforces: uv sync --locked, ruff check, ruff format --check, ty check, and the tui/ Rust checks when cargo is installed. Use after editing src/ or tui/, or when asked to verify, lint, or type-check the project.'
+description: 'Run the checks CI enforces for Python, the Rust TUI, and the macOS companion. Use after editing src/, tui/, or mac/, or when asked to verify, lint, or type-check the project.'
 ---
 # Project checks
 
@@ -33,6 +33,11 @@ cargo test --locked --manifest-path tui/Cargo.toml
 ```
 
 When `cargo` is not installed, say that the Rust checks did not run and that CI covers them.
+
+## macOS companion
+
+On macOS, run the native tests and packaged-art checks in
+[mac/Tests/README.md](../../../mac/Tests/README.md). These match the macOS CI job.
 
 ## Report
 
