@@ -60,21 +60,24 @@ struct ApprovalTests {
     }
 
     @Test @MainActor
-    func selectionSurvivesRefreshAndFallsBackWhenDecided() {
+    func refreshReplacesPendingApprovalsAndReportsQuestions() {
         let companion = Companion()
-        func snapshot(_ ids: [String], seq: Int) -> [String: Any] {
-            ["last_seq": seq, "pending_approvals": ids.map {
-                ["approval_id": $0, "tool": "archive_email", "args": [:]]
-            }]
+        func snapshot(_ items: [[String: Any]], seq: Int) -> [String: Any] {
+            ["last_seq": seq, "pending_approvals": items]
         }
-        companion.apply(snapshot: snapshot(["a", "b"], seq: 1))
-        companion.selectedApprovalID = "b"
-        companion.apply(snapshot: snapshot(["a", "b", "c"], seq: 2))
-        #expect(companion.selectedApproval?.id == "b")
-        companion.apply(snapshot: snapshot(["a", "c"], seq: 3))
-        #expect(companion.selectedApproval?.id == "a")
-        companion.apply(snapshot: snapshot([], seq: 4))
-        #expect(companion.selectedApproval == nil)
+        let archive: [String: Any] = ["approval_id": "a", "tool": "archive_email", "args": [:]]
+        let question: [String: Any] = [
+            "approval_id": "q", "tool": "ask_user", "args": ["question": "Which one?"]
+        ]
+        companion.apply(snapshot: snapshot([archive], seq: 1))
+        #expect(companion.approvals.map(\.id) == ["a"])
+        #expect(!companion.hasQuestion)
+        companion.apply(snapshot: snapshot([archive, question], seq: 2))
+        #expect(companion.approvals.map(\.id) == ["a", "q"])
+        #expect(companion.hasQuestion)
+        companion.apply(snapshot: snapshot([], seq: 3))
+        #expect(companion.approvals.isEmpty)
+        #expect(!companion.hasQuestion)
     }
 
     @Test
@@ -237,14 +240,13 @@ struct ApprovalTests {
         companion.completeBatch(.init(approved: ["a", "c"], failures: ["b": "Connection failed"]),
                                 ids: ["a", "b", "c"])
         #expect(companion.approvals.map(\.id) == ["b"])
-        #expect(companion.selectedApproval?.id == "b")
         #expect(companion.approvalFailures["b"] == "Connection failed")
         companion.apply(snapshot: state(["b", "new"], seq: 2))
-        let selected = try #require(companion.selectedApproval)
-        #expect(companion.failedApprovals(for: selected).map(\.id) == ["b"])
+        let failed = try #require(companion.approvals.first)
+        #expect(companion.failedApprovals(for: failed).map(\.id) == ["b"])
         companion.apply(snapshot: state(["new"], seq: 3))
         #expect(companion.approvalFailures.isEmpty)
-        let remaining = try #require(companion.selectedApproval)
+        let remaining = try #require(companion.approvals.first)
         #expect(companion.failedApprovals(for: remaining).isEmpty)
     }
 }

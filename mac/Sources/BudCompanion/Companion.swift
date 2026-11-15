@@ -166,6 +166,8 @@ final class Companion {
     private(set) var approvals: [Approval] = []
     /// Decisions sent and not yet confirmed: their buttons stay disabled, so one click is one call.
     private(set) var deciding: Set<String> = []
+    /// True while a batch approval is running, so single decisions wait for it.
+    private(set) var approvingBatch = false
     /// Why the last decision didn't go through, shown on the card.
     private(set) var decisionProblem: String?
     private(set) var approvalFailures: [String: String] = [:]
