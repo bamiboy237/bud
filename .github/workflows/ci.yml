@@ -15,9 +15,27 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  check:
+  # Lint and type-check once: ruff and ty do not depend on the interpreter
+  # version, and the test matrix below already covers both ends of the range.
+  lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff check src tests
+      - run: uv run ruff format --check src tests
+      # Diagnostics already in .ty/baseline.json are suppressed; new ones fail.
+      - run: uv run ty check
+
+  # Behavior tests are offline and deterministic: no model, account, or network
+  # calls. Real-model evals run manually (`bud eval`), never in CI.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -31,10 +49,30 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked
-      - run: uv run ruff check src
-      - run: uv run ruff format --check src
-      # Diagnostics already in .ty/baseline.json are suppressed; new ones fail.
-      - run: uv run ty check
+      - run: uv run pytest
+
+  # The wheel and sdist must work outside the checkout, without the dev group.
+  # A fresh venv catches missing package data and undeclared runtime deps.
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+      - run: uv build --out-dir dist
+      - name: Install the wheel into a fresh environment
+        run: |
+          uv venv --python 3.12 /tmp/wheel-venv
+          uv pip install --python /tmp/wheel-venv/bin/python dist/*.whl
+          /tmp/wheel-venv/bin/python -c "import bud; print(bud.__version__)"
+          /tmp/wheel-venv/bin/bud --help
+      - name: Install the sdist into a fresh environment
+        run: |
+          uv venv --python 3.12 /tmp/sdist-venv
+          uv pip install --python /tmp/sdist-venv/bin/python dist/*.tar.gz
+          /tmp/sdist-venv/bin/bud --help
 
   # The Rust terminal client in tui/ only exists on branches that carry it;
   # skip the job entirely where there is no crate to check.

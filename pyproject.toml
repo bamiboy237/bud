@@ -37,6 +37,9 @@ select = ["E", "F", "I", "B", "UP", "SIM"]
 
 [dependency-groups]
 dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.5.0",
+    "pytest-timeout>=2.4.0",
     "ruff>=0.17.4",
     "ty>=0.0.101",
 ]
@@ -46,3 +49,13 @@ dev = [
 # are suppressed (preview feature, >=0.0.93); new ones fail `ty check`.
 # Regenerate with `uv run ty check --update-baseline`.
 baseline = ".ty/baseline.json"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Behavior tests are async. Auto mode runs `async def` tests without a marker.
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# Recovery tests wait on real child processes. Without a per-test limit, one
+# stuck process holds the CI job until its own timeout and hides which test hung.
+timeout = 120
+addopts = ["-q", "--strict-markers", "--strict-config"]
