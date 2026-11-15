@@ -374,15 +374,21 @@ final class Companion {
             if spoken != nil { holdSpeech(text, because: "bud isn't connected, so that wasn't sent.") }
             return
         }
-        // A spoken answer goes in the request only; a half-typed answer stays in its field.
+        // An answer to bud's question is yours to confirm: spoken words join the field, after
+        // anything already typed, and Return sends them like a typed answer.
+        if spoken != nil, inputPurpose != .ask {
+            draft = draft.isEmpty ? text : draft + " " + text
+            inputOpen = true
+            return
+        }
         switch inputPurpose {
         case .answer(let id):
-            respond(to: id, path: "answer", body: ["text": text], spoken: spoken)
+            respond(to: id, path: "answer", body: ["text": text])
             return
         case .revise(let id):
             respond(to: id, path: "revise", body: [
                 "text": text, "message_id": UUID().uuidString.replacingOccurrences(of: "-", with: ""),
-            ], spoken: spoken)
+            ])
             return
         case .ask:
             break
@@ -436,7 +442,8 @@ final class Companion {
     /// The id a held recording was first sent under, when it got that far.
     @ObservationIgnored private var unsentSpeechID: String?
 
-    /// Spoken words, sent like typed ones: a message, or your answer when bud asked something.
+    /// Spoken words: sent at once as a message, or added to the field when they answer a
+    /// question of bud's.
     /// `destination` is what the field was for when you started talking. If a question was
     /// settled, or one arrived, while you spoke, the words are held rather than sent somewhere
     /// you didn't mean.
@@ -574,15 +581,14 @@ final class Companion {
         }
     }
 
-    /// `spoken`: the answer came by voice, so the field (and anything typed there) is left alone.
-    private func respond(to id: String, path: String?, body: [String: any Sendable], spoken: String? = nil) {
+    private func respond(to id: String, path: String?, body: [String: any Sendable]) {
         guard let connection, !deciding.contains(id) else { return }
         deciding.insert(id)
         decisionProblem = nil
         let route = "sessions/\(session)/approvals/\(id)" + (path.map { "/\($0)" } ?? "")
         // Typed in the field (an answer or a change), as opposed to a button or an option.
-        let typed = inputPurpose == .ask || spoken != nil ? "" : draft
-        if inputPurpose != .ask, spoken == nil {
+        let typed = inputPurpose == .ask ? "" : draft
+        if inputPurpose != .ask {
             draft = ""
             inputOpen = false
             inputPurpose = .ask
@@ -600,7 +606,6 @@ final class Companion {
                 openApprovals.remove(id)
             } catch {
                 decisionProblem = "That didn't go through: \(error)"
-                if let spoken { holdSpeech(spoken, because: "That didn't send.") }
                 if !typed.isEmpty {
                     // Keep what was typed, so trying again is one Return.
                     inputPurpose = path == "answer" ? .answer(id) : .revise(id)

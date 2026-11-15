@@ -93,8 +93,11 @@ final class Voice {
             let names = await ContactNames.load(ask: askForContacts)
             do {
                 transcriber = try await Transcriber.load(names: names) { fraction in
+                    // Updates arrive out of order across tasks; the bar only moves forward.
                     Task { @MainActor in
-                        if case .preparing = Voice.shared.state { Voice.shared.state = .preparing(fraction) }
+                        if case .preparing(let shown) = Voice.shared.state, fraction > shown {
+                            Voice.shared.state = .preparing(fraction)
+                        }
                     }
                 }
                 state = .ready
