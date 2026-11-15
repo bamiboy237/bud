@@ -68,6 +68,21 @@ Or ask a one-off question directly:
 uv run bud ask "What are the core principles of event sourcing?"
 ```
 
+### macOS companion
+
+Requires macOS 15 or later and Swift 6.2 or later. With the server running,
+build and launch the desktop companion:
+
+```bash
+./mac/build.sh --run
+```
+
+The build includes Bud's animated dog from `mac/Resources/pets/dog`.
+No separate artwork download is needed.
+
+Folders under `data/pets` override bundled pets with the same name.
+Set `BUD_PETS` to use another local pet folder.
+
 ### Jobs and approvals
 
 Quick questions stay in the chat. Longer work runs as a separate job with its
