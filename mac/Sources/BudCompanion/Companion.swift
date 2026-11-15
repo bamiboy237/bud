@@ -169,11 +169,8 @@ final class Companion {
     /// Why the last decision didn't go through, shown on the card.
     private(set) var decisionProblem: String?
     private(set) var approvalFailures: [String: String] = [:]
-    var selectedApprovalID: String?
-    private(set) var approvingBatch = false
-    var selectedApproval: Approval? {
-        approvals.first { $0.id == selectedApprovalID } ?? approvals.first
-    }
+    /// True while any pending item is a question rather than a permission request.
+    var hasQuestion: Bool { approvals.contains(where: \.isQuestion) }
     /// What the input field's text is for.
     var inputPurpose: InputPurpose = .ask
     /// Which side of the pet the bubble opens on, set by the panel as the pet is moved.
@@ -599,10 +596,6 @@ final class Companion {
         for (id, failure) in result.failures where openApprovals.contains(id) {
             approvalFailures[id] = failure
         }
-        if selectedApprovalID == nil || ids.contains(selectedApprovalID ?? ""),
-           let failed = ids.first(where: { approvalFailures[$0] != nil }) {
-            selectedApprovalID = failed
-        }
         showReceipt(text: "Approved \(result.approved.count) of \(ids.count) actions")
         refreshApprovals()
     }
@@ -665,9 +658,14 @@ final class Companion {
         deciding.insert(id)
         decisionProblem = nil
         let route = "sessions/\(session)/approvals/\(id)" + (path.map { "/\($0)" } ?? "")
-        // Typed in the field (an answer or a change), as opposed to a button or an option.
-        let typed = inputPurpose == .ask ? "" : draft
-        if inputPurpose != .ask {
+        // Typed in the field for this approval (an answer or a change), as opposed to a
+        // button. A draft opened for another approval stays where it is.
+        let targetsThis: Bool = switch inputPurpose {
+        case .answer(let target), .revise(let target): target == id
+        case .ask: false
+        }
+        let typed = targetsThis ? draft : ""
+        if targetsThis {
             draft = ""
             inputOpen = false
             inputPurpose = .ask
@@ -679,7 +677,9 @@ final class Companion {
             do {
                 let response = try await connection.send("POST", route, json: Self.payload(body))
                 guard mine == generation else { return }
-                try ApprovalBatch.requireApplied(response)
+                // Answers report `answered`; approvals and revisions report `applied`.
+                try ApprovalBatch.requireApplied(
+                    response, key: path == "answer" ? "answered" : "applied")
                 if let approval {
                     showReceipt(for: approval, path: path, approved: body["approved"] as? Bool, answer: answer)
                 }

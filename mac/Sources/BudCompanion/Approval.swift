@@ -86,7 +86,11 @@ struct Approval: Identifiable, Equatable {
         symbol = words.symbol
         facts = Self.facts(args)
         if args["is_html"] as? Bool == true {
-            body = (raw["preview"] as? [String: Any])?["proposed_body_text"] as? String
+            // Approvals saved before previews existed have no proposed text; show the body
+            // they carry rather than hiding what will be sent.
+            body = ((raw["preview"] as? [String: Any])?["proposed_body_text"] as? String)
+                .flatMap(\.nilIfEmpty)
+                ?? Self.text(args, "body", "body_text", "text", "description").nilIfEmpty
         } else {
             body = Self.text(args, "body", "body_text", "text", "description").nilIfEmpty
         }

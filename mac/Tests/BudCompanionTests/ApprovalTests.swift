@@ -157,6 +157,35 @@ struct ApprovalTests {
     }
 
     @Test @MainActor
+    func answerResponsesAreConfirmedByAnswered() throws {
+        // The answer endpoint reports `answered`, not `applied`.
+        try ApprovalBatch.requireApplied(["answered": true], key: "answered")
+        #expect(throws: ApprovalBatch.DecisionError.self) {
+            try ApprovalBatch.requireApplied(["applied": true], key: "answered")
+        }
+        #expect(throws: ApprovalBatch.DecisionError.self) {
+            try ApprovalBatch.requireApplied(["answered": true])
+        }
+    }
+
+    @Test @MainActor
+    func oneRowOpensAtATime() {
+        let expansion = ApprovalExpansion()
+        expansion.sync(["a", "b"])
+        #expect(expansion.open.isEmpty)
+        expansion.toggle("a")
+        #expect(expansion.open == ["a"])
+        expansion.toggle("b")
+        #expect(expansion.open == ["b"])
+        expansion.toggle("b")
+        #expect(expansion.open.isEmpty)
+        expansion.sync(["b"])
+        #expect(expansion.open == ["b"])
+        expansion.sync([])
+        #expect(expansion.open.isEmpty)
+    }
+
+    @Test @MainActor
     func cancellationPreventsAnyFurtherApproval() async {
         var sent: [String] = []
         let task = Task {

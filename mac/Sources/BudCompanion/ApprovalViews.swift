@@ -5,22 +5,21 @@ final class ApprovalLayout: ObservableObject {
     @Published var message = 0
 }
 
-/// Which pending rows are open. One pending action opens by default; with several, each row
-/// starts closed so the list stays short, and a click opens or closes that row.
+/// Which pending row is open. One pending action opens by default; with several, each row
+/// starts closed and opening one closes the other, so the panel never stacks tall cards.
 final class ApprovalExpansion: ObservableObject {
     @Published private(set) var open: Set<String> = []
     private var ids: [String] = []
 
     func sync(_ current: [String]) {
         guard current != ids else { return }
-        let first = ids.isEmpty
         ids = current
         open.formIntersection(current)
-        if first, current.count == 1, let only = current.first { open = [only] }
+        if current.count == 1, open.isEmpty, let only = current.first { open = [only] }
     }
 
     func toggle(_ id: String) {
-        if open.contains(id) { open.remove(id) } else { open.insert(id) }
+        open = open.contains(id) ? [] : [id]
     }
 }
 
@@ -140,6 +139,13 @@ struct ApprovalRow: View {
             .buttonStyle(.plain)
             .accessibilityLabel(approval.isQuestion ? "bud's question" : approval.title)
             .accessibilityHint(open ? "Collapse this request" : "Expand this request")
+            if let problem = companion.approvalFailures[approval.id] {
+                // A failed decision must stay readable while its row is closed.
+                Text(problem)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if open {
                 ApprovalCard(companion: companion, approval: approval, nested: true, showsHeading: false)
                     .transition(.opacity)

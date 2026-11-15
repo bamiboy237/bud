@@ -417,7 +417,7 @@ private struct Bubble: View {
         .fixedSize(horizontal: compact, vertical: false)
         .surface(BubbleShape(anchor: companion.anchor))
         .onHover { companion.bubbleHovered = $0 }
-        .animation(.easeOut(duration: 0.15), value: companion.selectedApproval?.id)
+        .animation(.easeOut(duration: 0.15), value: companion.approvals.first?.id)
         .animation(.easeOut(duration: 0.2), value: companion.receipt)
     }
 
@@ -524,7 +524,7 @@ private struct Bubble: View {
             }
             return ("Working on it", .secondary, true)
         case .needsYou:
-            let asking = companion.selectedApproval?.isQuestion == true
+            let asking = companion.hasQuestion
             return (asking ? "Has a question" : "Needs your OK", .orange, false)
         case .failed: return ("Couldn't finish", .red, false)
         case .done: return ("Done", .secondary, false)
@@ -677,7 +677,9 @@ struct ApprovalCard: View {
         companion.deciding.contains(approval.id) || companion.approvingBatch || companion.link != .connected
     }
     private var detailLimit: CGFloat {
-        let height: CGFloat = companion.windowOpen ? 300 : companion.inputOpen ? 140 : 190
+        // Several rows share one floating panel, so an open card gives up some height.
+        let crowded = companion.approvals.count > 2
+        let height: CGFloat = companion.windowOpen ? 300 : companion.inputOpen ? 140 : crowded ? 130 : 190
         let hasProblem = companion.approvalFailures[approval.id] != nil || companion.decisionProblem != nil
         return hasProblem ? max(80, height - 40) : height
     }

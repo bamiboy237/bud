@@ -13,8 +13,8 @@ struct ApprovalBatch {
         var cancelled = false
     }
 
-    static func requireApplied(_ response: [String: Any]) throws {
-        guard response["applied"] as? Bool == true else { throw DecisionError.noLongerPending }
+    static func requireApplied(_ response: [String: Any], key: String = "applied") throws {
+        guard response[key] as? Bool == true else { throw DecisionError.noLongerPending }
     }
 
     /// New arrivals are not eligible. Independent failures do not block other decisions.
