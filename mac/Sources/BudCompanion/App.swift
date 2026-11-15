@@ -37,10 +37,28 @@ private struct MenuContent: View {
         }
         Toggle("Show bud's steps after replies", isOn: $companion.showStepsAfter)
         Divider()
+        voice
+        Divider()
         Button("Reconnect") { companion.start() }
         SettingsLink { Text("Settings…") }
         Divider()
         Button("Quit bud") { NSApp.terminate(nil) }.keyboardShortcut("q")
+    }
+
+    /// Hold-to-talk: set it up, watch it download, then a reminder of the key.
+    @ViewBuilder private var voice: some View {
+        let voice = Voice.shared
+        switch voice.state {
+        case .off:
+            Button("Set up voice…", action: voice.setUp)
+        case .preparing(let fraction):
+            Text("Setting up voice… \(Int(fraction * 100))%")
+        case .failed(let message):
+            Text(message)
+            Button("Try setting up voice again", action: voice.setUp)
+        case .ready, .listening, .transcribing:
+            Text("Hold \(voice.keyName) to talk to bud")
+        }
     }
 
     private var status: String {
@@ -70,6 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.orderFrontRegardless()
         self.panel = panel
         companion.start()
+        Voice.shared.start()
     }
 
     func ask() {

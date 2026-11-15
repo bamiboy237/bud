@@ -21,6 +21,12 @@
 	<!-- A menu-bar app: no Dock icon, no app menu. -->
 	<key>LSUIElement</key>
 	<true/>
+	<!-- Hold-to-talk: speech is transcribed on this Mac and never uploaded. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>bud listens only while you hold the talk key, and turns your words into text on this Mac.</string>
+	<!-- Names from Contacts help bud spell the people you mention. -->
+	<key>NSContactsUsageDescription</key>
+	<string>bud reads the names in your contacts so it spells the people you mention correctly. Nothing leaves this Mac.</string>
 	<!-- bud runs on this Mac over plain HTTP; allow loopback only. -->
 	<key>NSAppTransportSecurity</key>
 	<dict>

@@ -150,6 +150,11 @@ final class Companion {
     private(set) var lastWork: Work?
     /// A reply (or part of one) you're answering; it's quoted at the top of your message.
     var replyingTo: String?
+    /// While you hold the talk key: the pet waits, listening.
+    var hearing = false {
+        didSet { if hearing != oldValue { hearingSince = .now } }
+    }
+    @ObservationIgnored private var hearingSince = Date.now
     /// While the conversation window is open, it is where bud talks: the bubble stays shut.
     var windowOpen = false
     /// What's waiting on the owner, oldest first, with enough detail to decide in the bubble.
@@ -414,6 +419,19 @@ final class Companion {
         }
     }
 
+    /// Spoken words, sent like typed ones: a message, or your answer when bud asked something.
+    func say(_ text: String) {
+        draft = text
+        send()
+    }
+
+    /// A short line in the bubble, for things like "voice isn't set up yet". Cleared with the
+    /// next message, like job notices.
+    func nudge(_ text: String) {
+        if !notices.contains(text) { notices.append(text) }
+        bubbleOpen = true
+    }
+
     func stop() {
         guard let connection else { return }
         Task { _ = try? await connection.send("POST", "sessions/\(session)/stop", json: [:]) }
@@ -424,6 +442,7 @@ final class Companion {
     /// The row to play right now: carried, then a gesture in progress, then the status.
     func pose(at now: Date) -> (row: PetRow, since: Date) {
         if let walk { return walk }
+        if hearing { return (.waiting, hearingSince) }
         if let reaction, now < reaction.since + Double(reaction.row.loopMs) / 1000 {
             return reaction
         }
