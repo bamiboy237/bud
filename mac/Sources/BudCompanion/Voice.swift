@@ -36,12 +36,14 @@ final class Voice {
     private(set) var level: Float = 0
     /// Which key you hold: ⌥ Space, or right ⌥ when another app owns ⌥ Space.
     private(set) var keyName = "⌥ Space"
+    /// The right ⌥ fallback needs Accessibility; the menu asks for it when this is true.
+    private(set) var needsAccessibility = false
 
     @ObservationIgnored private var transcriber: Transcriber?
     @ObservationIgnored private let recorder = Recorder()
     @ObservationIgnored private var talkKey: Hotkey?
     @ObservationIgnored private var optionHold: RightOptionHold?
-    @ObservationIgnored private var escapeKey: Hotkey?
+    @ObservationIgnored private var escapeKeys: [Hotkey] = []
 
     /// Takes the key, and loads the models if they were set up before.
     func start() {
@@ -49,6 +51,7 @@ final class Voice {
         if talkKey == nil {
             log.info("⌥ Space is taken; using the right Option key")
             keyName = "right ⌥"
+            needsAccessibility = !RightOptionHold.allowed
             optionHold = RightOptionHold(onPress: press, onRelease: release)
         }
         if Transcriber.downloaded { prepare(askForContacts: false) }
@@ -62,6 +65,21 @@ final class Voice {
                 return
             }
             prepare(askForContacts: true)
+        }
+    }
+
+    /// Opens the Accessibility prompt, then picks the key up once it's allowed. A monitor made
+    /// before the permission was granted stays blind, so it's made again.
+    func allowRightOption() {
+        RightOptionHold.askForPermission()
+        Task {
+            for _ in 0..<90 where !RightOptionHold.allowed {
+                try? await Task.sleep(for: .seconds(2))
+            }
+            guard RightOptionHold.allowed else { return }
+            optionHold?.stop()
+            optionHold = RightOptionHold(onPress: press, onRelease: release)
+            needsAccessibility = false
         }
     }
 
@@ -114,7 +132,8 @@ final class Voice {
         Companion.shared.hearing = true
         TalkSound.start.play()
         // Esc drops the recording; taken only while listening, so it's never stolen otherwise.
-        escapeKey = Hotkey(key: kVK_Escape, modifiers: 0, onPress: cancel)
+        // Option is still held, so it arrives as ⌥ Esc; plain Esc covers a key let go early.
+        escapeKeys = [optionKey, 0].compactMap { Hotkey(key: kVK_Escape, modifiers: $0, onPress: cancel) }
     }
 
     private func release() {
@@ -147,12 +166,17 @@ final class Voice {
     }
 
     private func finishListening() -> Clip {
-        escapeKey?.unregister()
-        escapeKey = nil
+        escapeKeys.forEach { $0.unregister() }
+        escapeKeys = []
         Companion.shared.hearing = false
         level = 0
         return recorder.stop()
     }
+}
+
+enum RecorderError: LocalizedError {
+    case noMicrophone
+    var errorDescription: String? { "No microphone is available." }
 }
 
 /// Audio as recorded: mono samples at the microphone's own rate.
@@ -171,6 +195,9 @@ final class Recorder {
     func start(level: @escaping @Sendable (Float) -> Void) throws {
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
+        // A Mac with no microphone reports an empty format, and tapping it raises an
+        // Objective-C exception Swift can't catch; refuse first instead.
+        guard format.sampleRate > 0, format.channelCount > 0 else { throw RecorderError.noMicrophone }
         sink.reset(rate: format.sampleRate)
         input.removeTap(onBus: 0)
         let sink = sink
@@ -308,6 +335,8 @@ enum ContactNames {
                 for name in [given, full] where name.count >= 3 { names.insert(name) }
             }
             // FluidAudio is tested to about 230 terms; past that, matching gets slower and looser.
+            // Contacts says nothing about who matters most, so with more names than that the
+            // ones kept are simply the first 200 in alphabetical order.
             return Array(names.sorted().prefix(200))
         }.value
     }

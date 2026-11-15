@@ -1037,7 +1037,7 @@ private struct InputField: View {
             .font(.body)
             .lineLimit(1...5)
             .focused($focused)
-            .onSubmit(companion.send)
+            .onSubmit { companion.send() }
             .onExitCommand {
                 companion.inputOpen = false
                 companion.inputPurpose = .ask

@@ -57,7 +57,12 @@ private struct MenuContent: View {
             Text(message)
             Button("Try setting up voice again", action: voice.setUp)
         case .ready, .listening, .transcribing:
-            Text("Hold \(voice.keyName) to talk to bud")
+            if voice.needsAccessibility {
+                // ⌥ Space belongs to another app, and right ⌥ can't be seen without this.
+                Button("Allow right ⌥ for talking…", action: voice.allowRightOption)
+            } else {
+                Text("Hold \(voice.keyName) to talk to bud")
+            }
         }
     }
 

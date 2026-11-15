@@ -25,8 +25,11 @@ final class Hotkey {
         // "bud " as a four-character code, so the events are recognisably ours.
         let hotKeyID = EventHotKeyID(signature: OSType(0x6275_6420), id: id)
         var ref: EventHotKeyRef?
+        // Exclusive, so a shortcut another app already owns fails here instead of registering
+        // quietly and never firing.
         let status = RegisterEventHotKey(
-            UInt32(key), UInt32(modifiers), hotKeyID, GetApplicationEventTarget(), 0, &ref)
+            UInt32(key), UInt32(modifiers), hotKeyID, GetApplicationEventTarget(),
+            OptionBits(kEventHotKeyExclusive), &ref)
         guard status == noErr, let ref else { return nil }
         self.ref = ref
         Self.registered[id] = self
@@ -66,22 +69,30 @@ final class Hotkey {
 }
 
 /// Holding the right Option key on its own, for when another app owns ⌥ Space. macOS only
-/// shows modifier keys to apps that watch the keyboard, so this needs the Accessibility
-/// permission; without it, it simply never fires.
+/// shows other apps' modifier keys to an app with the Accessibility permission, so `allowed`
+/// says whether it can work, and `askForPermission` opens the prompt.
 @MainActor
 final class RightOptionHold {
+    static var allowed: Bool { AXIsProcessTrusted() }
+
+    static func askForPermission() {
+        let prompt = "AXTrustedCheckOptionPrompt" as CFString
+        _ = AXIsProcessTrustedWithOptions([prompt: true] as CFDictionary)
+    }
+
     private var monitors: [Any] = []
     private var down = false
 
     init(onPress: @escaping () -> Void, onRelease: @escaping () -> Void) {
         let handle: (NSEvent) -> Void = { [weak self] event in
             guard let self else { return }
-            // 61 is the right Option key; its flag clears when it's let go.
-            let held = event.keyCode == UInt16(kVK_RightOption) && event.modifierFlags.contains(.option)
+            // The right key's own bit (NX_DEVICERALTKEYMASK), not the shared Option flag, which
+            // stays set while the left Option key is still down.
+            let held = event.modifierFlags.rawValue & 0x40 != 0
             if held, !down {
                 down = true
                 onPress()
-            } else if !held, down, event.keyCode == UInt16(kVK_RightOption) {
+            } else if !held, down {
                 down = false
                 onRelease()
             }

@@ -364,9 +364,20 @@ final class Companion {
 
     // MARK: Actions
 
-    func send() {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, let connection else { return }
+    /// Sends what's in the field, or `spoken` words, which leave the field as it was.
+    func send(spoken: String? = nil) {
+        let text = (spoken ?? draft).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        guard let connection else {
+            if spoken != nil {
+                // Never lose what was said: it waits in an empty field for a resend.
+                if draft.isEmpty { draft = text }
+                nudge("bud isn't connected, so that wasn't sent.")
+            }
+            return
+        }
+        // Spoken words answering a question become the answer, as if typed in its field.
+        if let spoken, inputPurpose != .ask { draft = spoken }
         switch inputPurpose {
         case .answer(let id):
             respond(to: id, path: "answer", body: ["text": text])
@@ -379,8 +390,10 @@ final class Companion {
         case .ask:
             break
         }
-        draft = ""
-        inputOpen = false
+        if spoken == nil {
+            draft = ""
+            inputOpen = false
+        }
         // The old reply moves into the conversation now, so the bubble clears at once.
         archiveReply()
         reply = ""
@@ -421,14 +434,13 @@ final class Companion {
 
     /// Spoken words, sent like typed ones: a message, or your answer when bud asked something.
     func say(_ text: String) {
-        draft = text
-        send()
+        send(spoken: text)
     }
 
     /// A short line in the bubble, for things like "voice isn't set up yet". Cleared with the
     /// next message, like job notices.
     func nudge(_ text: String) {
-        if !notices.contains(text) { notices.append(text) }
+        if !notices.contains(text) { notices = Array((notices + [text]).suffix(3)) }
         bubbleOpen = true
     }
 

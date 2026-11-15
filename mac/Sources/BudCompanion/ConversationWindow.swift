@@ -230,7 +230,7 @@ private struct ConversationView: View {
                     .font(.body)
                     .lineLimit(1...6)
                     .focused($typing)
-                    .onSubmit(companion.send)
+                    .onSubmit { companion.send() }
                     .onExitCommand {
                         companion.inputPurpose = .ask
                         companion.replyingTo = nil
@@ -239,7 +239,7 @@ private struct ConversationView: View {
                 if companion.status == .working {
                     RoundButton(symbol: "stop.fill", label: "Stop bud", action: companion.stop)
                 } else {
-                    RoundButton(symbol: "arrow.up", label: "Send", action: companion.send)
+                    RoundButton(symbol: "arrow.up", label: "Send", action: { companion.send() })
                         .opacity(companion.draft.trimmingCharacters(in: .whitespaces).isEmpty ? 0.35 : 1)
                 }
             }
