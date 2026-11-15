@@ -314,6 +314,28 @@ private struct VoicePill: View {
     }
 }
 
+/// Words you said that didn't go out, with the choice to send them now or let them go.
+struct UnsentSpeech: View {
+    let companion: Companion
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("“\(companion.unsentSpeech ?? "")”")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Send") { companion.resendSpeech() }
+                .buttonStyle(CardButton(kind: .secondary))
+            Button { companion.dropSpeech() } label: {
+                Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
+            }
+            .buttonStyle(IconButton(size: 20))
+            .accessibilityLabel("Don't send")
+        }
+    }
+}
+
 // MARK: Bubble
 
 private struct Bubble: View {
@@ -344,6 +366,7 @@ private struct Bubble: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             }
+            if companion.unsentSpeech != nil { UnsentSpeech(companion: companion) }
             if !companion.shown.isEmpty {
                 // The bubble hugs its text up to `maxReply`; longer replies scroll. Reading
                 // starts at the top, so streamed text grows below the fold instead of pulling
@@ -414,7 +437,7 @@ private struct Bubble: View {
 
     private var compact: Bool {
         companion.shown.isEmpty && companion.notices.isEmpty && companion.approvals.isEmpty
-            && companion.receipt == nil && companion.steps.isEmpty
+            && companion.receipt == nil && companion.steps.isEmpty && companion.unsentSpeech == nil
     }
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -826,7 +849,7 @@ struct IconButton: ButtonStyle {
     }
 }
 
-private struct CardButton: ButtonStyle {
+struct CardButton: ButtonStyle {
     enum Kind { case primary, secondary, quiet }
     let kind: Kind
 

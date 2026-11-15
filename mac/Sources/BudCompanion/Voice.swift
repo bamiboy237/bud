@@ -44,6 +44,8 @@ final class Voice {
     @ObservationIgnored private var talkKey: Hotkey?
     @ObservationIgnored private var optionHold: RightOptionHold?
     @ObservationIgnored private var escapeKeys: [Hotkey] = []
+    /// What the field was for when this recording started: a message, or an answer.
+    @ObservationIgnored private var destination: InputPurpose = .ask
 
     /// Takes the key, and loads the models if they were set up before.
     func start() {
@@ -129,6 +131,7 @@ final class Voice {
             return
         }
         state = .listening
+        destination = Companion.shared.inputPurpose
         Companion.shared.hearing = true
         TalkSound.start.play()
         // Esc drops the recording; taken only while listening, so it's never stolen otherwise.
@@ -146,11 +149,12 @@ final class Voice {
             return
         }
         state = .transcribing
+        let destination = destination
         Task {
             do {
                 let text = try await transcriber.transcribe(clip)
                 state = .ready
-                if !text.isEmpty { Companion.shared.say(text) }
+                if !text.isEmpty { Companion.shared.say(text, meant: destination) }
             } catch {
                 log.error("transcription failed: \(error.localizedDescription, privacy: .public)")
                 state = .ready

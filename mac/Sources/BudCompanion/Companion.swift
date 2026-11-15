@@ -369,11 +369,8 @@ final class Companion {
         let text = (spoken ?? draft).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         guard let connection else {
-            if spoken != nil {
-                // Never lose what was said: it waits in an empty field for a resend.
-                if draft.isEmpty { draft = text }
-                nudge("bud isn't connected, so that wasn't sent.")
-            }
+            // Never lose what was said: it waits apart from the field, ready to resend.
+            if spoken != nil { holdSpeech(text, because: "bud isn't connected, so that wasn't sent.") }
             return
         }
         // Spoken words answering a question become the answer, as if typed in its field.
@@ -423,18 +420,47 @@ final class Companion {
                 activity = .failed
                 reply = "Couldn't send: \(error)"
                 showWhole()
-                if draft.isEmpty {
+                if spoken != nil {
+                    unsent = (text, messageID)
+                    holdSpeech(text, because: "That didn't send.")
+                } else if draft.isEmpty {
                     draft = text
                     unsent = (text, messageID)
+                    inputOpen = true
                 }
-                inputOpen = true
             }
         }
     }
 
     /// Spoken words, sent like typed ones: a message, or your answer when bud asked something.
-    func say(_ text: String) {
+    /// Spoken words that couldn't go out, kept apart from the field so typing is never lost.
+    private(set) var unsentSpeech: String?
+
+    /// `destination` is what the field was for when you started talking. If a question was
+    /// settled, or one arrived, while you spoke, the words are held rather than sent somewhere
+    /// you didn't mean.
+    func say(_ text: String, meant destination: InputPurpose) {
+        guard destination == inputPurpose else {
+            holdSpeech(text, because: "Things changed while you were talking, so that wasn't sent.")
+            return
+        }
         send(spoken: text)
+    }
+
+    /// "Send" on the held line: you've seen where it will go now.
+    func resendSpeech() {
+        guard let text = unsentSpeech else { return }
+        unsentSpeech = nil
+        send(spoken: text)
+    }
+
+    func dropSpeech() {
+        unsentSpeech = nil
+    }
+
+    private func holdSpeech(_ text: String, because reason: String) {
+        unsentSpeech = text
+        nudge(reason)
     }
 
     /// A short line in the bubble, for things like "voice isn't set up yet". Cleared with the

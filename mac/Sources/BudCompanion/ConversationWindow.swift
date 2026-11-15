@@ -177,6 +177,9 @@ private struct ConversationView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
+            if companion.unsentSpeech != nil {
+                UnsentSpeech(companion: companion).frame(maxWidth: 420)
+            }
             if !companion.shown.isEmpty {
                 Reply(text: companion.shown, companion: companion, finished: companion.status != .working)
             }
