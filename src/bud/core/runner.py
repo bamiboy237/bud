@@ -53,6 +53,7 @@ from bud.core.projection import (
     parked_ids,
     queue_paused,
     reply_text,
+    request_groups,
     runs,
     snapshot,
     undecided_approvals,
@@ -982,9 +983,13 @@ class Runner(DBOSConfiguredInstance):
                 data["report"] = result.output.model_dump()
             deferred = result.output if isinstance(result.output, DeferredToolRequests) else None
             requests = deferred.approvals if deferred is not None else None
+            request_id = request_groups(self.hub.log.read(run["session_id"])).get(
+                run["run_id"], run["run_id"]
+            )
             approvals = [
                 {
                     "run_id": run["run_id"],
+                    "request_id": request_id,
                     "approval_id": uuid5(
                         NAMESPACE_URL, f"bud:{run['run_id']}:{call.tool_call_id}"
                     ).hex,
@@ -1336,7 +1341,14 @@ def _artifact(part: ToolReturnPart | RetryPromptPart) -> dict[str, str] | None:
 
 def _review_of(review: object) -> dict[str, dict]:
     """The reviewer's record of a held call, as an extra key on an approval or its metadata."""
-    return {"review": review} if isinstance(review, dict) and review else {}
+    if not isinstance(review, dict):
+        return {}
+    details = {key: value for key, value in review.items() if key != "email_preview"}
+    presentation = review.get("email_preview")
+    return {
+        **({"review": details} if details else {}),
+        **({"preview": presentation} if isinstance(presentation, dict) else {}),
+    }
 
 
 def _denial(request: dict) -> str:

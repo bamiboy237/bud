@@ -14,6 +14,7 @@ One command installs the runtime and dev dependencies. `--locked` fails when
 `.agents/prepare` runs this same command in each new managed checkout.
 
 Requires `uv` and Python >= 3.12. `.python-version` pins 3.14 for local work.
+If Cargo is missing from a non-login shell, add `~/.cargo/bin` to `PATH`.
 
 ## Checks
 
@@ -44,8 +45,8 @@ they never run in CI.
 Isolate each test: point `DATA_DIR` at a temp directory and bind port 0. `bud serve`
 binds a fixed `127.0.0.1:8420`, so tests start their own server instead.
 
-Test strategy, isolation details, and the manual eval commands are in
-[docs/testing.md](docs/testing.md).
+Test strategy, isolation details, manual app checks, and real-model eval commands
+are in [docs/testing.md](docs/testing.md).
 
 ## Conventions
 

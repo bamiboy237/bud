@@ -352,7 +352,14 @@ class EventLog:
             return bool(pending) and self._supersede_updates(db, session_id, pending[0]["run_id"])
 
     def _accept_message(
-        self, db, session_id: str, text: str, message_id: str, origin: dict | None
+        self,
+        db,
+        session_id: str,
+        text: str,
+        message_id: str,
+        origin: dict | None,
+        *,
+        source_run: str | None = None,
     ) -> Event | None:
         previous = db.execute(
             """SELECT data FROM events WHERE session_id = ?
@@ -371,7 +378,12 @@ class EventLog:
             db,
             session_id,
             "message.queued",
-            {"message_id": message_id, "text": text, "origin": origin},
+            {
+                "message_id": message_id,
+                "text": text,
+                "origin": origin,
+                **({"source_run": source_run} if source_run else {}),
+            },
         )
 
     def revise_approval(

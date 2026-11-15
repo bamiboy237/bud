@@ -168,8 +168,12 @@ final class Companion {
     private(set) var deciding: Set<String> = []
     /// Why the last decision didn't go through, shown on the card.
     private(set) var decisionProblem: String?
-    /// The approval whose full text is open on the card; others show a short preview.
-    var expandedApproval: String?
+    private(set) var approvalFailures: [String: String] = [:]
+    var selectedApprovalID: String?
+    private(set) var approvingBatch = false
+    var selectedApproval: Approval? {
+        approvals.first { $0.id == selectedApprovalID } ?? approvals.first
+    }
     /// What the input field's text is for.
     var inputPurpose: InputPurpose = .ask
     /// Which side of the pet the bubble opens on, set by the panel as the pet is moved.
@@ -194,6 +198,7 @@ final class Companion {
     /// Bumped by each start(), so a slower earlier connection can't install itself afterwards.
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var approvalPoll: Task<Void, Never>?
+    @ObservationIgnored private var batchTask: Task<Void, Never>?
     /// The newest stored event handled, so an older snapshot can't undo a newer event.
     @ObservationIgnored private var seenSeq = 0
     /// A message that failed to send, kept with its id so resending it can't run it twice.
@@ -219,6 +224,11 @@ final class Companion {
     /// Connect (or reconnect after a settings change): handshake, primary session, snapshot, stream.
     func start() {
         generation += 1
+        batchTask?.cancel()
+        approvingBatch = false
+        deciding.removeAll()
+        approvalFailures = [:]
+        connection = nil
         let mine = generation
         handshake?.cancel()
         follower?.cancel()
@@ -267,7 +277,7 @@ final class Companion {
         }
     }
 
-    private func apply(snapshot: [String: Any]) {
+    func apply(snapshot: [String: Any]) {
         switch snapshot["status"] as? String {
         case "running", "queued", "stopping":
             activity = .working
@@ -345,6 +355,7 @@ final class Companion {
         if !Set(approvals.map(\.id)).isSubset(of: openApprovals) { arrivals += 1 }
         openApprovals = Set(approvals.map(\.id))
         deciding.formIntersection(openApprovals)
+        approvalFailures = approvalFailures.filter { openApprovals.contains($0.key) }
         if approvals.isEmpty { decisionProblem = nil }
         approvalPoll?.cancel()
         // A job approval answered in another interface sends nothing to this stream, so
@@ -493,6 +504,7 @@ final class Companion {
     }
 
     func stop() {
+        batchTask?.cancel()
         guard let connection else { return }
         Task { _ = try? await connection.send("POST", "sessions/\(session)/stop", json: [:]) }
     }
@@ -545,6 +557,56 @@ final class Companion {
         respond(to: id, path: nil, body: ["approved": approved])
     }
 
+    func approveAll(for approval: Approval) {
+        let batch = approval.batch(in: approvals)
+        guard batch.count > 1 else { return }
+        approve(batch)
+    }
+
+    func failedApprovals(for approval: Approval) -> [Approval] {
+        approval.retryBatch(in: approvals, failures: approvalFailures)
+    }
+
+    func retryFailed(for approval: Approval) {
+        approve(failedApprovals(for: approval))
+    }
+
+    private func approve(_ batch: [Approval]) {
+        guard let connection, !approvingBatch, deciding.isEmpty, !batch.isEmpty else { return }
+        let ids = batch.map(\.id)
+        let route = "sessions/\(session)/approvals/"
+        let mine = generation
+        approvingBatch = true
+        deciding.formUnion(ids)
+        decisionProblem = nil
+        batchTask = Task {
+            let result = await ApprovalBatch.approve(ids) { id in
+                try Task.checkCancellation()
+                guard mine == generation else { throw CancellationError() }
+                return try await connection.send("POST", route + id, json: ["approved": true])
+            }
+            guard mine == generation else { return }
+            completeBatch(result, ids: ids)
+        }
+    }
+
+    func completeBatch(_ result: ApprovalBatch.Result, ids: [String]) {
+        approvals.removeAll { result.approved.contains($0.id) }
+        openApprovals.subtract(result.approved)
+        deciding.subtract(ids)
+        approvingBatch = false
+        for id in ids { approvalFailures.removeValue(forKey: id) }
+        for (id, failure) in result.failures where openApprovals.contains(id) {
+            approvalFailures[id] = failure
+        }
+        if selectedApprovalID == nil || ids.contains(selectedApprovalID ?? ""),
+           let failed = ids.first(where: { approvalFailures[$0] != nil }) {
+            selectedApprovalID = failed
+        }
+        showReceipt(text: "Approved \(result.approved.count) of \(ids.count) actions")
+        refreshApprovals()
+    }
+
     /// Opens the field to answer a question in your own words, or to say what should change.
     func write(_ purpose: InputPurpose) {
         inputPurpose = purpose
@@ -582,6 +644,14 @@ final class Companion {
         default:
             receipt = Receipt(text: "Denied. Nothing was done", symbol: "xmark")
         }
+        displayReceipt(receipt)
+    }
+
+    private func showReceipt(text: String) {
+        displayReceipt(Receipt(text: text, symbol: "checkmark"))
+    }
+
+    private func displayReceipt(_ receipt: Receipt) {
         self.receipt = receipt
         if receipt.symbol == "checkmark" { react(.hop) }
         Task {
@@ -591,7 +661,7 @@ final class Companion {
     }
 
     private func respond(to id: String, path: String?, body: [String: any Sendable]) {
-        guard let connection, !deciding.contains(id) else { return }
+        guard let connection, !approvingBatch, !deciding.contains(id) else { return }
         deciding.insert(id)
         decisionProblem = nil
         let route = "sessions/\(session)/approvals/\(id)" + (path.map { "/\($0)" } ?? "")
@@ -604,17 +674,26 @@ final class Companion {
         }
         let approval = approvals.first { $0.id == id }
         let answer = (body["text"] as? String) ?? typed
+        let mine = generation
         Task {
             do {
-                _ = try await connection.send("POST", route, json: Self.payload(body))
+                let response = try await connection.send("POST", route, json: Self.payload(body))
+                guard mine == generation else { return }
+                try ApprovalBatch.requireApplied(response)
                 if let approval {
                     showReceipt(for: approval, path: path, approved: body["approved"] as? Bool, answer: answer)
                 }
                 // Gone from the card at once; the snapshot confirms and brings the next one.
                 approvals.removeAll { $0.id == id }
                 openApprovals.remove(id)
+                approvalFailures.removeValue(forKey: id)
             } catch {
-                decisionProblem = "That didn't go through: \(error)"
+                guard mine == generation else { return }
+                if approvalFailures[id] != nil {
+                    approvalFailures[id] = "\(error)"
+                } else {
+                    decisionProblem = "That didn't go through: \(error)"
+                }
                 if !typed.isEmpty {
                     // Keep what was typed, so trying again is one Return.
                     inputPurpose = path == "answer" ? .answer(id) : .revise(id)

@@ -5,6 +5,9 @@ import Foundation
 struct Approval: Identifiable, Equatable {
     let id: String
     let tool: String
+    let requestID: String?
+    let emailPreview: EmailPreview?
+    let expectsOriginalEmail: Bool
     /// The job that asked, when it wasn't the main chat.
     let job: String?
     /// What will happen, in plain words: "Send email to dana@brightpath.example".
@@ -21,6 +24,7 @@ struct Approval: Identifiable, Equatable {
         case "Move": "Moved"
         case "Cancel it": "Cancelled"
         case "Archive": "Archived"
+        case "Mark read": "Marked read"
         case "Delete": "Deleted"
         case "Add": "Added"
         default: "Approved"
@@ -36,6 +40,20 @@ struct Approval: Identifiable, Equatable {
 
     var isQuestion: Bool { tool == "ask_user" }
 
+    var menuTitle: String {
+        let subject = facts.first { $0.label == "Subject" }?.value ?? emailPreview?.subject
+        return subject.map { "\(verb): \($0)" } ?? title
+    }
+
+    func batch(in approvals: [Approval]) -> [Approval] {
+        guard !isQuestion, let requestID else { return [] }
+        return approvals.filter { !$0.isQuestion && $0.requestID == requestID }
+    }
+
+    func retryBatch(in approvals: [Approval], failures: [String: String]) -> [Approval] {
+        batch(in: approvals).filter { failures[$0.id] != nil }
+    }
+
     static func == (a: Approval, b: Approval) -> Bool { a.id == b.id }
 
     init?(_ raw: [String: Any], jobs: [Int: String]) {
@@ -45,6 +63,13 @@ struct Approval: Identifiable, Equatable {
         let args = raw["args"] as? [String: Any] ?? [:]
         self.id = id
         self.tool = tool
+        requestID = (raw["request_id"] as? String)?.nilIfEmpty.map { "request:\($0)" }
+            ?? (raw["run_id"] as? String)?.nilIfEmpty.map {
+                "task:\(raw["task_id"] as? Int ?? 0):run:\($0)"
+            }
+        emailPreview = (raw["preview"] as? [String: Any]).flatMap(EmailPreview.init)
+        expectsOriginalEmail = ["archive_email", "mark_read", "draft_reply"].contains(tool)
+            || args["thread_id"] != nil || args["draft_id"] != nil
         job = (raw["task_id"] as? Int).flatMap { jobs[$0] }
         choices = (args["choices"] as? [String]) ?? []
         let words = Self.describe(tool.lowercased(), args)
@@ -52,7 +77,11 @@ struct Approval: Identifiable, Equatable {
         verb = words.verb
         symbol = words.symbol
         facts = Self.facts(args)
-        body = Self.text(args, "body", "text", "description").nilIfEmpty
+        if args["is_html"] as? Bool == true {
+            body = (raw["preview"] as? [String: Any])?["proposed_body_text"] as? String
+        } else {
+            body = Self.text(args, "body", "body_text", "text", "description").nilIfEmpty
+        }
     }
 
     /// The same plain words the terminal uses for each kind of action.
@@ -62,10 +91,12 @@ struct Approval: Identifiable, Equatable {
         let to = recipients(args)
         let named = text(args, "title", "summary")
         if tool == "ask_user" { return ("", "Answer", "questionmark.bubble") }
-        if tool.contains("draft") {
+        if tool == "archive_email" { return ("Archive email", "Archive", "archivebox") }
+        if tool == "mark_read" { return ("Mark email read", "Mark read", "envelope.open") }
+        if ["draft_reply", "gmail_create_email_draft"].contains(tool) {
             return (to.isEmpty ? "Save an email draft" : "Save a draft to \(to)", "Save draft", "square.and.pencil")
         }
-        if tool.contains("email") || tool.contains("reply") || tool.contains("send") {
+        if ["send_email", "gmail_send_email"].contains(tool) {
             return (to.isEmpty ? "Send an email" : "Send email to \(to)", "Send", "paperplane")
         }
         if tool.contains("rsvp") {
@@ -79,7 +110,6 @@ struct Approval: Identifiable, Equatable {
             let what = named.isEmpty ? "a meeting" : "\"\(named)\""
             return (move ? "Move \(what)" : "Schedule \(what)", move ? "Move" : "Schedule", "calendar")
         }
-        if tool.contains("archive") { return ("Archive email", "Archive", "archivebox") }
         if tool.contains("delete") || tool.contains("trash") || tool.contains("remove") {
             return ("Delete " + (named.isEmpty ? "this item" : named), "Delete", "trash")
         }
@@ -92,6 +122,12 @@ struct Approval: Identifiable, Equatable {
 
     private static func facts(_ args: [String: Any]) -> [(label: String, value: String)] {
         var out: [(String, String)] = []
+        let to = recipients(args)
+        if !to.isEmpty { out.append(("To", to)) }
+        for (key, label) in [("extra_recipients", "Also to"), ("cc", "Cc"), ("bcc", "Bcc")] {
+            let value = (args[key] as? [String])?.joined(separator: ", ") ?? text(args, key)
+            if !value.isEmpty { out.append((label, value)) }
+        }
         for (key, label) in [("subject", "Subject"), ("start", "When"), ("when", "When"),
                              ("location", "Where"), ("due", "Due")] {
             let value = text(args, key)
@@ -103,7 +139,7 @@ struct Approval: Identifiable, Equatable {
     }
 
     private static func recipients(_ args: [String: Any]) -> String {
-        for key in ["to", "recipient", "recipients"] {
+        for key in ["to", "recipient", "recipients", "recipient_email"] {
             if let list = args[key] as? [String], !list.isEmpty { return list.joined(separator: ", ") }
             if let one = args[key] as? String, !one.isEmpty { return one }
         }
@@ -126,6 +162,72 @@ struct Approval: Identifiable, Equatable {
             return parser.date(from: value)
         }() else { return value }
         return date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().hour().minute())
+    }
+}
+
+struct EmailPreview {
+    let subject: String?
+    let messages: [EmailMessage]
+    let unavailableReason: String?
+
+    init?(_ raw: [String: Any]) {
+        guard raw["kind"] as? String == "email" else { return nil }
+        subject = (raw["subject"] as? String)?.nilIfEmpty
+        messages = (raw["messages"] as? [[String: Any]] ?? []).map(EmailMessage.init)
+        unavailableReason = (raw["unavailable_reason"] as? String)?.nilIfEmpty
+    }
+}
+
+struct EmailMessage {
+    let sender: String?
+    let to: [String]
+    let cc: [String]
+    let bcc: [String]
+    let sentAt: String?
+    let body: String?
+
+    init(_ raw: [String: Any]) {
+        sender = (raw["sender"] as? String)?.nilIfEmpty
+        to = raw["to"] as? [String] ?? []
+        cc = raw["cc"] as? [String] ?? []
+        bcc = raw["bcc"] as? [String] ?? []
+        sentAt = (raw["sent_at"] as? String)?.nilIfEmpty
+        if raw["body_format"] as? String == "html" {
+            body = (raw["body_text"] as? String)?.nilIfEmpty
+        } else {
+            body = (raw["body"] as? String)?.nilIfEmpty
+        }
+    }
+}
+
+struct EmailParagraph: Identifiable {
+    let id: Int
+    let text: String
+    let quoted: Bool
+
+    static func parse(_ text: String) -> [EmailParagraph] {
+        var paragraphs: [EmailParagraph] = []
+        var lines: [String] = []
+        var quoted = false
+        func flush() {
+            if !lines.isEmpty {
+                paragraphs.append(Self(id: paragraphs.count, text: lines.joined(separator: "\n"), quoted: quoted))
+                lines = []
+            }
+        }
+        for line in text.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            let isQuote = trimmed.hasPrefix(">")
+            if trimmed.isEmpty {
+                flush()
+            } else {
+                if isQuote != quoted { flush() }
+                quoted = isQuote
+                lines.append(isQuote ? String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces) : line)
+            }
+        }
+        flush()
+        return paragraphs
     }
 }
 

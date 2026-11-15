@@ -8,6 +8,8 @@ Bud operates under a strict principle of least surprise: **Read is automatic; Wr
 3. The user grants approval via exact reference (`/approve <id>`) or denies it (`/deny <id>`).
 4. Replayed or duplicated dispatches verify pre-conditions against SQLite claim records to prevent double-execution.
 
+An email action also carries a readable preview of the original message: subject, recipients, and the full body, captured from Bud's own records when the action is held. The preview is presentation only. The decision still names one exact approval ID, and the tool arguments do not change. A preview that cannot be read marks itself unavailable and never blocks the decision. Previews apply to new approvals; older pending approvals keep their original shape.
+
 ## Approval modes
 Switch with `/mode`. There are two, and `auto` is the default.
 

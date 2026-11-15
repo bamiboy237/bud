@@ -3,6 +3,7 @@
 Tools may also enforce their own safety checks.
 """
 
+import asyncio
 import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -20,6 +21,7 @@ from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, ToolsetTool, WrapperToolset
 
+from bud.harness.email_preview import email_preview, unavailable_email_preview
 from bud.harness.review import (
     Describer,
     ReviewRequest,
@@ -182,7 +184,7 @@ class ActionGateway(WrapperToolset[None]):
                 if action == "review" and isinstance(session, str) and request is not None:
                     self.grants.remember(session, request)
         elif action == "ask":
-            raise ApprovalRequired()
+            raise ApprovalRequired(metadata=await self._presentation(name, tool_args, ctx))
         elif action == "review":
             result = await self._review(name, tool_args, ctx, tool)
             review = result.public()
@@ -198,7 +200,9 @@ class ActionGateway(WrapperToolset[None]):
                 )
                 # The runner stores this beside the approval request and hands it back when
                 # the owner decides, so a denial can carry the reviewer's concern.
-                raise ApprovalRequired(metadata=review)
+                raise ApprovalRequired(
+                    metadata={**review, **await self._presentation(name, tool_args, ctx)}
+                )
             rule = "auto-allow"
         if action != "deny" and not ctx.tool_call_approved and name in self_hosted_writes():
             # The world and workspace writes refuse to run without an approval id, which they
@@ -232,6 +236,23 @@ class ActionGateway(WrapperToolset[None]):
                 tool,
             )
         return await super().call_tool(name, tool_args, ctx, tool)
+
+    async def _presentation(self, name: str, args: dict, ctx: RunContext[None]) -> dict:
+        async def read(read_name: str, read_args: dict) -> Any:
+            if self.policy.decide(read_name) != "allow":
+                raise ValueError("Preview read is not allowed")
+            tools = await super(ActionGateway, self).get_tools(ctx)
+            return await super(ActionGateway, self).call_tool(
+                read_name, read_args, replace(ctx, tool_name=read_name), tools[read_name]
+            )
+
+        try:
+            async with asyncio.timeout(10):
+                preview = await email_preview(name, args, read)
+        except Exception:
+            # Presentation failure must not suppress the exact approval or expose connector errors.
+            preview = unavailable_email_preview(name, args)
+        return {"email_preview": preview.model_dump()} if preview else {}
 
 
 @dataclass(kw_only=True)

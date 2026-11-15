@@ -398,11 +398,8 @@ private struct Bubble: View {
                 .mask(edgeFade(companion.replyMore))
                 .animation(.easeOut(duration: 0.15), value: companion.replyMore)
             }
-            if let approval = companion.approvals.first {
-                ApprovalCard(
-                    companion: companion, approval: approval,
-                    position: companion.approvals.count > 1 ? "1 of \(companion.approvals.count)" : nil)
-                    .id(approval.id)
+            if !companion.approvals.isEmpty {
+                ApprovalDeck(companion: companion)
                     .transition(cardTransition)
             } else if let receipt = companion.receipt {
                 ReceiptLine(receipt: receipt)
@@ -420,7 +417,7 @@ private struct Bubble: View {
         .fixedSize(horizontal: compact, vertical: false)
         .surface(BubbleShape(anchor: companion.anchor))
         .onHover { companion.bubbleHovered = $0 }
-        .animation(.spring(duration: 0.3, bounce: 0), value: companion.approvals.first?.id)
+        .animation(.easeOut(duration: 0.15), value: companion.selectedApproval?.id)
         .animation(.easeOut(duration: 0.2), value: companion.receipt)
     }
 
@@ -452,7 +449,7 @@ private struct Bubble: View {
     }
 
     /// The reply gives way when a card needs the room, so both fit above the pet.
-    private var maxReply: CGFloat { companion.approvals.isEmpty ? 260 : 140 }
+    private var maxReply: CGFloat { companion.approvals.isEmpty ? 260 : 60 }
 
     /// Who is speaking and what they're doing, like a name above a message.
     private var header: some View {
@@ -527,7 +524,7 @@ private struct Bubble: View {
             }
             return ("Working on it", .secondary, true)
         case .needsYou:
-            let asking = companion.approvals.first?.isQuestion == true
+            let asking = companion.selectedApproval?.isQuestion == true
             return (asking ? "Has a question" : "Needs your OK", .orange, false)
         case .failed: return ("Couldn't finish", .red, false)
         case .done: return ("Done", .secondary, false)
@@ -671,18 +668,56 @@ private struct StepsSummary: View {
 struct ApprovalCard: View {
     let companion: Companion
     let approval: Approval
-    /// "1 of 3" when more are waiting behind this one.
-    let position: String?
+    @StateObject private var layout = ApprovalLayout()
 
-    private var busy: Bool { companion.deciding.contains(approval.id) }
+    private var busy: Bool {
+        companion.deciding.contains(approval.id) || companion.approvingBatch || companion.link != .connected
+    }
+    private var detailLimit: CGFloat {
+        let height: CGFloat = companion.windowOpen ? 300 : companion.inputOpen ? 140 : 190
+        let hasProblem = companion.approvalFailures[approval.id] != nil || companion.decisionProblem != nil
+        return hasProblem ? max(80, height - 40) : height
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             heading
-            if !approval.facts.isEmpty { facts }
-            if let text = approval.body, !approval.isQuestion { preview(text) }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    if approval.isQuestion {
+                        Text(approval.title).font(.callout).fixedSize(horizontal: false, vertical: true)
+                    }
+                    if !approval.facts.isEmpty { facts }
+                    if let text = approval.body, !approval.isQuestion { EmailBody(text: text) }
+                    if let email = approval.emailPreview,
+                       !email.messages.isEmpty || email.unavailableReason != nil {
+                        if approval.body != nil {
+                            Divider()
+                            Text("Original email").font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                        }
+                        EmailThreadPreview(email: email)
+                    } else if approval.expectsOriginalEmail && approval.emailPreview == nil {
+                        Text("Original email preview unavailable")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
+                    layout.height = $0
+                }
+                .padding(.trailing, 6)
+            }
+            .frame(height: min(layout.height, detailLimit))
+            .scrollBounceBehavior(.basedOnSize)
+            .textSelection(.enabled)
+            if layout.height > detailLimit {
+                Text("Scroll to read more")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             if approval.isQuestion { choices } else { buttons }
-            if let problem = companion.decisionProblem {
+            if let problem = companion.approvalFailures[approval.id] ?? companion.decisionProblem {
                 Text(problem)
                     .font(.caption)
                     .foregroundStyle(.red)
@@ -703,10 +738,11 @@ struct ApprovalCard: View {
                 .font(.system(size: 12, weight: .medium))
                 .frame(width: 26, height: 26)
                 .background(Paper.ink.opacity(0.07), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
-                Text(approval.title.isEmpty ? "bud has a question" : approval.title)
+                Text(approval.isQuestion ? "bud has a question" : approval.title)
                     .font(.system(size: 13, weight: .semibold))
-                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(2)
                 if let job = approval.job {
                     Text("For the job “\(job)”")
                         .font(.caption)
@@ -716,12 +752,6 @@ struct ApprovalCard: View {
             }
             .padding(.top, approval.job == nil ? 4 : 0)
             Spacer(minLength: 0)
-            if let position {
-                Text(position)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.tertiary)
-                    .padding(.top, 5)
-            }
         }
     }
 
@@ -731,30 +761,12 @@ struct ApprovalCard: View {
                 GridRow {
                     Text(approval.facts[index].label).foregroundStyle(.secondary)
                     Text(approval.facts[index].value)
-                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                 }
             }
         }
         .font(.callout)
-    }
-
-    /// What will go out, so you read it before it's sent. Short at first; click for the rest.
-    private func preview(_ text: String) -> some View {
-        let open = companion.expandedApproval == approval.id
-        return Text(text)
-            .font(.callout)
-            .foregroundStyle(.secondary)
-            .lineLimit(open ? nil : 4)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.leading, 10)
-            .overlay(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 1).fill(Paper.hairline).frame(width: 2)
-            }
-            .contentShape(Rectangle())
-            .onTapGesture { companion.expandedApproval = open ? nil : approval.id }
-            .help(open ? "Show less" : "Show all")
     }
 
     private var buttons: some View {
@@ -765,7 +777,9 @@ struct ApprovalCard: View {
             Spacer(minLength: 0)
             Button("Deny") { companion.decide(approval.id, approved: false) }
                 .buttonStyle(CardButton(kind: .secondary))
-            Button(approval.verb) { companion.decide(approval.id, approved: true) }
+            Button(companion.approvalFailures[approval.id] == nil ? approval.verb : "Retry") {
+                companion.decide(approval.id, approved: true)
+            }
                 .buttonStyle(CardButton(kind: .primary))
         }
     }

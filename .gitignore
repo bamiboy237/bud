@@ -43,9 +43,6 @@ data/
 skills-lock.json
 
 # Private course material and working notes
-AGENTS.md
-# The project AGENTS.md is shared; only personal notes stay ignored.
-!AGENTS.md
 CLAUDE.md
 COURSE.md
 PROGRESS.md
