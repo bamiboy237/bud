@@ -364,7 +364,9 @@ final class Companion {
 
     // MARK: Actions
 
-    /// Sends what's in the field, or `spoken` words, which leave the field as it was.
+    /// Sends what's in the field, or `spoken` words. Spoken words sent as a message leave the
+    /// field as it was; spoken words answering bud's question are added to the field instead,
+    /// for you to send with Return.
     /// `messageID` resends a held recording under its first id, so it can't arrive twice.
     func send(spoken: String? = nil, messageID heldID: String? = nil) {
         let text = (spoken ?? draft).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -455,7 +457,8 @@ final class Companion {
         send(spoken: text)
     }
 
-    /// "Send" on the held line: you've seen where it will go now.
+    /// The held line's button: sends the words as a message, or, while bud waits for an
+    /// answer, adds them to the field (the button then says so).
     func resendSpeech() {
         guard let text = unsentSpeech else { return }
         let id = unsentSpeechID

@@ -325,7 +325,7 @@ struct UnsentSpeech: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            Button("Send") { companion.resendSpeech() }
+            Button(companion.inputPurpose == .ask ? "Send" : "Add to answer") { companion.resendSpeech() }
                 .buttonStyle(CardButton(kind: .secondary))
             Button { companion.dropSpeech() } label: {
                 Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
