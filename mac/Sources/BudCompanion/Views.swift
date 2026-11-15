@@ -19,13 +19,13 @@ struct PetView: View {
         VStack(alignment: anchor.left ? .leading : .trailing, spacing: 8) {
             if anchor.below {
                 petRow
-                if companion.inputOpen { InputField(companion: companion) }
+                if companion.inputOpen && !companion.windowOpen { InputField(companion: companion) }
                 bubble
                 Spacer(minLength: 0)
             } else {
                 Spacer(minLength: 0)
                 bubble
-                if companion.inputOpen { InputField(companion: companion) }
+                if companion.inputOpen && !companion.windowOpen { InputField(companion: companion) }
                 petRow
             }
         }
@@ -45,7 +45,7 @@ struct PetView: View {
     }
 
     @ViewBuilder private var bubble: some View {
-        if companion.bubbleOpen {
+        if companion.bubbleOpen && !companion.windowOpen {
             Bubble(companion: companion)
                 .transition(bubbleTransition)
         }
@@ -67,6 +67,11 @@ struct PetView: View {
                 PetButton(companion: companion) {
                     // The release that ends a drag isn't a click.
                     if companion.dragging { return }
+                    // With the window open, bud talks there: the pet brings it forward.
+                    if companion.windowOpen {
+                        ConversationWindow.shared.show()
+                        return
+                    }
                     // Something waiting comes first: a click shows it rather than a blank field.
                     if !companion.approvals.isEmpty && !companion.bubbleOpen {
                         companion.bubbleOpen = true
@@ -279,6 +284,16 @@ private struct Bubble: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
+            if !compact, !companion.question.isEmpty {
+                // What you asked, so the answer keeps its context. One line: a reminder.
+                Text(companion.question)
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .padding(.top, -4)
+                    .transition(.opacity)
+            }
             if companion.status == .working, companion.stepsLayout == .checklist, !companion.steps.isEmpty {
                 StepList(steps: companion.steps, live: true)
             }
@@ -401,6 +416,7 @@ private struct Bubble: View {
                     .foregroundStyle(.tertiary)
                     .contentTransition(.numericText())
             }
+            expand
             close
         }
         .animation(.easeOut(duration: 0.15), value: state?.text)
@@ -415,19 +431,26 @@ private struct Bubble: View {
 
     /// Shown only on hover: less chrome on a surface that floats over your work.
     private var close: some View {
-        Button {
-            companion.bubbleOpen = false
-        } label: {
-            Image(systemName: "xmark")
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: 18, height: 18)
-                .contentShape(Rectangle())
+        chrome("xmark", label: "Close reply") { companion.bubbleOpen = false }
+    }
+
+    /// Opens the whole conversation in a window, for long replies and earlier messages.
+    private var expand: some View {
+        chrome("arrow.up.left.and.arrow.down.right", label: "Open in a window") {
+            ConversationWindow.shared.show()
         }
-        .buttonStyle(.plain)
+        .help("Open in a window")
+    }
+
+    private func chrome(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 9, weight: .semibold))
+        }
+        .buttonStyle(IconButton(size: 20))
         .opacity(companion.bubbleHovered ? 1 : 0)
         .animation(.easeOut(duration: 0.12), value: companion.bubbleHovered)
-        .accessibilityLabel("Close reply")
+        .accessibilityLabel(label)
     }
 
     /// Plain words for what bud is doing. Colour only when it's your move or something broke.
@@ -456,7 +479,7 @@ private struct Bubble: View {
 
 /// bud's steps as rows: ticked when done, the current one shimmering. Long runs show the
 /// latest few, with a count of the earlier ones, so the bubble doesn't grow without end.
-private struct StepList: View {
+struct StepList: View {
     let steps: [Step]
     /// While the run is going, the last unfinished step is the live one.
     let live: Bool
@@ -584,7 +607,7 @@ private struct StepsSummary: View {
 
 /// What bud wants to do, in plain words, with what you'd check before saying yes, and the
 /// buttons to decide. A question shows its options instead, plus a way to answer in your words.
-private struct ApprovalCard: View {
+struct ApprovalCard: View {
     let companion: Companion
     let approval: Approval
     /// "1 of 3" when more are waiting behind this one.
@@ -721,6 +744,50 @@ final class Flag: ObservableObject {
     @Published var on = false
 }
 
+/// Small icon buttons answer the pointer: a soft round highlight fades in, the icon darkens
+/// and grows a touch, and it presses in on click. Fast and small, since the pointer often
+/// only passes by. `highlight: false` keeps a button's own look (a filled circle) and only
+/// adds the motion. Reduced motion: colour only, no size change.
+struct IconButton: ButtonStyle {
+    var size: CGFloat = 24
+    var highlight = true
+
+    func makeBody(configuration: Configuration) -> some View {
+        Face(configuration: configuration, size: size, highlight: highlight)
+    }
+
+    private struct Face: View {
+        let configuration: Configuration
+        let size: CGFloat
+        let highlight: Bool
+        @StateObject private var hover = Flag()
+        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+        var body: some View {
+            configuration.label
+                .foregroundStyle(ink)
+                .frame(width: size, height: size)
+                .background(Circle().fill(Paper.ink.opacity(highlight && hover.on ? 0.07 : 0)))
+                .contentShape(Circle())
+                .scaleEffect(scale)
+                .onHover { hover.on = $0 }
+                .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+                .animation(.easeOut(duration: 0.12), value: hover.on)
+        }
+
+        private var ink: AnyShapeStyle {
+            guard highlight else { return AnyShapeStyle(Paper.surface) }
+            return hover.on ? AnyShapeStyle(Paper.ink) : AnyShapeStyle(.secondary)
+        }
+
+        private var scale: CGFloat {
+            if reduceMotion { return 1 }
+            if configuration.isPressed { return 0.9 }
+            return hover.on ? 1.08 : 1
+        }
+    }
+}
+
 private struct CardButton: ButtonStyle {
     enum Kind { case primary, secondary, quiet }
     let kind: Kind
@@ -836,7 +903,7 @@ private struct Stagger: ViewModifier {
 }
 
 /// What a decided card leaves behind for a moment: the outcome, in a word or two.
-private struct ReceiptLine: View {
+struct ReceiptLine: View {
     let receipt: Receipt
 
     var body: some View {

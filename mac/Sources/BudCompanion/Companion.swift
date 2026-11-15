@@ -60,6 +60,21 @@ enum StepsLayout: String, CaseIterable {
     }
 }
 
+/// One message in the main conversation, yours or bud's.
+struct Turn: Identifiable, Equatable {
+    let id = UUID()
+    let fromOwner: Bool
+    let text: String
+    /// What bud did for this reply, when it happened while the app was watching.
+    var work: Work?
+}
+
+/// A run's work, for the folded line above its reply: "Worked for 34s · 4 steps".
+struct Work: Equatable {
+    var steps: [Step]
+    var seconds: Int
+}
+
 struct ReplyMore: Equatable {
     var above = false
     var below = false
@@ -125,6 +140,18 @@ final class Companion {
         didSet { pace() }
     }
     private(set) var shown = ""
+    /// The main conversation so far, finished turns only: the reply being written is `shown`.
+    private(set) var turns: [Turn] = []
+    /// What you last asked, shown faded above the reply so the answer keeps its context.
+    private(set) var question = ""
+    /// When the current run began, for "Working for 12s"; nil when bud isn't working.
+    private(set) var runStart: Date?
+    /// The last finished run's work, until its reply joins `turns`.
+    private(set) var lastWork: Work?
+    /// A reply (or part of one) you're answering; it's quoted at the top of your message.
+    var replyingTo: String?
+    /// While the conversation window is open, it is where bud talks: the bubble stays shut.
+    var windowOpen = false
     /// What's waiting on the owner, oldest first, with enough detail to decide in the bubble.
     private(set) var approvals: [Approval] = []
     /// Decisions sent and not yet confirmed: their buttons stay disabled, so one click is one call.
@@ -231,14 +258,27 @@ final class Companion {
 
     private func apply(snapshot: [String: Any]) {
         switch snapshot["status"] as? String {
-        case "running", "queued", "stopping": activity = .working
+        case "running", "queued", "stopping":
+            activity = .working
+            // Joined mid-run: the timer counts from now, not from a start it never saw.
+            if runStart == nil { runStart = .now }
         default: activity = .idle
         }
         setOpenApprovals(from: snapshot)
-        let turns = snapshot["transcript"] as? [[String: Any]] ?? []
+        // The main chat's turns; a job's messages live in the job, not here.
+        let transcript = (snapshot["transcript"] as? [[String: Any]] ?? []).filter {
+            $0["task_id"] == nil || $0["task_id"] is NSNull
+        }
+        turns = transcript.compactMap { turn in
+            guard let text = turn["text"] as? String, !text.isEmpty else { return nil }
+            return Turn(fromOwner: turn["role"] as? String == "user", text: text)
+        }
+        question = turns.last(where: \.fromOwner)?.text ?? ""
         // Only a reply to the latest message: after a newer message, an older reply misleads.
-        if let last = turns.last, last["role"] as? String == "assistant" {
-            reply = last["text"] as? String ?? ""
+        // It becomes the reply, not a turn: the latest reply is always `reply`, so it's drawn once.
+        if let last = turns.last, !last.fromOwner {
+            reply = last.text
+            turns.removeLast()
         } else {
             reply = ""
         }
@@ -336,7 +376,13 @@ final class Companion {
         }
         draft = ""
         inputOpen = false
+        // The old reply moves into the conversation now, so the bubble clears at once.
+        archiveReply()
         reply = ""
+        question = text
+        // A reply to something bud said carries it as a markdown quote, so bud sees what you mean.
+        let message = replyingTo.map { Self.quote($0) + "\n\n" + text } ?? text
+        replyingTo = nil
         blocks = []
         bubbleOpen = true
         // The pet starts working when bud says so (user.message), not on a hopeful send.
@@ -349,7 +395,7 @@ final class Companion {
             do {
                 // Built here: a [String: Any] can't cross into the task under Swift 6 checking.
                 let body: [String: Any] = [
-                    "text": text, "message_id": messageID, "origin": BudConnection.origin,
+                    "text": message, "message_id": messageID, "origin": BudConnection.origin,
                 ]
                 _ = try await connection.send("POST", "sessions/\(session)/messages", json: body)
             } catch {
@@ -529,6 +575,12 @@ final class Companion {
         case "user.message":
             // A new turn, from this app or any other interface: the old reply no longer applies.
             settle?.cancel()
+            // The previous reply joins the conversation, and the new message follows it.
+            archiveReply()
+            let said = event.string("text")
+            question = Self.unquoted(said).text
+            if !said.isEmpty { turns.append(Turn(fromOwner: true, text: said)) }
+            runStart = .now
             blocks = []
             seenRequests = []
             reply = ""
@@ -541,6 +593,7 @@ final class Companion {
             bubbleOpen = true
         case "run.started", "run.recovered":
             settle?.cancel()
+            if runStart == nil { runStart = .now }
             activity = .working
         case "text.reset":
             let request = event.string("request")
@@ -628,9 +681,36 @@ final class Companion {
 
     /// The run is over: its steps all count as done, and they move to the summary.
     private func closeSteps() {
-        guard !steps.isEmpty else { return }
-        lastSteps = steps.map { Step(id: $0.id, text: $0.text, done: true) }
-        steps = []
+        if !steps.isEmpty {
+            lastSteps = steps.map { Step(id: $0.id, text: $0.text, done: true) }
+            steps = []
+        }
+        if let runStart {
+            lastWork = Work(steps: lastSteps, seconds: Int(Date.now.timeIntervalSince(runStart).rounded()))
+        }
+        runStart = nil
+    }
+
+    /// The finished reply joins the conversation, carrying the work that produced it.
+    private func archiveReply() {
+        if !reply.isEmpty { turns.append(Turn(fromOwner: false, text: reply, work: lastWork)) }
+        lastWork = nil
+    }
+
+    /// Quoted text as markdown, cut to a few hundred characters: enough to point at.
+    static func quote(_ text: String) -> String {
+        let cut = text.count > 400 ? String(text.prefix(400)) + "…" : text
+        return cut.split(separator: "\n", omittingEmptySubsequences: false).map { "> " + $0 }.joined(separator: "\n")
+    }
+
+    /// A message split into the quote it opens with, if any, and your own words.
+    static func unquoted(_ text: String) -> (quote: String?, text: String) {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        let quoted = lines.prefix { $0.hasPrefix(">") }
+        guard !quoted.isEmpty else { return (nil, text) }
+        let quote = quoted.map { $0.dropFirst().drop { $0 == " " } }.joined(separator: "\n")
+        let rest = lines.dropFirst(quoted.count).joined(separator: "\n")
+        return (quote, rest.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     private func appendDelta(block: String, text: String) {
