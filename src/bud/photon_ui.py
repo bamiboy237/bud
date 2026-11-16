@@ -2,8 +2,6 @@
 
 import json
 
-from bud.harness.ask import question_lines
-
 
 def _value(value) -> str:
     if isinstance(value, bool):
@@ -16,9 +14,12 @@ def _value(value) -> str:
 def action_preview(approval: dict, *, decision: bool = True) -> str:
     args, tool = approval["args"], approval["tool"]
     if tool == "ask_user":
-        parts = ["\n".join(question_lines(args))]
+        parts = [args.get("question", "Question?")]
         if approval.get("reference"):
             parts[0] = f"Task {approval['reference']}: {parts[0]}"
+        choices = args.get("choices") or []
+        if choices:
+            parts.append("\n".join(f"{index}. {choice}" for index, choice in enumerate(choices, 1)))
         identity = approval.get("reference") or approval["approval_id"]
         parts.append(f"Reply here, or /answer {identity} <reply>")
         return "\n\n".join(parts)
@@ -34,8 +35,6 @@ def action_preview(approval: dict, *, decision: bool = True) -> str:
         "GOOGLECALENDAR_PATCH_EVENT": "Move this meeting?",
         "workspace_create": f"Create {target}?",
         "workspace_update": f"Replace the contents of {target}?",
-        "write_file": f"Create {target}?",
-        "edit_file": f"Replace the contents of {target}?",
     }
     title = titles.get(tool, tool.replace("_", " ").capitalize() + "?")
     if approval.get("reference"):
@@ -46,12 +45,7 @@ def action_preview(approval: dict, *, decision: bool = True) -> str:
         # Their full values remain bound to the proposal and available in terminal status.
         if key in ("expected_etag", "expected_revision"):
             continue
-        if key == "path" and tool in (
-            "workspace_create",
-            "workspace_update",
-            "write_file",
-            "edit_file",
-        ):
+        if key == "path" and tool in ("workspace_create", "workspace_update"):
             continue
         if key in ("content", "body", "message_body") and isinstance(value, str):
             details.append(value)

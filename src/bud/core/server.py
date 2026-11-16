@@ -59,6 +59,7 @@ from bud.workspace import GUIDANCE as WORKSPACE_GUIDANCE
 from bud.workspace import READ_TOOLS as WORKSPACE_READ_TOOLS
 from bud.workspace import WRITE_TOOLS as WORKSPACE_WRITE_TOOLS
 from bud.workspace import build_tools as build_workspace_tools
+from bud.workspace import read_capabilities as workspace_read_capabilities
 from bud.world.describe import build_describers, build_notifies_others
 from bud.world.store import World
 from bud.world.tools import READ_TOOLS as WORLD_READ_TOOLS
@@ -131,14 +132,18 @@ def hold_single_server_lock(path: Path) -> TextIO:
     return lock
 
 
-def workspace_tools(directory: Path) -> FunctionToolset[None]:
+def workspace_root(directory: Path) -> Path:
     # The data folder is resolved once, here, because /tmp and /var are symlinks on macOS and
     # the workspace walk refuses symlinks. The workspace root below it is not resolved, so a
     # symlink swapped in at that level is still refused.
-    directory = directory.resolve()
-    root = directory / "workspace"
+    root = directory.resolve() / "workspace"
     root.mkdir(exist_ok=True, mode=0o700)
-    return FunctionToolset(build_workspace_tools(root, directory / "workspace-dispatches.jsonl"))
+    return root
+
+
+def workspace_tools(directory: Path) -> FunctionToolset[None]:
+    root = workspace_root(directory)
+    return FunctionToolset(build_workspace_tools(root, root.parent / "workspace-dispatches.jsonl"))
 
 
 def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAPI:
@@ -267,6 +272,7 @@ def _create_app(
             result_path=db_path,
             read_tools=READ_TOOLS | WEB_READ_TOOLS | WORKSPACE_READ_TOOLS | {"current_time"},
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
+            capabilities=workspace_read_capabilities(workspace_root(session_dir)),
         )
         tools_policy = harness.policy
         harness.live_instructions.append(
@@ -297,6 +303,7 @@ def _create_app(
             result_path=db_path,
             read_tools=WORLD_READ_TOOLS | WEB_READ_TOOLS | WORKSPACE_READ_TOOLS,
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
+            capabilities=workspace_read_capabilities(workspace_root(settings.data_dir)),
         )
     # One seam for both branches: memory/skill rules are unioned inside the
     # Harness, so the profile overlay lands on the composed policy. The

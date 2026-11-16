@@ -21,7 +21,7 @@ from bud.harness.actions import Action, Policy
 from bud.harness.agent import Harness
 from bud.harness.ask import ask_user
 from bud.harness.spiral import SpiralConfig
-from bud.workspace import READ_TOOLS, WRITE_TOOLS, build_tools
+from bud.workspace import READ_TOOLS, WRITE_TOOLS, build_tools, read_capabilities
 
 ResponseFunction = Callable[[list[ModelMessage], AgentInfo], ModelResponse]
 
@@ -93,6 +93,7 @@ async def running_bud(
         state_dir=directory,
         result_path=log.path,
         read_tools=READ_TOOLS,
+        capabilities=read_capabilities(root),
     )
     harness.clock = lambda: datetime(2026, 11, 6, 12, tzinfo=UTC)
     if spiral is not None:

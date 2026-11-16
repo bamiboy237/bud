@@ -1,6 +1,6 @@
 """Builds bud's agent with its system prompt, guarded tools, and spiral detection."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
 from hashlib import sha256
 from importlib import resources
@@ -65,7 +65,10 @@ class Harness:
         result_path: Path,
         read_tools: set[str],
         result_retention: timedelta = timedelta(hours=24),
+        capabilities: Sequence[AbstractCapability[None]] = (),
     ) -> None:
+        # Fixed for the process, unlike `tools`, which swap_tools replaces between runs.
+        self.capabilities = list(capabilities)
         self.toolset = tools if isinstance(tools, AbstractToolset) else FunctionToolset[None](tools)
         self.skills = SkillStore(state_dir / "skills")
         self.toolset = CombinedToolset([self.toolset, FunctionToolset[None](self.skills.tools())])
@@ -198,6 +201,7 @@ class Harness:
                     ]
                 ),
                 *([durability] if durability is not None else []),
+                *self.capabilities,
                 *capabilities,
             ],
         )

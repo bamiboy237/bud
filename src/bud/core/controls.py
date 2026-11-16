@@ -11,7 +11,6 @@ from uuid import uuid4
 import httpx
 
 from bud.core.events import MessageOrigin
-from bud.harness.ask import question_lines
 
 HELP = (
     "/status /pause /resume /stop /cancel <message-id> "
@@ -41,12 +40,12 @@ def approval_text(approval: dict) -> str:
         "GOOGLECALENDAR_PATCH_EVENT": "Move a meeting",
         "workspace_create": "Create a workspace file",
         "workspace_update": "Update a workspace file",
-        "write_file": "Create a workspace file",
-        "edit_file": "Update a workspace file",
     }
     task = f"Task {approval['reference']}: " if approval.get("reference") else ""
     if approval["tool"] == "ask_user":
-        lines = [f"{task}Question:", *question_lines(approval["args"])]
+        lines = [f"{task}Question: {approval['args'].get('question', '')}"]
+        for index, choice in enumerate(approval["args"].get("choices") or [], start=1):
+            lines.append(f"  {index}. {choice}")
         lines.append(f"/answer {identity} <your reply>")
         return "\n".join(lines)
     lines = [f"{task}Permission needed: {titles.get(approval['tool'], approval['tool'])}"]

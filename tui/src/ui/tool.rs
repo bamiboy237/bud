@@ -54,8 +54,8 @@ pub fn humanize_name(tool: &str) -> String {
     let cleaned = tool.replace("GOOGLECALENDAR_", "").replace("GMAIL_", "");
     let mapped = |t: &str| -> Option<&'static str> {
         Some(match t {
-            "workspace_read" => "Read file",
-            "workspace_list" => "Searched workspace files",
+            "read_file" => "Read file",
+            "list_directory" | "find_files" | "search_files" => "Searched workspace files",
             "workspace_create" => "Saved file",
             "workspace_update" => "Updated file",
             "draft_reply" => "Drafted email reply",
