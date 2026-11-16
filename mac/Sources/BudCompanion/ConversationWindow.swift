@@ -95,7 +95,7 @@ private struct ConversationView: View {
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
+                    LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(companion.turns.enumerated()), id: \.element.id) { index, turn in
                             TurnView(turn: turn, companion: companion)
                                 .padding(.top, index == 0 ? 0 : turn.fromOwner ? Rhythm.exchange - Rhythm.actions : Rhythm.answer)
@@ -167,7 +167,7 @@ private struct ConversationView: View {
     /// The reply in progress, or the last one, with what bud is doing and anything it needs.
     @ViewBuilder private var latest: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if companion.status == .working, let start = companion.runStart {
+            if companion.running, let start = companion.runStart {
                 Working(since: start, steps: companion.steps)
             } else if let work = companion.lastWork, !companion.shown.isEmpty {
                 WorkLine(work: work)
@@ -180,8 +180,11 @@ private struct ConversationView: View {
             if companion.unsentSpeech != nil {
                 UnsentSpeech(companion: companion).frame(maxWidth: 420)
             }
+            if !companion.heldMessages.isEmpty {
+                UnsentMessage(companion: companion).frame(maxWidth: 420)
+            }
             if !companion.shown.isEmpty {
-                Reply(text: companion.shown, companion: companion, finished: companion.status != .working)
+                Reply(text: companion.shown, companion: companion, finished: !companion.running)
             }
             if !companion.approvals.isEmpty {
                 ApprovalDeck(companion: companion)
@@ -236,7 +239,9 @@ private struct ConversationView: View {
                         companion.replyingTo = nil
                     }
                     .padding(.vertical, 4)
-                if companion.status == .working {
+                // Stop while bud works and the field is empty; typed text (an answer to a job's
+                // question, or a message to queue) turns it back into Send.
+                if companion.running, companion.draft.trimmingCharacters(in: .whitespaces).isEmpty {
                     RoundButton(symbol: "stop.fill", label: "Stop bud", action: companion.stop)
                 } else {
                     RoundButton(symbol: "arrow.up", label: "Send", action: { companion.send() })

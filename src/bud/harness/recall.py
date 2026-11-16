@@ -32,6 +32,12 @@ MAX_CHARS = 1_500
 MAX_TURN_CHARS = 600
 # Below this cosine a dense-only hit is noise; dense search always returns something.
 MIN_COSINE = 0.35
+# Conversation turns pile up for the life of the install, so keep the newest ones. Older
+# turns are forgotten; memory lines are never pruned here.
+MAX_CONVERSATION_CHUNKS = 3_000
+# Vectors compared per search: every memory line, plus this many of the newest turns. Older
+# turns stay reachable by keyword.
+DENSE_TURNS = 1_000
 WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9'@.-]{2,}")
 STOP = frozenset(
     [
@@ -145,9 +151,8 @@ def _unpack(blob: bytes) -> list[float]:
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b, strict=False))
-    norm = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
-    return dot / norm if norm else 0.0
+    norm = math.sqrt(math.sumprod(a, a) * math.sumprod(b, b))
+    return math.sumprod(a, b) / norm if norm else 0.0
 
 
 def _match_query(text: str) -> str | None:
@@ -203,6 +208,17 @@ class Recall:
             return
         text = f"Owner: {owner.strip()[:MAX_TURN_CHARS]}\nbud: {reply.strip()[:MAX_TURN_CHARS]}"
         self._upsert([(f"turn:{run_id}", "conversation", session_id, text)], None)
+        self._prune_turns()
+
+    def _prune_turns(self) -> None:
+        """Forget the oldest conversation turns beyond the cap, from both indexes."""
+        with self._connect() as db:
+            old = (
+                "SELECT id FROM chunks WHERE source = 'conversation' "
+                "ORDER BY rowid DESC LIMIT -1 OFFSET ?"
+            )
+            db.execute(f"DELETE FROM chunks_fts WHERE id IN ({old})", (MAX_CONVERSATION_CHUNKS,))
+            db.execute(f"DELETE FROM chunks WHERE id IN ({old})", (MAX_CONVERSATION_CHUNKS,))
 
     async def embed_pending(self) -> None:
         """Add vectors to chunks that were indexed without one."""
@@ -262,24 +278,38 @@ class Recall:
                         (match, exclude_session or ""),
                     )
                 ]
+            # Only vectors the search will compare, picked in SQL: every memory line and the
+            # newest turns. The text of a chunk is read later, for the few that are returned.
             rows = db.execute(
-                "SELECT id, source, text, embedding FROM chunks "
-                "WHERE session_id IS NULL OR session_id != ?",
-                (exclude_session or "",),
+                "SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL "
+                "AND source = 'memory' "
+                "UNION ALL SELECT id, embedding FROM ("
+                "SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL "
+                "AND source = 'conversation' AND session_id != ? "
+                "ORDER BY rowid DESC LIMIT ?)",
+                (exclude_session or "", DENSE_TURNS),
             ).fetchall()
-        texts = {row[0]: (row[1], row[2]) for row in rows}
         dense: list[str] = []
         vector = await self._embed([query])
         if vector:
-            scored = [
-                (_cosine(vector[0], _unpack(row[3])), row[0]) for row in rows if row[3] is not None
-            ]
+            scored = [(_cosine(vector[0], _unpack(blob)), cid) for cid, blob in rows]
             dense = [cid for score, cid in sorted(scored, reverse=True)[:20] if score >= MIN_COSINE]
         fused: dict[str, float] = {}
         for ranking in (lexical, dense):
             for rank, chunk_id in enumerate(ranking):
                 fused[chunk_id] = fused.get(chunk_id, 0.0) + 1 / (RRF_K + rank + 1)
         best = sorted(fused.items(), key=lambda item: item[1], reverse=True)[:MAX_HITS]
+        if not best:
+            return []
+        with self._connect() as db:
+            marks = ",".join("?" * len(best))
+            texts = {
+                row[0]: (row[1], row[2])
+                for row in db.execute(
+                    f"SELECT id, source, text FROM chunks WHERE id IN ({marks})",
+                    [cid for cid, _ in best],
+                )
+            }
         return [
             Hit(cid, texts[cid][0], texts[cid][1], score) for cid, score in best if cid in texts
         ]

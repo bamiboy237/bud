@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from pydantic_ai_harness import Memory
+from pydantic_ai_harness import ArtifactScanner, Memory
 from pydantic_ai_harness.memory import SqliteMemoryStore
 
 from bud.harness.actions import Action
@@ -28,4 +28,7 @@ def build_memory(path: Path, *, namespace: str) -> Memory:
         namespace=namespace,
         guidance=GUIDANCE,
         injection_errors="raise",
+        # Notes are model-written and loaded into later sessions: refuse planted
+        # instructions, exfiltration links and invisible text on the way in and out.
+        scanner=ArtifactScanner(),
     )

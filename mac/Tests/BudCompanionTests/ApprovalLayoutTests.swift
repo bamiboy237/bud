@@ -6,6 +6,38 @@ import Testing
 @MainActor
 struct ApprovalLayoutTests {
     @Test
+    func longQuestionFitsThePetPanel() async throws {
+        _ = NSApplication.shared
+        let companion = Companion()
+        let options = (1...6).map { ["label": "Option \($0)", "description": String(repeating: "Details. ", count: 20)] }
+        let question: [String: Any] = [
+            "header": "First", "question": String(repeating: "A long question. ", count: 50),
+            "options": options, "multi_select": true,
+        ]
+        companion.apply(snapshot: [
+            "last_seq": 1, "pending_approvals": [[
+                "approval_id": "question", "tool": "ask_user", "args": ["questions": [question]],
+            ]],
+        ])
+        companion.link = .connected
+        let host = NSHostingView(rootView: PetView(companion: companion, focusPanel: {})
+            .transaction { $0.disablesAnimations = true })
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: PetPanel.size),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.close() }
+        host.frame = NSRect(origin: .zero, size: PetPanel.size)
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(150))
+        host.layoutSubtreeIfNeeded()
+        #expect(host.fittingSize.height <= PetPanel.size.height)
+        if let directory = ProcessInfo.processInfo.environment["BUD_APPROVAL_SNAPSHOTS"] {
+            try snapshot(host, to: URL(filePath: directory).appending(path: "question-long.png"))
+        }
+    }
+
+    @Test
     func longEmailFitsThePetPanelWithActionsVisible() async throws {
         _ = NSApplication.shared
         let companion = Companion()

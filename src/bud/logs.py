@@ -73,7 +73,15 @@ class PrivateLogFilter(logging.Filter):
             message = "Job step cancelled (expected when a job is stopped)."
             record.exc_info = None
         secrets = _secrets()
-        record.msg, record.args = _clean(message, MAX_MESSAGE, secrets), None
+        if record.name == "uvicorn.access" and isinstance(record.args, tuple):
+            # uvicorn's AccessFormatter unpacks (client, method, path, http_version, status)
+            # from `args`, so the shape must stay: clean each part and leave the format alone.
+            record.args = tuple(
+                _clean(part, MAX_MESSAGE, secrets) if isinstance(part, str) else part
+                for part in record.args
+            )
+        else:
+            record.msg, record.args = _clean(message, MAX_MESSAGE, secrets), None
         if record.exc_info:
             record.exc_text = _clean(
                 logging.Formatter().formatException(record.exc_info), MAX_TRACEBACK, secrets

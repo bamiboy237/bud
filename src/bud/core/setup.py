@@ -104,6 +104,10 @@ class SetupJournal:
     def publish(self, session_id: str, type: EventType, data: dict[str, Any], *, key: str) -> None:
         self._live.publish_once(session_id, type, data, key=key)
 
+    def show_live(self, session_id: str, type: EventType, data: dict[str, Any]) -> None:
+        """Deliver data to the streams open now and store nothing."""
+        self._live.broadcast(session_id, type, data)
+
     def pending(self, session_id: str) -> dict[str, PendingSetup]:
         """The session's setup cards that still need the person, by id."""
         events = self._live.log.read(session_id)
@@ -206,10 +210,14 @@ def setup_tool(
         else:
             data["steps"] = list(initiation.steps)
         data["status"] = "waiting"
-        # The link reaches the person's card, never the model: bud's sign-in
-        # links appear only in the owner-authenticated event stream and the card
-        # it renders, not in model input, history, or status metadata.
+        # The sign-in link is single-use and grants access to an account, so it never enters
+        # the journal, the model's input, or status metadata. The journaled card says a link
+        # is waiting; the link itself goes once, live, to the owner's open streams. A client
+        # that connects later gets the card without it, and /connect issues a fresh link.
+        link = data.pop("url", None)
         journal.publish(session, "capability.setup", data, key=key)
+        if link is not None:
+            journal.show_live(session, "capability.setup", {**data, "url": link})
         note = (
             "The person's chat shows a setup card with the sign-in link. Ask them to "
             "finish the sign-in in their browser, then check again."

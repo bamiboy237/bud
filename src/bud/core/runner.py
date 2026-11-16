@@ -55,7 +55,6 @@ from bud.core.projection import (
     reply_text,
     request_groups,
     runs,
-    snapshot,
     undecided_approvals,
     waiting_batch,
 )
@@ -67,6 +66,7 @@ from bud.gateway.registry import Tier
 from bud.gateway.router import NoModelAvailable
 from bud.gateway.tracked import TrackedModel, request_session
 from bud.harness.agent import Harness
+from bud.harness.ask import AskAnswer, answer_from_text, ask_summary, questions_of, render_answers
 from bud.harness.context import BackgroundCompaction
 from bud.harness.learning import Learner
 from bud.harness.recall import Recall, render
@@ -77,6 +77,8 @@ from bud.limits import MAX_MESSAGE_CHARS
 RESULTS = TypeAdapter(DeferredToolResults)
 logger = logging.getLogger(__name__)
 RECENT_LESSONS = 5
+# How long a durable run may keep the server open at shutdown before it is left to recovery.
+SHUTDOWN_WAIT_SECONDS = 5
 
 
 class UnknownApproval(Exception):
@@ -195,7 +197,7 @@ class Runner(DBOSConfiguredInstance):
         )
 
     def snapshot(self, session_id: str) -> Snapshot:
-        state = snapshot(session_id, self.hub.log.read(session_id))
+        state = self.hub.log.snapshot(session_id, self.hub.log.read(session_id))
         if self.work_items is not None and self.work_items.for_session(session_id) is None:
             state.tasks = self.work_items.views(session_id)
             state.pending_approvals.extend(
@@ -306,27 +308,47 @@ class Runner(DBOSConfiguredInstance):
             "version": self.version,
         }
 
+    def _on_loop(self, call, *args) -> None:
+        """Run orchestration on the event loop, which owns the runner's in-memory state.
+
+        The commands below write to the log, which can block, so the server runs them on
+        worker threads. What follows the write launches runs and sets timers, which only the
+        loop may do; from a worker thread it is handed to the loop, like `_kick`.
+        """
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not None and (self._loop is None or running is self._loop):
+            self._loop = running
+            call(*args)
+            return
+        if self._loop is None or self._loop.is_closed():
+            raise RuntimeError("The runner's event loop is not running.")
+        self._loop.call_soon_threadsafe(call, *args, context=Context())
+
     def start(
         self, session_id: str, text: str, message_id: str, origin: dict | None = None
     ) -> Event | None:
-        self._loop = asyncio.get_running_loop()
         self._validate_text(text)
         event = self.hub.log.accept_message(session_id, text, message_id, origin)
         if event is not None:
             self.hub.wake(session_id)
-        if (
-            event is not None
-            and origin
-            and origin.get("channel") == "imessage"
-            and not self._busy(session_id)
-        ):
+        imessage = (
+            event is not None and bool(origin) and (origin or {}).get("channel") == "imessage"
+        )
+        self._on_loop(self._after_message, session_id, imessage)
+        return event
+
+    def _after_message(self, session_id: str, imessage: bool) -> None:
+        if imessage and not self._busy(session_id):
             if session_id not in self._bursts:
                 # A fixed window, not an indefinitely reset timer. Accepted text
                 # is already durable; a restart can drain it without this timer.
+                assert self._loop is not None
                 self._bursts[session_id] = self._loop.call_later(1, self._flush_burst, session_id)
         else:
             self._drain(session_id)
-        return event
 
     def _flush_burst(self, session_id: str) -> None:
         self._bursts.pop(session_id, None)
@@ -361,7 +383,7 @@ class Runner(DBOSConfiguredInstance):
         changed = self.hub.log.set_queue_paused(session_id, paused)
         self.hub.wake(session_id)
         if not paused:
-            self._drain(session_id)
+            self._on_loop(self._drain, session_id)
         return changed
 
     def _drain(self, session_id: str) -> None:
@@ -394,7 +416,7 @@ class Runner(DBOSConfiguredInstance):
         timer = self._bursts.pop(session_id, None)
         if timer is not None:
             timer.cancel()
-        request = self.hub.log.request_stop(session_id)
+        request = await asyncio.to_thread(self.hub.log.request_stop, session_id)
         self.hub.wake(session_id)
         child_stopped = False
         if self.work_items is not None:
@@ -445,7 +467,7 @@ class Runner(DBOSConfiguredInstance):
         )
         if event is None:
             return False
-        self._resume_if_ready(session_id)
+        self._on_loop(self._resume_if_ready, session_id)
         return True
 
     def revise(
@@ -465,18 +487,28 @@ class Runner(DBOSConfiguredInstance):
             raise DecisionRejected(approval_id, expects_answer=True)
         event = self.hub.log.revise_approval(session_id, approval_id, text, message_id, origin)
         self.hub.wake(session_id)
-        self._drain(session_id)
+        self._on_loop(self._drain, session_id)
         return event is not None
 
     def answer(
-        self, session_id: str, approval_id: str, text: str, origin: dict | None = None
+        self,
+        session_id: str,
+        approval_id: str,
+        text: str | None,
+        origin: dict | None = None,
+        answers: list[AskAnswer] | None = None,
     ) -> bool:
-        """Record the owner's answer to an ask_user question and resume the run."""
+        """Record the owner's answers to an ask_user call and resume the run.
+
+        Either typed text (a chat reply) or one structured answer per question (a card)."""
         if self.work_items is not None:
             target = self.work_items.resolve(session_id, approval_id)
             if target is not None:
-                return self.answer(target[0], target[1], text, origin)
-        self._validate_text(text)
+                return self.answer(target[0], target[1], text, origin, answers)
+        if (text is None) == (answers is None):
+            raise ValueError("Send either text or answers.")
+        if text is not None:
+            self._validate_text(text)
         events = self.hub.log.read(session_id)
         if approval_id in decisions(events):
             return False
@@ -487,15 +519,23 @@ class Runner(DBOSConfiguredInstance):
         if request.get("tool") != "ask_user":
             # Action approvals are approved or denied; answers must not grant them.
             raise DecisionRejected(approval_id, expects_answer=False)
+        questions = questions_of(request["args"])
+        # What the model reads back: each question beside its answer, checked against the
+        # options offered.
+        reply = (
+            render_answers(questions, answers)
+            if answers is not None
+            else answer_from_text(questions, text or "")
+        )
         event = self.hub.publish_once(
             session_id,
             "question.answered",
-            {"approval_id": approval_id, "text": text, "origin": origin},
+            {"approval_id": approval_id, "text": reply, "origin": origin},
             key=f"{session_id}:answer:{approval_id}",
         )
         if event is None:
             return False
-        self._resume_if_ready(session_id)
+        self._on_loop(self._resume_if_ready, session_id)
         return True
 
     def _brief(self, run: dict) -> dict | None:
@@ -599,8 +639,10 @@ class Runner(DBOSConfiguredInstance):
             approvals={
                 request["call_id"]: ToolApproved()
                 if decided.get(request["approval_id"])
+                # A decision outranks parking: a parked request the owner already denied is
+                # denied, not reported as still open.
                 else ToolDenied(_parked_note(request["approval_id"]))
-                if request["approval_id"] in parked
+                if request["approval_id"] in parked and request["approval_id"] not in decided
                 else ToolDenied(
                     "The owner sent another message before answering this. If it corrects or "
                     "replaces this request, follow it. If it is about something else, handle it, "
@@ -850,12 +892,23 @@ class Runner(DBOSConfiguredInstance):
         for timer in self._bursts.values():
             timer.cancel()
         self._bursts.clear()
-        if not self.durable:
+        if self.durable:
+            # A durable run can take minutes, and uvicorn waits for shutdown with no limit, so
+            # a long run would keep the server (and its single-server lock) alive after
+            # Ctrl-C. Give it a moment to finish, then let go of it: its workflow is
+            # journaled, and the next start resumes it.
+            running = {*self._monitors, *self._executing.values()}
+            if running:
+                await asyncio.wait(running, timeout=SHUTDOWN_WAIT_SECONDS)
             for task in self._monitors:
                 task.cancel()
-        # Keep ownership until launch submissions and actual executions have exited.
-        await asyncio.gather(*self._monitors, return_exceptions=True)
-        await asyncio.gather(*self._executing.values(), return_exceptions=True)
+            await asyncio.gather(*self._monitors, return_exceptions=True)
+        else:
+            for task in self._monitors:
+                task.cancel()
+            # Keep ownership until launch submissions and actual executions have exited.
+            await asyncio.gather(*self._monitors, return_exceptions=True)
+            await asyncio.gather(*self._executing.values(), return_exceptions=True)
         await self.settle_learning()
         await self.context.close()
         if self.harness.reviewer is not None:
@@ -929,9 +982,10 @@ class Runner(DBOSConfiguredInstance):
             gap = time_gap_note(history_events, run)
             still_open = superseded_note(history_events, run)
             jobs = job_updates_note(history_events, run)
+            declined = parked_decisions_note(history_events, run)
             surface = surface_note(run)
             result = await self.agent.run(
-                (run["text"] + recalled + gap + still_open + jobs + surface)
+                (run["text"] + recalled + gap + still_open + jobs + declined + surface)
                 if run["text"]
                 else run["text"],
                 model=(
@@ -1197,22 +1251,7 @@ def job_updates_note(events: list[Event], run: dict) -> str:
     """
     if run.get("trigger") != "message" or run.get("task_id") is not None:
         return ""
-    prompted = {
-        e.data["run_id"]
-        for e in events
-        if e.type == "run.queued" and e.data.get("trigger") == "message"
-    }
-    starts = [e.seq for e in events if e.type == "run.started" and e.data.get("run_id") in prompted]
-    current = next(
-        (
-            e.seq
-            for e in events
-            if e.type == "run.started" and e.data.get("run_id") == run["run_id"]
-        ),
-        None,
-    )
-    upper = current if current is not None else (events[-1].seq + 1 if events else 0)
-    lower = max((seq for seq in starts if seq < upper), default=-1)
+    lower, upper = _since_last_prompt(events, run)
     lines = []
     for e in events:
         if e.type not in JOB_UPDATES or not lower < e.seq < upper:
@@ -1245,6 +1284,67 @@ def job_updates_note(events: list[Event], run: dict) -> str:
     )
 
 
+def _since_last_prompt(events: list[Event], run: dict) -> tuple[int, int]:
+    """The log window (exclusive) from the previous owner-prompted run's start to this one's.
+
+    Anything in it happened since the owner's last message, so a note built from it shows
+    each update exactly once, including ones that arrived during an approval resume.
+    """
+    prompted = {
+        e.data["run_id"]
+        for e in events
+        if e.type == "run.queued" and e.data.get("trigger") == "message"
+    }
+    starts = [e.seq for e in events if e.type == "run.started" and e.data.get("run_id") in prompted]
+    current = next(
+        (
+            e.seq
+            for e in events
+            if e.type == "run.started" and e.data.get("run_id") == run["run_id"]
+        ),
+        None,
+    )
+    upper = current if current is not None else (events[-1].seq + 1 if events else 0)
+    lower = max((seq for seq in starts if seq < upper), default=-1)
+    return lower, upper
+
+
+def parked_decisions_note(events: list[Event], run: dict) -> str:
+    """Parked requests the owner declined since their last message.
+
+    A parked request tells bud "you will be told". An approval runs the action at once, so
+    bud hears through the result; a denial has no run of its own, so it rides the next
+    message like the other notes. bud's own withdrawals are left out: it already knows.
+    """
+    if run.get("trigger") != "message" or run.get("task_id") is not None:
+        return ""
+    lower, upper = _since_last_prompt(events, run)
+    parked = parked_ids(events)
+    requested = {e.data["approval_id"]: e.data for e in events if e.type == "approval.requested"}
+    lines = []
+    for e in events:
+        approval_id = e.data.get("approval_id")
+        if (
+            e.type != "approval.denied"
+            or not lower < e.seq < upper
+            or approval_id not in parked
+            or e.data.get("reason")
+            or e.data.get("revision_message_id")
+        ):
+            continue
+        request = requested.get(approval_id, {})
+        call = f"{request.get('tool', 'an action')} {json.dumps(request.get('args', {}))[:200]}"
+        lines.append(f"- {approval_id}: {call}")
+    if not lines:
+        return ""
+    return (
+        "\n\n<parked_decisions>The owner declined these requests you set aside earlier. They "
+        "will not run. Do not propose them again unless the owner asks.\n"
+        + "\n".join(lines)
+        + "</parked_decisions>"
+    )
+
+
 def superseded_note(events: list[Event], run: dict) -> str:
     """What this message interrupted: proposals or questions it superseded before the owner
     answered. A burst of messages must not silently drop the earlier request."""
@@ -1265,7 +1365,7 @@ def superseded_note(events: list[Event], run: dict) -> str:
         if pending is None:
             continue
         what = (
-            f"your question: {str(pending['args'].get('question', ''))[:200]}"
+            f"your question: {ask_summary(pending['args'])[:200]}"
             if pending["tool"] == "ask_user"
             else f"approval to run {pending['tool']} {json.dumps(pending['args'])[:200]}"
         )

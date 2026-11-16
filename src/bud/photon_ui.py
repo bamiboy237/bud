@@ -2,6 +2,8 @@
 
 import json
 
+from bud.harness.ask import question_lines
+
 
 def _value(value) -> str:
     if isinstance(value, bool):
@@ -14,12 +16,9 @@ def _value(value) -> str:
 def action_preview(approval: dict, *, decision: bool = True) -> str:
     args, tool = approval["args"], approval["tool"]
     if tool == "ask_user":
-        parts = [args.get("question", "Question?")]
+        parts = ["\n".join(question_lines(args))]
         if approval.get("reference"):
             parts[0] = f"Task {approval['reference']}: {parts[0]}"
-        choices = args.get("choices") or []
-        if choices:
-            parts.append("\n".join(f"{index}. {choice}" for index, choice in enumerate(choices, 1)))
         identity = approval.get("reference") or approval["approval_id"]
         parts.append(f"Reply here, or /answer {identity} <reply>")
         return "\n\n".join(parts)

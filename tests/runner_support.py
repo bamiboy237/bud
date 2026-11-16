@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
@@ -18,6 +19,7 @@ from bud.gateway.registry import ModelSpec, Registry
 from bud.gateway.router import Gateway
 from bud.harness.actions import Action, Policy
 from bud.harness.agent import Harness
+from bud.harness.ask import ask_user
 from bud.workspace import READ_TOOLS, WRITE_TOOLS, build_tools
 
 ResponseFunction = Callable[[list[ModelMessage], AgentInfo], ModelResponse]
@@ -58,7 +60,9 @@ class RunningBud:
 
 
 @asynccontextmanager
-async def running_bud(directory: Path, function: ResponseFunction, *, jobs: bool = False):
+async def running_bud(
+    directory: Path, function: ResponseFunction, *, jobs: bool = False, ask: bool = False
+):
     directory = directory.resolve()
     directory.mkdir(parents=True, exist_ok=True)
     root = directory / "workspace"
@@ -71,8 +75,12 @@ async def running_bud(directory: Path, function: ResponseFunction, *, jobs: bool
     gateway = Gateway(registry, Ledger(directory / "costs.db"), lambda _: model)
     policy: dict[str, Action] = dict.fromkeys(READ_TOOLS, "allow")
     policy.update(dict.fromkeys(WRITE_TOOLS, "ask"))
+    tools: list[Any] = [tool.function for tool in build_tools(root, claims)]
+    if ask:
+        policy["ask_user"] = "ask"
+        tools.append(ask_user)
     harness = Harness(
-        FunctionToolset[None]([tool.function for tool in build_tools(root, claims)]),
+        FunctionToolset[None](tools),
         Policy(tools=policy),
         registry,
         "A synthetic workspace for behavior tests.",

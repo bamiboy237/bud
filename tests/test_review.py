@@ -4,7 +4,14 @@ from typing import Any
 
 import httpx
 import pytest
-from pydantic_ai.messages import ModelMessage, ModelRequest, ToolReturnPart, UserPromptPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 
 from bud.harness.review import ReviewRequest, SessionGrants, ToolReviewer, Verdict, owner_answers
 
@@ -204,7 +211,47 @@ def test_only_current_owner_clarifications_reach_review_payload():
             ]
         ),
     ]
-    assert owner_answers(messages) == ["owner clarification"]
+    assert [item.answer for item in owner_answers(messages)] == ["owner clarification"]
+
+
+def test_clarification_pairs_answer_with_its_question():
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart("Check my calendar")]),
+        ModelResponse(parts=[ToolCallPart("ask_user", {"question": "Tidy the inbox?"}, "call-1")]),
+        ModelRequest(parts=[ToolReturnPart("ask_user", "yes", "call-1")]),
+    ]
+    answers = owner_answers(messages)
+    assert [(item.question, item.answer) for item in answers] == [("Tidy the inbox?", "yes")]
+
+
+def test_clarification_preserves_the_questions_in_a_group():
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart("Check my calendar")]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "ask_user",
+                    {
+                        "questions": [
+                            {"header": "Day", "question": "Which day?"},
+                            {"header": "Time", "question": "Which time?"},
+                        ]
+                    },
+                    "call-1",
+                )
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    "ask_user", "Which day?\nAnswer: Friday\n\nWhich time?\nAnswer: Noon", "call-1"
+                )
+            ]
+        ),
+    ]
+    answers = owner_answers(messages)
+    assert answers[0].question == "Which day? / Which time?"
+    assert answers[0].answer == "Which day?\nAnswer: Friday\n\nWhich time?\nAnswer: Noon"
 
 
 def test_session_grant_covers_only_exact_tool_arguments_and_session(request_to_review):

@@ -27,7 +27,6 @@ from bud.core.projection import (
     reply_text,
     report_text,
     runs,
-    snapshot,
 )
 from bud.harness.actions import Policy
 from bud.harness.spiral import work_tools_off
@@ -425,7 +424,7 @@ class WorkItems:
 
     def view(self, item: WorkItem) -> TaskView:
         events = self.log.read(item.session_id)
-        state = snapshot(item.session_id, events)
+        state = self.log.snapshot(item.session_id, events)
         references = self.references(item)
         status = state.recent_runs[-1].status if state.recent_runs else "queued"
         if state.queued_messages and status in FINISHED:

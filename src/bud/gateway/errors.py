@@ -6,6 +6,7 @@ from typing import Literal
 import httpx
 from pydantic_ai import exceptions as ai
 from pydantic_ai.exceptions import ModelAPIError
+from pydantic_ai_harness.spend import SpendLimitExceeded
 
 from bud.composio.connection import ConnectionError as AccountConnectionError
 from bud.gateway.chatgpt import ChatGPTError
@@ -26,6 +27,7 @@ ErrorKind = Literal[
     "service",
     "context_full",
     "content_filter",
+    "budget",
     "model_unavailable",
     "account",
     "skill",
@@ -46,6 +48,7 @@ NEXT_STEP: dict[ErrorKind, str] = {
     "context_full": "The conversation is too long for this model; start a new one or pick "
     "a model with a larger context.",
     "content_filter": "The provider refused this content; rephrase the request.",
+    "budget": "Wait for the next UTC day, or raise BUD_DAILY_USD and restart bud.",
     "model_unavailable": "Configure that model's key, or pick another model (/model).",
     "account": "Reconnect the account, then resend.",
     "skill": "Check the skill, then resend.",
@@ -60,6 +63,7 @@ def error_kind(exc: BaseException) -> ErrorKind:
     if isinstance(exc, BaseExceptionGroup) and exc.exceptions:
         return error_kind(exc.exceptions[0])
     checks: list[tuple[type[BaseException] | tuple[type[BaseException], ...], ErrorKind]] = [
+        (SpendLimitExceeded, "budget"),
         (ai.ModelQuotaExceededError, "quota"),
         (ai.ModelRateLimitError, "rate_limit"),
         (ai.ModelContextWindowExceededError, "context_full"),
@@ -103,6 +107,13 @@ def error_summary(exc: BaseException) -> str:
         return "; ".join(error_summary(error) for error in exc.exceptions)[:500]
     if isinstance(exc, (ChatGPTError, AccountConnectionError, SkillError, NoModelAvailable)):
         return str(exc)
+    if isinstance(exc, SpendLimitExceeded):
+        return (
+            "Today's model budget (BUD_DAILY_USD) is spent. bud stops until the UTC day "
+            "rolls over, or until the limit is raised in .env and bud restarts."
+        )
+    if isinstance(exc, ai.ContentFilterError):
+        return "The model provider's content filter blocked this reply."
     fields = [type(exc).__name__]
     status = getattr(exc, "status_code", None)
     if isinstance(status, int):

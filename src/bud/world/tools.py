@@ -5,6 +5,7 @@ from typing import Any
 
 from pydantic_ai import RunContext, Tool
 
+from bud.harness.ask import ask_user
 from bud.world.store import World, WorldError
 
 READ_TOOLS = {
@@ -355,25 +356,6 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
         """
         return _safely(lambda: world.search_contacts(query))
 
-    def ask_user(ctx: RunContext[None], question: str, choices: list[str] | None = None) -> str:
-        """Ask the person a question and wait for their answer.
-
-        Use this only when a missing preference or decision genuinely blocks the
-        task and no available tool can supply the fact: prefer reading data with
-        tools first. It pauses and returns the person's exact reply. Offer 2-5
-        concrete choices when the options are known; omit choices for a
-        free-text answer. Ask one question at a time. For risky actions, still
-        call the action tool so it goes through approval.
-
-        Args:
-            question: One complete question for the person.
-            choices: Exact option labels, 2 to 5 items, when known.
-        """
-        metadata = ctx.tool_call_metadata or {}
-        if ctx.tool_call_approved and metadata.get("question_answer"):
-            return str(metadata["question_answer"])
-        raise WorldError("ask_user needs an answer from the person through the question flow.")
-
     fns = [
         current_time,
         search_email,
@@ -397,7 +379,7 @@ def build_tools(world: World, *, include_ask_user: bool = True) -> list[Tool[Non
         search_contacts,
     ]
     if include_ask_user:
-        fns.append(ask_user)
+        fns.append(ask_user)  # shared with the account tools: bud.harness.ask
     tools: list[Tool[None]] = [Tool(tool) for tool in fns]
     return tools
 

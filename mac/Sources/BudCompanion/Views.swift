@@ -58,7 +58,7 @@ struct PetView: View {
             if Voice.shared.state == .listening || Voice.shared.state == .transcribing {
                 VoicePill(voice: Voice.shared)
                     .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: anchor.left ? .leading : .trailing)))
-            } else if companion.status == .working {
+            } else if companion.running {
                 StopButton(action: companion.stop)
                     .transition(.opacity)
             }
@@ -336,6 +336,30 @@ struct UnsentSpeech: View {
     }
 }
 
+struct UnsentMessage: View {
+    let companion: Companion
+
+    var body: some View {
+        if let message = companion.heldMessages.first {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("“\(message.text)”")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button("Retry") { companion.retryHeldMessage() }
+                    .buttonStyle(CardButton(kind: .secondary))
+                Button { companion.dropHeldMessage() } label: {
+                    Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
+                }
+                .buttonStyle(IconButton(size: 20))
+                .accessibilityLabel("Discard unsent message")
+            }
+            .disabled(companion.retryingHeldMessage)
+        }
+    }
+}
+
 // MARK: Bubble
 
 private struct Bubble: View {
@@ -354,10 +378,10 @@ private struct Bubble: View {
                     .padding(.top, -4)
                     .transition(.opacity)
             }
-            if companion.status == .working, companion.stepsLayout == .checklist, !companion.steps.isEmpty {
+            if companion.running, companion.stepsLayout == .checklist, !companion.steps.isEmpty {
                 StepList(steps: companion.steps, live: true)
             }
-            if companion.showStepsAfter, companion.status != .working, !companion.lastSteps.isEmpty {
+            if companion.showStepsAfter, !companion.running, !companion.lastSteps.isEmpty {
                 StepsSummary(companion: companion)
             }
             ForEach(companion.notices, id: \.self) { notice in
@@ -367,6 +391,7 @@ private struct Bubble: View {
                     .lineLimit(2)
             }
             if companion.unsentSpeech != nil { UnsentSpeech(companion: companion) }
+            if !companion.heldMessages.isEmpty { UnsentMessage(companion: companion) }
             if !companion.shown.isEmpty {
                 // The bubble hugs its text up to `maxReply`; longer replies scroll. Reading
                 // starts at the top, so streamed text grows below the fold instead of pulling
@@ -435,6 +460,7 @@ private struct Bubble: View {
     private var compact: Bool {
         companion.shown.isEmpty && companion.notices.isEmpty && companion.approvals.isEmpty
             && companion.receipt == nil && companion.steps.isEmpty && companion.unsentSpeech == nil
+            && companion.heldMessages.isEmpty
     }
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -482,7 +508,7 @@ private struct Bubble: View {
 
     /// "step 3", for the counted layout while bud works.
     private var stepCount: String? {
-        guard companion.stepsLayout == .counted, companion.status == .working,
+        guard companion.stepsLayout == .counted, companion.running,
               !companion.steps.isEmpty else { return nil }
         return "step \(companion.steps.count)"
     }
@@ -705,11 +731,26 @@ struct ApprovalCard: View {
     private var content: some View {
         VStack(alignment: .leading, spacing: 10) {
             if showsHeading { heading }
+            if approval.isQuestion {
+                QuestionCards(companion: companion, approval: approval,
+                              flow: companion.questionFlow(for: approval), listLimit: detailLimit)
+            } else {
+                detail
+                buttons
+            }
+            if let problem = companion.approvalFailures[approval.id] ?? companion.decisionProblem {
+                Text(problem)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var detail: some View {
+        VStack(alignment: .leading, spacing: 10) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    if approval.isQuestion {
-                        Text(approval.title).font(.callout).fixedSize(horizontal: false, vertical: true)
-                    }
                     if !approval.facts.isEmpty { facts }
                     if let text = approval.body, !approval.isQuestion { EmailBody(text: text) }
                     if let email = approval.emailPreview,
@@ -738,13 +779,6 @@ struct ApprovalCard: View {
                 Text("Scroll to read more")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            }
-            if approval.isQuestion { choices } else { buttons }
-            if let problem = companion.approvalFailures[approval.id] ?? companion.decisionProblem {
-                Text(problem)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -801,33 +835,6 @@ struct ApprovalCard: View {
         }
     }
 
-    private var choices: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach(Array(approval.choices.enumerated()), id: \.offset) { index, choice in
-                Button { companion.choose(choice, for: approval.id) } label: {
-                    row(choice, symbol: "arrow.right", tone: .primary)
-                }
-                .buttonStyle(ChoiceRow())
-                .modifier(Stagger(index: index))
-            }
-            Button { companion.write(.answer(approval.id)) } label: {
-                row(approval.choices.isEmpty ? "Answer…" : "Something else…", symbol: "pencil", tone: .secondary)
-            }
-            .buttonStyle(ChoiceRow())
-            .modifier(Stagger(index: approval.choices.count))
-        }
-    }
-
-    private func row(_ text: String, symbol: String, tone: HierarchicalShapeStyle) -> some View {
-        HStack(spacing: 8) {
-            Text(text)
-                .foregroundStyle(tone)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-            RowSymbol(name: symbol)
-        }
-        .font(.callout)
-    }
 }
 
 /// Per-view state without `@State` (a macro whose plugin ships only with Xcode): an
@@ -926,7 +933,7 @@ struct CardButton: ButtonStyle {
 
 /// One option of a question: a full-width row, so the whole line is the target. On hover the
 /// row darkens and its arrow nudges forward, pointing at what a click will do.
-private struct ChoiceRow: ButtonStyle {
+struct ChoiceRow: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         Face(configuration: configuration)
     }
@@ -964,7 +971,7 @@ extension EnvironmentValues {
 }
 
 /// The row's trailing symbol, which steps forward while its row is hovered.
-private struct RowSymbol: View {
+struct RowSymbol: View {
     let name: String
     @Environment(\.choiceHovered) private var hovered
 
@@ -977,7 +984,7 @@ private struct RowSymbol: View {
 }
 
 /// Items of a set arriving one after another, 40 ms apart: read as a list, not a block.
-private struct Stagger: ViewModifier {
+struct Stagger: ViewModifier {
     let index: Int
     @StateObject private var shown = Flag()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion

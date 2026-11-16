@@ -16,7 +16,7 @@ from uuid import uuid4
 from pydantic_ai import RunContext, Tool
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.workspaces import LocalWorkspaceBackend
-from pydantic_ai_harness import Skills
+from pydantic_ai_harness import ArtifactScanner, Skills
 
 from bud.skills.installer import Installer, SkillError
 
@@ -214,8 +214,11 @@ class SkillStore:
         with tempfile.TemporaryDirectory(dir=self.root) as temporary:
             directory, revision = await self.installer.prepare(source, name, Path(temporary))
             version = await asyncio.to_thread(self.capture, directory, name)
+        # A flagged skill is left out of the catalog, so the check below refuses the install.
         catalog = await Skills(
-            str(self.objects / version), workspace=LocalWorkspaceBackend(self.root)
+            str(self.objects / version),
+            workspace=LocalWorkspaceBackend(self.root),
+            scanner=ArtifactScanner(),
         ).load()
         if catalog.skipped or len(catalog.skills) != 1 or catalog.skills[0].name != name:
             raise SkillError("The package does not define one valid matching skill.")
@@ -368,4 +371,6 @@ class SkillMethods(AbstractCapability):
         paths = [str(self.store.check(name, version).parent) for name, version in versions.items()]
         if not paths:
             return self
-        return await Skills(paths, workspace=LocalWorkspaceBackend(self.store.root)).for_run(ctx)
+        return await Skills(
+            paths, workspace=LocalWorkspaceBackend(self.store.root), scanner=ArtifactScanner()
+        ).for_run(ctx)

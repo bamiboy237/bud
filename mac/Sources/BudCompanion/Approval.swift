@@ -35,8 +35,8 @@ struct Approval: Identifiable, Equatable {
     let facts: [(label: String, value: String)]
     /// The text that will go out, when there is one, so you can read before approving.
     let body: String?
-    /// For a question: the options bud offered. Empty means a free answer.
-    let choices: [String]
+    let questions: [Question]
+    let isQuestionList: Bool
 
     var isQuestion: Bool { tool == "ask_user" }
 
@@ -79,9 +79,11 @@ struct Approval: Identifiable, Equatable {
         expectsOriginalEmail = ["archive_email", "mark_read", "draft_reply"].contains(tool)
             || args["thread_id"] != nil || args["draft_id"] != nil
         job = (raw["task_id"] as? Int).flatMap { jobs[$0] }
-        choices = (args["choices"] as? [String]) ?? []
+        let parsed = Question.parse(args)
+        questions = parsed.questions
+        isQuestionList = parsed.isList
         let words = Self.describe(tool.lowercased(), args)
-        title = tool == "ask_user" ? Self.text(args, "question") : words.title
+        title = tool == "ask_user" ? (questions.first?.text ?? "") : words.title
         verb = words.verb
         symbol = words.symbol
         facts = Self.facts(args)
@@ -174,6 +176,57 @@ struct Approval: Identifiable, Equatable {
             return parser.date(from: value)
         }() else { return value }
         return date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().hour().minute())
+    }
+}
+
+struct Question: Equatable, Sendable {
+    let header: String
+    let text: String
+    let options: [QuestionOption]
+    let multiSelect: Bool
+
+    static func parse(_ args: [String: Any]) -> (questions: [Question], isList: Bool) {
+        if let raw = args["questions"] as? [[String: Any]] {
+            let parsed = raw.compactMap(Question.init)
+            if !parsed.isEmpty { return (parsed, true) }
+        }
+        let text = args["question"] as? String ?? ""
+        let choices = (args["choices"] as? [String]) ?? []
+        return ([Question(header: "Question", text: text.isEmpty ? "bud has a question" : text,
+                          options: choices.filter { !$0.isEmpty }.map { QuestionOption(label: $0) },
+                          multiSelect: false)], false)
+    }
+
+    private init?(_ raw: [String: Any]) {
+        guard let header = (raw["header"] as? String)?.nilIfEmpty,
+              let text = (raw["question"] as? String)?.nilIfEmpty else { return nil }
+        self.header = header
+        self.text = text
+        options = (raw["options"] as? [[String: Any]] ?? []).compactMap(QuestionOption.init)
+        multiSelect = raw["multi_select"] as? Bool ?? false
+    }
+
+    private init(header: String, text: String, options: [QuestionOption], multiSelect: Bool) {
+        self.header = header
+        self.text = text
+        self.options = options
+        self.multiSelect = multiSelect
+    }
+}
+
+struct QuestionOption: Equatable, Sendable {
+    let label: String
+    let description: String?
+
+    fileprivate init?(_ raw: [String: Any]) {
+        guard let label = (raw["label"] as? String)?.nilIfEmpty else { return nil }
+        self.label = label
+        description = (raw["description"] as? String)?.nilIfEmpty
+    }
+
+    fileprivate init(label: String) {
+        self.label = label
+        description = nil
     }
 }
 

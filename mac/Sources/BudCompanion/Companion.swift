@@ -18,7 +18,7 @@ enum PetStatus: String {
 }
 
 /// What the text you type is for: a new message, or a reply to something bud is waiting on.
-enum InputPurpose: Equatable {
+enum InputPurpose: Hashable {
     case ask
     /// Your own answer to a question, when none of its options fit.
     case answer(String)
@@ -32,6 +32,15 @@ enum InputPurpose: Equatable {
         case .revise: "What should change?"
         }
     }
+}
+
+struct HeldMessage: Identifiable {
+    let id: String
+    let text: String
+    let payload: String
+    let session: String
+    let base: URL
+    let scope: String
 }
 
 /// One thing bud did on the way to its reply, in plain words.
@@ -110,6 +119,9 @@ final class Companion {
             }
         }
     }
+    /// Whether a run is in progress. Stop and the live work views gate on this, not on
+    /// `status`: a job's approval turns the pet to "needs you" while the main run still works.
+    private(set) var running = false
     /// What bud is doing, from run events.
     @ObservationIgnored private var activity: PetStatus = .idle {
         didSet { showStatus() }
@@ -185,6 +197,9 @@ final class Companion {
     var replyMore: ReplyMore = .init()
     var inputOpen = false
     var draft = ""
+    @ObservationIgnored private var savedDrafts: [InputPurpose: String] = [:]
+    private(set) var heldMessages: [HeldMessage] = []
+    private(set) var retryingHeldMessage = false
     /// Short job milestones (started, needs you, finished). Progress notes never come here.
     var notices: [String] = []
     /// Send to first streamed text, for the latency baseline.
@@ -201,7 +216,7 @@ final class Companion {
     /// The newest stored event handled, so an older snapshot can't undo a newer event.
     @ObservationIgnored private var seenSeq = 0
     /// A message that failed to send, kept with its id so resending it can't run it twice.
-    @ObservationIgnored private var unsent: (text: String, id: String)?
+    @ObservationIgnored private var unsent: HeldMessage?
     @ObservationIgnored private var blocks: [(id: String, text: String)] = []
     /// Model requests already streamed. A second text.reset for one means bud is replaying that
     /// step after a restart, so its partial text is dropped instead of shown twice.
@@ -335,6 +350,7 @@ final class Companion {
     }
 
     private func showStatus() {
+        running = activity == .working
         status = openApprovals.isEmpty ? activity : .needsYou
     }
 
@@ -353,6 +369,7 @@ final class Companion {
         closeStaleInput()
         if !Set(approvals.map(\.id)).isSubset(of: openApprovals) { arrivals += 1 }
         openApprovals = Set(approvals.map(\.id))
+        questionFlows = questionFlows.filter { openApprovals.contains($0.key) }
         deciding.formIntersection(openApprovals)
         approvalFailures = approvalFailures.filter { openApprovals.contains($0.key) }
         if approvals.isEmpty { decisionProblem = nil }
@@ -392,6 +409,11 @@ final class Companion {
             if spoken != nil { holdSpeech(text, because: "bud isn't connected, so that wasn't sent.") }
             return
         }
+        if spoken == nil, inputPurpose == .ask, let unsent, unsent.text == text,
+           (unsent.session != session || unsent.base != connection.base || unsent.scope != connection.scope) {
+            nudge("Reconnect to the original bud session to retry this message.")
+            return
+        }
         // An answer to bud's question is yours to confirm: spoken words join the field, after
         // anything already typed, and Return sends them like a typed answer.
         if spoken != nil, inputPurpose != .ask {
@@ -401,7 +423,11 @@ final class Companion {
         }
         switch inputPurpose {
         case .answer(let id):
-            respond(to: id, path: "answer", body: ["text": text])
+            if let approval = approvals.first(where: { $0.id == id }), approval.isQuestionList {
+                answerQuestionText(text, for: approval)
+            } else {
+                respond(to: id, path: "answer", body: ["text": text])
+            }
             return
         case .revise(let id):
             respond(to: id, path: "revise", body: [
@@ -420,15 +446,17 @@ final class Companion {
         reply = ""
         question = text
         // A reply to something bud said carries it as a markdown quote, so bud sees what you mean.
-        let message = replyingTo.map { Self.quote($0) + "\n\n" + text } ?? text
+        let message = spoken == nil && unsent?.text == text
+            ? unsent!.payload : replyingTo.map { Self.quote($0) + "\n\n" + text } ?? text
         replyingTo = nil
         blocks = []
         bubbleOpen = true
         // The pet starts working when bud says so (user.message), not on a hopeful send.
         sentAt = .now
         lastFirstText = nil
-        let messageID = heldID ?? (unsent?.text == text
+        let messageID = heldID ?? (spoken == nil && unsent?.text == text
             ? unsent!.id : UUID().uuidString.replacingOccurrences(of: "-", with: ""))
+        let destination = session
         // A typed message waiting for its retry keeps its id; speech never clears it.
         if spoken == nil { unsent = nil }
         Task {
@@ -437,23 +465,54 @@ final class Companion {
                 let body: [String: Any] = [
                     "text": message, "message_id": messageID, "origin": BudConnection.origin,
                 ]
-                _ = try await connection.send("POST", "sessions/\(session)/messages", json: body)
+                _ = try await connection.send("POST", "sessions/\(destination)/messages", json: body)
             } catch {
                 // Keep what was typed: put it back in the field so one Return resends it. The
                 // request may have arrived before the error, so the resend reuses its id and
                 // bud runs it at most once.
-                activity = .failed
-                reply = "Couldn't send: \(error)"
-                showWhole()
+                nudge("Couldn't send: \(error)")
                 if spoken != nil {
                     holdSpeech(text, id: messageID, because: "That didn't send.")
-                } else if draft.isEmpty {
+                } else if draft.isEmpty, inputPurpose == .ask, session == destination,
+                          self.connection?.base == connection.base,
+                          self.connection?.scope == connection.scope {
                     draft = text
-                    unsent = (text, messageID)
+                    unsent = HeldMessage(
+                        id: messageID, text: text, payload: message, session: destination,
+                        base: connection.base, scope: connection.scope)
                     inputOpen = true
+                } else {
+                    heldMessages.append(HeldMessage(
+                        id: messageID, text: text, payload: message, session: destination,
+                        base: connection.base, scope: connection.scope))
                 }
             }
         }
+    }
+
+    func retryHeldMessage() {
+        guard let connection, let held = heldMessages.first, !retryingHeldMessage else { return }
+        guard held.session == session, held.base == connection.base, held.scope == connection.scope else {
+            nudge("Reconnect to the original bud session to retry this message.")
+            return
+        }
+        retryingHeldMessage = true
+        Task {
+            do {
+                _ = try await connection.send("POST", "sessions/\(held.session)/messages", json: [
+                    "text": held.payload, "message_id": held.id, "origin": BudConnection.origin,
+                ])
+                heldMessages.removeAll { $0.id == held.id }
+            } catch {
+                nudge("Couldn't send: \(error)")
+            }
+            retryingHeldMessage = false
+        }
+    }
+
+    func dropHeldMessage() {
+        guard !heldMessages.isEmpty, !retryingHeldMessage else { return }
+        heldMessages.removeFirst()
     }
 
     /// Spoken words that couldn't go out, held apart from the field, which keeps what you typed.
@@ -604,14 +663,39 @@ final class Companion {
 
     /// Opens the field to answer a question in your own words, or to say what should change.
     func write(_ purpose: InputPurpose) {
+        savedDrafts[inputPurpose] = draft
         inputPurpose = purpose
-        draft = ""
+        draft = savedDrafts.removeValue(forKey: purpose) ?? ""
         inputOpen = true
     }
 
     /// Choosing one of a question's options sends it as the answer, word for word.
     func choose(_ choice: String, for id: String) {
         respond(to: id, path: "answer", body: ["text": choice])
+    }
+
+    @ObservationIgnored private var questionFlows: [String: QuestionFlow] = [:]
+
+    func questionFlow(for approval: Approval) -> QuestionFlow {
+        if let flow = questionFlows[approval.id] { return flow }
+        let id = approval.id
+        let flow = QuestionFlow(questions: approval.questions) { [weak self] answers in
+            self?.answerQuestions(id, answers)
+        }
+        questionFlows[id] = flow
+        return flow
+    }
+
+    private func answerQuestions(_ id: String, _ answers: [QuestionAnswer]) {
+        respond(to: id, path: "answer", body: ["answers": answers])
+    }
+
+    func answerQuestionText(_ text: String, for approval: Approval) {
+        savedDrafts.removeValue(forKey: .answer(approval.id))
+        draft = savedDrafts.removeValue(forKey: .ask) ?? ""
+        inputOpen = !draft.isEmpty
+        inputPurpose = .ask
+        questionFlow(for: approval).answerTyped(text)
     }
 
     /// A field opened to answer or revise something that's since been settled (in another
@@ -622,9 +706,11 @@ final class Companion {
         case .ask: nil
         }
         guard let target, !approvals.contains(where: { $0.id == target }) else { return }
+        let unfinished = draft
         inputPurpose = .ask
-        inputOpen = false
-        draft = ""
+        let previous = savedDrafts.removeValue(forKey: .ask) ?? ""
+        draft = [previous, unfinished].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        inputOpen = !draft.isEmpty
     }
 
     private func showReceipt(for approval: Approval, path: String?, approved: Bool?, answer: String) {
@@ -668,12 +754,14 @@ final class Companion {
         }
         let typed = targetsThis ? draft : ""
         if targetsThis {
-            draft = ""
-            inputOpen = false
+            draft = savedDrafts.removeValue(forKey: .ask) ?? ""
+            inputOpen = !draft.isEmpty
             inputPurpose = .ask
         }
         let approval = approvals.first { $0.id == id }
-        let answer = (body["text"] as? String) ?? typed
+        let answer = (body["text"] as? String)
+            ?? (body["answers"] as? [QuestionAnswer]).map(QuestionAnswer.summary)
+            ?? typed
         let mine = generation
         Task {
             do {
@@ -698,6 +786,7 @@ final class Companion {
                 }
                 if !typed.isEmpty {
                     // Keep what was typed, so trying again is one Return.
+                    savedDrafts[inputPurpose] = draft
                     inputPurpose = path == "answer" ? .answer(id) : .revise(id)
                     draft = typed
                     inputOpen = true
@@ -927,18 +1016,28 @@ final class Companion {
     /// the dictionary is free to hand to the connection under Swift 6 checking.
     nonisolated private static func payload(_ body: [String: any Sendable]) -> [String: Any] {
         var json: [String: Any] = body.mapValues { $0 as Any }
+        if let answers = body["answers"] as? [QuestionAnswer] {
+            json["answers"] = answers.map(\.json)
+        }
         json["origin"] = BudConnection.origin
         return json
     }
 
-    /// The assistant's text from a stored run end, the same rule the TUI uses.
+    /// The assistant's text from a stored run end: the server's rule (projection.reply_text),
+    /// which leaves out bud's self-check notes, since they are for the model, not the owner.
     static func replyText(_ data: [String: Any]) -> String {
         let messages = data["messages"] as? [[String: Any]] ?? []
         return messages
             .filter { $0["kind"] as? String == "response" }
-            .flatMap { $0["parts"] as? [[String: Any]] ?? [] }
-            .filter { $0["part_kind"] as? String == "text" }
-            .compactMap { $0["content"] as? String }
+            .flatMap { message -> [String] in
+                let spiral = (message["metadata"] as? [String: Any])?["bud_spiral"] as? [String: Any]
+                let notes = Set(
+                    (spiral?["notes"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String })
+                return (message["parts"] as? [[String: Any]] ?? [])
+                    .filter { $0["part_kind"] as? String == "text" }
+                    .compactMap { $0["content"] as? String }
+                    .filter { !notes.contains($0) }
+            }
             .joined()
     }
 }

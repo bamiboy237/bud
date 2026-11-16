@@ -7,12 +7,21 @@ from importlib import resources
 from pathlib import Path
 
 from pydantic_ai import Agent, DeferredToolRequests, Tool
-from pydantic_ai.capabilities import AbstractCapability, Capability
+from pydantic_ai.capabilities import (
+    AbstractCapability,
+    Caching,
+    Capability,
+    RaiseContentFilterError,
+)
 from pydantic_ai.models import Model
 from pydantic_ai.toolsets import AbstractToolset, CombinedToolset, FunctionToolset
-from pydantic_ai_harness import Memory
+from pydantic_ai_harness import Memory, SystemReminders, WarnOnCacheBusts
+from pydantic_ai_harness.repair_tool_arguments import RepairToolArguments
+from pydantic_ai_harness.system_reminders import Reminder
 
+from bud.config import get_settings
 from bud.gateway.registry import Registry
+from bud.gateway.spend import build_spend_limits
 from bud.harness.actions import GuardTools, Policy, RecordDecision
 from bud.harness.code import CODE_GUIDANCE, build_code_mode
 from bud.harness.context import BackgroundCompaction
@@ -23,6 +32,13 @@ from bud.harness.spiral import LoopReport, SpiralConfig, SpiralGuard, build_judg
 from bud.skills import GUIDANCE as SKILL_GUIDANCE
 from bud.skills import RULES as SKILL_RULES
 from bud.skills import SkillMethods, SkillStore
+
+LONG_RUN_REMINDER_EVERY = 8
+LONG_RUN_REMINDER = (
+    "Check your next step still serves the owner's most recent request. Use the results "
+    "you already have instead of calling a tool again for the same thing. Writes still go "
+    "through approval: propose them, never work around a denial."
+)
 
 
 def load_system_prompt() -> str:
@@ -91,6 +107,12 @@ class Harness:
         prompt = self.system_prompt + memory_guidance
         self.prompt_version = sha256(prompt.encode()).hexdigest()[:12]
         self.spiral = SpiralConfig.from_settings()
+        settings = get_settings()
+        # One daily cap for the whole install, so it lives in the data directory, not in
+        # this account's session folder.
+        self.spend = build_spend_limits(
+            settings.data_dir / "spend.db", registry, settings.daily_spend_usd
+        )
 
     def _today(self) -> str:
         # Day granularity: instructions lead the prompt, so a per-minute clock here
@@ -119,6 +141,7 @@ class Harness:
             toolsets=[self.toolset],
             output_type=[str, DeferredToolRequests],
             capabilities=[
+                RepairToolArguments(),
                 GuardTools(
                     policy=self.policy,
                     record=record,
@@ -145,6 +168,16 @@ class Harness:
                     ],
                 ),
                 *([self.memory] if self.memory is not None else []),
+                *([self.spend] if self.spend is not None else []),
+                Caching(),
+                WarnOnCacheBusts(),
+                RaiseContentFilterError(),
+                # Request-only reminders leave the cached history unchanged.
+                SystemReminders(
+                    reminders=[
+                        Reminder(LONG_RUN_REMINDER, interval=LONG_RUN_REMINDER_EVERY, tag=None)
+                    ]
+                ),
                 *([durability] if durability is not None else []),
                 *capabilities,
             ],

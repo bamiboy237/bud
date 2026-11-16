@@ -2,11 +2,18 @@
 The gateway and the core server read API keys and the data directory through `get_settings()`.
 """
 
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Where `bud serve` listens and where its clients look for it. Every module that needs the
+# address takes it from here, so changing it is one edit.
+HOST = "127.0.0.1"
+PORT = 8420
+LOCAL_URL = f"http://{HOST}:{PORT}"
 
 
 class Settings(BaseSettings):
@@ -21,6 +28,7 @@ class Settings(BaseSettings):
     photon_project_id: str | None = Field(default=None, repr=False)
     photon_owner_handle: str | None = Field(default=None, repr=False)
     photon_agent_handle: str | None = Field(default=None, repr=False)
+    logfire_token: SecretStr | None = Field(default=None, repr=False)
 
     debug: bool = False
     data_dir: Path = Path("data")
@@ -34,8 +42,11 @@ class Settings(BaseSettings):
     approval_review_model: str = "gpt-6-luna"
     model_api_keys: dict[str, SecretStr] = Field(default_factory=dict, repr=False)
     tool_result_retention_hours: float = Field(default=24, gt=0, allow_inf_nan=False)
+    # Most bud may spend on model calls in one UTC day, across every conversation and job.
+    # Once spent, the next model request is refused until the day rolls over. 0 turns it off.
+    daily_spend_usd: Decimal = Field(default=Decimal("5"), ge=0, validation_alias="BUD_DAILY_USD")
 
-    # Spiral detection (bud.harness.spiral). bud has no step or money cap, so these
+    # Spiral detection (bud.harness.spiral). bud has no step cap, so these
     # decide when a run that is going in circles gets a nudge and then a pause.
     loop_detection: bool = True
     # The same tool call with the same result N times in a row: a note, then a pause.

@@ -14,11 +14,13 @@ from uuid import uuid4
 from bud.core.events import RUN_END_EVENTS, Event, EventType
 from bud.core.projection import (
     AUTO_PAUSES,
+    Snapshot,
     message_batch,
     pause_reason,
     queue_paused,
     queued_messages,
     runs,
+    snapshot,
     undecided_approvals,
 )
 from bud.limits import MAX_QUEUED_MESSAGES
@@ -71,6 +73,7 @@ CREATE INDEX IF NOT EXISTS events_by_type_session ON events (type, session_id);
 # Recovery replays one run, which needs its predecessor's snapshot; keep a spare.
 KEEP_CONVERSATIONS = 2
 CACHED_SESSIONS = 32
+FOLDED_SESSIONS = 128
 
 
 class EventLog:
@@ -80,6 +83,8 @@ class EventLog:
         # cached prefix plus a fetch of later rows equals a full read.
         self._cache: OrderedDict[str, list[Event]] = OrderedDict()
         self._cache_lock = threading.Lock()
+        # The latest fold of each session, tagged with the last seq it covers.
+        self._folded: OrderedDict[str, tuple[int, Snapshot]] = OrderedDict()
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
@@ -198,6 +203,36 @@ class EventLog:
                     while len(self._cache) > CACHED_SESSIONS:
                         self._cache.popitem(last=False)
         return [event for event in cached or [] if event.seq > after] + fresh
+
+    def snapshot(self, session_id: str, events: list[Event]) -> Snapshot:
+        """Fold a session's events into its snapshot, reusing the last fold while no event has
+        been appended since. The log is append-only, so the events up to a given seq never
+        change and the fold is a pure function of them; the log stays the only source of truth.
+
+        `events` must be the whole session, as `read` returns it. The copy's lists are its own
+        to change; the turns and approvals inside are shared and must not be mutated.
+        """
+        last = events[-1].seq if events else 0
+        with self._cache_lock:
+            hit = self._folded.get(session_id)
+            if hit is not None and hit[0] == last:
+                self._folded.move_to_end(session_id)
+                folded = hit[1]
+            else:
+                folded = None
+        if folded is None:
+            folded = snapshot(session_id, events)
+            with self._cache_lock:
+                self._folded[session_id] = (last, folded)
+                self._folded.move_to_end(session_id)
+                while len(self._folded) > FOLDED_SESSIONS:
+                    self._folded.popitem(last=False)
+        return folded.model_copy(
+            update={
+                "pending_approvals": list(folded.pending_approvals),
+                "tasks": list(folded.tasks),
+            }
+        )
 
     def last_seq(self, session_id: str) -> int:
         """Capture a stored-event boundary without reading the event payloads."""
@@ -389,7 +424,11 @@ class EventLog:
     def revise_approval(
         self, session_id: str, approval_id: str, text: str, message_id: str, origin: dict
     ) -> Event | None:
-        """Retire one pending permission and accept its correction atomically."""
+        """Retire one pending permission and accept its correction atomically.
+
+        Other proposals waiting in the same step are handled as for any new message: parked
+        in the owner's conversation, retired in a job's session.
+        """
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             event = self._accept_message(db, session_id, text, message_id, origin)
@@ -397,14 +436,15 @@ class EventLog:
                 # A repeated transport request cannot decline a later proposal.
                 return None
             pending = undecided_approvals(self._read(db, session_id))
-            if len(pending) != 1 or pending[0]["approval_id"] != approval_id:
-                raise ValueError("The exact action must be the only pending approval to revise.")
+            if approval_id not in {request["approval_id"] for request in pending}:
+                raise ValueError("That action is no longer waiting for approval.")
             self._insert(
                 db,
                 session_id,
                 "approval.denied",
                 {"approval_id": approval_id, "origin": origin, "revision_message_id": message_id},
             )
+            self._supersede(db, session_id, message_id, origin)
             return event
 
     def edit_message(self, session_id: str, message_id: str, text: str) -> None:

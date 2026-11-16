@@ -4,6 +4,7 @@ Requests with zero reported tokens are incomplete; exceptions are failures.
 Ledger writes can fail without failing the request.
 """
 
+import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -49,10 +50,10 @@ class TrackedModel(WrapperModel):
         try:
             response = await super().request(messages, model_settings, model_request_parameters)
         except BaseException as exc:
-            self._record_failure(exc, started)
+            await self._record_failure(exc, started)
             raise
         response.metadata = (response.metadata or {}) | {"bud_model_id": self.spec.id}
-        self._record_usage(response.usage, started)
+        await self._record_usage(response.usage, started)
         return response
 
     @asynccontextmanager
@@ -71,16 +72,15 @@ class TrackedModel(WrapperModel):
                 stream.metadata = (stream.metadata or {}) | {"bud_model_id": self.spec.id}
                 yield stream
         except BaseException as exc:
-            self._record_failure(exc, started)
+            await self._record_failure(exc, started)
             raise
-        self._record_usage(stream.usage, started)
+        await self._record_usage(stream.usage, started)
 
-    def _record_usage(self, usage: RequestUsage, started: float) -> None:
-
+    async def _record_usage(self, usage: RequestUsage, started: float) -> None:
         if usage.total_tokens == 0:
-            self._write("incomplete", started)
+            await self._write("incomplete", started)
             return
-        self._write(
+        await self._write(
             "ok",
             started,
             input_tokens=usage.input_tokens,
@@ -90,11 +90,14 @@ class TrackedModel(WrapperModel):
             cost_usd=self.spec.cost(usage),
         )
 
-    def _record_failure(self, exc: BaseException, started: float) -> None:
-        self._write("failed", started, error=error_summary(exc))
+    async def _record_failure(self, exc: BaseException, started: float) -> None:
+        await self._write("failed", started, error=error_summary(exc))
 
-    def _write(self, status: str, started: float, **fields: Any) -> None:
-        self.ledger.record(
+    async def _write(self, status: str, started: float, **fields: Any) -> None:
+        # The write is SQLite, so it runs off the event loop. The entry is built here, where
+        # the request's session context is still readable.
+        await asyncio.to_thread(
+            self.ledger.record,
             LedgerEntry(
                 model=self.spec.id,
                 billing=self.spec.billing,
@@ -102,5 +105,5 @@ class TrackedModel(WrapperModel):
                 latency_ms=(perf_counter() - started) * 1000,
                 session_id=self.session_id or request_session.get(),
                 **fields,
-            )
+            ),
         )

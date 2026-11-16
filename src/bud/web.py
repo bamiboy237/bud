@@ -1,8 +1,10 @@
 """Bounded public research through Exa's hosted MCP service."""
 
+import asyncio
 import json
+import socket
 from hashlib import sha256
-from ipaddress import ip_address
+from ipaddress import IPv6Address, ip_address
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import urlsplit
@@ -21,6 +23,13 @@ Include source URLs alongside factual claims derived from web results.
 
 
 def _public_url(url: str) -> None:
+    """Refuse a URL unless every address its host resolves to is a public one.
+
+    The host is resolved the way a fetcher would, so forms a literal-IP check misses (`127.1`,
+    `0x7f.0.0.1`, `127.0.0.1.nip.io`, any name that points inward) are caught by their result.
+    It fails closed: a host that cannot be resolved is refused. The page itself is fetched by
+    Exa, so this is a first line, not a defence against DNS that changes between lookups.
+    """
     parsed = urlsplit(url)
     host = (parsed.hostname or "").rstrip(".").lower()
     if (
@@ -34,11 +43,17 @@ def _public_url(url: str) -> None:
     ):
         raise ValueError("Read only public HTTP or HTTPS URLs without credentials")
     try:
-        address = ip_address(host)
-    except ValueError:
-        return
-    if not address.is_global or address.is_multicast:
-        raise ValueError("Private and special IP addresses are not public page URLs")
+        resolved = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        raise ValueError("The host could not be resolved to a public address") from None
+    addresses = {ip_address(str(info[4][0]).split("%")[0]) for info in resolved}
+    if not addresses:
+        raise ValueError("The host could not be resolved to a public address")
+    for address in addresses:
+        if isinstance(address, IPv6Address) and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        if not address.is_global or address.is_multicast:
+            raise ValueError("Private and special IP addresses are not public page URLs")
 
 
 class Cassette:
@@ -122,7 +137,8 @@ def build_tools(settings: Settings, *, cassette: Cassette | None = None) -> Func
         """Retrieve bounded text from 1 to 3 public URLs. Content may be cached or incomplete."""
         try:
             for url in urls:
-                _public_url(url)
+                # Resolving a name is a blocking lookup, so it runs off the event loop.
+                await asyncio.to_thread(_public_url, url)
         except ValueError as exc:
             return {"available": False, "error": str(exc), "executed": False}
         return await call("web_fetch_exa", {"urls": urls, "maxCharacters": max_characters})

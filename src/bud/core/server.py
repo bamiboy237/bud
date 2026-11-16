@@ -35,6 +35,7 @@ from bud.core.setup import SetupJournal, build_setup_toolset, setup_registry
 from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
+from bud.harness.ask import MAX_QUESTIONS, AskAnswer
 from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
 from bud.harness.recall import Recall, embedder
@@ -84,7 +85,10 @@ class Decision(BaseModel):
 
 
 class Answer(BaseModel):
-    text: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+    """A typed reply (`text`), or one answer per question from a card (`answers`)."""
+
+    text: str | None = Field(default=None, min_length=1, max_length=MAX_MESSAGE_CHARS)
+    answers: list[AskAnswer] | None = Field(default=None, min_length=1, max_length=MAX_QUESTIONS)
     origin: MessageOrigin = Field(default_factory=MessageOrigin)
 
 
@@ -109,6 +113,10 @@ def hold_single_server_lock(path: Path) -> TextIO:
 
 
 def workspace_tools(directory: Path) -> FunctionToolset[None]:
+    # The data folder is resolved once, here, because /tmp and /var are symlinks on macOS and
+    # the workspace walk refuses symlinks. The workspace root below it is not resolved, so a
+    # symlink swapped in at that level is still refused.
+    directory = directory.resolve()
     root = directory / "workspace"
     root.mkdir(exist_ok=True, mode=0o700)
     return FunctionToolset(build_workspace_tools(root, directory / "workspace-dispatches.jsonl"))
@@ -549,8 +557,11 @@ def _create_app(
             "conversation": runner.snapshot(item.session_id).model_dump(),
         }
 
+    # Routes that write to the log are plain `def`, so FastAPI runs them on its thread pool and
+    # a slow write never stalls the event loop that serves every stream. The runner hands
+    # anything that launches work back to the loop itself (Runner._on_loop).
     @app.post("/sessions/{session_id}/messages", status_code=202)
-    async def post_message(session_id: str, message: NewMessage) -> dict[str, bool]:
+    def post_message(session_id: str, message: NewMessage) -> dict[str, bool]:
         require_session(session_id)
         require_current_binding()
         try:
@@ -567,7 +578,7 @@ def _create_app(
         return {"duplicate": event is None}
 
     @app.patch("/sessions/{session_id}/queue/{message_id}")
-    async def edit_queued_message(session_id: str, message_id: str, message: EditMessage) -> dict:
+    def edit_queued_message(session_id: str, message_id: str, message: EditMessage) -> dict:
         require_session(session_id)
         try:
             runner.edit_message(session_id, message_id, message.text)
@@ -576,17 +587,17 @@ def _create_app(
         return {"edited": True}
 
     @app.delete("/sessions/{session_id}/queue/{message_id}")
-    async def cancel_queued_message(session_id: str, message_id: str) -> dict:
+    def cancel_queued_message(session_id: str, message_id: str) -> dict:
         require_session(session_id)
         return {"cancelled": runner.cancel_message(session_id, message_id)}
 
     @app.post("/sessions/{session_id}/queue/pause")
-    async def pause_queue(session_id: str) -> dict:
+    def pause_queue(session_id: str) -> dict:
         require_session(session_id)
         return {"changed": runner.pause_queue(session_id, True), "queue_paused": True}
 
     @app.post("/sessions/{session_id}/queue/resume")
-    async def resume_queue(session_id: str) -> dict:
+    def resume_queue(session_id: str) -> dict:
         require_session(session_id)
         require_current_binding()
         return {"changed": runner.pause_queue(session_id, False), "queue_paused": False}
@@ -597,7 +608,7 @@ def _create_app(
         return await runner.stop_session(session_id)
 
     @app.post("/sessions/{session_id}/approvals/{approval_id}")
-    async def decide(session_id: str, approval_id: str, decision: Decision) -> dict[str, bool]:
+    def decide(session_id: str, approval_id: str, decision: Decision) -> dict[str, bool]:
         require_session(session_id)
         if decision.approved:
             require_current_binding()
@@ -613,7 +624,7 @@ def _create_app(
             raise HTTPException(409, str(exc)) from None
 
     @app.post("/sessions/{session_id}/approvals/{approval_id}/revise")
-    async def revise(session_id: str, approval_id: str, message: NewMessage) -> dict[str, bool]:
+    def revise(session_id: str, approval_id: str, message: NewMessage) -> dict[str, bool]:
         require_session(session_id)
         require_current_binding()
         try:
@@ -634,13 +645,17 @@ def _create_app(
             raise HTTPException(409, str(exc)) from None
 
     @app.post("/sessions/{session_id}/approvals/{approval_id}/answer")
-    async def answer(session_id: str, approval_id: str, answer: Answer) -> dict[str, bool]:
+    def answer(session_id: str, approval_id: str, answer: Answer) -> dict[str, bool]:
         require_session(session_id)
         require_current_binding()
         try:
             return {
                 "answered": runner.answer(
-                    session_id, approval_id, answer.text, answer.origin.model_dump()
+                    session_id,
+                    approval_id,
+                    answer.text,
+                    answer.origin.model_dump(),
+                    answer.answers,
                 )
             }
         except UnknownApproval:

@@ -32,10 +32,9 @@ from uuid import uuid4
 
 import httpx
 
+from bud.config import HOST, PORT
 from bud.core.projection import reply_text
 from bud.world.store import World
-
-LIVE_PORT = 8420
 
 
 def _state(data: Path) -> dict:
@@ -51,15 +50,15 @@ def _client(data: Path) -> httpx.Client:
     state = _state(data)
     token = (data / "auth" / "owner.token").read_text().strip()
     return httpx.Client(
-        base_url=f"http://127.0.0.1:{state['port']}",
+        base_url=f"http://{HOST}:{state['port']}",
         headers={"Authorization": f"Bearer {token}"},
         timeout=30,
     )
 
 
 def start(data: Path, port: int) -> None:
-    if port == LIVE_PORT:
-        sys.exit("Port 8420 is the owner's live server; pick another port.")
+    if port == PORT:
+        sys.exit(f"Port {PORT} is the owner's live server; pick another port.")
     data.mkdir(parents=True, exist_ok=True)
     # Owner-only, like Codex and Vibe's log files.
     log = os.fdopen(
@@ -68,7 +67,7 @@ def start(data: Path, port: int) -> None:
     env = {**os.environ, "DATA_DIR": str(data), "PYDANTIC_AI_NO_BANNER": "1"}
     code = (
         "import uvicorn; from bud.core.server import create_app; "
-        f"uvicorn.run(create_app(simulate=True), host='127.0.0.1', port={port}, "
+        f"uvicorn.run(create_app(simulate=True), host={HOST!r}, port={port}, "
         "log_level='warning', timeout_graceful_shutdown=3)"
     )
     process = subprocess.Popen(
@@ -77,7 +76,7 @@ def start(data: Path, port: int) -> None:
     _save(data, {**_state(data), "port": port, "pid": process.pid})
     for _ in range(120):
         try:
-            if httpx.get(f"http://127.0.0.1:{port}/runtime", timeout=2).status_code == 401:
+            if httpx.get(f"http://{HOST}:{port}/runtime", timeout=2).status_code == 401:
                 break
         except httpx.HTTPError:
             pass

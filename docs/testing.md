@@ -29,6 +29,15 @@ uv run pytest -x
 `uv sync --locked` fails when `uv.lock` does not match `pyproject.toml`. Change dependencies
 with `uv add` or `uv add --dev` and commit the updated lock.
 
+The dev group includes Logfire so CI also tests the optional tracing path. The tracing test
+uses an in-memory exporter and checks that prompts, tool data, and replies are absent.
+It does not send traces to Logfire cloud. Runtime-only installs need the `tracing` extra
+to use `LOGFIRE_TOKEN`:
+
+```sh
+uv sync --locked --no-dev --extra tracing
+```
+
 ## What the suite covers
 
 | Area | What it proves |
@@ -59,9 +68,8 @@ Concurrent agents and concurrent tests must not share writable state or ports.
 - **State.** Each server gets its own temporary `DATA_DIR`. Direct runner and tool tests also
   use temporary databases and workspaces. The fixture clears inherited settings and changes
   the working directory so the developer's `.env` is not loaded.
-- **Resolve the path.** `create_app` refuses symlinked path components. On macOS `/tmp` and
-  `/var` are symlinks, so pass `tmp_path.resolve()`; a raw temp path fails with
-  `NotADirectoryError`.
+- **Workspace paths.** The server resolves the configured data directory before setting up
+  workspace tools. The workspace root and its contents still reject symlinks.
 - **Model config.** `create_app` needs a model for the `fast` tier and raises
   `NoModelAvailable` without one. Tests patch the gateway with a pydantic-ai `FunctionModel`, so
   no model-provider request leaves the test environment.

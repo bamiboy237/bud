@@ -249,4 +249,25 @@ struct ApprovalTests {
         let remaining = try #require(companion.approvals.first)
         #expect(companion.failedApprovals(for: remaining).isEmpty)
     }
+
+    @Test @MainActor
+    func switchingAndClosingInputPreservesDrafts() {
+        let companion = Companion()
+        companion.apply(snapshot: [
+            "last_seq": 1,
+            "pending_approvals": [
+                ["approval_id": "a", "tool": "ask_user", "args": [:], "run_id": "run"]
+            ],
+        ])
+        companion.draft = "unfinished message"
+        companion.write(.answer("a"))
+        companion.draft = "unfinished answer"
+        companion.write(.ask)
+        #expect(companion.draft == "unfinished message")
+        companion.write(.answer("a"))
+        #expect(companion.draft == "unfinished answer")
+        companion.apply(snapshot: ["last_seq": 2, "pending_approvals": []])
+        #expect(companion.inputPurpose == .ask)
+        #expect(companion.draft == "unfinished message\n\nunfinished answer")
+    }
 }
