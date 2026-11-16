@@ -406,7 +406,7 @@ def owner_answers(messages: list[ModelMessage]) -> list[Clarification]:
             for part in message.parts:
                 if isinstance(part, ToolCallPart) and part.tool_name == "ask_user":
                     args = part.args_as_dict()
-                    question = ask_summary(args) if "questions" in args else args.get("question")
+                    question = ask_summary(args)
                     questions[part.tool_call_id] = question if isinstance(question, str) else ""
         if not isinstance(message, ModelRequest):
             continue

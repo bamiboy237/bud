@@ -1325,8 +1325,7 @@ final class Companion {
         return json
     }
 
-    /// The assistant's text from a stored run end: the server's rule (projection.reply_text),
-    /// which leaves out bud's self-check notes, since they are for the model, not the owner.
+    /// Matches projection.reply_text, including filtering legacy self-check notes in saved runs.
     static func replyText(_ data: [String: Any]) -> String {
         let messages = data["messages"] as? [[String: Any]] ?? []
         return messages

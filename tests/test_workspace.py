@@ -274,6 +274,23 @@ async def test_hidden_folders_cannot_be_listed_or_read(workspace):
     assert ".git" not in await reader.listing()
 
 
+@pytest.mark.parametrize(
+    "directory", ["secrets", "credentials", "sub/secrets", "sub/api-key", "private"]
+)
+async def test_private_directories_block_reads_and_searches(workspace, directory):
+    root, _ = workspace
+    folder = root / directory
+    folder.mkdir(parents=True)
+    (folder / "notes.txt").write_text("private-directory-marker")
+    reader = Reader(root)
+
+    with pytest.raises(ModelRetry):
+        await reader.read(f"{directory}/notes.txt")
+    with pytest.raises(ModelRetry):
+        await reader.listing(directory)
+    assert "private-directory-marker" not in await reader.search("private-directory-marker")
+
+
 @pytest.mark.parametrize("path", ["keyboard.md", "monkey.txt", "progressive.md"])
 async def test_words_inside_other_words_are_not_private(workspace, path):
     root, tools = workspace

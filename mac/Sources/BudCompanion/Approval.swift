@@ -55,14 +55,6 @@ struct Approval: Identifiable, Equatable {
         return subject.map { "\(verb): \($0)" } ?? title
     }
 
-    /// The one line under a collapsed row: what the action is about, in the fewest words.
-    var rowDetail: String? {
-        if let subject = emailPreview?.subject { return subject }
-        if let job { return "For the job “\(job)”" }
-        if let first = facts.first { return "\(first.label): \(first.value)" }
-        return body?.split(separator: "\n").first.map(String.init)
-    }
-
     func batch(in approvals: [Approval]) -> [Approval] {
         guard !isQuestion, let requestID else { return [] }
         return approvals.filter { !$0.isQuestion && $0.requestID == requestID }

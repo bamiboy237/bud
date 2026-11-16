@@ -58,7 +58,7 @@ def notification(event: dict, origin: MessageOrigin) -> str | None:
                 return None
             for message in reversed(data["messages"]):
                 if message.get("kind") == "response":
-                    # bud's self-check notes are for the model, not the owner.
+                    # Saved runs from before DetectLoops can contain assistant self-check notes.
                     notes = spiral_notes(message)
                     body = "\n".join(
                         part["content"]

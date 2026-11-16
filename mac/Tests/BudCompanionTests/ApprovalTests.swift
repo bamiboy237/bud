@@ -208,6 +208,19 @@ struct ApprovalTests {
     }
 
     @Test @MainActor
+    func savedLegacyLoopNotesStayOutOfReplies() {
+        let data: [String: Any] = ["messages": [[
+            "kind": "response",
+            "metadata": ["bud_spiral": ["notes": [["text": "Legacy internal note"]]]],
+            "parts": [
+                ["part_kind": "text", "content": "Legacy internal note"],
+                ["part_kind": "text", "content": "Here is the result."],
+            ],
+        ]]]
+        #expect(Companion.replyText(data) == "Here is the result.")
+    }
+
+    @Test @MainActor
     func cancellationPreventsAnyFurtherApproval() async {
         var sent: [String] = []
         let task = Task {

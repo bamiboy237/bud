@@ -153,7 +153,7 @@ struct ApprovalDeck: View {
         }
         .buttonStyle(CardButton(kind: .secondary))
         .disabled(!companion.deciding.isEmpty || companion.approvingBatch || companion.link != .connected)
-        .help(failed.isEmpty ? "Approve all pending actions from this job" : "Retry only failed actions")
+        .help(failed.isEmpty ? "Approve all actions in this request" : "Retry only failed actions")
     }
 
     private var cardStack: some View {
@@ -174,22 +174,12 @@ struct ApprovalDeck: View {
             }
 
             if let activeApproval = currentApproval {
-                Group {
-                    if activeApproval.isQuestion {
-                        ApprovalCard(
-                            companion: companion, approval: activeApproval,
-                            nested: false, showsHeading: true
-                        )
-                    } else {
-                        InteractiveApprovalCard(
-                            companion: companion,
-                            approval: activeApproval,
-                            onDecide: { approved in
-                                handleDecision(approval: activeApproval, approved: approved)
-                            }
-                        )
+                ApprovalCard(
+                    companion: companion, approval: activeApproval,
+                    onDecide: { approved in
+                        handleDecision(approval: activeApproval, approved: approved)
                     }
-                }
+                )
                 .id(activeApproval.id)
                 .offset(x: deck.flyOffset, y: 0)
                 .rotationEffect(.degrees(deck.flyRotation))
@@ -321,139 +311,6 @@ struct PeekCard: View {
         .zIndex(Double(5 - offset))
         .animation(.spring(response: 0.35, dampingFraction: 0.75), value: isTopAdvancing)
         .allowsHitTesting(false)
-    }
-}
-
-/// The top, interactive card inside the stacked deck.
-struct InteractiveApprovalCard: View {
-    let companion: Companion
-    let approval: Approval
-    let onDecide: (Bool) -> Void
-    private var busy: Bool {
-        companion.deciding.contains(approval.id) || companion.approvingBatch || companion.link != .connected
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            heading
-                .contentShape(Rectangle())
-                .gesture(
-                    DragGesture(minimumDistance: 24)
-                        .onEnded { value in
-                            guard !busy,
-                                  let direction = DecisionDirection.swipe(value.translation)
-                            else { return }
-                            onDecide(direction == .approve)
-                        }
-                )
-                .help("Swipe right to approve or left to deny")
-            detailScroll
-            actionBar
-            if let problem = companion.approvalFailures[approval.id] ?? companion.decisionProblem {
-                Text(problem)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: 240)
-        .background(Paper.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Paper.hairline, lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.12), radius: 8, x: 0, y: 3)
-        .disabled(busy)
-        .opacity(busy ? 0.6 : 1)
-    }
-
-    private var heading: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: approval.symbol)
-                .font(.system(size: 13, weight: .semibold))
-                .frame(width: 28, height: 28)
-                .background(Paper.ink.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .foregroundStyle(Paper.ink)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(approval.isQuestion ? "bud has a question" : approval.title)
-                    .font(.system(size: 13, weight: .semibold))
-                    .lineLimit(2)
-                    .foregroundStyle(Paper.ink)
-                if let job = approval.job {
-                    Text("For “\(job)”")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-            Spacer(minLength: 0)
-        }
-    }
-
-    private var detailScroll: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
-                if !approval.facts.isEmpty { facts }
-                if let text = approval.body, !approval.isQuestion { EmailBody(text: text) }
-                if let email = approval.emailPreview,
-                   !email.messages.isEmpty || email.unavailableReason != nil {
-                    if approval.body != nil {
-                        Divider()
-                        Text("Original email").font(.caption.weight(.medium)).foregroundStyle(.secondary)
-                    }
-                    EmailThreadPreview(email: email)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.trailing, 4)
-        }
-        .frame(maxHeight: 110)
-        .scrollBounceBehavior(.basedOnSize)
-        .scrollIndicators(.automatic)
-    }
-
-    private var actionBar: some View {
-        VStack(alignment: .trailing, spacing: 6) {
-            HStack(spacing: 8) {
-                Button("Change…") { companion.write(.revise(approval.id)) }
-                    .buttonStyle(CardButton(kind: .quiet))
-                    .help("Tell bud what to do differently")
-
-                Spacer(minLength: 0)
-
-                Button("Deny") { onDecide(false) }
-                    .buttonStyle(CardButton(kind: .deny))
-
-                Button(companion.approvalFailures[approval.id] == nil ? approval.verb : "Retry") {
-                    onDecide(true)
-                }
-                .buttonStyle(CardButton(kind: .approve))
-            }
-            if approval.grantable {
-                Button("Always allow") { companion.alwaysAllow(approval) }
-                    .buttonStyle(CardButton(kind: .secondary))
-                    .font(.caption)
-            }
-        }
-    }
-
-    private var facts: some View {
-        Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 4) {
-            ForEach(approval.facts.indices, id: \.self) { index in
-                GridRow {
-                    Text(approval.facts[index].label)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text(approval.facts[index].value)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(Paper.ink)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-        }
     }
 }
 

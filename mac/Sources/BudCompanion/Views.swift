@@ -238,14 +238,6 @@ struct ChildPupView: View {
         self.since = task.finishedAt ?? .now
     }
 
-    init(move: PetMove = .working, size: CGSize = defaultSize, title: String = "Pup helper", status: String = "running", since: Date = .now) {
-        self.move = move
-        self.title = title
-        self.statusText = status
-        self.size = size
-        self.since = since
-    }
-
     var body: some View {
         Button {
             ConversationWindow.shared.show()
@@ -798,35 +790,26 @@ private struct StepsSummary: View {
 struct ApprovalCard: View {
     let companion: Companion
     let approval: Approval
-    /// Inside a collapsible row: the row draws the surface, so the card draws only its content.
-    let nested: Bool
-    let showsHeading: Bool
+    let onDecide: (Bool) -> Void
     @StateObject private var layout = ApprovalLayout()
 
     private var busy: Bool {
         companion.deciding.contains(approval.id) || companion.approvingBatch || companion.link != .connected
     }
     private var detailLimit: CGFloat {
-        // Several rows share one floating panel, so an open card gives up some height.
-        let crowded = companion.approvals.count > 2
-        let height: CGFloat = companion.windowOpen ? 300 : companion.inputOpen ? 140 : crowded ? 130 : 190
+        let height: CGFloat = approval.isQuestion ? 190 : 110
         let hasProblem = companion.approvalFailures[approval.id] != nil || companion.decisionProblem != nil
         return hasProblem ? max(80, height - 40) : height
     }
 
     var body: some View {
-        Group {
-            if nested {
-                content
-            } else {
-                content
-                    .padding(12)
-                    .background(Paper.ink.opacity(0.035),
-                                in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(Paper.hairline, lineWidth: 0.5))
-            }
-        }
+        content
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Paper.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .strokeBorder(Paper.hairline, lineWidth: 1))
+        .shadow(color: .black.opacity(0.12), radius: 8, x: 0, y: 3)
         .disabled(busy)
         .opacity(busy ? 0.55 : 1)
         .animation(.easeOut(duration: 0.12), value: busy)
@@ -834,7 +817,17 @@ struct ApprovalCard: View {
 
     private var content: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if showsHeading { heading }
+            heading
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 24)
+                        .onEnded { value in
+                            guard !busy, !approval.isQuestion,
+                                  let direction = DecisionDirection.swipe(value.translation)
+                            else { return }
+                            onDecide(direction == .approve)
+                        }
+                )
             if approval.isQuestion {
                 QuestionCards(companion: companion, approval: approval,
                               flow: companion.questionFlow(for: approval), listLimit: detailLimit)
@@ -931,12 +924,12 @@ struct ApprovalCard: View {
                     .buttonStyle(CardButton(kind: .quiet))
                     .help("Tell bud what to do differently")
                 Spacer(minLength: 0)
-                Button("Deny") { companion.decide(approval.id, approved: false) }
-                    .buttonStyle(CardButton(kind: .secondary))
+                Button("Deny") { onDecide(false) }
+                    .buttonStyle(CardButton(kind: .deny))
                 Button(companion.approvalFailures[approval.id] == nil ? approval.verb : "Retry") {
-                    companion.decide(approval.id, approved: true)
+                    onDecide(true)
                 }
-                    .buttonStyle(CardButton(kind: .primary))
+                    .buttonStyle(CardButton(kind: .approve))
             }
             if approval.grantable { alwaysAllow }
         }
