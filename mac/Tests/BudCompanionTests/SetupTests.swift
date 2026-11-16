@@ -47,6 +47,27 @@ struct SetupTests {
     }
 
     @Test
+    func reopenedTaskKeepsItsPupAfterTheOldCompletionDelay() async throws {
+        let companion = Companion()
+        companion.apply(snapshot: [
+            "last_seq": 1,
+            "tasks": [["task_id": 1, "title": "Check", "status": "running"]],
+        ])
+        let completed = try #require(BudEvent(json:
+            #"{"seq":2,"type":"task.completed","data":{"task_id":1}}"#))
+        companion.handle(completed)
+        #expect(companion.activeTasks.first?.status == "completed")
+        companion.apply(snapshot: [
+            "last_seq": 3,
+            "tasks": [["task_id": 1, "title": "Check", "status": "running"]],
+        ])
+
+        try await Task.sleep(for: .milliseconds(3700))
+        #expect(companion.activeTasks.map(\.id) == [1])
+        #expect(companion.activeTasks.first?.status == "running")
+    }
+
+    @Test
     func waitingSetupNeedsAttentionAndOpensTheBubble() {
         let companion = Companion()
         companion.apply(snapshot: [

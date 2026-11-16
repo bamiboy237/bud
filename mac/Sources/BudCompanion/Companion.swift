@@ -1322,10 +1322,14 @@ final class Companion {
     }
 
     private func scheduleTaskRemoval(id: Int, delay: Double) {
+        guard let finishedAt = activeTasks.first(where: { $0.id == id })?.finishedAt else { return }
         Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(Int(delay * 1000)))
             await MainActor.run {
-                self?.activeTasks.removeAll { $0.id == id }
+                self?.activeTasks.removeAll {
+                    $0.id == id && $0.finishedAt == finishedAt
+                        && ["completed", "failed", "cancelled"].contains($0.status)
+                }
             }
         }
     }
