@@ -19,6 +19,10 @@ struct QuestionAnswers: Equatable {
     private(set) var index = 0
     private var given: [Int: QuestionAnswer] = [:]
 
+    init(questions: [Question]) {
+        self.questions = questions
+    }
+
     var isFirst: Bool { index == 0 }
     var isLast: Bool { index == questions.count - 1 }
     var current: Question { questions[index] }
