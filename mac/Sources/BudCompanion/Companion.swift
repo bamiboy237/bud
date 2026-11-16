@@ -612,7 +612,12 @@ final class Companion {
 
     /// Yes or no on an action. A job's approval goes through this session too: bud finds the job.
     func decide(_ id: String, approved: Bool) {
-        respond(to: id, path: nil, body: ["approved": approved])
+        respond(to: id, path: nil, body: ApprovalDecision(approved: approved).body)
+    }
+
+    /// Yes now, and yes to this tool from now on: bud records the standing grant, then applies.
+    func alwaysAllow(_ approval: Approval) {
+        respond(to: approval.id, path: nil, body: ApprovalDecision.always.body)
     }
 
     func approveAll(for approval: Approval) {
@@ -713,13 +718,17 @@ final class Companion {
         inputOpen = !draft.isEmpty
     }
 
-    private func showReceipt(for approval: Approval, path: String?, approved: Bool?, answer: String) {
+    private func showReceipt(
+        for approval: Approval, path: String?, approved: Bool?, remember: Bool, answer: String
+    ) {
         let receipt: Receipt
         switch (path, approved) {
         case ("answer", _):
             receipt = Receipt(text: "Answered “\(answer.prefix(60))”", symbol: "checkmark")
         case ("revise", _):
             receipt = Receipt(text: "Sent back with your changes", symbol: "arrow.uturn.backward")
+        case (_, true) where remember:
+            receipt = Receipt(text: approval.alwaysAllowDone, symbol: "checkmark")
         case (_, true):
             receipt = Receipt(text: approval.done, symbol: "checkmark")
         default:
@@ -771,7 +780,8 @@ final class Companion {
                 try ApprovalBatch.requireApplied(
                     response, key: path == "answer" ? "answered" : "applied")
                 if let approval {
-                    showReceipt(for: approval, path: path, approved: body["approved"] as? Bool, answer: answer)
+                    showReceipt(for: approval, path: path, approved: body["approved"] as? Bool,
+                                remember: body["remember"] as? Bool == true, answer: answer)
                 }
                 // Gone from the card at once; the snapshot confirms and brings the next one.
                 approvals.removeAll { $0.id == id }
@@ -892,7 +902,8 @@ final class Companion {
             {
                 showReceipt(
                     for: approval, path: event.type == "question.answered" ? "answer" : nil,
-                    approved: event.type == "approval.granted", answer: event.string("text"))
+                    approved: event.type == "approval.granted", remember: false,
+                    answer: event.string("text"))
                 approvals.removeAll { $0.id == id }
                 openApprovals.remove(id)
                 closeStaleInput()

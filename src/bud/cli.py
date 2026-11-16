@@ -133,7 +133,7 @@ def connect(toolkit: str, no_browser: bool) -> None:
         webbrowser.open(url)
     print(
         "Sign in at this URL, then run `bud connections` to check the connection. "
-        "Restart bud serve and start a new chat to load the changed account tools."
+        "Refresh connections in bud serve to load account tools."
     )
 
 
@@ -144,9 +144,55 @@ def connections() -> None:
         statuses = Connections(get_settings()).statuses()
     except ConnectionError as exc:
         raise SystemExit(str(exc)) from None
-    for toolkit in ("gmail", "googlecalendar"):
-        print(f"{toolkit}: {statuses.get(toolkit, 'NOT_CONNECTED')}")
-    print("Account tool changes require a full bud serve restart and a new chat.")
+    for toolkit in sorted(statuses):
+        print(f"{toolkit}: {statuses[toolkit]}")
+    print("Refresh connections in bud serve to load account tools.")
+
+
+def grants(action: str, tool: str | None, url: str = LOCAL_URL) -> None:
+    """List or revoke standing tool permissions, through the running server when it answers."""
+    import httpx
+
+    from bud.core.auth import OwnerAuthError, owner_token
+    from bud.harness.grants import Grants
+
+    settings = get_settings()
+    path = settings.data_dir / "grants.json"
+    if action == "revoke" and not tool:
+        raise SystemExit("Name the tool to revoke, for example: bud grants revoke archive_email")
+    headers: dict[str, str] = {}
+    try:
+        headers["Authorization"] = f"Bearer {owner_token(settings).get_secret_value()}"
+    except OwnerAuthError:
+        headers = {}
+    url = f"{url}/grants" + (f"/{tool}" if action == "revoke" else "")
+    data: dict[str, object]
+    try:
+        with httpx.Client(timeout=5) as client:
+            response = client.request(
+                "DELETE" if action == "revoke" else "GET", url, headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+    except (httpx.HTTPError, OSError, ValueError):
+        # The server is not running: read or edit the file directly. It applies at next start.
+        store = Grants(path)
+        data = (
+            {"removed": store.remove(tool or "")}
+            if action == "revoke"
+            else {"tools": sorted(store.tools)}
+        )
+        print("bud is not running; a change here applies the next time it starts.")
+    if action == "revoke":
+        print(f"{tool}: {'revoked' if data.get('removed') else 'was not granted'}")
+        return
+    stored = data.get("tools")
+    tools = [name for name in stored if isinstance(name, str)] if isinstance(stored, list) else []
+    if not tools:
+        print("No tool runs without asking.")
+        return
+    for name in tools:
+        print(name)
 
 
 def _main(argv: list[str] | None = None) -> None:
@@ -180,6 +226,12 @@ def _main(argv: list[str] | None = None) -> None:
         "--no-browser", action="store_true", help="only print the sign-in URL"
     )
     commands.add_parser("connections", help="show connection status metadata, not mailbox data")
+    grants_parser = commands.add_parser(
+        "grants", help="list or revoke tools that run without asking again"
+    )
+    grants_parser.add_argument("action", nargs="?", choices=["list", "revoke"], default="list")
+    grants_parser.add_argument("tool", nargs="?", help="tool name to revoke")
+    grants_parser.add_argument("--url", default=LOCAL_URL)
     eval_parser = commands.add_parser("eval", help="run the task suite on the simulated world")
     eval_parser.add_argument("--trials", type=int, default=3)
     eval_parser.add_argument("--task", help="run one task by id")
@@ -225,6 +277,8 @@ def _main(argv: list[str] | None = None) -> None:
         connect("googlecalendar" if args.toolkit == "calendar" else args.toolkit, args.no_browser)
     elif args.command == "connections":
         connections()
+    elif args.command == "grants":
+        grants(args.action, args.tool, args.url)
     elif args.command == "eval":
         if args.probe:
             from bud.evals.probe import probe

@@ -25,6 +25,7 @@ from bud.gateway.spend import build_spend_limits
 from bud.harness.actions import GuardTools, Policy, RecordDecision
 from bud.harness.code import CODE_GUIDANCE, build_code_mode
 from bud.harness.context import BackgroundCompaction
+from bud.harness.live import LiveState, LiveTools
 from bud.harness.memory import MEMORY_RULES
 from bud.harness.results import SqliteResultStore, build_output_limits
 from bud.harness.review import Describer, SessionGrants, ToolReviewer
@@ -62,13 +63,16 @@ class Harness:
         self.toolset = tools if isinstance(tools, AbstractToolset) else FunctionToolset[None](tools)
         self.skills = SkillStore(state_dir / "skills")
         self.toolset = CombinedToolset([self.toolset, FunctionToolset[None](self.skills.tools())])
+        # The agent holds this wrapper, so tools can be replaced between runs.
+        self.live = LiveTools(state=LiveState(current=self.toolset))
         self.memory = memory
         tools_policy = policy.tools | MEMORY_RULES if memory else policy.tools
         self.policy = Policy(
-            tools={"load_tool_result": "allow", "run_code": "allow"}
+            tools={"load_tool_result": "allow", "run_code": "allow", "search_tools": "allow"}
             | tools_policy
             | {"read_tool_result": "allow", "read_tool_result_chars": "allow"}
-            | SKILL_RULES
+            | SKILL_RULES,
+            no_grants=policy.no_grants,
         )
         self.results = SqliteResultStore(result_path, retention=result_retention)
         self.output_limits = build_output_limits(self.results, read_tools)
@@ -114,6 +118,10 @@ class Harness:
             settings.data_dir / "spend.db", registry, settings.daily_spend_usd
         )
 
+    def swap_tools(self, toolset: AbstractToolset[None]) -> None:
+        """Replace the tools the next run sees; the running step keeps the ones it started with."""
+        self.live.swap(CombinedToolset([toolset, FunctionToolset[None](self.skills.tools())]))
+
     def _today(self) -> str:
         # Day granularity: instructions lead the prompt, so a per-minute clock here
         # would invalidate the cached conversation on every turn.
@@ -138,7 +146,7 @@ class Harness:
             name="bud",
             deps_type=type(None),
             instructions=[self.system_prompt, *self.live_instructions],
-            toolsets=[self.toolset],
+            toolsets=[self.live],
             output_type=[str, DeferredToolRequests],
             capabilities=[
                 RepairToolArguments(),

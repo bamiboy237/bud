@@ -1,7 +1,9 @@
 import pytest
 from pydantic_ai.messages import ModelResponse, ToolCallPart, ToolReturnPart
 
+from bud.composio.tools import ask_user as account_ask_user
 from bud.harness.ask import AskAnswer, answer_from_text, questions_of, render_answers
+from bud.harness.ask import ask_user as shared_ask_user
 from tests.runner_support import reply, running_bud
 
 QUESTIONS = {
@@ -19,6 +21,10 @@ QUESTIONS = {
         },
     ]
 }
+
+
+def test_real_account_questions_use_the_shared_grouped_contract():
+    assert account_ask_user is shared_ask_user
 
 
 def test_legacy_question_reads_as_one_question_and_numbers_pick_options():

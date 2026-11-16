@@ -203,6 +203,12 @@ class Runner(DBOSConfiguredInstance):
             state.pending_approvals.extend(
                 approval for task in state.tasks for approval in task.pending_approvals
             )
+        policy = self.harness.policy
+        for approval in state.pending_approvals:
+            # The card offers a standing grant only where one is allowed and not already held.
+            approval.grantable = (
+                policy.grantable(approval.tool) and approval.tool not in policy.grants
+            )
         return state
 
     def _kick(self, session_id: str) -> None:
@@ -1050,6 +1056,9 @@ class Runner(DBOSConfiguredInstance):
                     "call_id": call.tool_call_id,
                     "tool": call.tool_name,
                     "args": call.args_as_dict(),
+                    # The card can offer a standing grant without waiting for a snapshot.
+                    "grantable": self.harness.policy.grantable(call.tool_name)
+                    and call.tool_name not in self.harness.policy.grants,
                     # Why the reviewer held this call; absent when a rule asked, not it.
                     **_review_of(deferred.metadata.get(call.tool_call_id) if deferred else None),
                 }
