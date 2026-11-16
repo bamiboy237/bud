@@ -278,8 +278,6 @@ class Recall:
                         (match, exclude_session or ""),
                     )
                 ]
-            # Only vectors the search will compare, picked in SQL: every memory line and the
-            # newest turns. The text of a chunk is read later, for the few that are returned.
             rows = db.execute(
                 "SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL "
                 "AND source = 'memory' "

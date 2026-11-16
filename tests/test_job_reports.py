@@ -181,11 +181,7 @@ async def test_queued_job_report_survives_runner_reconstruction(tmp_path, monkey
         await bud.runner.recover()
         await bud.settle()
         events = bud.log.read("owner")
-        reports = [
-            e.data for e in events if e.type == "run.queued" and e.data["trigger"] == "job"
-        ]
+        reports = [e.data for e in events if e.type == "run.queued" and e.data["trigger"] == "job"]
         assert [run["run_id"] for run in reports] == [report_id]
-        assert any(
-            e.type == "run.completed" and e.data["run_id"] == report_id for e in events
-        )
+        assert any(e.type == "run.completed" and e.data["run_id"] == report_id for e in events)
         assert "The lease renews on 3 March." in prompts[-1]

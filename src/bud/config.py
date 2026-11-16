@@ -9,8 +9,6 @@ from pathlib import Path
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Where `bud serve` listens and where its clients look for it. Every module that needs the
-# address takes it from here, so changing it is one edit.
 HOST = "127.0.0.1"
 PORT = 8420
 LOCAL_URL = f"http://{HOST}:{PORT}"
