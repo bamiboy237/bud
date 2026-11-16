@@ -180,8 +180,9 @@ def setup_tool(
                         return {
                             "capability": capability,
                             "label": entry.label,
-                            "status": "waiting",
+                            "status": "failed",
                             "reason": str(exc),
+                            "note": "Do not reconnect the account. Follow the reason above.",
                         }
                 journal.publish(session, "capability.status", data, key=key)
                 return {

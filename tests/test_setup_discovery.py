@@ -92,7 +92,9 @@ def test_failed_tool_refresh_keeps_the_card_and_retries_without_reconnecting(tmp
         )
 
     assert setup(ctx("one"), "slack")["status"] == "waiting"
-    assert setup(ctx("two"), "slack")["status"] == "waiting"
+    result = setup(ctx("two"), "slack")
+    assert result["status"] == "failed"
+    assert result["reason"] == "Could not load tools. Try again."
     assert "slack" in journal.pending("session")
     assert setup(ctx("three"), "slack")["status"] == "connected"
     assert journal.pending("session") == {}
