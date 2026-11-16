@@ -5,12 +5,13 @@ import Testing
 struct ApprovalTests {
     private func approval(
         _ tool: String, id: String = "a", run: String? = "r", task: Int? = nil,
-        args: [String: Any] = [:], preview: [String: Any]? = nil
+        args: [String: Any] = [:], preview: [String: Any]? = nil, grantable: Bool? = nil
     ) throws -> Approval {
         var raw: [String: Any] = ["approval_id": id, "tool": tool, "args": args]
         raw["run_id"] = run
         raw["task_id"] = task
         raw["preview"] = preview
+        raw["grantable"] = grantable
         return try #require(Approval(raw, jobs: [:]))
     }
 
@@ -29,6 +30,32 @@ struct ApprovalTests {
             #expect(item.done == done)
         }
         #expect(try approval("unknown_email_tool").verb == "Approve")
+    }
+
+    @Test
+    func grantableApprovalsOfferAlwaysAllow() throws {
+        let grantable = try approval("archive_email", grantable: true)
+        #expect(grantable.grantable)
+        #expect(grantable.alwaysAllowHelp == "Archive email without asking again")
+        #expect(grantable.alwaysAllowDone == "Archive email will always run")
+        // Absent or false: the card keeps its two answers.
+        let absent = try approval("archive_email")
+        #expect(!absent.grantable)
+        let refused = try approval("archive_email", grantable: false)
+        #expect(!refused.grantable)
+    }
+
+    @Test
+    func onlyAlwaysAllowRemembersTheTool() {
+        let always = ApprovalDecision.always.body
+        #expect(always["approved"] as? Bool == true)
+        #expect(always["remember"] as? Bool == true)
+        let approve = ApprovalDecision(approved: true).body
+        #expect(approve["approved"] as? Bool == true)
+        #expect(approve["remember"] == nil)
+        let deny = ApprovalDecision(approved: false).body
+        #expect(deny["approved"] as? Bool == false)
+        #expect(deny["remember"] == nil)
     }
 
     @Test

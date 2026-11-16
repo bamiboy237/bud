@@ -2,7 +2,8 @@
 
 Bud uses Composio's Model Context Protocol (MCP) integrations to securely interact with external accounts.
 
-## Supported Services
+## Supported services
+
 - **Gmail:** Triage unread threads, retrieve drafts, and propose replies.
 - **Google Calendar:** Check schedule conflicts, resolve timezones, and propose calendar events.
 
@@ -14,7 +15,5 @@ Bud uses Composio's Model Context Protocol (MCP) integrations to securely intera
    uv run bud connect gmail
    uv run bud connect calendar
    ```
-4. Restart the server:
-   ```bash
-   uv run bud serve
-   ```
+4. Finish the sign-in in your browser, then refresh connections in Bud. Replacing an
+   account requires a server restart and a new chat.

@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
-from bud.composio.binding import ConnectionError
+from bud.composio.binding import ConnectionError, valid_toolkit
 from bud.composio.connection import Connections
 from bud.core.events import EventType
 from bud.core.hub import Hub
@@ -62,10 +62,15 @@ class SetupEntry:
 
 
 class SetupRegistry:
-    """Capability id → label, initiate, and status check."""
+    """Capability id → label, initiate, and status check.
 
-    def __init__(self) -> None:
+    ``fallback`` builds an entry on demand for a capability bud did not ship, such as an app
+    the model discovered in Composio's catalog.
+    """
+
+    def __init__(self, fallback: Callable[[str], SetupEntry | None] | None = None) -> None:
         self._entries: dict[str, SetupEntry] = {}
+        self._fallback = fallback
 
     def register(self, capability: str, entry: SetupEntry) -> None:
         """Add one setup-able capability; the card UX comes for free."""
@@ -76,7 +81,10 @@ class SetupRegistry:
         self._entries[capability] = entry
 
     def entry(self, capability: str) -> SetupEntry | None:
-        return self._entries.get(capability)
+        found = self._entries.get(capability)
+        if found is not None:
+            return found
+        return self._fallback(capability) if self._fallback is not None else None
 
     def capabilities(self) -> list[str]:
         return sorted(self._entries)
@@ -111,7 +119,7 @@ class SetupJournal:
 
 
 def setup_tool(
-    registry: SetupRegistry, journal: SetupJournal
+    registry: SetupRegistry, journal: SetupJournal, *, refresh: Callable[[], None] | None = None
 ) -> Callable[[RunContext[None], str], dict[str, Any]]:
     """The model-facing half of the machinery: one tool over the whole registry."""
 
@@ -123,11 +131,11 @@ def setup_tool(
         to run a command: their chat gets an actionable card with the sign-in
         link or the steps, and the person authorizes in their browser.
         Initiation is metadata only; no approval is requested. While the card
-        waits, another call rechecks and settles it. A connection still needs
-        a bud server restart before its tools load; say so.
+        waits, another call rechecks and settles it. Once it is connected, the
+        app's tools load for the next message; no restart is needed.
 
         Args:
-            capability: The capability id, such as gmail or calendar.
+            capability: The capability id, such as gmail, calendar, or a discovered app slug.
         """
         session = str((ctx.metadata or {}).get("bud_session_id") or "")
         if not session:
@@ -155,8 +163,8 @@ def setup_tool(
             }
             if status.reason:
                 data["reason"] = status.reason
-            journal.publish(session, "capability.status", data, key=key)
             if status.state == "waiting":
+                journal.publish(session, "capability.status", data, key=key)
                 return {
                     "capability": capability,
                     "label": entry.label,
@@ -165,14 +173,26 @@ def setup_tool(
                     "its link; ask them to finish in their browser, then check again.",
                 }
             if status.state == "connected":
+                if refresh is not None:
+                    try:
+                        refresh()
+                    except ConnectionError as exc:
+                        return {
+                            "capability": capability,
+                            "label": entry.label,
+                            "status": "failed",
+                            "reason": str(exc),
+                            "note": "Do not reconnect the account. Follow the reason above.",
+                        }
+                journal.publish(session, "capability.status", data, key=key)
                 return {
                     "capability": capability,
                     "label": entry.label,
                     "status": "connected",
-                    "note": "The capability is connected. Its tools load after the bud "
-                    "server restarts; tell the person to restart bud and start a new "
-                    "conversation, then retry the task.",
+                    "note": "The capability is connected. Its tools load for the next "
+                    "message. End this turn and continue when the person sends a message.",
                 }
+            journal.publish(session, "capability.status", data, key=key)
             return {
                 "capability": capability,
                 "label": entry.label,
@@ -228,9 +248,15 @@ def setup_tool(
     return setup_capability
 
 
-def build_setup_toolset(registry: SetupRegistry, journal: SetupJournal) -> FunctionToolset[None]:
-    """Registration for the harness: the setup tool as one toolset."""
-    return FunctionToolset([setup_tool(registry, journal)])
+def build_setup_toolset(
+    registry: SetupRegistry, journal: SetupJournal, *, refresh: Callable[[], None] | None = None
+) -> FunctionToolset[None]:
+    """Registration for the harness: the setup tool as one toolset.
+
+    ``refresh`` runs when a card settles as connected, so the new app's tools load without
+    a restart.
+    """
+    return FunctionToolset([setup_tool(registry, journal, refresh=refresh)])
 
 
 # Remote statuses a card reads as still waiting on the person.
@@ -271,9 +297,16 @@ def _composio_entry(connections: Connections, toolkit: str, label: str) -> Setup
     return SetupEntry(label=label, kind="url", initiate=initiate, status=status)
 
 
+def _discovered_entry(connections: Connections, slug: str) -> SetupEntry | None:
+    """One app from Composio's catalog, set up exactly like the shipped ones."""
+    if not valid_toolkit(slug):
+        return None
+    return _composio_entry(connections, slug, slug.replace("_", " ").title())
+
+
 def setup_registry(connections: Connections) -> SetupRegistry:
-    """The capabilities bud can set up today, one registration each."""
-    registry = SetupRegistry()
+    """The capabilities bud can set up today, plus any app the model discovers."""
+    registry = SetupRegistry(fallback=lambda slug: _discovered_entry(connections, slug))
     registry.register("gmail", _composio_entry(connections, "gmail", "Gmail"))
     registry.register("calendar", _composio_entry(connections, "googlecalendar", "Calendar"))
     return registry

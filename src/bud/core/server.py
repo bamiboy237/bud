@@ -7,10 +7,11 @@ import asyncio
 import fcntl
 import hashlib
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, TextIO
 from uuid import uuid4
 
@@ -35,6 +36,7 @@ from bud.core.setup import SetupJournal, build_setup_toolset, setup_registry
 from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
+from bud.harness.grants import Grants
 from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
 from bud.harness.recall import Recall, embedder
@@ -55,6 +57,10 @@ from bud.world.tools import READ_TOOLS as WORLD_READ_TOOLS
 from bud.world.tools import build_tools
 
 logger = logging.getLogger(__name__)
+
+
+def _noop() -> None:
+    return None
 
 
 class ModeRequest(BaseModel):
@@ -81,6 +87,8 @@ class EditMessage(BaseModel):
 class Decision(BaseModel):
     approved: bool
     origin: MessageOrigin = Field(default_factory=MessageOrigin)
+    # Also record a standing permission for this tool, so later calls do not ask.
+    remember: bool = False
 
 
 class Answer(BaseModel):
@@ -144,6 +152,11 @@ def _create_app(
     photon = None
     setup_journal = None
     world: World | None = None
+    account_scope: str | None = None
+
+    # Set by the account branch: reloads the tool list after a new app connects.
+    refresh_tools: Callable[[], None] = _noop
+
     # The approval mode applies to the harness policy after composition (the
     # Harness unions memory/skill rules in), one seam for every tool class.
     profile_store = ProfileStore(settings.data_dir / "approval-mode.json")
@@ -166,13 +179,19 @@ def _create_app(
         else "not_configured"
     }
     if not simulate:
-        from bud.composio.tools import PROFILE, READ_TOOLS, build_toolset, policy
+        from bud.composio.tools import (
+            PROFILE,
+            READ_TOOLS,
+            build_toolset,
+            policy,
+        )
 
         connections = Connections(settings)
         binding = connections.capture_binding()
         accounts = binding.accounts
         # Neither old approvals nor memory cross an owner/generation boundary.
-        session_dir = connections.folder / "sessions" / binding.scope
+        account_scope = connections.store.session_scope(binding)
+        session_dir = connections.folder / "sessions" / account_scope
         session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         db_path = session_dir / "bud.db"
         gateway = build_gateway(
@@ -186,33 +205,53 @@ def _create_app(
         setup = setup_registry(connections)
         setup_journal = SetupJournal()
         tools_policy.tools.update(dict.fromkeys(WORKSPACE_WRITE_TOOLS, "ask"))
-        harness = Harness(
-            CombinedToolset(
+        loaded = {"accounts": frozenset(accounts)}
+        refresh_lock = Lock()
+
+        def account_toolset() -> CombinedToolset[None]:
+            return CombinedToolset(
                 [
-                    build_toolset(connections, accounts, session_dir),
+                    build_toolset(connections, connections.accounts(), session_dir, tools_policy),
                     build_web_tools(settings),
                     workspace_tools(session_dir),
-                    build_setup_toolset(setup, setup_journal),
+                    build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
                 ]
-            ),
+            )
+
+        def refresh_account_tools() -> None:
+            """Swap in the tools of a newly connected app; the next message sees them."""
+            with refresh_lock:
+                if connections.restart_required():
+                    raise ConnectionError("Account changed. Restart Bud and start a new chat.")
+                current = frozenset(connections.accounts())
+                if current == loaded["accounts"]:
+                    return
+                replacement = account_toolset()
+                if connections.restart_required() or frozenset(connections.accounts()) != current:
+                    raise ConnectionError("Accounts changed while loading tools. Try again.")
+                harness.swap_tools(replacement)
+                loaded["accounts"] = current
+
+        refresh_tools = refresh_account_tools
+        harness = Harness(
+            account_toolset(),
             tools_policy,
             gateway.registry,
             PROFILE
             + "\nConnected apps: "
             + (", ".join(sorted(accounts)) or "none")
-            + "\nFor a missing or disconnected app, call setup_capability('gmail'|'calendar'): "
-            "it surfaces an actionable setup card with the sign-in link in the person's chat, "
-            "and the person authorizes in their browser. Never send the person to a command "
-            "line (/connect remains a manual fallback). A connected account loads its tools "
-            "only after /refresh and a full bud serve restart with a new conversation; say so."
-            + WEB_GUIDANCE
-            + WORKSPACE_GUIDANCE,
+            + "\nFor a missing or disconnected app, call discover_tools to find one, then "
+            "setup_capability with its slug: the person gets a sign-in card in chat and "
+            "authorizes in their browser. Never send the person to a command line "
+            "(/connect remains a manual fallback). A connected app's tools load for the "
+            "next message; no restart is needed." + WEB_GUIDANCE + WORKSPACE_GUIDANCE,
             memory=build_memory(session_dir / "memory.db", namespace="owner"),
             state_dir=session_dir,
             result_path=db_path,
             read_tools=READ_TOOLS | WEB_READ_TOOLS | WORKSPACE_READ_TOOLS | {"current_time"},
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
         )
+        tools_policy = harness.policy
     else:
         db_path = settings.data_dir / "bud.db"
         gateway = build_gateway(settings, model_id=model_id)
@@ -245,6 +284,10 @@ def _create_app(
     # Auto mode reviews each write when a reviewer exists (an OpenAI key, review not turned
     # off). Set before the Runner builds its agent, which captures the reviewer.
     harness.reviewer = build_reviewer()
+    # Standing permissions the owner granted from an approval card. The policy reads them on
+    # every call, so a new grant or a revoke applies without a restart.
+    grants = Grants(settings.data_dir / "grants.json")
+    harness.policy.grants = grants.tools
     if world is not None:
         harness.describers = build_describers(world)
         harness.notifies_others = build_notifies_others(world)
@@ -359,8 +402,8 @@ def _create_app(
                     lock.close()
 
     scope_id = (
-        binding.scope
-        if binding is not None
+        account_scope
+        if account_scope is not None
         else hashlib.sha256(str(db_path.resolve()).encode()).hexdigest()
     )
     app = FastAPI(title="bud core", lifespan=lifespan)
@@ -425,13 +468,15 @@ def _create_app(
         try:
             statuses = current.statuses()
             restart_required = current.restart_required()
+            if not restart_required:
+                refresh_tools()
         except ConnectionError as exc:
             raise HTTPException(503, str(exc)) from None
         return JSONResponse(
             {
                 "statuses": {"gmail": statuses["gmail"], "calendar": statuses["googlecalendar"]},
                 "restart_required": restart_required,
-                "refresh_boundary": "process_restart",
+                "refresh_boundary": "process_restart" if restart_required else "next_message",
             },
             headers={"Cache-Control": "no-store"},
         )
@@ -444,12 +489,17 @@ def _create_app(
             raise HTTPException(400, "Use /connect gmail or /connect calendar.")
         try:
             url = current.connect(name)
+            restart_required = current.restart_required()
         except ConnectionError as exc:
             raise HTTPException(503, str(exc)) from None
         # The sign-in link exists only in this immediate authenticated response,
         # not in session events, model input/history, status metadata or logs.
         return JSONResponse(
-            {"url": url, "restart_required": True, "refresh_boundary": "process_restart"},
+            {
+                "url": url,
+                "restart_required": restart_required,
+                "refresh_boundary": "process_restart" if restart_required else "next_message",
+            },
             headers={"Cache-Control": "no-store"},
         )
 
@@ -601,16 +651,43 @@ def _create_app(
         require_session(session_id)
         if decision.approved:
             require_current_binding()
+        grant_tool = None
+        if decision.approved and decision.remember:
+            grant_tool = next(
+                (
+                    request.tool
+                    for request in runner.snapshot(session_id).pending_approvals
+                    if request.approval_id == approval_id
+                ),
+                None,
+            )
+            if grant_tool is None:
+                raise HTTPException(404, "unknown approval")
+            if not runner.harness.policy.grantable(grant_tool):
+                raise HTTPException(409, "This action can never run without asking.")
         try:
-            return {
-                "applied": runner.decide(
-                    session_id, approval_id, decision.approved, decision.origin.model_dump()
-                )
-            }
+            applied = runner.decide(
+                session_id, approval_id, decision.approved, decision.origin.model_dump()
+            )
         except UnknownApproval:
             raise HTTPException(404, "unknown approval") from None
         except DecisionRejected as exc:
             raise HTTPException(409, str(exc)) from None
+        if applied and grant_tool is not None and grants.add(grant_tool):
+            runner.harness.policy.grants = grants.tools
+        return {"applied": applied}
+
+    @app.get("/grants")
+    def list_grants() -> dict[str, list[str]]:
+        """Tools the owner allowed to run without asking again."""
+        return {"tools": sorted(grants.tools)}
+
+    @app.delete("/grants/{tool}")
+    async def revoke_grant(tool: str) -> dict[str, bool]:
+        """Revoke one standing permission; the tool asks again from the next call."""
+        removed = grants.remove(tool)
+        runner.harness.policy.grants = grants.tools
+        return {"removed": removed}
 
     @app.post("/sessions/{session_id}/approvals/{approval_id}/revise")
     async def revise(session_id: str, approval_id: str, message: NewMessage) -> dict[str, bool]:

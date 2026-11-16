@@ -40,6 +40,16 @@ struct Approval: Identifiable, Equatable {
 
     var isQuestion: Bool { tool == "ask_user" }
 
+    /// True when bud may keep this tool's permission: the card then offers "Always allow".
+    /// Sends, real Gmail and Calendar writes, and skill installs never are.
+    let grantable: Bool
+
+    /// "Archive email without asking again": the action's own words, so the grant is clear.
+    var alwaysAllowHelp: String { "\(title) without asking again" }
+
+    /// "Archive email will always run": what a standing grant leaves behind.
+    var alwaysAllowDone: String { "\(title) will always run" }
+
     var menuTitle: String {
         let subject = facts.first { $0.label == "Subject" }?.value ?? emailPreview?.subject
         return subject.map { "\(verb): \($0)" } ?? title
@@ -76,6 +86,7 @@ struct Approval: Identifiable, Equatable {
                 "task:\(raw["task_id"] as? Int ?? 0):run:\($0)"
             }
         emailPreview = (raw["preview"] as? [String: Any]).flatMap(EmailPreview.init)
+        grantable = raw["grantable"] as? Bool ?? false
         expectsOriginalEmail = ["archive_email", "mark_read", "draft_reply"].contains(tool)
             || args["thread_id"] != nil || args["draft_id"] != nil
         job = (raw["task_id"] as? Int).flatMap { jobs[$0] }
@@ -174,6 +185,20 @@ struct Approval: Identifiable, Equatable {
             return parser.date(from: value)
         }() else { return value }
         return date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().hour().minute())
+    }
+}
+
+/// The body a decision sends. `remember` asks bud to keep this tool's permission, so later
+/// calls of the same tool run without asking.
+struct ApprovalDecision {
+    var approved: Bool
+    var remember = false
+
+    /// A standing grant: yes now, and yes to this tool from now on.
+    static let always = ApprovalDecision(approved: true, remember: true)
+
+    var body: [String: any Sendable] {
+        remember ? ["approved": approved, "remember": true] : ["approved": approved]
     }
 }
 
