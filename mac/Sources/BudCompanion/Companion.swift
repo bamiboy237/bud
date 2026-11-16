@@ -240,6 +240,9 @@ final class Companion {
         didSet { showStatus() }
     }
     var visiblePups: [RunningTask] { Array(activeTasks.prefix(4)) }
+    var requiresSnapshotRefresh: Bool {
+        !openApprovals.isEmpty || activeTasks.contains { $0.status == "stalled" }
+    }
     /// Send to first streamed text, for the latency baseline.
     var lastFirstText: Duration?
 
@@ -467,9 +470,9 @@ final class Companion {
         approvalFailures = approvalFailures.filter { openApprovals.contains($0.key) }
         if approvals.isEmpty { decisionProblem = nil }
         approvalPoll?.cancel()
-        // A job approval answered in another interface sends nothing to this stream, so
-        // check again while one is open.
-        if !openApprovals.isEmpty {
+        // Child-session activity is not streamed here. Refresh until open decisions and
+        // stalled jobs no longer need the owner.
+        if requiresSnapshotRefresh {
             approvalPoll = Task {
                 try? await Task.sleep(for: .seconds(10))
                 if !Task.isCancelled { refreshApprovals() }
@@ -532,7 +535,7 @@ final class Companion {
         Task {
             do {
                 let result = try await connection.send(
-                    "POST", "connections/\(setup.id)/connect", json: ["resume": setup.status != "failed"])
+                    "POST", "connections/\(setup.id)/connect", json: ["resume": true])
                 guard mine == generation else { return }
                 guard let url = CapabilitySetup.signInURL(result["url"] as? String) else {
                     setupProblems[setup.id] = "The sign-in link is unavailable. Try again."
@@ -1208,6 +1211,7 @@ final class Companion {
                 activeTasks[index].status = "stalled"
             }
             notice(event)
+            refreshApprovals()
         case "task.paused":
             if let id = event.data["task_id"] as? Int,
                let index = activeTasks.firstIndex(where: { $0.id == id }) {

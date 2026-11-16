@@ -88,6 +88,27 @@ def test_recovering_a_pending_link_preserves_the_chat_and_account_binding(connec
     assert not found.restart_required()
 
 
+def test_retrying_expired_first_sign_in_preserves_the_active_binding(connections, monkeypatch):
+    found, remote = connections
+    binding = found.capture_binding()
+    scope = found.store.session_scope(binding)
+    attempt = found.store.begin_connect("github")
+    found.store.save_pending(attempt, "github", "expired-github")
+    remote["expired-github"] = ("github", "EXPIRED")
+    assert found.pending_url("github") is None
+    request = SimpleNamespace(id="new-github", redirect_url="https://example.test/fresh-sign-in")
+    client = SimpleNamespace(
+        connected_accounts=FakeComposio(found.user_id, remote),
+        create=lambda **kwargs: SimpleNamespace(authorize=lambda toolkit: request),
+    )
+    monkeypatch.setattr(found, "client", lambda: client)
+
+    assert found.connect("github", resume=True) == request.redirect_url
+    assert found.store.snapshot()[0] == binding
+    assert not found.restart_required()
+    assert found.store.session_scope(found.capture_binding()) == scope
+
+
 def test_pending_link_checks_the_owner_before_returning_it(connections, monkeypatch):
     found, remote = connections
     attempt = found.store.begin_connect("github")

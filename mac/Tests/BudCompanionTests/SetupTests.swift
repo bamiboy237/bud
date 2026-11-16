@@ -194,6 +194,13 @@ struct SetupTests {
         #expect(companion.activeTasks.map(\.status) == ["stalled"])
         #expect(companion.activeTasks[0].move == .needsYou)
         #expect(companion.status == .needsYou)
+        #expect(companion.requiresSnapshotRefresh)
+        companion.apply(snapshot: [
+            "last_seq": 3,
+            "tasks": [["task_id": 1, "title": "Index repo", "status": "running"]],
+        ])
+        #expect(companion.status != .needsYou)
+        #expect(!companion.requiresSnapshotRefresh)
     }
 
     @Test
