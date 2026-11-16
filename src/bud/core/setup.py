@@ -122,6 +122,55 @@ class SetupJournal:
         return {card.capability: card for card in pending_setups(events)}
 
 
+def check_setup(
+    entry: SetupEntry,
+    journal: SetupJournal,
+    session: str,
+    capability: str,
+    *,
+    key: str,
+    refresh: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Recheck a card and load connected tools, without issuing another sign-in link."""
+    try:
+        status = entry.status()
+    except ConnectionError as exc:
+        status = SetupStatus(state="failed", reason=str(exc))
+    data: dict[str, Any] = {
+        "capability": capability,
+        "label": entry.label,
+        "status": status.state,
+    }
+    if status.reason:
+        data["reason"] = status.reason
+    if status.state == "connected" and refresh is not None:
+        try:
+            refresh()
+        except ConnectionError as exc:
+            return {
+                **data,
+                "status": "failed",
+                "reason": str(exc),
+                "note": "Do not reconnect the account. Follow the reason above.",
+            }
+    previous = journal.pending(session).get(capability)
+    if previous is None or (previous.status, previous.reason) != (status.state, status.reason):
+        journal.publish(session, "capability.status", data, key=key)
+    if status.state == "waiting":
+        return {
+            **data,
+            "note": "The person has not finished the sign-in yet. The card keeps "
+            "its link; ask them to finish in their browser, then check again.",
+        }
+    if status.state == "connected":
+        return {
+            **data,
+            "note": "The capability is connected. Its tools load for the next "
+            "message. End this turn and continue when the person sends a message.",
+        }
+    return data
+
+
 def setup_tool(
     registry: SetupRegistry, journal: SetupJournal, *, refresh: Callable[[], None] | None = None
 ) -> Callable[[RunContext[None], str], dict[str, Any]]:
@@ -156,53 +205,7 @@ def setup_tool(
         card = journal.pending(session).get(capability)
         if card is not None and card.status == "waiting":
             # The card is up: a new call rechecks it, never hands out a second link.
-            try:
-                status = entry.status()
-            except ConnectionError as exc:
-                status = SetupStatus(state="failed", reason=str(exc))
-            data: dict[str, Any] = {
-                "capability": capability,
-                "label": entry.label,
-                "status": status.state,
-            }
-            if status.reason:
-                data["reason"] = status.reason
-            if status.state == "waiting":
-                journal.publish(session, "capability.status", data, key=key)
-                return {
-                    "capability": capability,
-                    "label": entry.label,
-                    "status": "waiting",
-                    "note": "The person has not finished the sign-in yet. The card keeps "
-                    "its link; ask them to finish in their browser, then check again.",
-                }
-            if status.state == "connected":
-                if refresh is not None:
-                    try:
-                        refresh()
-                    except ConnectionError as exc:
-                        return {
-                            "capability": capability,
-                            "label": entry.label,
-                            "status": "failed",
-                            "reason": str(exc),
-                            "note": "Do not reconnect the account. Follow the reason above.",
-                        }
-                journal.publish(session, "capability.status", data, key=key)
-                return {
-                    "capability": capability,
-                    "label": entry.label,
-                    "status": "connected",
-                    "note": "The capability is connected. Its tools load for the next "
-                    "message. End this turn and continue when the person sends a message.",
-                }
-            journal.publish(session, "capability.status", data, key=key)
-            return {
-                "capability": capability,
-                "label": entry.label,
-                "status": "failed",
-                "reason": status.reason,
-            }
+            return check_setup(entry, journal, session, capability, key=key, refresh=refresh)
         try:
             initiation = entry.initiate()
         except ConnectionError as exc:

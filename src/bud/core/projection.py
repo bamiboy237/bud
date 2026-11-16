@@ -218,7 +218,7 @@ def pending_setups(events: list[Event]) -> list[PendingSetup]:
                 update={"status": incoming.status, "reason": incoming.reason}
             )
         cards[incoming.capability] = incoming
-    return [card for card in cards.values() if card.status != "connected"]
+    return [card for card in cards.values() if card.status not in {"connected", "cancelled"}]
 
 
 def runs(events: list[Event], *, summaries: bool = False) -> list[RunView]:

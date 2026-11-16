@@ -6,6 +6,35 @@ import Testing
 @MainActor
 struct ApprovalLayoutTests {
     @Test
+    func setupCardFitsThePetPanel() async throws {
+        _ = NSApplication.shared
+        let companion = Companion()
+        companion.apply(snapshot: [
+            "last_seq": 1,
+            "pending_setup": [[
+                "capability": "github", "label": "GitHub", "kind": "url", "status": "waiting",
+            ]],
+            "transcript": [["role": "assistant", "text": "Connect GitHub to continue."]],
+        ])
+        companion.link = .connected
+        let host = NSHostingView(rootView: PetView(companion: companion, focusPanel: {})
+            .transaction { $0.disablesAnimations = true })
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: PetPanel.size),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.close() }
+        host.frame = NSRect(origin: .zero, size: PetPanel.size)
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(150))
+        host.layoutSubtreeIfNeeded()
+        #expect(host.fittingSize.height <= PetPanel.size.height)
+        if let directory = ProcessInfo.processInfo.environment["BUD_APPROVAL_SNAPSHOTS"] {
+            try snapshot(host, to: URL(filePath: directory).appending(path: "setup-github.png"))
+        }
+    }
+
+    @Test
     func longQuestionFitsThePetPanel() async throws {
         _ = NSApplication.shared
         let companion = Companion()

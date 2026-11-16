@@ -77,7 +77,7 @@ struct PetView: View {
                         return
                     }
                     // Something waiting comes first: a click shows it rather than a blank field.
-                    if !companion.approvals.isEmpty && !companion.bubbleOpen {
+                    if companion.needsAttention && !companion.bubbleOpen {
                         companion.bubbleOpen = true
                         return
                     }
@@ -368,7 +368,7 @@ private struct Bubble: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
-            if !compact, !companion.question.isEmpty {
+            if !compact, !companion.question.isEmpty, companion.setups.isEmpty {
                 // What you asked, so the answer keeps its context. One line: a reminder.
                 Text(companion.question)
                     .font(.callout)
@@ -392,7 +392,7 @@ private struct Bubble: View {
             }
             if companion.unsentSpeech != nil { UnsentSpeech(companion: companion) }
             if !companion.heldMessages.isEmpty { UnsentMessage(companion: companion) }
-            if !companion.shown.isEmpty {
+            if !companion.shown.isEmpty, companion.setups.isEmpty {
                 // The bubble hugs its text up to `maxReply`; longer replies scroll. Reading
                 // starts at the top, so streamed text grows below the fold instead of pulling
                 // the page away from you. Measured, because a ScrollView takes every point it's
@@ -422,6 +422,10 @@ private struct Bubble: View {
                 // that has more, and only while it does.
                 .mask(edgeFade(companion.replyMore))
                 .animation(.easeOut(duration: 0.15), value: companion.replyMore)
+            }
+            if !companion.setups.isEmpty {
+                SetupDeck(companion: companion)
+                    .transition(cardTransition)
             }
             if !companion.approvals.isEmpty {
                 ApprovalDeck(companion: companion)
@@ -458,7 +462,7 @@ private struct Bubble: View {
     }
 
     private var compact: Bool {
-        companion.shown.isEmpty && companion.notices.isEmpty && companion.approvals.isEmpty
+        companion.shown.isEmpty && companion.notices.isEmpty && !companion.needsAttention
             && companion.receipt == nil && companion.steps.isEmpty && companion.unsentSpeech == nil
             && companion.heldMessages.isEmpty
     }
@@ -475,7 +479,7 @@ private struct Bubble: View {
     }
 
     /// The reply gives way when a card needs the room, so both fit above the pet.
-    private var maxReply: CGFloat { companion.approvals.isEmpty ? 260 : 60 }
+    private var maxReply: CGFloat { companion.needsAttention ? 60 : 260 }
 
     /// Who is speaking and what they're doing, like a name above a message.
     private var header: some View {
@@ -550,6 +554,7 @@ private struct Bubble: View {
             }
             return ("Working on it", .secondary, true)
         case .needsYou:
+            if !companion.setups.isEmpty { return ("Needs you", .orange, false) }
             let asking = companion.hasQuestion
             return (asking ? "Has a question" : "Needs your OK", .orange, false)
         case .failed: return ("Couldn't finish", .red, false)

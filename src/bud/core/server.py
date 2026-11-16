@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field, SecretStr
 from pydantic_ai import ModelRetry
 from pydantic_ai.toolsets import CombinedToolset, FunctionToolset
 
+from bud.composio.binding import valid_toolkit
 from bud.composio.connection import ConnectionError, Connections
 from bud.config import Settings, get_settings
 from bud.core.auth import OwnerAuthentication, owner_token
@@ -32,7 +33,13 @@ from bud.core.profiles import Mode, ProfileStore, apply_mode, as_mode, mode_summ
 from bud.core.profiles import guidance as MODE_GUIDANCE
 from bud.core.projection import Snapshot
 from bud.core.runner import DecisionRejected, Runner, UnknownApproval
-from bud.core.setup import SetupJournal, build_setup_toolset, setup_registry
+from bud.core.setup import (
+    SetupJournal,
+    SetupRegistry,
+    build_setup_toolset,
+    check_setup,
+    setup_registry,
+)
 from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
@@ -100,6 +107,10 @@ class Answer(BaseModel):
     origin: MessageOrigin = Field(default_factory=MessageOrigin)
 
 
+class ConnectRequest(BaseModel):
+    resume: bool = False
+
+
 def sse_frame(event: Event) -> str:
     # Live text has no stored position; only stored events move the reconnect cursor.
     cursor = "" if event.live else f"id: {event.seq}\n"
@@ -159,6 +170,7 @@ def _create_app(
     binding = None
     photon = None
     setup_journal = None
+    setup: SetupRegistry | None = None
     world: World | None = None
     account_scope: str | None = None
 
@@ -245,10 +257,7 @@ def _create_app(
             account_toolset(),
             tools_policy,
             gateway.registry,
-            PROFILE
-            + "\nConnected apps: "
-            + (", ".join(sorted(accounts)) or "none")
-            + "\nFor a missing or disconnected app, call discover_tools to find one, then "
+            PROFILE + "\nFor a missing or disconnected app, call discover_tools to find one, then "
             "setup_capability with its slug: the person gets a sign-in card in chat and "
             "authorizes in their browser. Never send the person to a command line "
             "(/connect remains a manual fallback). A connected app's tools load for the "
@@ -260,6 +269,9 @@ def _create_app(
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
         )
         tools_policy = harness.policy
+        harness.live_instructions.append(
+            lambda: "\nConnected apps: " + (", ".join(sorted(loaded["accounts"])) or "none")
+        )
     else:
         db_path = settings.data_dir / "bud.db"
         gateway = build_gateway(settings, model_id=model_id)
@@ -490,13 +502,19 @@ def _create_app(
         )
 
     @app.post("/connections/{toolkit}/connect")
-    def connect_account(toolkit: str) -> JSONResponse:
+    def connect_account(toolkit: str, request: ConnectRequest | None = None) -> JSONResponse:
         current = live_connections()
-        name = {"gmail": "gmail", "calendar": "googlecalendar"}.get(toolkit)
-        if name is None:
-            raise HTTPException(400, "Use /connect gmail or /connect calendar.")
+        name = {"calendar": "googlecalendar"}.get(toolkit, toolkit)
+        if not valid_toolkit(name):
+            raise HTTPException(400, "Use a valid app id.")
         try:
-            url = current.connect(name)
+            url = current.pending_url(name) if request is not None and request.resume else None
+            if url is None:
+                url = (
+                    current.connect(name, resume=True)
+                    if request is not None and request.resume
+                    else current.connect(name)
+                )
             restart_required = current.restart_required()
         except ConnectionError as exc:
             raise HTTPException(503, str(exc)) from None
@@ -518,6 +536,47 @@ def _create_app(
     def require_current_binding() -> None:
         if connections is not None and connections.restart_required():
             raise HTTPException(409, "Account binding changed. Restart bud and start a new chat.")
+
+    @app.post("/sessions/{session_id}/setup/{capability}/check")
+    def check_capability(session_id: str, capability: str) -> JSONResponse:
+        require_session(session_id)
+        require_current_binding()
+        if setup is None or setup_journal is None:
+            raise HTTPException(409, "Account setup is unavailable in this mode.")
+        entry = setup.entry(capability)
+        if entry is None or capability not in setup_journal.pending(session_id):
+            raise HTTPException(404, "unknown setup card")
+        result = check_setup(
+            entry,
+            setup_journal,
+            session_id,
+            capability,
+            key=f"owner-setup-check:{uuid4().hex}",
+            refresh=refresh_tools,
+        )
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @app.post("/sessions/{session_id}/setup/{capability}/cancel")
+    def cancel_capability(session_id: str, capability: str) -> JSONResponse:
+        require_session(session_id)
+        if setup_journal is None:
+            raise HTTPException(404, "unknown setup card")
+        card = setup_journal.pending(session_id).get(capability)
+        if card is None:
+            return JSONResponse({"capability": capability, "status": "cancelled"})
+        status = "cancelled"
+        if connections is not None:
+            name = {"calendar": "googlecalendar"}.get(capability, capability)
+            removed = connections.store.cancel_connect(name)
+            if not removed and name in connections.accounts():
+                try:
+                    refresh_tools()
+                except ConnectionError as exc:
+                    raise HTTPException(503, str(exc)) from None
+                status = "connected"
+        data = {"capability": capability, "label": card.label, "status": status}
+        hub.publish(session_id, "capability.status", data)
+        return JSONResponse(data)
 
     @app.get("/models")
     def list_models() -> list[dict]:

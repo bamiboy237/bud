@@ -96,6 +96,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Voice.shared.start()
     }
 
+    func applicationDidBecomeActive(_ notification: Notification) {
+        Companion.shared.refreshSetupStatus()
+    }
+
     func ask() {
         // With the window open, that's where you type.
         if Companion.shared.windowOpen {

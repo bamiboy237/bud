@@ -989,9 +989,10 @@ class Runner(DBOSConfiguredInstance):
             still_open = superseded_note(history_events, run)
             jobs = job_updates_note(history_events, run)
             declined = parked_decisions_note(history_events, run)
+            setups = setup_updates_note(history_events, run)
             surface = surface_note(run)
             result = await self.agent.run(
-                (run["text"] + recalled + gap + still_open + jobs + declined + surface)
+                (run["text"] + recalled + gap + still_open + jobs + declined + setups + surface)
                 if run["text"]
                 else run["text"],
                 model=(
@@ -1316,6 +1317,32 @@ def _since_last_prompt(events: list[Event], run: dict) -> tuple[int, int]:
     upper = current if current is not None else (events[-1].seq + 1 if events else 0)
     lower = max((seq for seq in starts if seq < upper), default=-1)
     return lower, upper
+
+
+def setup_updates_note(events: list[Event], run: dict) -> str:
+    """Connection outcomes since the preceding owner turn, without sign-in links."""
+    if run.get("trigger") != "message":
+        return ""
+    lower, upper = _since_last_prompt(events, run)
+    latest = {
+        event.data["capability"]: event.data.get("status")
+        for event in events
+        if event.type == "capability.status" and lower < event.seq < upper
+    }
+    changes = {
+        capability: status
+        for capability, status in latest.items()
+        if status in {"connected", "cancelled"}
+    }
+    if not changes:
+        return ""
+    return (
+        "\n\n<setup_updates>Connection state from Bud, not a new request from the owner. "
+        "Connected apps are available through tool search. The owner cancelled any setup "
+        "marked cancelled; do not reopen it unless they ask to connect that app again.\n"
+        + json.dumps(changes, ensure_ascii=False)
+        + "</setup_updates>"
+    )
 
 
 def parked_decisions_note(events: list[Event], run: dict) -> str:

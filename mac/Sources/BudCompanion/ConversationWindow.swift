@@ -186,6 +186,10 @@ private struct ConversationView: View {
             if !companion.shown.isEmpty {
                 Reply(text: companion.shown, companion: companion, finished: !companion.running)
             }
+            if !companion.setups.isEmpty {
+                SetupDeck(companion: companion)
+                    .frame(maxWidth: 420, alignment: .leading)
+            }
             if !companion.approvals.isEmpty {
                 ApprovalDeck(companion: companion)
                     .frame(maxWidth: 420, alignment: .leading)

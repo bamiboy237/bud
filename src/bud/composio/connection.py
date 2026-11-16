@@ -2,6 +2,7 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from urllib.parse import urlsplit
 
 from composio import SESSION_PRESET_DIRECT_TOOLS, Composio
 
@@ -49,11 +50,39 @@ class Connections:
     def accounts(self) -> dict[str, str]:
         return self.store.snapshot()[0].accounts
 
-    def connect(self, toolkit: str) -> str:
+    def pending_url(self, toolkit: str) -> str | None:
+        """Recover an unfinished sign-in link without replacing its account reference."""
+        binding, pending = self.store.snapshot()
+        account_id = pending.get(toolkit)
+        if account_id is None:
+            if toolkit in binding.accounts:
+                raise ConnectionError("This app is already connected.")
+            return None
+        with safe_errors("Could not recover sign-in. Try again or check the connection."):
+            account = self.client().connected_accounts.get(nanoid=account_id)
+            if (
+                account.id != account_id
+                or account.user_id != binding.owner
+                or binding.owner != self.user_id
+                or account.toolkit.slug != toolkit
+            ):
+                raise ConnectionError("Connection owner or toolkit changed. Reconnect the account.")
+            if account.status == "ACTIVE":
+                raise ConnectionError("This app is already connected.")
+            if account.is_disabled or account.status not in {"INITIATED", "INITIALIZING"}:
+                return None
+            value = account.state.model_dump().get("val", {}).get("redirect_url")
+            if not isinstance(value, str) or urlsplit(value).scheme != "https":
+                raise ConnectionError("The sign-in link is unavailable. Check the connection.")
+            if self.store.snapshot() != (binding, pending):
+                raise ConnectionError("Connection changed while recovering sign-in. Try again.")
+            return value
+
+    def connect(self, toolkit: str, *, resume: bool = False) -> str:
         if not valid_toolkit(toolkit):
             raise ConnectionError("Unsupported toolkit name.")
         with safe_errors("Could not start Composio sign-in. Check your key and connection."):
-            attempt = self.store.begin_connect(toolkit)
+            attempt = self.store.begin_connect(toolkit, resume=resume)
             client = self.client()
             session = client.create(
                 user_id=attempt.owner,

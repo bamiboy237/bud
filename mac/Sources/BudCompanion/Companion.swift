@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 import os
@@ -176,6 +177,16 @@ final class Companion {
     var windowOpen = false
     /// What's waiting on the owner, oldest first, with enough detail to decide in the bubble.
     private(set) var approvals: [Approval] = []
+    private(set) var setups: [CapabilitySetup] = [] {
+        didSet {
+            showStatus()
+            monitorSetups()
+        }
+    }
+    @ObservationIgnored private var setupMonitor: Task<Void, Never>?
+    private(set) var updatingSetups: Set<String> = []
+    private(set) var setupProblems: [String: String] = [:]
+    var needsAttention: Bool { !approvals.isEmpty || !setups.isEmpty }
     /// Decisions sent and not yet confirmed: their buttons stay disabled, so one click is one call.
     private(set) var deciding: Set<String> = []
     /// True while a batch approval is running, so single decisions wait for it.
@@ -238,10 +249,15 @@ final class Companion {
     /// Connect (or reconnect after a settings change): handshake, primary session, snapshot, stream.
     func start() {
         generation += 1
+        setupMonitor?.cancel()
+        setupMonitor = nil
         batchTask?.cancel()
         approvingBatch = false
         deciding.removeAll()
         approvalFailures = [:]
+        setups = []
+        updatingSetups = []
+        setupProblems = [:]
         connection = nil
         let mine = generation
         handshake?.cancel()
@@ -320,7 +336,7 @@ final class Companion {
         // An old reply isn't news: it appears whole.
         showWhole()
         // Something already waiting on you is shown, not left behind the dot.
-        if !approvals.isEmpty { bubbleOpen = true }
+        if needsAttention { bubbleOpen = true }
     }
 
     /// Moves `shown` toward `reply`. The step grows with the backlog, so a long burst eases in
@@ -351,7 +367,7 @@ final class Companion {
 
     private func showStatus() {
         running = activity == .working
-        status = openApprovals.isEmpty ? activity : .needsYou
+        status = openApprovals.isEmpty && setups.isEmpty ? activity : .needsYou
     }
 
     /// The snapshot's pending list is the authority. Events alone can't tell: a parked
@@ -360,6 +376,14 @@ final class Companion {
         let at = snapshot["last_seq"] as? Int ?? 0
         guard at >= seenSeq else { return }
         seenSeq = at
+        let previous = Dictionary(uniqueKeysWithValues: setups.map { ($0.id, $0) })
+        setups = (snapshot["pending_setup"] as? [[String: Any]] ?? []).compactMap {
+            guard var setup = CapabilitySetup($0),
+                  !["connected", "cancelled"].contains(setup.status) else { return nil }
+            setup.url = setup.url ?? previous[setup.id]?.url
+            return setup
+        }
+        setupProblems = setupProblems.filter { key, _ in setups.contains { $0.id == key } }
         let pending = snapshot["pending_approvals"] as? [[String: Any]] ?? []
         var jobs: [Int: String] = [:]
         for task in snapshot["tasks"] as? [[String: Any]] ?? [] {
@@ -396,6 +420,124 @@ final class Companion {
     }
 
     // MARK: Actions
+
+    func receiveSetup(_ data: [String: Any], replacing: Bool = false) {
+        guard var incoming = CapabilitySetup(data) else { return }
+        if ["connected", "cancelled"].contains(incoming.status) {
+            setups.removeAll { $0.id == incoming.id }
+            setupProblems.removeValue(forKey: incoming.id)
+            return
+        }
+        if let index = setups.firstIndex(where: { $0.id == incoming.id }) {
+            if !replacing {
+                var current = setups[index]
+                current.status = incoming.status
+                current.reason = incoming.reason
+                incoming = current
+            }
+            setups[index] = incoming
+        } else {
+            setups.append(incoming)
+            arrivals += 1
+        }
+        bubbleOpen = true
+    }
+
+    func connectSetup(_ setup: CapabilitySetup) {
+        guard let connection, !updatingSetups.contains(setup.id) else { return }
+        if let url = setups.first(where: { $0.id == setup.id })?.url {
+            if !NSWorkspace.shared.open(url) {
+                setupProblems[setup.id] = "Could not open your browser. Try again."
+            }
+            return
+        }
+        updatingSetups.insert(setup.id)
+        setupProblems.removeValue(forKey: setup.id)
+        let mine = generation
+        Task {
+            do {
+                let result = try await connection.send(
+                    "POST", "connections/\(setup.id)/connect", json: ["resume": true])
+                guard mine == generation else { return }
+                guard let url = CapabilitySetup.signInURL(result["url"] as? String) else {
+                    throw ConnectionError.http(0, "The sign-in link is unavailable. Try again.")
+                }
+                if let index = setups.firstIndex(where: { $0.id == setup.id }) {
+                    setups[index].url = url
+                    if !NSWorkspace.shared.open(url) {
+                        setupProblems[setup.id] = "Could not open your browser. Try again."
+                    }
+                }
+            } catch {
+                guard mine == generation else { return }
+                setupProblems[setup.id] = "\(error)"
+            }
+            updatingSetups.remove(setup.id)
+        }
+    }
+
+    func cancelSetup(_ setup: CapabilitySetup) {
+        guard let connection else { return }
+        let mine = generation
+        let route = "sessions/\(session)/setup/\(setup.id)/cancel"
+        Task {
+            do {
+                let result = try await connection.send("POST", route)
+                guard mine == generation else { return }
+                receiveSetup(result)
+            } catch {
+                guard mine == generation else { return }
+                setupProblems[setup.id] = "\(error)"
+            }
+        }
+    }
+
+    func refreshSetupStatus() {
+        setupMonitor?.cancel()
+        setupMonitor = nil
+        monitorSetups()
+    }
+
+    private func monitorSetups() {
+        if setups.isEmpty {
+            setupMonitor?.cancel()
+            setupMonitor = nil
+            return
+        }
+        guard setupMonitor == nil, let connection else { return }
+        let mine = generation
+        setupMonitor = Task {
+            while !Task.isCancelled, mine == generation, !setups.isEmpty {
+                if link == .connected {
+                    for setup in setups {
+                        await refreshSetup(setup, connection: connection, generation: mine)
+                    }
+                }
+                do {
+                    try await Task.sleep(for: .seconds(5))
+                } catch {
+                    break
+                }
+            }
+        }
+    }
+
+    private func refreshSetup(
+        _ setup: CapabilitySetup, connection: BudConnection, generation mine: Int
+    ) async {
+        guard !Task.isCancelled else { return }
+        do {
+            let result = try await connection.send(
+                "POST", "sessions/\(session)/setup/\(setup.id)/check")
+            guard mine == generation, !Task.isCancelled else { return }
+            receiveSetup(result)
+            setupProblems[setup.id] = result["status"] as? String == "failed"
+                ? result["reason"] as? String : nil
+        } catch {
+            guard mine == generation, !Task.isCancelled else { return }
+            setupProblems[setup.id] = "\(error)"
+        }
+    }
 
     /// Sends what's in the field, or `spoken` words. Spoken words sent as a message leave the
     /// field as it was; spoken words answering bud's question are added to the field instead,
@@ -867,6 +1009,8 @@ final class Companion {
             for index in steps.indices where steps[index].id.hasPrefix(call) { steps[index].done = true }
         case "text.delta":
             appendDelta(block: event.string("block"), text: event.string("text"))
+        case "capability.setup", "capability.status":
+            receiveSetup(event.data, replacing: event.type == "capability.setup")
         case "run.completed":
             finish(with: Self.replyText(event.data))
             closeSteps()
