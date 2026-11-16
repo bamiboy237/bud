@@ -14,9 +14,8 @@ from email.utils import getaddresses
 from pathlib import Path
 from typing import Any, Self
 
-import httpx2
-import httpx2._sse
 from composio import SESSION_PRESET_DIRECT_TOOLS
+from fastmcp.client.transports import StreamableHttpTransport
 from pydantic_ai import RunContext, Tool
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.toolsets import (
@@ -38,25 +37,8 @@ from bud.composio.drafts import verify_reply_body
 from bud.harness.actions import Policy
 from bud.harness.ask import ask_user
 
-_MAX_SSE_EVENT_SIZE = 16 * 1024 * 1024
-
-
-def _configure_sse_event_limit() -> None:
-    orig_init = httpx2.EventSource.__init__
-
-    def _patched_init(
-        self: httpx2.EventSource,
-        response: httpx2.Response,
-        max_event_size: int | None = _MAX_SSE_EVENT_SIZE,
-    ) -> None:
-        size = max(max_event_size or 0, _MAX_SSE_EVENT_SIZE)
-        orig_init(self, response, max_event_size=size)
-
-    httpx2.EventSource.__init__ = _patched_init
-    httpx2._sse.EventSource.__init__ = _patched_init
-
-
-_configure_sse_event_limit()
+# Composio returns large tool lists in one event; the transport's default is 1 MiB.
+MAX_SSE_EVENT_BYTES = 16 * 1024 * 1024
 
 READ_TOOLS = {
     "GMAIL_FETCH_EMAILS",
@@ -490,8 +472,11 @@ def build_toolset(
             mcp=True,
         )
         remote = MCPToolset(
-            session.mcp.url,
-            headers=session.mcp.headers,
+            StreamableHttpTransport(
+                session.mcp.url,
+                headers=session.mcp.headers,
+                max_sse_event_size=MAX_SSE_EVENT_BYTES,
+            ),
             id="composio",
             max_retries=0,
             tool_error_behavior="error",

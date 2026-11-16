@@ -12,7 +12,6 @@ from pydantic_ai.capabilities import (
     Caching,
     Capability,
     RaiseContentFilterError,
-    ToolSearch,
 )
 from pydantic_ai.models import Model
 from pydantic_ai.toolsets import AbstractToolset, CombinedToolset, FunctionToolset
@@ -178,7 +177,6 @@ class Harness:
                 ),
                 *([self.memory] if self.memory is not None else []),
                 *([self.spend] if self.spend is not None else []),
-                ToolSearch(),
                 Caching(),
                 WarnOnCacheBusts(),
                 RaiseContentFilterError(),
