@@ -8,7 +8,8 @@ pydantic-ai share the same ``LiveState``, so a swap reaches them too.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic_ai import RunContext
@@ -18,11 +19,15 @@ from pydantic_ai.toolsets import AbstractToolset, ToolsetTool
 @dataclass
 class LiveState:
     current: AbstractToolset[None]
+    pending: AbstractToolset[None] | None = None
 
 
 @dataclass
 class LiveTools(AbstractToolset[None]):
     state: LiveState
+    active: ContextVar[AbstractToolset[None] | None] = field(
+        default_factory=lambda: ContextVar("bud_live_tools", default=None)
+    )
 
     @property
     def id(self) -> str | None:
@@ -33,7 +38,7 @@ class LiveTools(AbstractToolset[None]):
         return f"LiveTools({self.state.current.label})"
 
     async def get_tools(self, ctx: RunContext[None]) -> dict[str, ToolsetTool[None]]:
-        return await self.state.current.get_tools(ctx)
+        return await (self.active.get() or self.state.current).get_tools(ctx)
 
     async def call_tool(
         self,
@@ -42,14 +47,26 @@ class LiveTools(AbstractToolset[None]):
         ctx: RunContext[None],
         tool: ToolsetTool[None],
     ) -> Any:
-        return await self.state.current.call_tool(name, tool_args, ctx, tool)
+        return await (self.active.get() or self.state.current).call_tool(name, tool_args, ctx, tool)
 
     async def __aenter__(self) -> LiveTools:
-        await self.state.current.__aenter__()
+        # A swap requested during a run takes effect here, at the next run's start, so the
+        # toolset entered is always the one exited.
+        if self.state.pending is not None:
+            self.state.current = self.state.pending
+            self.state.pending = None
+        active = self.state.current
+        await active.__aenter__()
+        self.active.set(active)
         return self
 
     async def __aexit__(self, *args: Any) -> bool | None:
-        return await self.state.current.__aexit__(*args)
+        active = self.active.get()
+        assert active is not None
+        try:
+            return await active.__aexit__(*args)
+        finally:
+            self.active.set(None)
 
     def apply(self, visitor) -> None:
         self.state.current.apply(visitor)
@@ -60,5 +77,5 @@ class LiveTools(AbstractToolset[None]):
         return self
 
     def swap(self, toolset: AbstractToolset[None]) -> None:
-        """Replace the tools the next run sees. Call this between runs, not during one."""
-        self.state.current = toolset
+        """Stage a replacement; it takes effect at the start of the next run."""
+        self.state.pending = toolset

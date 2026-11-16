@@ -97,8 +97,9 @@ class Connections:
     def refresh(self) -> tuple[AccountBinding, dict[str, str]]:
         """Verify references, accept completed sign-ins, and fence removed accounts.
 
-        This updates local metadata only. It never replaces a running toolset/DBOS
-        instance; a full process restart is the supported refresh boundary.
+        This updates local metadata only. A newly added app is adopted as the current
+        binding, so its tools load without a restart; a removal or replacement keeps the
+        restart fence.
         """
         with safe_errors("Could not verify connections. No account tools were refreshed."):
             previous, pending = self.store.snapshot()
@@ -118,6 +119,11 @@ class Connections:
             active = {k: v for k, v in references.items() if statuses[k] == "ACTIVE"}
             remaining = {k: v for k, v in pending.items() if statuses[k] != "ACTIVE"}
             accepted = self.store.accept_verified(previous, pending, active, remaining)
+            # Adding an app cannot redirect an approval that already exists: every earlier
+            # account is unchanged. Adopt it so the new app's tools work in this session.
+            # A removal or replacement keeps the restart fence.
+            if self.binding is not None and self._additive(self.binding, accepted):
+                self.binding = accepted
             return accepted, statuses
 
     def capture_binding(self) -> AccountBinding:
@@ -136,6 +142,21 @@ class Connections:
     def restart_required(self) -> bool:
         return self.binding is None or self.store.snapshot()[0] != self.binding
 
+    @staticmethod
+    def _additive(old: AccountBinding, new: AccountBinding) -> bool:
+        """A new app was added and no existing account changed or left."""
+        return (
+            old.owner == new.owner
+            and old.generation == new.generation
+            and all(
+                new.accounts.get(toolkit) == account for toolkit, account in old.accounts.items()
+            )
+        )
+
+    def _fenced(self, binding: AccountBinding, current: AccountBinding) -> bool:
+        """True when an account this toolset holds was removed or replaced."""
+        return current != binding and not self._additive(binding, current)
+
     def assert_current_binding(self, binding: AccountBinding, target_toolkit: str) -> None:
         """Fence EVERY remote dispatch, including internal verification/read-back calls.
 
@@ -144,11 +165,15 @@ class Connections:
         """
         with safe_errors("Could not verify the account binding. No new tool call is authorized."):
             current = self.store.snapshot()[0]
-            if self.binding != binding or binding.owner != self.user_id or current != binding:
+            if binding.owner != self.user_id or current.owner != binding.owner:
                 raise ConnectionError("Account binding changed. Restart bud and use a new session.")
             account_id = binding.accounts.get(target_toolkit)
-            if target_toolkit not in TOOLKITS or account_id is None:
-                raise ConnectionError("App not connected. Use /connect gmail or /connect calendar.")
+            if not valid_toolkit(target_toolkit) or account_id is None:
+                raise ConnectionError("App not connected. Connect it first.")
+            # Adding another app leaves every earlier account in place, so a call to one
+            # of them is still authorized. A removal or replacement keeps the fence.
+            if self._fenced(binding, current):
+                raise ConnectionError("Account binding changed. Restart bud and use a new session.")
             try:
                 status = self._status(self.client(), binding, target_toolkit, account_id)
             except Exception:
@@ -159,7 +184,7 @@ class Connections:
                 raise ConnectionError(
                     "Account is not active. Reconnect, restart and use a new session."
                 )
-            if self.store.snapshot()[0] != binding:
+            if self._fenced(binding, self.store.snapshot()[0]):
                 raise ConnectionError(
                     "Account changed during verification. Restart with a new session."
                 )

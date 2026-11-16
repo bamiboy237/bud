@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from threading import Lock
 
 from bud.harness.writes import never_reviewed
 
@@ -20,6 +21,7 @@ class Grants:
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._lock = Lock()
         self.tools: frozenset[str] = frozenset()
         self.load()
 
@@ -39,16 +41,18 @@ class Grants:
 
     def add(self, tool: str) -> bool:
         """Record a standing permission; False for a hard-rule tool or a repeat."""
-        if never_reviewed(tool) or tool in self.tools:
-            return False
-        self._save(self.tools | {tool})
-        return True
+        with self._lock:
+            if never_reviewed(tool) or tool in self.tools:
+                return False
+            self._save(self.tools | {tool})
+            return True
 
     def remove(self, tool: str) -> bool:
-        if tool not in self.tools:
-            return False
-        self._save(self.tools - {tool})
-        return True
+        with self._lock:
+            if tool not in self.tools:
+                return False
+            self._save(self.tools - {tool})
+            return True
 
     def _save(self, tools: frozenset[str]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

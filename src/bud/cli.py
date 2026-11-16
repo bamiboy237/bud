@@ -135,7 +135,7 @@ def connect(toolkit: str, no_browser: bool) -> None:
         webbrowser.open(url)
     print(
         "Sign in at this URL, then run `bud connections` to check the connection. "
-        "Restart bud serve and start a new chat to load the changed account tools."
+        "Refresh connections in bud serve to load account tools."
     )
 
 
@@ -146,9 +146,9 @@ def connections() -> None:
         statuses = Connections(get_settings()).statuses()
     except ConnectionError as exc:
         raise SystemExit(str(exc)) from None
-    for toolkit in ("gmail", "googlecalendar"):
-        print(f"{toolkit}: {statuses.get(toolkit, 'NOT_CONNECTED')}")
-    print("Account tool changes require a full bud serve restart and a new chat.")
+    for toolkit in sorted(statuses):
+        print(f"{toolkit}: {statuses[toolkit]}")
+    print("Refresh connections in bud serve to load account tools.")
 
 
 def grants(action: str, tool: str | None, url: str = DEFAULT_URL) -> None:

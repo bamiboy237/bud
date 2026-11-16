@@ -10,11 +10,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from bud.composio.binding import valid_toolkit
 from bud.composio.connection import Connections, safe_errors
 
 MAX_CANDIDATES = 6
 MAX_QUERY = 200
-SLUG = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 
 
 @dataclass(frozen=True)
@@ -24,10 +24,6 @@ class Candidate:
     description: str
     tools: int
     connected: bool
-
-
-def valid_toolkit(slug: str) -> bool:
-    return bool(SLUG.fullmatch(slug))
 
 
 def search(connections: Connections, query: str) -> list[Candidate]:

@@ -52,10 +52,11 @@ class Harness:
         self.memory = memory
         tools_policy = policy.tools | MEMORY_RULES if memory else policy.tools
         self.policy = Policy(
-            tools={"load_tool_result": "allow", "run_code": "allow"}
+            tools={"load_tool_result": "allow", "run_code": "allow", "search_tools": "allow"}
             | tools_policy
             | {"read_tool_result": "allow", "read_tool_result_chars": "allow"}
-            | SKILL_RULES
+            | SKILL_RULES,
+            no_grants=policy.no_grants,
         )
         self.results = SqliteResultStore(result_path, retention=result_retention)
         self.output_limits = build_output_limits(self.results, read_tools)
@@ -97,7 +98,7 @@ class Harness:
 
     def swap_tools(self, toolset: AbstractToolset[None]) -> None:
         """Replace the tools the next run sees; the running step keeps the ones it started with."""
-        self.live.swap(toolset)
+        self.live.swap(CombinedToolset([toolset, FunctionToolset[None](self.skills.tools())]))
 
     def _today(self) -> str:
         # Day granularity: instructions lead the prompt, so a per-minute clock here

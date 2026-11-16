@@ -151,6 +151,7 @@ def _create_app(
     photon = None
     setup_journal = None
     world: World | None = None
+    account_scope: str | None = None
 
     # Set by the account branch: reloads the tool list after a new app connects.
     refresh_tools: Callable[[], None] = _noop
@@ -188,7 +189,8 @@ def _create_app(
         binding = connections.capture_binding()
         accounts = binding.accounts
         # Neither old approvals nor memory cross an owner/generation boundary.
-        session_dir = connections.folder / "sessions" / binding.scope
+        account_scope = connections.store.session_scope(binding)
+        session_dir = connections.folder / "sessions" / account_scope
         session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         db_path = session_dir / "bud.db"
         gateway = build_gateway(
@@ -207,7 +209,9 @@ def _create_app(
         def account_toolset() -> CombinedToolset[None]:
             return CombinedToolset(
                 [
-                    build_composio_toolset(connections, connections.accounts(), session_dir),
+                    build_composio_toolset(
+                        connections, connections.accounts(), session_dir, tools_policy
+                    ),
                     build_web_tools(settings),
                     workspace_tools(session_dir),
                     build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
@@ -219,8 +223,8 @@ def _create_app(
             current = frozenset(connections.accounts())
             if current == loaded["accounts"]:
                 return
-            loaded["accounts"] = current
             harness.swap_tools(account_toolset())
+            loaded["accounts"] = current
 
         refresh_tools = refresh_account_tools
         harness = Harness(
@@ -241,6 +245,7 @@ def _create_app(
             read_tools=READ_TOOLS | WEB_READ_TOOLS | WORKSPACE_READ_TOOLS | {"current_time"},
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
         )
+        tools_policy = harness.policy
     else:
         db_path = settings.data_dir / "bud.db"
         gateway = build_gateway(settings, model_id=model_id)
@@ -391,8 +396,8 @@ def _create_app(
                     lock.close()
 
     scope_id = (
-        binding.scope
-        if binding is not None
+        account_scope
+        if account_scope is not None
         else hashlib.sha256(str(db_path.resolve()).encode()).hexdigest()
     )
     app = FastAPI(title="bud core", lifespan=lifespan)
@@ -457,10 +462,10 @@ def _create_app(
         try:
             statuses = current.statuses()
             restart_required = current.restart_required()
+            if not restart_required:
+                refresh_tools()
         except ConnectionError as exc:
             raise HTTPException(503, str(exc)) from None
-        # A sign-in finished since the last check: load the new app's tools now.
-        refresh_tools()
         return JSONResponse(
             {
                 "statuses": {"gmail": statuses["gmail"], "calendar": statuses["googlecalendar"]},
@@ -635,8 +640,9 @@ def _create_app(
         require_session(session_id)
         if decision.approved:
             require_current_binding()
-        if decision.remember:
-            tool = next(
+        grant_tool = None
+        if decision.approved and decision.remember:
+            grant_tool = next(
                 (
                     request.tool
                     for request in runner.snapshot(session_id).pending_approvals
@@ -644,22 +650,21 @@ def _create_app(
                 ),
                 None,
             )
-            if tool is None:
+            if grant_tool is None:
                 raise HTTPException(404, "unknown approval")
-            if not runner.harness.policy.grantable(tool):
+            if not runner.harness.policy.grantable(grant_tool):
                 raise HTTPException(409, "This action can never run without asking.")
-            if grants.add(tool):
-                runner.harness.policy.grants = grants.tools
         try:
-            return {
-                "applied": runner.decide(
-                    session_id, approval_id, decision.approved, decision.origin.model_dump()
-                )
-            }
+            applied = runner.decide(
+                session_id, approval_id, decision.approved, decision.origin.model_dump()
+            )
         except UnknownApproval:
             raise HTTPException(404, "unknown approval") from None
         except DecisionRejected as exc:
             raise HTTPException(409, str(exc)) from None
+        if applied and grant_tool is not None and grants.add(grant_tool):
+            runner.harness.policy.grants = grants.tools
+        return {"applied": applied}
 
     @app.get("/grants")
     def list_grants() -> dict[str, list[str]]:
@@ -667,7 +672,7 @@ def _create_app(
         return {"tools": sorted(grants.tools)}
 
     @app.delete("/grants/{tool}")
-    def revoke_grant(tool: str) -> dict[str, bool]:
+    async def revoke_grant(tool: str) -> dict[str, bool]:
         """Revoke one standing permission; the tool asks again from the next call."""
         removed = grants.remove(tool)
         runner.harness.policy.grants = grants.tools

@@ -76,6 +76,10 @@ class BindingStore:
                 "CREATE TABLE IF NOT EXISTS pending_accounts "
                 "(toolkit TEXT PRIMARY KEY, account_id TEXT)"
             )
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS session_scopes "
+                "(generation INTEGER PRIMARY KEY, scope TEXT NOT NULL)"
+            )
             if "owner" not in existing:
                 if db.execute("SELECT count(*) FROM accounts").fetchone()[0]:
                     raise ConnectionError(
@@ -125,14 +129,29 @@ class BindingStore:
             db.execute("BEGIN")
             return self._read(db)
 
+    def session_scope(self, binding: AccountBinding) -> str:
+        """Keep a generation's session directory stable when an app is added."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if self._read(db)[0] != binding:
+                raise ConnectionError("Account binding changed before opening the session.")
+            db.execute(
+                "INSERT OR IGNORE INTO session_scopes VALUES (?, ?)",
+                (binding.generation, binding.scope),
+            )
+            return db.execute(
+                "SELECT scope FROM session_scopes WHERE generation = ?", (binding.generation,)
+            ).fetchone()[0]
+
     def begin_connect(self, toolkit: str) -> AccountBinding:
         if not valid_toolkit(toolkit):
             raise ConnectionError("Unsupported toolkit name.")
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            self._read(db)
+            current, pending = self._read(db)
             # Fence even an explicit reconnect to exactly the same remote ID.
-            db.execute("UPDATE binding_state SET generation = generation + 1 WHERE id = 1")
+            if toolkit in current.accounts or toolkit in pending:
+                db.execute("UPDATE binding_state SET generation = generation + 1 WHERE id = 1")
             db.execute("DELETE FROM accounts WHERE toolkit = ?", (toolkit,))
             db.execute("INSERT OR REPLACE INTO pending_accounts VALUES (?, NULL)", (toolkit,))
             return self._read(db)[0]
@@ -167,7 +186,10 @@ class BindingStore:
                     "Connections changed during verification. Check /connections."
                 )
             if expected.accounts != active or pending != remaining:
-                db.execute("UPDATE binding_state SET generation = generation + 1 WHERE id = 1")
+                if any(
+                    active.get(toolkit) != account for toolkit, account in expected.accounts.items()
+                ):
+                    db.execute("UPDATE binding_state SET generation = generation + 1 WHERE id = 1")
                 db.execute("DELETE FROM accounts")
                 db.executemany("INSERT INTO accounts VALUES (?, ?)", sorted(active.items()))
                 db.execute("DELETE FROM pending_accounts")

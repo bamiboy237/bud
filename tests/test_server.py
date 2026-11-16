@@ -310,6 +310,19 @@ def test_always_allow_records_a_grant_and_revoke_restores_asking(tmp_path):
         assert server.request("GET", "/grants") == {"tools": []}
 
 
+def test_a_grant_is_recorded_only_for_an_approved_decision(tmp_path):
+    """A deny with "remember" must not leave a standing permission behind."""
+    with running(tmp_path) as server:
+        session, approval = start_report(server)
+        assert server.request(
+            "POST",
+            f"/sessions/{session}/approvals/{approval['approval_id']}",
+            json={"approved": False, "remember": True},
+        ) == {"applied": True}
+        assert server.request("GET", "/grants") == {"tools": []}
+        assert server.settled(session)["tasks"][0]["outcome"] == "not_delivered"
+
+
 def test_revised_workspace_approval_survives_process_restart(tmp_path):
     with running(tmp_path) as server:
         session, original = start_report(server)

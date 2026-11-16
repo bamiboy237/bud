@@ -1,5 +1,8 @@
 """Standing tool permissions: what they cover, what they can never cover, and revocation."""
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 import pytest
 
 from bud.harness.actions import Policy
@@ -59,6 +62,24 @@ def test_corrupt_file_reads_as_no_grants(tmp_path):
     assert Grants(path).tools == frozenset()
     path.write_text('{"tools": [1, "", "archive_email"]}')
     assert Grants(path).tools == frozenset({"archive_email"})
+
+
+def test_concurrent_revocations_remove_both_grants(tmp_path):
+    path = tmp_path / "grants.json"
+    store = Grants(path)
+    store.add("workspace_create")
+    store.add("archive_email")
+    barrier = Barrier(2)
+
+    def revoke(tool):
+        barrier.wait()
+        return store.remove(tool)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(revoke, ["workspace_create", "archive_email"]))
+    assert results == [True, True]
+    assert store.tools == frozenset()
+    assert Grants(path).tools == frozenset()
 
 
 async def test_snapshot_marks_only_grantable_pending_tools(tmp_path):
