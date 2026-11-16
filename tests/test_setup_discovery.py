@@ -2,9 +2,23 @@
 
 from typing import cast
 
-from bud.composio.binding import valid_toolkit
+from pydantic_ai import RunContext
+from pydantic_ai.models.test import TestModel
+from pydantic_ai.usage import RunUsage
+
+from bud.composio.binding import ConnectionError, valid_toolkit
 from bud.composio.connection import Connections
-from bud.core.setup import setup_registry
+from bud.core.hub import Hub
+from bud.core.log import EventLog
+from bud.core.setup import (
+    SetupEntry,
+    SetupInitiation,
+    SetupJournal,
+    SetupRegistry,
+    SetupStatus,
+    setup_registry,
+    setup_tool,
+)
 
 
 class FakeConnections:
@@ -39,3 +53,47 @@ def test_invalid_capability_has_no_entry():
     assert registry.entry("../escape") is None
     assert registry.entry("Bad Slug") is None
     assert not valid_toolkit("Bad Slug")
+
+
+def test_failed_tool_refresh_keeps_the_card_and_retries_without_reconnecting(tmp_path):
+    journal = SetupJournal()
+    journal.bind(Hub(EventLog(tmp_path / "events.db")))
+    initiated = []
+    registry = SetupRegistry()
+    registry.register(
+        "slack",
+        SetupEntry(
+            label="Slack",
+            kind="url",
+            initiate=lambda: (
+                initiated.append(True)
+                or SetupInitiation(kind="url", url="https://example.test/slack")
+            ),
+            status=lambda: SetupStatus(state="connected"),
+        ),
+    )
+    attempts = []
+
+    def refresh():
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise ConnectionError("Could not load tools. Try again.")
+
+    setup = setup_tool(registry, journal, refresh=refresh)
+
+    def ctx(call_id):
+        return RunContext(
+            deps=None,
+            model=TestModel(),
+            usage=RunUsage(),
+            run_id="run",
+            tool_call_id=call_id,
+            metadata={"bud_session_id": "session"},
+        )
+
+    assert setup(ctx("one"), "slack")["status"] == "waiting"
+    assert setup(ctx("two"), "slack")["status"] == "waiting"
+    assert "slack" in journal.pending("session")
+    assert setup(ctx("three"), "slack")["status"] == "connected"
+    assert journal.pending("session") == {}
+    assert len(initiated) == 1

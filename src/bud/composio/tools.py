@@ -425,17 +425,6 @@ def compose_tools(remote: AbstractToolset[None], base: list[Tool[None]]) -> Comb
     return CombinedToolset([DeferredLoadingToolset(remote), FunctionToolset(base)])
 
 
-def build_composio_toolset(
-    connections: Connections, accounts: dict[str, str], session_dir: Path, policy: Policy
-) -> AbstractToolset[None]:
-    """The one place the Composio branch is built.
-
-    Wrap this result (for example in a deferred-loading toolset) rather than wrapping the
-    call sites: the live swap rebuilds the branch through here too.
-    """
-    return build_toolset(connections, accounts, session_dir, policy)
-
-
 def build_toolset(
     connections: Connections, accounts: dict[str, str], session_dir: Path, policy: Policy
 ) -> CombinedToolset[None]:

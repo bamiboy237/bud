@@ -163,8 +163,8 @@ def setup_tool(
             }
             if status.reason:
                 data["reason"] = status.reason
-            journal.publish(session, "capability.status", data, key=key)
             if status.state == "waiting":
+                journal.publish(session, "capability.status", data, key=key)
                 return {
                     "capability": capability,
                     "label": entry.label,
@@ -174,14 +174,24 @@ def setup_tool(
                 }
             if status.state == "connected":
                 if refresh is not None:
-                    refresh()
+                    try:
+                        refresh()
+                    except ConnectionError as exc:
+                        return {
+                            "capability": capability,
+                            "label": entry.label,
+                            "status": "waiting",
+                            "reason": str(exc),
+                        }
+                journal.publish(session, "capability.status", data, key=key)
                 return {
                     "capability": capability,
                     "label": entry.label,
                     "status": "connected",
-                    "note": "The capability is connected. Its tools load for your next "
-                    "message; retry the task now.",
+                    "note": "The capability is connected. Its tools load for the next "
+                    "message. End this turn and continue when the person sends a message.",
                 }
+            journal.publish(session, "capability.status", data, key=key)
             return {
                 "capability": capability,
                 "label": entry.label,

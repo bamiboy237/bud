@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, TextIO
 from uuid import uuid4
 
@@ -181,7 +182,7 @@ def _create_app(
         from bud.composio.tools import (
             PROFILE,
             READ_TOOLS,
-            build_composio_toolset,
+            build_toolset,
             policy,
         )
 
@@ -205,13 +206,12 @@ def _create_app(
         setup_journal = SetupJournal()
         tools_policy.tools.update(dict.fromkeys(WORKSPACE_WRITE_TOOLS, "ask"))
         loaded = {"accounts": frozenset(accounts)}
+        refresh_lock = Lock()
 
         def account_toolset() -> CombinedToolset[None]:
             return CombinedToolset(
                 [
-                    build_composio_toolset(
-                        connections, connections.accounts(), session_dir, tools_policy
-                    ),
+                    build_toolset(connections, connections.accounts(), session_dir, tools_policy),
                     build_web_tools(settings),
                     workspace_tools(session_dir),
                     build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
@@ -220,11 +220,17 @@ def _create_app(
 
         def refresh_account_tools() -> None:
             """Swap in the tools of a newly connected app; the next message sees them."""
-            current = frozenset(connections.accounts())
-            if current == loaded["accounts"]:
-                return
-            harness.swap_tools(account_toolset())
-            loaded["accounts"] = current
+            with refresh_lock:
+                if connections.restart_required():
+                    raise ConnectionError("Account changed. Restart Bud and start a new chat.")
+                current = frozenset(connections.accounts())
+                if current == loaded["accounts"]:
+                    return
+                replacement = account_toolset()
+                if connections.restart_required() or frozenset(connections.accounts()) != current:
+                    raise ConnectionError("Accounts changed while loading tools. Try again.")
+                harness.swap_tools(replacement)
+                loaded["accounts"] = current
 
         refresh_tools = refresh_account_tools
         harness = Harness(
@@ -470,7 +476,7 @@ def _create_app(
             {
                 "statuses": {"gmail": statuses["gmail"], "calendar": statuses["googlecalendar"]},
                 "restart_required": restart_required,
-                "refresh_boundary": "process_restart",
+                "refresh_boundary": "process_restart" if restart_required else "next_message",
             },
             headers={"Cache-Control": "no-store"},
         )
@@ -483,12 +489,17 @@ def _create_app(
             raise HTTPException(400, "Use /connect gmail or /connect calendar.")
         try:
             url = current.connect(name)
+            restart_required = current.restart_required()
         except ConnectionError as exc:
             raise HTTPException(503, str(exc)) from None
         # The sign-in link exists only in this immediate authenticated response,
         # not in session events, model input/history, status metadata or logs.
         return JSONResponse(
-            {"url": url, "restart_required": True, "refresh_boundary": "process_restart"},
+            {
+                "url": url,
+                "restart_required": restart_required,
+                "refresh_boundary": "process_restart" if restart_required else "next_message",
+            },
             headers={"Cache-Control": "no-store"},
         )
 
