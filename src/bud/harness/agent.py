@@ -22,7 +22,7 @@ from pydantic_ai_harness.system_reminders import Reminder
 from bud.config import get_settings
 from bud.gateway.registry import Registry
 from bud.gateway.spend import build_spend_limits
-from bud.harness.actions import GuardTools, Policy, RecordDecision
+from bud.harness.actions import Action, GuardTools, Policy, RecordDecision
 from bud.harness.code import CODE_GUIDANCE, build_code_mode
 from bud.harness.context import BackgroundCompaction
 from bud.harness.live import LiveState, LiveTools
@@ -76,8 +76,12 @@ class Harness:
         self.live = LiveTools(state=LiveState(current=self.toolset))
         self.memory = memory
         tools_policy = policy.tools | MEMORY_RULES if memory else policy.tools
+        reads: dict[str, Action] = dict.fromkeys(
+            ("load_tool_result", "run_code", "search_tools", "search_conversation_history"),
+            "allow",
+        )
         self.policy = Policy(
-            tools={"load_tool_result": "allow", "run_code": "allow", "search_tools": "allow"}
+            tools=reads
             | tools_policy
             | {"read_tool_result": "allow", "read_tool_result_chars": "allow"}
             | SKILL_RULES,

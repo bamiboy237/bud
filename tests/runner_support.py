@@ -11,6 +11,7 @@ from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCall
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from pydantic_ai.toolsets import FunctionToolset
 
+from bud.core.history import conversation_search
 from bud.core.hub import Hub
 from bud.core.log import EventLog
 from bud.core.runner import Runner
@@ -93,7 +94,7 @@ async def running_bud(
         state_dir=directory,
         result_path=log.path,
         read_tools=READ_TOOLS,
-        capabilities=read_capabilities(root),
+        capabilities=[*read_capabilities(root), conversation_search(log)],
     )
     harness.clock = lambda: datetime(2026, 11, 6, 12, tzinfo=UTC)
     if spiral is not None:

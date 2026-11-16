@@ -713,6 +713,29 @@ class EventLog:
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
 
+    def saved_runs(self) -> list[tuple[str, str, datetime]]:
+        """Each run with saved messages: session, run id, and when its messages were first
+        saved, oldest first."""
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT session_id, json_extract(data, '$.run_id'), MIN(created_at)
+                FROM events WHERE type IN ('run.waiting', 'run.completed')
+                GROUP BY session_id, json_extract(data, '$.run_id')
+                ORDER BY MIN(created_at), MIN(seq)"""
+            ).fetchall()
+        return [(row[0], row[1], datetime.fromisoformat(row[2])) for row in rows]
+
+    def run_messages(self, run_id: str) -> list[dict]:
+        """The messages a run saved, in order, across its approval pauses."""
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT json_extract(data, '$.messages') FROM events
+                WHERE type IN ('run.waiting', 'run.completed')
+                AND json_extract(data, '$.run_id') = ? ORDER BY created_at, seq""",
+                (run_id,),
+            ).fetchall()
+        return [message for row in rows for message in json.loads(row[0])]
+
     def unfinished_runs(self) -> list[tuple[str, str]]:
         placeholders = ", ".join("?" for _ in RUN_END_EVENTS)
         with self._connect() as db:

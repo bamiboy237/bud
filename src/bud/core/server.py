@@ -27,6 +27,7 @@ from bud.composio.connection import ConnectionError, Connections
 from bud.config import Settings, get_settings
 from bud.core.auth import OwnerAuthentication, owner_token
 from bud.core.events import Event, MessageOrigin
+from bud.core.history import conversation_search
 from bud.core.hub import Hub
 from bud.core.log import EventLog, QueueFull
 from bud.core.profiles import Mode, ProfileStore, apply_mode, as_mode, mode_summary
@@ -332,6 +333,8 @@ def _create_app(
     )
     gateway.model("fast", require_tools=True)
     log = EventLog(db_path)
+    # Before the runner builds the agent, which reads the harness's capabilities.
+    harness.capabilities.append(conversation_search(log))
     hub = Hub(log)
     if setup_journal is not None:
         # The setup toolset was built before the log and hub existed; one seam
