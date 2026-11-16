@@ -15,6 +15,7 @@ from bud.core.events import RUN_END_EVENTS, Event, EventType
 from bud.core.projection import (
     AUTO_PAUSES,
     Snapshot,
+    decisions,
     message_batch,
     pause_reason,
     pending_setups,
@@ -25,6 +26,7 @@ from bud.core.projection import (
     snapshot,
     undecided_approvals,
     unreported_job_news,
+    waiting_batch,
 )
 from bud.limits import MAX_QUEUED_MESSAGES
 
@@ -136,6 +138,30 @@ class EventLog:
             if (current.status, current.reason) != (data["status"], data.get("reason")):
                 self._insert(db, session_id, "capability.status", data, once=True, key=key)
             return True
+
+    def answer_question(
+        self, session_id: str, approval_id: str, text: str, origin: dict | None = None
+    ) -> Event | None:
+        """Answer only a still-pending question, atomically with message supersession."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            events = self._read(db, session_id)
+            if approval_id in decisions(events):
+                return None
+            request = next(
+                (item for item in waiting_batch(events) if item["approval_id"] == approval_id),
+                None,
+            )
+            if request is None or request["tool"] != "ask_user":
+                return None
+            return self._insert(
+                db,
+                session_id,
+                "question.answered",
+                {"approval_id": approval_id, "text": text, "origin": origin},
+                once=True,
+                key=f"{session_id}:answer:{approval_id}",
+            )
 
     @staticmethod
     def _insert(

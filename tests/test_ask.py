@@ -111,6 +111,34 @@ async def test_card_answers_resume_the_run_with_each_question_beside_its_answer(
         )
 
 
+async def test_answer_retired_by_a_new_message_is_not_reported_as_accepted(tmp_path, monkeypatch):
+    calls = []
+
+    def model(messages, info):
+        calls.append(True)
+        if len(calls) == 1:
+            return ModelResponse(
+                parts=[ToolCallPart("ask_user", QUESTIONS, tool_call_id="ask-race")]
+            )
+        return reply()
+
+    async with running_bud(tmp_path, model, ask=True) as bud:
+        bud.log.append("owner", "session.created")
+        bud.runner.start("owner", "Move my meeting.", "message-1")
+        await bud.settle()
+        request = bud.runner.snapshot("owner").pending_approvals[0]
+        record = bud.log.answer_question
+
+        def interleaved_answer(session_id, approval_id, text, origin=None):
+            bud.runner.start("owner", "Cancel that request.", "message-2")
+            return record(session_id, approval_id, text, origin)
+
+        monkeypatch.setattr(bud.log, "answer_question", interleaved_answer)
+        assert not bud.runner.answer("owner", request.approval_id, "Sam Lee; Wednesday")
+        await bud.settle()
+        assert not any(event.type == "question.answered" for event in bud.log.read("owner"))
+
+
 @pytest.mark.parametrize(
     "questions",
     [

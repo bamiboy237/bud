@@ -215,6 +215,22 @@ def test_owner_message_must_report_new_job_results(tmp_path):
     assert "mention a job only if it matters" not in note
 
 
+def test_stopping_a_report_pauses_its_queue_and_prevents_redispatch(tmp_path):
+    log = EventLog(tmp_path / "events.db")
+    log.append(
+        "owner", "task.completed", {"task_id": 1, "title": "Lease", "text": "Renews in March."}
+    )
+    log.append("owner", "run.queued", {"run_id": "report", "trigger": "job"})
+    log.append("owner", "run.started", {"run_id": "report", "trigger": "job"})
+
+    assert log.request_stop("owner") is not None
+    log.acknowledge_stop("owner", "report")
+
+    assert log.snapshot("owner", log.read("owner")).queue_paused
+    assert not log.dispatch_job_report("owner", {"run_id": "duplicate", "trigger": "job"})
+    assert len([event for event in log.read("owner") if event.type == "run.queued"]) == 1
+
+
 async def test_queued_job_report_survives_runner_reconstruction(tmp_path, monkeypatch):
     prompts: list[str] = []
     async with running_bud(tmp_path, bud_with_one_job(prompts), jobs=True) as bud:

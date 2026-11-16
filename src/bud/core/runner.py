@@ -573,14 +573,10 @@ class Runner(DBOSConfiguredInstance):
             if answers is not None
             else answer_from_text(questions, text or "")
         )
-        event = self.hub.publish_once(
-            session_id,
-            "question.answered",
-            {"approval_id": approval_id, "text": reply, "origin": origin},
-            key=f"{session_id}:answer:{approval_id}",
-        )
+        event = self.hub.log.answer_question(session_id, approval_id, reply, origin)
         if event is None:
             return False
+        self.hub.wake(session_id)
         self._on_loop(self._resume_if_ready, session_id)
         return True
 
