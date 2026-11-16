@@ -73,7 +73,7 @@ struct SetupCard: View {
                 Button("Cancel") { companion.cancelSetup(setup) }
                     .buttonStyle(CardButton(kind: .quiet))
                     .accessibilityLabel("Cancel \(setup.label) setup")
-                    .disabled(companion.link != .connected)
+                    .disabled(busy)
                 if setup.kind == "url" {
                     Button("Connect") { companion.connectSetup(setup) }
                         .buttonStyle(CardButton(kind: .primary))

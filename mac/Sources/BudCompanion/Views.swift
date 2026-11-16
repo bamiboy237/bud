@@ -53,8 +53,11 @@ struct PetView: View {
 
     /// The stop button sits on the bubble's side of the pet.
     private var petRow: some View {
-        HStack(spacing: 10) {
-            if anchor.left { pet }
+        HStack(alignment: .bottom, spacing: 8) {
+            if anchor.left {
+                pet
+                pupStack
+            }
             if Voice.shared.state == .listening || Voice.shared.state == .transcribing {
                 VoicePill(voice: Voice.shared)
                     .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: anchor.left ? .leading : .trailing)))
@@ -62,9 +65,36 @@ struct PetView: View {
                 StopButton(action: companion.stop)
                     .transition(.opacity)
             }
-            if !anchor.left { pet }
+            if !anchor.left {
+                pupStack
+                pet
+            }
         }
         .animation(.spring(duration: 0.25, bounce: 0), value: Voice.shared.state)
+        .animation(.spring(duration: 0.35, bounce: 0), value: companion.activeTasks.isEmpty)
+    }
+
+    @ViewBuilder private var pupStack: some View {
+        if !companion.visiblePups.isEmpty {
+            let overflow = max(0, companion.activeTasks.count - companion.visiblePups.count)
+            HStack(alignment: .bottom, spacing: 4) {
+                ForEach(companion.visiblePups) { task in
+                    ChildPupView(task: task)
+                        .transition(.scale(scale: 0.6).combined(with: .opacity))
+                }
+                if overflow > 0 {
+                    Text("+\(overflow)")
+                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 2)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .help("\(overflow) more background job\(overflow == 1 ? "" : "s") running")
+                        .transition(.opacity)
+                }
+            }
+            .animation(.spring(duration: 0.35, bounce: 0), value: companion.activeTasks)
+        }
     }
 
     private var pet: some View {
@@ -184,6 +214,75 @@ private struct PetButton: View {
     private var statusText: String {
         if case .problem(let detail) = companion.link { return detail }
         return companion.status.label
+    }
+}
+
+// MARK: Mini Kid Pup
+
+/// A mini kid/pup sub-agent sprite representing a background job working beside Bud.
+struct ChildPupView: View {
+    static let defaultSize = CGSize(width: 44, height: 48)
+
+    let move: PetMove
+    let title: String
+    let statusText: String
+    var size: CGSize = defaultSize
+    var since: Date = .now
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    init(task: RunningTask, size: CGSize = defaultSize) {
+        self.move = task.move
+        self.title = task.title
+        self.statusText = task.status
+        self.size = size
+        self.since = task.finishedAt ?? .now
+    }
+
+    init(move: PetMove = .working, size: CGSize = defaultSize, title: String = "Pup helper", status: String = "running", since: Date = .now) {
+        self.move = move
+        self.title = title
+        self.statusText = status
+        self.size = size
+        self.since = since
+    }
+
+    var body: some View {
+        Button {
+            ConversationWindow.shared.show()
+        } label: {
+            if let sprite = PetSprite.named("pup") ?? PetSprite.named("dog") {
+                pupImage(sprite)
+            } else {
+                fallbackPaw
+            }
+        }
+        .buttonStyle(PressScale())
+        .help("\(title) (\(statusText))")
+        .accessibilityLabel("Helper pup for \(title)")
+        .accessibilityValue(move == .working ? "Working" : "Done")
+    }
+
+    private func pupImage(_ sprite: PetSprite) -> some View {
+        TimelineView(.animation(minimumInterval: 0.08, paused: reduceMotion)) { context in
+            let moment = reduceMotion ? Date.distantPast : context.date
+            let pose = PetPose(status: move, statusSince: reduceMotion ? Date.distantPast : since)
+            if let rect = sprite.frame(for: pose, at: moment),
+               let image = sprite.image(rect) {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .shadow(color: .black.opacity(0.18), radius: 3, y: 1.5)
+    }
+
+    private var fallbackPaw: some View {
+        Image(systemName: "pawprint.fill")
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .frame(width: size.width, height: size.height)
     }
 }
 
@@ -906,7 +1005,7 @@ struct IconButton: ButtonStyle {
 }
 
 struct CardButton: ButtonStyle {
-    enum Kind { case primary, secondary, quiet }
+    enum Kind { case primary, secondary, quiet, approve, deny }
     let kind: Kind
 
     func makeBody(configuration: Configuration) -> some View {
@@ -920,15 +1019,19 @@ struct CardButton: ButtonStyle {
 
         var body: some View {
             configuration.label
-                .font(.system(size: 12.5, weight: .medium))
+                .font(.system(size: 12.5, weight: kind == .approve || kind == .deny ? .semibold : .medium))
                 .foregroundStyle(ink)
-                .padding(.horizontal, kind == .quiet ? 6 : 12)
+                .padding(.horizontal, kind == .quiet ? 6 : 14)
                 .frame(height: 26)
                 .background {
                     switch kind {
                     case .primary: Capsule().fill(Paper.ink.opacity(hover.on ? 0.86 : 1))
                     case .secondary: Capsule().fill(Paper.ink.opacity(hover.on ? 0.11 : 0.07))
                     case .quiet: Capsule().fill(Paper.ink.opacity(hover.on ? 0.06 : 0))
+                    case .approve:
+                        Capsule().fill(Color(red: 0.14, green: 0.62, blue: 0.35).opacity(hover.on ? 0.88 : 1.0))
+                    case .deny:
+                        Capsule().fill(Color(red: 0.82, green: 0.24, blue: 0.24).opacity(hover.on ? 0.88 : 1.0))
                     }
                 }
                 .contentShape(Capsule())
@@ -941,7 +1044,7 @@ struct CardButton: ButtonStyle {
 
         private var ink: AnyShapeStyle {
             switch kind {
-            case .primary: AnyShapeStyle(Paper.surface)
+            case .primary, .approve, .deny: AnyShapeStyle(Color.white)
             case .secondary: AnyShapeStyle(Paper.ink)
             case .quiet: hover.on ? AnyShapeStyle(Paper.ink) : AnyShapeStyle(.secondary)
             }

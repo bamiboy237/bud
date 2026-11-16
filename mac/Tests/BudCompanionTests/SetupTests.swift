@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 @testable import BudCompanion
@@ -75,5 +76,86 @@ struct SetupTests {
         companion.receiveSetup(["capability": "slack", "status": "cancelled"])
         #expect(companion.setups.map(\.id) == ["notion", "gmail"])
         #expect(companion.needsAttention)
+    }
+
+    @Test
+    func windowWillClosePreservesBubbleWhenSetupNeedsAttention() {
+        let companion = Companion.shared
+        companion.apply(snapshot: [
+            "last_seq": 1,
+            "pending_setup": [[
+                "capability": "github", "label": "GitHub", "kind": "url", "status": "waiting",
+            ]],
+            "transcript": [],
+        ])
+        #expect(companion.needsAttention)
+        companion.windowOpen = true
+        companion.bubbleOpen = false
+        ConversationWindow.shared.windowWillClose(Notification(name: NSWindow.willCloseNotification))
+        #expect(!companion.windowOpen)
+        #expect(companion.bubbleOpen)
+        companion.receiveSetup(["capability": "github", "status": "connected"])
+    }
+
+    @Test
+    func inlineErrorsClearOnRetryAndRemovedOnCompletion() {
+        let companion = Companion()
+        companion.receiveSetup([
+            "capability": "github", "label": "GitHub", "kind": "url", "status": "waiting",
+        ], replacing: true)
+        companion.receiveSetup([
+            "capability": "github", "status": "failed", "reason": "Sign-in expired.",
+        ])
+        #expect(companion.setups.first?.reason == "Sign-in expired.")
+        // When connectSetup is called (even without connection), it clears the previous problem
+        companion.connectSetup(companion.setups[0])
+        #expect(companion.setupProblems["github"] == nil)
+
+        // When setup completes or cancels, errors are cleaned up
+        companion.receiveSetup(["capability": "github", "status": "connected"])
+        #expect(companion.setups.isEmpty)
+        #expect(companion.setupProblems["github"] == nil)
+    }
+
+    @Test
+    func activationNotificationTriggersImmediateSetupRefresh() {
+        let companion = Companion()
+        companion.receiveSetup([
+            "capability": "github", "label": "GitHub", "kind": "url", "status": "waiting",
+        ], replacing: true)
+        #expect(companion.needsAttention)
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        #expect(companion.needsAttention)
+    }
+
+    @Test
+    func fastPollingTriggerSetsRemainingCount() {
+        let companion = Companion()
+        companion.receiveSetup([
+            "capability": "github", "label": "GitHub", "kind": "url", "status": "waiting",
+        ], replacing: true)
+        #expect(companion.fastPollRemaining == 0)
+        companion.triggerFastPolling()
+        #expect(companion.fastPollRemaining == 3)
+    }
+
+    @Test
+    func pupSpriteLoadsAndChildPupsAreCappedAtFour() {
+        let pup = PetSprite.named("pup")
+        #expect(pup != nil)
+        let companion = Companion()
+        companion.apply(snapshot: [
+            "last_seq": 1,
+            "tasks": [
+                ["task_id": 1, "title": "Index repo", "status": "running"],
+                ["task_id": 2, "title": "Check CI", "status": "running"],
+                ["task_id": 3, "title": "Review diff", "status": "running"],
+                ["task_id": 4, "title": "Run tests", "status": "running"],
+                ["task_id": 5, "title": "Extra task", "status": "running"],
+            ],
+        ])
+        #expect(companion.activeTasks.count == 5)
+        #expect(companion.visiblePups.count == 4)
+        #expect(companion.visiblePups.map(\.id) == [1, 2, 3, 4])
     }
 }

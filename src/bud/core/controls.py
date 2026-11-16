@@ -41,6 +41,8 @@ def approval_text(approval: dict) -> str:
         "GOOGLECALENDAR_PATCH_EVENT": "Move a meeting",
         "workspace_create": "Create a workspace file",
         "workspace_update": "Update a workspace file",
+        "write_file": "Create a workspace file",
+        "edit_file": "Update a workspace file",
     }
     task = f"Task {approval['reference']}: " if approval.get("reference") else ""
     if approval["tool"] == "ask_user":

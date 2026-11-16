@@ -12,9 +12,16 @@ struct BudSettings: Sendable {
     static func load() -> BudSettings {
         let env = ProcessInfo.processInfo.environment
         let defaults = UserDefaults.standard
+        var home = env["BUD_HOME"] ?? defaults.string(forKey: "budHome") ?? ""
+        if home.isEmpty {
+            let candidate = URL(filePath: NSHomeDirectory()).appending(path: "Desktop/bud")
+            if FileManager.default.fileExists(atPath: candidate.path()) {
+                home = candidate.path()
+            }
+        }
         return BudSettings(
             url: env["BUD_URL"] ?? defaults.string(forKey: "budURL") ?? defaultURL,
-            home: env["BUD_HOME"] ?? defaults.string(forKey: "budHome") ?? ""
+            home: home
         )
     }
 
@@ -70,7 +77,13 @@ struct BudConnection: Sendable {
 
     static func ownerToken(home: String) throws -> String {
         let env = ProcessInfo.processInfo.environment
-        let homeURL = URL(filePath: home.isEmpty ? FileManager.default.currentDirectoryPath : home)
+        var homeURL = URL(filePath: home.isEmpty ? FileManager.default.currentDirectoryPath : home)
+        if home.isEmpty || homeURL.path() == "/" {
+            let candidate = URL(filePath: NSHomeDirectory()).appending(path: "Desktop/bud")
+            if FileManager.default.fileExists(atPath: candidate.path()) {
+                homeURL = candidate
+            }
+        }
         let dotenv = Self.dotenv(homeURL.appending(path: ".env"))
         if let token = env["OWNER_TOKEN"] ?? dotenv["OWNER_TOKEN"], !token.isEmpty {
             guard valid(token) else {

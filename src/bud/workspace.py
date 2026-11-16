@@ -31,10 +31,21 @@ from typing import Any
 
 from pydantic_ai import RunContext, Tool, ToolReturn
 
-READ_TOOLS = {"workspace_list", "workspace_read", "workspace_search"}
-WRITE_TOOLS = {"workspace_create", "workspace_update"}
-GUIDANCE = """Manage plain-text (.md and .txt) files in the dedicated workspace using
-relative paths.
+READ_TOOLS = {
+    "workspace_list",
+    "workspace_read",
+    "workspace_search",
+    "read_file",
+    "list_directory",
+    "search_files",
+}
+WRITE_TOOLS = {
+    "workspace_create",
+    "workspace_update",
+    "write_file",
+    "edit_file",
+}
+GUIDANCE = """Manage plain-text files in the dedicated workspace using relative paths.
 Reading files provides their SHA-256 revision hash. File updates require the revision hash
 from the latest read. File creations and updates require user approval.
 """
@@ -43,7 +54,7 @@ _MAX_BYTES = 128 * 1024
 _MAX_ENTRIES = 500
 _PRIVATE = re.compile(
     r"(^|[._\- ])(env|credentials?|secrets?|tokens?|passwords?|passwd|shadow|"
-    r"private|id_rsa|id_ed25519|agents|claude|course|progress)([._\- ]|$)",
+    r"private|id_rsa|id_ed25519|key|pem|agents|claude|course|progress)([._\- ]|$)",
     re.I,
 )
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -70,8 +81,6 @@ def _parts(path: str, *, directory: bool = False) -> list[str]:
         )
     ):
         raise _Refused("Path is not an allowed visible relative workspace path.")
-    if not directory and Path(parts[-1]).suffix.lower() not in {".md", ".txt"}:
-        raise _Refused("Only .md and .txt files are supported.")
     return parts
 
 
@@ -415,6 +424,28 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool]:
         """Replace a text file after approval, only if its SHA-256 revision still matches."""
         return write(ctx, path, content, expected_revision)
 
+    def read_file(path: str, limit: int = 16000, offset: int = 0) -> dict[str, Any]:
+        """Read a text file slice and whole-file SHA-256 revision."""
+        return workspace_read(path, limit=limit, offset=offset)
+
+    def list_directory(directory: str = "") -> dict[str, Any]:
+        """List safe text files and directories in one relative directory."""
+        return workspace_list(directory=directory)
+
+    def search_files(query: str, directory: str = "") -> dict[str, Any]:
+        """Find literal text in files in one relative directory."""
+        return workspace_search(query=query, directory=directory)
+
+    def write_file(ctx: RunContext[None], path: str, content: str) -> dict[str, Any] | ToolReturn:
+        """Create a new text file after approval. Rejects paths that already exist."""
+        return workspace_create(ctx, path, content)
+
+    def edit_file(
+        ctx: RunContext[None], path: str, content: str, expected_revision: str
+    ) -> dict[str, Any] | ToolReturn:
+        """Replace a text file after approval, only if its SHA-256 revision still matches."""
+        return workspace_update(ctx, path, content, expected_revision)
+
     return [
         Tool(fn)
         for fn in (
@@ -423,5 +454,10 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool]:
             workspace_search,
             workspace_create,
             workspace_update,
+            read_file,
+            write_file,
+            edit_file,
+            list_directory,
+            search_files,
         )
     ]

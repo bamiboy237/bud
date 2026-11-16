@@ -121,9 +121,14 @@ async def test_cancelling_dismisses_the_setup_and_not_the_active_accounts(setup_
         route = "/sessions/session/setup/github/cancel"
         assert (await client.post(route)).status_code == 401
         client.headers["Authorization"] = f"Bearer {token}"
-        assert (await client.post(route)).json()["status"] == "cancelled"
+        cancelled = await client.post(route)
+        assert cancelled.status_code == 200
+        assert cancelled.headers["cache-control"] == "no-store"
+        assert cancelled.json()["status"] == "cancelled"
         assert (await client.get("/sessions/session")).json()["pending_setup"] == []
-        assert (await client.post(route)).status_code == 200
+        idempotent = await client.post(route)
+        assert idempotent.status_code == 200
+        assert idempotent.headers["cache-control"] == "no-store"
     found.store.cancel_connect.assert_called_once_with("github")
     found.connect.assert_not_called()
     assert log.read("session")[-1].data["status"] == "cancelled"

@@ -44,6 +44,29 @@ struct HeldMessage: Identifiable {
     let scope: String
 }
 
+struct RunningTask: Identifiable, Equatable, Sendable {
+    let id: Int
+    let title: String
+    var status: String
+    var finishedAt: Date? = nil
+
+    var isWorking: Bool {
+        status == "running" || status == "queued" || status == "waiting"
+    }
+
+    var move: PetMove {
+        if status == "completed" || status == "done" {
+            return .done
+        } else if status == "failed" || status == "cancelled" {
+            return .failed
+        } else if status == "paused" {
+            return .idle
+        } else {
+            return .working
+        }
+    }
+}
+
 /// One thing bud did on the way to its reply, in plain words.
 struct Step: Identifiable, Equatable {
     /// The tool call it came from, and its place among that call's steps.
@@ -213,6 +236,9 @@ final class Companion {
     private(set) var retryingHeldMessage = false
     /// Short job milestones (started, needs you, finished). Progress notes never come here.
     var notices: [String] = []
+    /// Active background tasks/jobs and their helper pups (capped at max 4).
+    private(set) var activeTasks: [RunningTask] = []
+    var visiblePups: [RunningTask] { Array(activeTasks.prefix(4)) }
     /// Send to first streamed text, for the latency baseline.
     var lastFirstText: Duration?
 
@@ -245,12 +271,32 @@ final class Companion {
     /// A short gesture the pet plays over its status (a wave, a hop), then drops.
     @ObservationIgnored private var reaction: (move: PetMove, since: Date)?
     @ObservationIgnored private var reactionAtStatusStart: (move: PetMove, since: Date)?
+    @ObservationIgnored private nonisolated(unsafe) var activationObserver: (any NSObjectProtocol)?
+
+    init() {
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.refreshSetupStatus()
+            }
+        }
+    }
+
+    deinit {
+        if let activationObserver {
+            NotificationCenter.default.removeObserver(activationObserver)
+        }
+    }
 
     /// Connect (or reconnect after a settings change): handshake, primary session, snapshot, stream.
     func start() {
         generation += 1
         setupMonitor?.cancel()
         setupMonitor = nil
+        fastPollRemaining = 0
         batchTask?.cancel()
         approvingBatch = false
         deciding.removeAll()
@@ -258,6 +304,7 @@ final class Companion {
         setups = []
         updatingSetups = []
         setupProblems = [:]
+        activeTasks = []
         connection = nil
         let mine = generation
         handshake?.cancel()
@@ -386,8 +433,27 @@ final class Companion {
         setupProblems = setupProblems.filter { key, _ in setups.contains { $0.id == key } }
         let pending = snapshot["pending_approvals"] as? [[String: Any]] ?? []
         var jobs: [Int: String] = [:]
-        for task in snapshot["tasks"] as? [[String: Any]] ?? [] {
+        let rawTasks = snapshot["tasks"] as? [[String: Any]] ?? []
+        for task in rawTasks {
             if let id = task["task_id"] as? Int { jobs[id] = task["title"] as? String }
+        }
+        let now = Date()
+        activeTasks = rawTasks.compactMap { dict in
+            guard let id = dict["task_id"] as? Int,
+                  let status = dict["status"] as? String else { return nil }
+            if let existing = activeTasks.first(where: { $0.id == id }) {
+                if !["completed", "failed", "cancelled"].contains(status) {
+                    var updated = existing
+                    updated.status = status
+                    return updated
+                } else if let finishedAt = existing.finishedAt, now.timeIntervalSince(finishedAt) < 3.5 {
+                    return existing
+                }
+                return nil
+            }
+            if ["completed", "failed", "cancelled"].contains(status) { return nil }
+            let title = dict["title"] as? String ?? "Task \(id)"
+            return RunningTask(id: id, title: title.isEmpty ? "Task \(id)" : title, status: status)
         }
         approvals = pending.compactMap { Approval($0, jobs: jobs) }
         closeStaleInput()
@@ -425,6 +491,7 @@ final class Companion {
         guard var incoming = CapabilitySetup(data) else { return }
         if ["connected", "cancelled"].contains(incoming.status) {
             setups.removeAll { $0.id == incoming.id }
+            updatingSetups.remove(incoming.id)
             setupProblems.removeValue(forKey: incoming.id)
             return
         }
@@ -443,16 +510,20 @@ final class Companion {
         bubbleOpen = true
     }
 
+    @ObservationIgnored var fastPollRemaining = 0
+
     func connectSetup(_ setup: CapabilitySetup) {
         guard let connection, !updatingSetups.contains(setup.id) else { return }
+        setupProblems.removeValue(forKey: setup.id)
         if let url = setups.first(where: { $0.id == setup.id })?.url {
             if !NSWorkspace.shared.open(url) {
                 setupProblems[setup.id] = "Could not open your browser. Try again."
+            } else {
+                triggerFastPolling()
             }
             return
         }
         updatingSetups.insert(setup.id)
-        setupProblems.removeValue(forKey: setup.id)
         let mine = generation
         Task {
             do {
@@ -460,12 +531,16 @@ final class Companion {
                     "POST", "connections/\(setup.id)/connect", json: ["resume": true])
                 guard mine == generation else { return }
                 guard let url = CapabilitySetup.signInURL(result["url"] as? String) else {
-                    throw ConnectionError.http(0, "The sign-in link is unavailable. Try again.")
+                    setupProblems[setup.id] = "The sign-in link is unavailable. Try again."
+                    updatingSetups.remove(setup.id)
+                    return
                 }
                 if let index = setups.firstIndex(where: { $0.id == setup.id }) {
                     setups[index].url = url
                     if !NSWorkspace.shared.open(url) {
                         setupProblems[setup.id] = "Could not open your browser. Try again."
+                    } else {
+                        triggerFastPolling()
                     }
                 }
             } catch {
@@ -477,7 +552,9 @@ final class Companion {
     }
 
     func cancelSetup(_ setup: CapabilitySetup) {
-        guard let connection else { return }
+        guard let connection, !updatingSetups.contains(setup.id) else { return }
+        updatingSetups.insert(setup.id)
+        setupProblems.removeValue(forKey: setup.id)
         let mine = generation
         let route = "sessions/\(session)/setup/\(setup.id)/cancel"
         Task {
@@ -489,7 +566,13 @@ final class Companion {
                 guard mine == generation else { return }
                 setupProblems[setup.id] = "\(error)"
             }
+            updatingSetups.remove(setup.id)
         }
+    }
+
+    func triggerFastPolling() {
+        fastPollRemaining = 3
+        refreshSetupStatus()
     }
 
     func refreshSetupStatus() {
@@ -502,6 +585,7 @@ final class Companion {
         if setups.isEmpty {
             setupMonitor?.cancel()
             setupMonitor = nil
+            fastPollRemaining = 0
             return
         }
         guard setupMonitor == nil, let connection else { return }
@@ -513,8 +597,18 @@ final class Companion {
                         await refreshSetup(setup, connection: connection, generation: mine)
                     }
                 }
+                let delay: Duration
+                if fastPollRemaining > 1 {
+                    delay = .seconds(1)
+                    fastPollRemaining -= 1
+                } else if fastPollRemaining == 1 {
+                    delay = .seconds(2)
+                    fastPollRemaining = 0
+                } else {
+                    delay = .seconds(5)
+                }
                 do {
-                    try await Task.sleep(for: .seconds(5))
+                    try await Task.sleep(for: delay)
                 } catch {
                     break
                 }
@@ -525,16 +619,16 @@ final class Companion {
     private func refreshSetup(
         _ setup: CapabilitySetup, connection: BudConnection, generation mine: Int
     ) async {
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, setups.contains(where: { $0.id == setup.id }) else { return }
         do {
             let result = try await connection.send(
                 "POST", "sessions/\(session)/setup/\(setup.id)/check")
-            guard mine == generation, !Task.isCancelled else { return }
+            guard mine == generation, !Task.isCancelled, setups.contains(where: { $0.id == setup.id }) else { return }
             receiveSetup(result)
             setupProblems[setup.id] = result["status"] as? String == "failed"
                 ? result["reason"] as? String : nil
         } catch {
-            guard mine == generation, !Task.isCancelled else { return }
+            guard mine == generation, !Task.isCancelled, setups.contains(where: { $0.id == setup.id }) else { return }
             setupProblems[setup.id] = "\(error)"
         }
     }
@@ -1065,9 +1159,41 @@ final class Companion {
             closeSteps()
             activity = .idle
             refreshApprovals()
-        case "task.created", "task.completed", "task.failed", "task.cancelled", "task.paused":
+        case "task.created":
+            if let id = event.data["task_id"] as? Int {
+                let title = event.string("title")
+                if !activeTasks.contains(where: { $0.id == id }) {
+                    activeTasks.append(RunningTask(id: id, title: title.isEmpty ? "Task \(id)" : title, status: "running"))
+                }
+            }
             notice(event)
-            if event.type != "task.created" { refreshApprovals() }
+        case "task.completed":
+            if let id = event.data["task_id"] as? Int,
+               let index = activeTasks.firstIndex(where: { $0.id == id }) {
+                activeTasks[index].status = "completed"
+                activeTasks[index].finishedAt = .now
+                scheduleTaskRemoval(id: id, delay: 3.5)
+            }
+            notice(event)
+            refreshApprovals()
+        case "task.failed", "task.cancelled":
+            if let id = event.data["task_id"] as? Int,
+               let index = activeTasks.firstIndex(where: { $0.id == id }) {
+                activeTasks[index].status = event.type == "task.failed" ? "failed" : "cancelled"
+                activeTasks[index].finishedAt = .now
+                scheduleTaskRemoval(id: id, delay: 2.5)
+            } else if let id = event.data["task_id"] as? Int {
+                activeTasks.removeAll { $0.id == id }
+            }
+            notice(event)
+            refreshApprovals()
+        case "task.paused":
+            if let id = event.data["task_id"] as? Int,
+               let index = activeTasks.firstIndex(where: { $0.id == id }) {
+                activeTasks[index].status = "paused"
+            }
+            notice(event)
+            refreshApprovals()
         default:
             break
         }
@@ -1164,6 +1290,31 @@ final class Companion {
         settle = Task {
             try? await Task.sleep(for: .seconds(6))
             if !Task.isCancelled, activity == .done { activity = .idle }
+        }
+    }
+
+    private func scheduleTaskRemoval(id: Int, delay: Double) {
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int(delay * 1000)))
+            await MainActor.run {
+                self?.activeTasks.removeAll { $0.id == id }
+            }
+        }
+    }
+
+    func addTaskForTesting(id: Int, title: String = "Test job", status: String = "running") {
+        if let idx = activeTasks.firstIndex(where: { $0.id == id }) {
+            activeTasks[idx].status = status
+            activeTasks[idx].finishedAt = nil
+        } else {
+            activeTasks.append(RunningTask(id: id, title: title, status: status))
+        }
+    }
+
+    func completeTaskForTesting(id: Int) {
+        if let idx = activeTasks.firstIndex(where: { $0.id == id }) {
+            activeTasks[idx].status = "completed"
+            activeTasks[idx].finishedAt = .now
         }
     }
 

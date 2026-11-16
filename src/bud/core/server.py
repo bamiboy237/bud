@@ -563,7 +563,10 @@ def _create_app(
             raise HTTPException(404, "unknown setup card")
         card = setup_journal.pending(session_id).get(capability)
         if card is None:
-            return JSONResponse({"capability": capability, "status": "cancelled"})
+            return JSONResponse(
+                {"capability": capability, "status": "cancelled"},
+                headers={"Cache-Control": "no-store"},
+            )
         status = "cancelled"
         if connections is not None:
             name = {"calendar": "googlecalendar"}.get(capability, capability)
@@ -576,7 +579,7 @@ def _create_app(
                 status = "connected"
         data = {"capability": capability, "label": card.label, "status": status}
         hub.publish(session_id, "capability.status", data)
-        return JSONResponse(data)
+        return JSONResponse(data, headers={"Cache-Control": "no-store"})
 
     @app.get("/models")
     def list_models() -> list[dict]:

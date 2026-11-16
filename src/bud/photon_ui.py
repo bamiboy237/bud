@@ -34,6 +34,8 @@ def action_preview(approval: dict, *, decision: bool = True) -> str:
         "GOOGLECALENDAR_PATCH_EVENT": "Move this meeting?",
         "workspace_create": f"Create {target}?",
         "workspace_update": f"Replace the contents of {target}?",
+        "write_file": f"Create {target}?",
+        "edit_file": f"Replace the contents of {target}?",
     }
     title = titles.get(tool, tool.replace("_", " ").capitalize() + "?")
     if approval.get("reference"):
@@ -44,7 +46,12 @@ def action_preview(approval: dict, *, decision: bool = True) -> str:
         # Their full values remain bound to the proposal and available in terminal status.
         if key in ("expected_etag", "expected_revision"):
             continue
-        if key == "path" and tool in ("workspace_create", "workspace_update"):
+        if key == "path" and tool in (
+            "workspace_create",
+            "workspace_update",
+            "write_file",
+            "edit_file",
+        ):
             continue
         if key in ("content", "body", "message_body") and isinstance(value, str):
             details.append(value)

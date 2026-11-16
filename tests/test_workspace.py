@@ -168,3 +168,92 @@ def test_replayed_approval_does_not_redispatch_or_authorize_other_bytes(workspac
     replay_after_edit = tools["workspace_create"](approved(), "note.md", "approved bytes")
     assert result_of(replay_after_edit)["ok"] is False
     assert (root / "note.md").read_text() == "later edit"
+
+
+def test_general_text_files_supported(workspace):
+    root, tools = workspace
+    files = {
+        "script.py": "def hello():\n    return 'world'\n",
+        "config.json": '{"setting": true, "count": 42}',
+        "data.csv": "col1,col2\nval1,val2\n",
+        "run.sh": "#!/bin/sh\necho ok\n",
+    }
+    for idx, (path, content) in enumerate(files.items()):
+        created = tools["workspace_create"](approved(f"create-{idx}"), path, content)
+        assert result_of(created)["ok"] is True
+        assert (root / path).read_text() == content
+
+        read = tools["workspace_read"](path)
+        assert read["ok"] is True
+        assert read["text"] == content
+
+    assert tools["workspace_search"]("def hello")["matches"][0]["path"] == "script.py"
+    listing = tools["workspace_list"]()
+    assert listing["ok"] is True
+    found_paths = {entry["path"] for entry in listing["entries"]}
+    assert set(files.keys()).issubset(found_paths)
+
+
+def test_binary_content_refused(workspace):
+    root, tools = workspace
+    # NUL byte in content during write
+    result = tools["workspace_create"](approved(), "binary.dat", "hello\x00world")
+    assert result_of(result)["ok"] is False
+
+    # External file with NUL byte in workspace
+    (root / "binary.bin").write_bytes(b"some\x00data")
+    read = tools["workspace_read"]("binary.bin")
+    assert read["ok"] is False
+
+
+@pytest.mark.parametrize(
+    "secret_path",
+    [
+        ".env",
+        ".env.local",
+        "secrets.txt",
+        "api_token.json",
+        "id_rsa",
+        "server.key",
+        "cert.pem",
+        "credentials.yaml",
+        "sub/password.txt",
+        ".git/config",
+    ],
+)
+def test_secret_and_private_files_refused(workspace, secret_path):
+    root, tools = workspace
+    read = tools["workspace_read"](secret_path)
+    assert read["ok"] is False
+
+    create = tools["workspace_create"](approved(), secret_path, "secret content")
+    assert result_of(create)["ok"] is False
+
+
+def test_library_tool_names_and_exact_effect_ledger(workspace):
+    root, tools = workspace
+    # Test library tool names: write_file, read_file, edit_file, list_directory, search_files
+    created = tools["write_file"](approved("lib-app-1"), "code.py", "x = 10\n")
+    assert isinstance(created, ToolReturn)
+    assert created.return_value["ok"] is True
+    assert created.metadata["artifact"]["path"] == "code.py"
+    assert (root / "code.py").read_text() == "x = 10\n"
+
+    read = tools["read_file"]("code.py")
+    assert read["ok"] is True
+    assert read["text"] == "x = 10\n"
+    revision = read["revision"]
+
+    edited = tools["edit_file"](approved("lib-app-2"), "code.py", "x = 20\n", revision)
+    assert isinstance(edited, ToolReturn)
+    assert edited.return_value["ok"] is True
+    assert (root / "code.py").read_text() == "x = 20\n"
+
+    listing = tools["list_directory"]()
+    assert listing["ok"] is True
+    paths = [e["path"] for e in listing["entries"]]
+    assert "code.py" in paths
+
+    search = tools["search_files"]("x = 20")
+    assert search["ok"] is True
+    assert search["matches"][0]["path"] == "code.py"

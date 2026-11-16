@@ -31,22 +31,33 @@ import logging
 import math
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 import httpx
 from pydantic_ai import RunContext
-from pydantic_ai.capabilities import AbstractCapability, durable_operation
+from pydantic_ai.capabilities import durable_operation
 from pydantic_ai.messages import (
     InstructionPart,
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    SystemPromptPart,
     TextPart,
     ToolCallPart,
     UserPromptPart,
 )
 from pydantic_ai.models import ModelRequestContext
+from pydantic_ai_harness.detect_loops import (
+    DetectedLoop,
+    DetectLoops,
+)
+from pydantic_ai_harness.detect_loops._capability import (
+    _CHANGE_APPROACH,
+    _NUDGE_ORIGIN,
+    _model_facing,
+    _record_results,
+)
 
 from bud.harness.review import DECISIONS_URL
 
@@ -274,11 +285,20 @@ def work_tools_off(request_context: ModelRequestContext) -> ModelRequestContext:
     job's finish_job) keeps only that tool; any other run is told to answer in text."""
     params = request_context.model_request_parameters
     if params.output_tools and not params.allow_text_output:
-        return replace(request_context, model_request_parameters=replace(params, function_tools=[]))
-    return replace(
-        request_context,
-        model_settings=(request_context.model_settings or {}) | {"tool_choice": "none"},
-    )
+        if hasattr(params, "__dataclass_fields__"):
+            params = replace(params, function_tools=[])
+        else:
+            params.function_tools = []
+        if hasattr(request_context, "__dataclass_fields__"):
+            return replace(request_context, model_request_parameters=params)
+        request_context.model_request_parameters = params
+        return request_context
+
+    settings = (request_context.model_settings or {}) | {"tool_choice": "none"}
+    if hasattr(request_context, "__dataclass_fields__"):
+        return replace(request_context, model_settings=settings)
+    request_context.model_settings = settings
+    return request_context
 
 
 def paused_in(messages: Sequence[ModelMessage]) -> dict[str, Any] | None:
@@ -288,6 +308,18 @@ def paused_in(messages: Sequence[ModelMessage]) -> dict[str, Any] | None:
             for note in _marks(message):
                 if note.get("phase") == "pause":
                     return note
+        elif isinstance(message, ModelRequest):
+            for part in message.parts:
+                if (
+                    isinstance(part, SystemPromptPart)
+                    and isinstance(part.metadata, dict)
+                    and part.metadata.get("phase") == "pause"
+                ):
+                    return {
+                        "phase": "pause",
+                        "kind": part.metadata.get("pattern", "loop"),
+                        "detail": str(part.content),
+                    }
     return None
 
 
@@ -473,85 +505,240 @@ HANDOFF = (
 )
 
 
+def steps_from_messages(messages: Sequence[ModelMessage]) -> list[Step]:
+    calls: dict[str, ToolCallPart] = {}
+    results: dict[str, str] = {}
+    for message in messages:
+        if isinstance(message, ModelResponse):
+            for part in message.parts:
+                if isinstance(part, ToolCallPart):
+                    calls[part.tool_call_id] = part
+        elif isinstance(message, ModelRequest):
+            for part in message.parts:
+                if part.part_kind in ("tool-return", "retry-prompt"):
+                    call_id = getattr(part, "tool_call_id", None)
+                    if call_id:
+                        results[call_id] = _content_text(getattr(part, "content", ""))
+    steps: list[Step] = []
+    for call_id, part in calls.items():
+        if call_id in results:
+            result = results[call_id]
+            args = _canonical_args(part)
+            steps.append(
+                Step(
+                    tool=part.tool_name,
+                    call=_digest(f"{part.tool_name}\0{args}"),
+                    result=_digest(result),
+                    args=args,
+                    shown=result[:SUMMARY_FIELD_CHARS].replace("\n", " "),
+                )
+            )
+    return steps
+
+
 @dataclass(kw_only=True)
-class SpiralGuard(AbstractCapability[None]):
+class SpiralGuard(DetectLoops[None]):
     config: SpiralConfig
     report: LoopReport
     judge: ProgressJudge | None = None
     id: str | None = "bud_spiral_guard"
 
+    _judged: dict[str, int] = field(default_factory=dict, init=False, repr=False, compare=False)
+    _nudged: bool = field(default=False, init=False, repr=False, compare=False)
+    _paused: bool = field(default=False, init=False, repr=False, compare=False)
+    _requests_count: int = field(default=0, init=False, repr=False, compare=False)
+    _nudge_fingerprint: str | None = field(default=None, init=False, repr=False, compare=False)
+    _last_loop_pattern: str | None = field(default=None, init=False, repr=False, compare=False)
+    _last_loop_message: str | None = field(default=None, init=False, repr=False, compare=False)
+
     def __post_init__(self) -> None:
-        self._judged: dict[str, int] = {}
+        self.repeated_result_threshold = self.config.repeat_note
+        self.alternating_calls_threshold = self.config.cycle_repeats
+        self.repeated_text_threshold = self.config.chant_repeats
+        self.repeated_call_threshold = max(self.config.repeat_pause, self.config.repeat_note + 1)
+        self.window = max(
+            20,
+            (self.alternating_calls_threshold or 2) * 4,
+            (self.config.repeat_pause or 2) * 2,
+        )
+        super().__post_init__()
+
+    async def for_run(self, ctx: RunContext[None]) -> "SpiralGuard":
+        fresh = replace(self)
+        fresh._judged = dict(self._judged)
+        fresh._nudged = False
+        fresh._paused = False
+        fresh._requests_count = 0
+        fresh._nudge_fingerprint = None
+        fresh._last_loop_pattern = None
+        fresh._last_loop_message = None
+        fresh._steps = []
+        fresh._results_pending = False
+        fresh._counted_steps = 0
+        return fresh
 
     async def before_model_request(
         self, ctx: RunContext[None], request_context: ModelRequestContext
     ) -> ModelRequestContext:
         if not self.config.enabled:
             return request_context
-        messages = request_context.messages
-        state = read_state(ctx.run_id, messages, self.config.chant_min_chars)
-        if state.paused:
-            # The handoff is being written (or a retry of it): keep tools off.
+        if self._paused:
             return self._tools_off(request_context)
-        noted = state.notes[-1] if state.notes else None
-        detection = self._detect(state, noted)
-        if detection is None:
-            detection = await self._progress(ctx, messages, state)
-        if detection is None:
-            return request_context
-        if noted is None:
-            self._write(ctx, messages, state, detection, phase="note", text=NOTE_TEXT)
-            return request_context
-        self._write(ctx, messages, state, detection, phase="pause", text=PAUSE_TEXT)
-        self.report(
-            {
-                "run_id": ctx.run_id,
-                "kind": detection.kind,
-                "detail": detection.detail,
-                **(
-                    {"confidence": detection.confidence} if detection.confidence is not None else {}
-                ),
-            }
-        )
-        return self._tools_off(request_context)
 
-    def _detect(self, state: RunState, noted: dict[str, Any] | None) -> Detection | None:
-        steps_before = noted["steps"] if noted is not None else None
-        request_before = noted["request"] if noted is not None else None
-        return (
-            detect_repeat(state.steps, self.config, steps_before)
-            or detect_cycle(state.steps, self.config, steps_before)
-            or detect_chanting(state.sentences, self.config, request_before)
+        self._requests_count += 1
+
+        if self._results_pending:
+            _record_results(self._steps[-1], request_context.messages)
+            self._results_pending = False
+
+        loop = self._detect_loop()
+        if loop is not None:
+            self._counted_steps = len(self._steps)
+            await self._act(ctx, loop)
+
+        if self._paused:
+            return self._tools_off(request_context)
+
+        progress_detection = await self._progress(ctx, request_context.messages)
+        if progress_detection is not None:
+            if not self._nudged:
+                self._nudged = True
+                self._last_loop_pattern = progress_detection.kind
+                self._last_loop_message = progress_detection.detail
+                message = f"Self-check: {progress_detection.detail} {_CHANGE_APPROACH}"
+                ctx.enqueue(
+                    SystemPromptPart(
+                        message,
+                        metadata={
+                            "origin": _NUDGE_ORIGIN,
+                            "pattern": progress_detection.kind,
+                            "phase": "nudge",
+                        },
+                    )
+                )
+            else:
+                self._paused = True
+                self._last_loop_pattern = progress_detection.kind
+                self._last_loop_message = progress_detection.detail
+                self.report(
+                    {
+                        "run_id": ctx.run_id,
+                        "kind": progress_detection.kind,
+                        "detail": progress_detection.detail,
+                        **(
+                            {"confidence": progress_detection.confidence}
+                            if progress_detection.confidence is not None
+                            else {}
+                        ),
+                    }
+                )
+                return self._tools_off(request_context)
+
+        return request_context
+
+    def _detect_loop(self) -> DetectedLoop | None:
+        loop = self._detect(self._steps[self._counted_steps :])
+        if loop is not None:
+            return loop
+        if self._nudged and self._nudge_fingerprint:
+            recent = [call for step in self._steps for call in step.calls][-self.window :]
+            streaks: dict[str, tuple[str | None, int]] = {}
+            for call in recent:
+                previous, streak = streaks.get(call.fingerprint, (None, 0))
+                same = call.result is not None and call.result == previous
+                streaks[call.fingerprint] = (call.result, streak + 1 if same else 1)
+            for call in reversed(recent):
+                if call.fingerprint == self._nudge_fingerprint:
+                    _, streak = streaks[call.fingerprint]
+                    if streak >= self.config.repeat_pause:
+                        return DetectedLoop(
+                            pattern="repeated_result",
+                            tool_names=(call.tool_name,),
+                            count=streak,
+                            window=len(recent),
+                            fingerprints=(call.fingerprint,),
+                            message=(
+                                f"Your last {streak} calls to `{_model_facing(call.tool_name)}` "
+                                "used the same arguments and returned the same result, so "
+                                f"calling it again will not change the outcome. {_CHANGE_APPROACH}"
+                            ),
+                        )
+        return None
+
+    async def _act(self, ctx: RunContext[None], loop: DetectedLoop) -> None:
+        self._last_loop_pattern = loop.pattern
+        self._last_loop_message = loop.message
+        if not self._nudged:
+            self._nudged = True
+            if loop.fingerprints:
+                self._nudge_fingerprint = loop.fingerprints[0]
+            metadata = {
+                "origin": _NUDGE_ORIGIN,
+                "pattern": loop.pattern,
+                "tool_names": list(loop.tool_names),
+                "phase": "nudge",
+            }
+            ctx.enqueue(SystemPromptPart(loop.message, metadata=metadata))
+        else:
+            self._paused = True
+            self.report(
+                {
+                    "run_id": ctx.run_id,
+                    "kind": loop.pattern,
+                    "detail": loop.message,
+                    "tool_names": list(loop.tool_names),
+                }
+            )
+
+    async def after_model_request(
+        self,
+        ctx: RunContext[None],
+        *,
+        request_context: ModelRequestContext,
+        response: ModelResponse,
+    ) -> ModelResponse:
+        res = await super().after_model_request(
+            ctx, request_context=request_context, response=response
         )
+        if self._paused:
+            mark = {
+                "phase": "pause",
+                "kind": self._last_loop_pattern or "loop",
+                "detail": self._last_loop_message or "Run paused due to loop detection.",
+            }
+            notes = _marks(res)
+            notes.append(mark)
+            res.metadata = {**(res.metadata or {}), MARK: {"notes": notes}}
+        return res
 
     async def _progress(
-        self, ctx: RunContext[None], messages: Sequence[ModelMessage], state: RunState
+        self, ctx: RunContext[None], messages: Sequence[ModelMessage]
     ) -> Detection | None:
         run_id = ctx.run_id or ""
+        req_text = owner_request(messages)
         if (
             self.judge is None
-            or not state.request_text
-            or not judge_due(state.requests, self.config)
-            or self._judged.get(run_id) == state.requests
+            or not req_text
+            or not judge_due(self._requests_count, self.config)
+            or self._judged.get(run_id) == self._requests_count
         ):
             return None
         if len(self._judged) > 256:
             self._judged.clear()
-        self._judged[run_id] = state.requests
-        probability = await self._ask(
-            ctx, state.request_text, step_log(state.steps), len(state.steps)
-        )
+        self._judged[run_id] = self._requests_count
+        steps = steps_from_messages(messages)
+        probability = await self._ask(ctx, req_text, step_log(steps), len(steps))
         logger.info(
             "progress check in run %s after %d requests: probability of progress %s",
             run_id,
-            state.requests,
+            self._requests_count,
             "unavailable" if probability is None else f"{probability:.2f}",
         )
         if probability is None or probability >= self.config.progress_threshold:
             return None
         return Detection(
             "no_progress",
-            f"a progress check after {state.requests} model requests judged that the run is "
+            f"a progress check after {self._requests_count} model requests judged that the run is "
             f"not moving toward the request (probability of progress {probability:.2f}).",
             confidence=round(1 - probability, 2),
         )
@@ -568,49 +755,16 @@ class SpiralGuard(AbstractCapability[None]):
         """Disable tools and ask for the handoff. Only the paused run's last requests see this."""
         params = request_context.model_request_parameters
         report = bool(params.output_tools) and not params.allow_text_output
+        handoff_prompt = JOB_HANDOFF if report else HANDOFF
         if params.instruction_parts is not None:
-            note = InstructionPart(content=JOB_HANDOFF if report else HANDOFF, dynamic=True)
-            params = replace(
-                params, instruction_parts=InstructionPart.sorted([*params.instruction_parts, note])
-            )
-        return work_tools_off(replace(request_context, model_request_parameters=params))
-
-    @staticmethod
-    def _write(
-        ctx: RunContext[None],
-        messages: Sequence[ModelMessage],
-        state: RunState,
-        detection: Detection,
-        *,
-        phase: str,
-        text: str,
-    ) -> None:
-        """Put the note in the assistant's last message, where the model reads it as its own.
-
-        It is a leading text part of that message, never a user prompt: an earlier bud note
-        in the owner's voice was once mistaken for the owner's own words. The message is
-        edited in place so the note stays in the run's history and in its saved reply.
-        """
-        response = next(
-            (
-                m
-                for m in reversed(messages)
-                if isinstance(m, ModelResponse) and m.run_id == ctx.run_id
-            ),
-            None,
-        )
-        if response is None:
-            return
-        note = text.format(detail=detection.detail[:300].rstrip())
-        mark = {
-            "phase": phase,
-            "kind": detection.kind,
-            "detail": detection.detail,
-            "text": note,
-            "steps": len(state.steps),
-            "request": state.requests,
-        }
-        existing = (response.metadata or {}).get(MARK)
-        notes = [*existing["notes"], mark] if isinstance(existing, dict) else [mark]
-        response.metadata = {**(response.metadata or {}), MARK: {"notes": notes}}
-        response.parts = [TextPart(note), *response.parts]
+            note = InstructionPart(content=handoff_prompt, dynamic=True)
+            new_parts = InstructionPart.sorted([*params.instruction_parts, note])
+            if hasattr(params, "__dataclass_fields__"):
+                params = replace(params, instruction_parts=new_parts)
+            else:
+                params.instruction_parts = new_parts
+        if hasattr(request_context, "__dataclass_fields__"):
+            request_context = replace(request_context, model_request_parameters=params)
+        else:
+            request_context.model_request_parameters = params
+        return work_tools_off(request_context)

@@ -39,7 +39,7 @@ final class ConversationWindow: NSObject, NSWindowDelegate {
         let companion = Companion.shared
         companion.windowOpen = false
         // Back to the bubble, with whatever bud last said or still needs.
-        companion.bubbleOpen = !companion.shown.isEmpty || !companion.approvals.isEmpty
+        companion.bubbleOpen = !companion.shown.isEmpty || companion.needsAttention
     }
 
     private func make() -> NSWindow {
