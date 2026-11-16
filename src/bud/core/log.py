@@ -21,6 +21,7 @@ from bud.core.projection import (
     queue_paused,
     queued_messages,
     runs,
+    setup_status_version,
     snapshot,
     undecided_approvals,
     unreported_job_news,
@@ -125,20 +126,12 @@ class EventLog:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             events = self._read(db, session_id)
-            latest = next(
-                (
-                    event
-                    for event in reversed(events)
-                    if event.type in ("capability.setup", "capability.status")
-                    and event.data.get("capability") == data["capability"]
-                ),
-                None,
-            )
+            version = setup_status_version(events, data["capability"])
             current = next(
                 (card for card in pending_setups(events) if card.capability == data["capability"]),
                 None,
             )
-            if latest is None or latest.id != expected_event or current is None:
+            if version is None or version != expected_event or current is None:
                 return False
             if (current.status, current.reason) != (data["status"], data.get("reason")):
                 self._insert(db, session_id, "capability.status", data, once=True, key=key)

@@ -197,6 +197,19 @@ def pause_reason(events: list[Event]) -> str | None:
     return last.data.get("reason", "owner")
 
 
+def setup_status_version(events: list[Event], capability: str) -> str | None:
+    """The last event that changed one setup card, used for status compare-and-set."""
+    return next(
+        (
+            event.id
+            for event in reversed(events)
+            if event.type in ("capability.setup", "capability.status")
+            and event.data.get("capability") == capability
+        ),
+        None,
+    )
+
+
 def pending_setups(events: list[Event]) -> list[PendingSetup]:
     """Fold capability cards: one per capability, kept until it connects.
 

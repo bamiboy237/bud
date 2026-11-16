@@ -270,7 +270,7 @@ class Runner(DBOSConfiguredInstance):
             self._drain(session_id)
         if self.work_items is not None:
             for item in self.work_items.items():
-                self.work_items.publish(item.session_id)
+                self._publish_task(item.session_id)
 
     def _inputs(
         self,

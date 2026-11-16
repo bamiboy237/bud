@@ -23,7 +23,7 @@ from bud.composio.binding import ConnectionError, valid_toolkit
 from bud.composio.connection import Connections
 from bud.core.events import EventType
 from bud.core.hub import Hub
-from bud.core.projection import PendingSetup, pending_setups
+from bud.core.projection import PendingSetup, pending_setups, setup_status_version
 
 SetupState = Literal["waiting", "connected", "failed"]
 
@@ -122,15 +122,7 @@ class SetupJournal:
         return {card.capability: card for card in pending_setups(events)}
 
     def status_version(self, session_id: str, capability: str) -> str | None:
-        return next(
-            (
-                event.id
-                for event in reversed(self._live.log.read(session_id))
-                if event.type in ("capability.setup", "capability.status")
-                and event.data.get("capability") == capability
-            ),
-            None,
-        )
+        return setup_status_version(self._live.log.read(session_id), capability)
 
     def update_status(
         self, session_id: str, data: dict[str, Any], version: str | None, *, key: str

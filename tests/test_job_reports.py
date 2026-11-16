@@ -3,6 +3,7 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -79,6 +80,39 @@ async def test_a_finished_job_is_reported_without_a_new_message(tmp_path):
     assert [e.data["text"] for e in events if e.type == "user.message"] == [
         "When does my lease renew?"
     ]
+
+
+@pytest.mark.parametrize("failed", [False, True])
+async def test_recovery_reports_job_that_ended_before_notice_was_published(
+    tmp_path, monkeypatch, failed
+):
+    prompts: list[str] = []
+    base_model = bud_with_one_job(prompts)
+
+    def model(messages, info):
+        if failed and any(tool.name == "finish_job" for tool in info.output_tools):
+            raise RuntimeError("Synthetic worker failure")
+        return base_model(messages, info)
+
+    async with running_bud(tmp_path, model, jobs=True) as bud:
+        monkeypatch.setattr(bud.runner, "_publish_task", lambda _: None)
+        bud.log.append("owner", "session.created")
+        bud.runner.start("owner", "When does my lease renew?", "message-1")
+        await bud.settle()
+        assert not any(
+            event.type in ("task.completed", "task.failed") for event in bud.log.read("owner")
+        )
+
+    async with running_bud(tmp_path, model, jobs=True) as bud:
+        await bud.runner.recover()
+        await asyncio.sleep(0)
+        await bud.settle()
+        events = bud.log.read("owner")
+        expected = "task.failed" if failed else "task.completed"
+        assert any(event.type == expected for event in events)
+        triggers = [event.data["trigger"] for event in events if event.type == "run.queued"]
+        assert triggers == ["message", "job"]
+        assert prompts[-1].startswith(JOB_REPORT)
 
 
 async def test_the_next_message_does_not_repeat_a_reported_job(tmp_path):
