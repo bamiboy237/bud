@@ -140,9 +140,7 @@ struct SetupTests {
     }
 
     @Test
-    func pupSpriteLoadsAndChildPupsAreCappedAtFour() {
-        let pup = PetSprite.named("pup")
-        #expect(pup != nil)
+    func childPupsAreCappedAtFour() {
         let companion = Companion()
         companion.apply(snapshot: [
             "last_seq": 1,

@@ -24,7 +24,7 @@ struct PupSpriteTests {
         #expect(data["id"] as? String == "pup")
         #expect(data["spritesheetPath"] as? String == "spritesheet.png")
 
-        let sprite = try #require(PetSprite.named("pup"))
+        let sprite = try #require(PetSprite.loadCodex(pupFolder))
         #expect(sprite.cell == CGSize(width: 192, height: 208))
 
         let start = Date(timeIntervalSince1970: 1000)

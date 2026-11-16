@@ -143,12 +143,6 @@ final class PetSprite {
         if let resources = Bundle.main.resourceURL {
             found.append(resources.appending(path: "pets/\(id)"))
         }
-        let dev = URL(filePath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appending(path: "Resources/pets/\(id)")
-        found.append(dev)
         return found
     }
 
@@ -169,7 +163,7 @@ final class PetSprite {
     }
 
     /// The Codex format: rows in a fixed order, each a loop with a held last frame.
-    private static func loadCodex(_ folder: URL) -> PetSprite? {
+    static func loadCodex(_ folder: URL) -> PetSprite? {
         guard let manifest = json(folder.appending(path: "pet.json")),
               let path = manifest["spritesheetPath"] as? String,
               let sheet = image(named: path, in: folder),
