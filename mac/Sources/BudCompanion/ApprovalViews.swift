@@ -174,13 +174,22 @@ struct ApprovalDeck: View {
             }
 
             if let activeApproval = currentApproval {
-                InteractiveApprovalCard(
-                    companion: companion,
-                    approval: activeApproval,
-                    onDecide: { approved in
-                        handleDecision(approval: activeApproval, approved: approved)
+                Group {
+                    if activeApproval.isQuestion {
+                        ApprovalCard(
+                            companion: companion, approval: activeApproval,
+                            nested: false, showsHeading: true
+                        )
+                    } else {
+                        InteractiveApprovalCard(
+                            companion: companion,
+                            approval: activeApproval,
+                            onDecide: { approved in
+                                handleDecision(approval: activeApproval, approved: approved)
+                            }
+                        )
                     }
-                )
+                }
                 .id(activeApproval.id)
                 .offset(x: deck.flyOffset, y: 0)
                 .rotationEffect(.degrees(deck.flyRotation))
