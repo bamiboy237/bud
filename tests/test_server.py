@@ -149,7 +149,9 @@ class ServerProcess:
                 )
                 and not state["run_active"]
                 and not state["pending_approvals"]
-                and not unreported_job_news(log.read(session))
+                and not unreported_job_news(
+                    [event for event in log.read(session) if event.seq <= state["last_seq"]]
+                )
             ):
                 return state
             return None
