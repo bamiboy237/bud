@@ -1,381 +1,152 @@
-from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock
+"""Spiral detection through a real agent run: nudge once, then pause with tools off."""
 
-import pytest
-from pydantic_ai import RunContext
-from pydantic_ai.messages import (
-    ModelRequest,
-    ModelResponse,
-    SystemPromptPart,
-    TextPart,
-    ToolCallPart,
-    ToolReturnPart,
-    UserPromptPart,
-)
-from pydantic_ai.models.test import TestModel
-from pydantic_ai.usage import RunUsage
+import json
+from itertools import count
+
+from pydantic_ai import Agent
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from bud.harness.spiral import (
-    ProgressJudge,
+    NUDGE,
     SpiralConfig,
     SpiralGuard,
+    loop_detector,
+    marks,
     paused_in,
 )
+from tests.runner_support import reply, running_bud
+
+HANDOFF_TEXT = "Done: nothing. Stuck on: the report. Next step: ask the owner."
 
 
-def now():
-    return datetime.now(UTC)
+def scripted(
+    results: list[str],
+    config: SpiralConfig,
+    reports: list[dict],
+    *,
+    judge=None,
+    until: int | None = None,
+) -> tuple[Agent[None, str], list[int]]:
+    """An agent that calls `check` until its tools are off, or `until` calls have run."""
+    calls: list[int] = []
+    ids = count()
 
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if (info.model_settings or {}).get("tool_choice") == "none":
+            return ModelResponse(parts=[TextPart(HANDOFF_TEXT)])
+        if until is not None and len(calls) >= until:
+            return ModelResponse(parts=[TextPart("ready")])
+        return ModelResponse(parts=[ToolCallPart("check", {}, tool_call_id=f"c{next(ids)}")])
 
-def make_ctx(run_id="run-1"):
-    return RunContext(
-        deps=None,
-        model=TestModel(),
-        usage=RunUsage(),
-        run_id=run_id,
-        pending_messages=[],
+    agent = Agent(
+        FunctionModel(model),
+        output_type=str,
+        capabilities=[
+            loop_detector(config, reports.append),
+            SpiralGuard(config=config, report=reports.append, judge=judge),
+        ],
     )
 
+    @agent.tool_plain
+    def check() -> str:
+        calls.append(len(calls))
+        return results[min(len(calls) - 1, len(results) - 1)]
 
-@pytest.mark.asyncio
-async def test_repeat_calls_triggers_system_prompt_nudge_without_hidden_note():
-    reported = []
-    config = SpiralConfig(repeat_note=2, repeat_pause=3)
-    guard = SpiralGuard(config=config, report=reported.append)
-
-    ctx = make_ctx()
-    req1 = ModelRequest(parts=[UserPromptPart(content="inspect files")])
-
-    # Step 1: Tool call
-    resp1 = ModelResponse(
-        parts=[ToolCallPart(tool_name="read_file", args={"path": "a.txt"}, tool_call_id="c1")],
-        timestamp=now(),
-    )
-    await guard.after_model_request(
-        ctx,
-        request_context=MagicMock(),
-        response=resp1,
-    )
-
-    req2 = ModelRequest(
-        parts=[
-            ToolReturnPart(tool_name="read_file", content="hello", tool_call_id="c1"),
-        ]
-    )
-    req_ctx2 = MagicMock()
-    req_ctx2.messages = [req1, resp1, req2]
-    req_ctx2.model_request_parameters.instruction_parts = []
-    req_ctx2.model_request_parameters.output_tools = []
-    req_ctx2.model_request_parameters.allow_text_output = True
-    req_ctx2.model_settings = {}
-
-    await guard.before_model_request(ctx, req_ctx2)
-    assert not guard._nudged
-
-    # Step 2: Same tool call and same result
-    resp2 = ModelResponse(
-        parts=[ToolCallPart(tool_name="read_file", args={"path": "a.txt"}, tool_call_id="c2")],
-        timestamp=now(),
-    )
-    await guard.after_model_request(ctx, request_context=MagicMock(), response=resp2)
-
-    req3 = ModelRequest(
-        parts=[
-            ToolReturnPart(tool_name="read_file", content="hello", tool_call_id="c2"),
-        ]
-    )
-    req_ctx3 = MagicMock()
-    req_ctx3.messages = [req1, resp1, req2, resp2, req3]
-    req_ctx3.model_request_parameters.instruction_parts = []
-    req_ctx3.model_request_parameters.output_tools = []
-    req_ctx3.model_request_parameters.allow_text_output = True
-    req_ctx3.model_settings = {}
-
-    await guard.before_model_request(ctx, req_ctx3)
-
-    # First loop triggers nudge
-    assert guard._nudged is True
-    assert guard._paused is False
-    assert len(reported) == 0
-
-    # Verify nudge was enqueued as SystemPromptPart
-    enqueued_parts = [
-        part for pending in ctx.pending_messages for msg in pending.messages for part in msg.parts
-    ]
-    system_parts = [p for p in enqueued_parts if isinstance(p, SystemPromptPart)]
-    assert len(system_parts) >= 1
-    assert system_parts[0].metadata.get("phase") == "nudge"
-    assert "read_file" in system_parts[0].content
-
-    # Crucial invariant: ModelResponse was NOT modified with hidden notes
-    for part in resp2.parts:
-        if isinstance(part, TextPart):
-            assert "Self-check" not in part.content
+    return agent, calls
 
 
-@pytest.mark.asyncio
-async def test_second_loop_triggers_pause_and_loop_detected_report():
-    reported = []
-    config = SpiralConfig(repeat_note=2, repeat_pause=3)
-    guard = SpiralGuard(config=config, report=reported.append)
-    ctx = make_ctx()
-
-    req1 = ModelRequest(parts=[UserPromptPart(content="inspect files")])
-
-    # Call 1
-    resp1 = ModelResponse(
-        parts=[ToolCallPart(tool_name="read_file", args={"path": "a.txt"}, tool_call_id="c1")],
-        timestamp=now(),
-    )
-    await guard.after_model_request(ctx, request_context=MagicMock(), response=resp1)
-
-    req2 = ModelRequest(
-        parts=[ToolReturnPart(tool_name="read_file", content="hello", tool_call_id="c1")]
-    )
-    req_ctx2 = MagicMock()
-    req_ctx2.messages = [req1, resp1, req2]
-    req_ctx2.model_request_parameters.instruction_parts = []
-    req_ctx2.model_request_parameters.output_tools = []
-    req_ctx2.model_request_parameters.allow_text_output = True
-    req_ctx2.model_settings = {}
-    await guard.before_model_request(ctx, req_ctx2)
-
-    # Call 2 -> Nudge
-    resp2 = ModelResponse(
-        parts=[ToolCallPart(tool_name="read_file", args={"path": "a.txt"}, tool_call_id="c2")],
-        timestamp=now(),
-    )
-    await guard.after_model_request(ctx, request_context=MagicMock(), response=resp2)
-
-    req3 = ModelRequest(
-        parts=[ToolReturnPart(tool_name="read_file", content="hello", tool_call_id="c2")]
-    )
-    req_ctx3 = MagicMock()
-    req_ctx3.messages = [req1, resp1, req2, resp2, req3]
-    req_ctx3.model_request_parameters.instruction_parts = []
-    req_ctx3.model_request_parameters.output_tools = []
-    req_ctx3.model_request_parameters.allow_text_output = True
-    req_ctx3.model_settings = {}
-    await guard.before_model_request(ctx, req_ctx3)
-    assert guard._nudged is True
-    assert guard._paused is False
-
-    # Call 3 (streak reaches repeat_pause = 3) -> Pause!
-    resp3 = ModelResponse(
-        parts=[ToolCallPart(tool_name="read_file", args={"path": "a.txt"}, tool_call_id="c3")],
-        timestamp=now(),
-    )
-    await guard.after_model_request(ctx, request_context=MagicMock(), response=resp3)
-
-    req4 = ModelRequest(
-        parts=[ToolReturnPart(tool_name="read_file", content="hello", tool_call_id="c3")]
-    )
-    req_ctx4 = MagicMock()
-    req_ctx4.messages = [req1, resp1, req2, resp2, req3, resp3, req4]
-    req_ctx4.model_request_parameters.instruction_parts = []
-    req_ctx4.model_request_parameters.output_tools = []
-    req_ctx4.model_request_parameters.allow_text_output = True
-    req_ctx4.model_settings = {}
-
-    res_ctx = await guard.before_model_request(ctx, req_ctx4)
-
-    assert guard._paused is True
-    assert len(reported) == 1
-    assert reported[0]["run_id"] == "run-1"
-    assert reported[0]["kind"] == "repeated_result"
-
-    # Work tools must be turned off
-    assert res_ctx.model_settings["tool_choice"] == "none"
-
-    # Handoff response is recorded with pause metadata
-    handoff_text = "Done: verified a.txt\nStuck on: loop\nNext: check b.txt"
-    handoff_resp = ModelResponse(parts=[TextPart(handoff_text)])
-    await guard.after_model_request(ctx, request_context=MagicMock(), response=handoff_resp)
-
-    pause_record = paused_in([handoff_resp])
-    assert pause_record is not None
-    assert pause_record["phase"] == "pause"
+def nudges(messages: list[ModelMessage]) -> list[dict]:
+    return [mark for mark in marks(messages) if mark["origin"] == NUDGE]
 
 
-@pytest.mark.asyncio
-async def test_polling_with_changing_results_does_not_trigger_loop():
-    reported = []
-    # Configure high repeated_call_threshold so call count alone doesn't flag polling
-    config = SpiralConfig(repeat_note=2, repeat_pause=3)
-    guard = SpiralGuard(config=config, report=reported.append)
-    guard.repeated_call_threshold = 10
-    ctx = make_ctx()
+async def test_a_repeated_result_is_nudged_then_paused_with_a_handoff():
+    reports: list[dict] = []
+    agent, calls = scripted(["pending"], SpiralConfig(repeat_note=2), reports)
 
-    history = [ModelRequest(parts=[UserPromptPart(content="poll status")])]
-    for i in range(1, 4):
-        resp = ModelResponse(
-            parts=[ToolCallPart(tool_name="check_status", args={"page": i}, tool_call_id=f"c{i}")],
-            timestamp=now(),
-        )
-        await guard.after_model_request(ctx, request_context=MagicMock(), response=resp)
+    result = await agent.run("Get me the report.")
 
-        req = ModelRequest(
-            parts=[
-                ToolReturnPart(
-                    tool_name="check_status",
-                    content=f"status_progress_{i}",  # Result changes each time!
-                    tool_call_id=f"c{i}",
-                )
-            ]
-        )
-        history.extend([resp, req])
-        req_ctx = MagicMock()
-        req_ctx.messages = list(history)
-        req_ctx.model_request_parameters.instruction_parts = []
-        req_ctx.model_request_parameters.output_tools = []
-        req_ctx.model_request_parameters.allow_text_output = True
-        req_ctx.model_settings = {}
-
-        await guard.before_model_request(ctx, req_ctx)
-
-    assert not guard._nudged
-    assert not guard._paused
-    assert len(reported) == 0
+    assert result.output == HANDOFF_TEXT
+    # Two identical results raise the nudge; two more after it pause the run.
+    assert len(calls) == 4
+    assert [n["kind"] for n in nudges(result.all_messages())] == ["repeated_result"]
+    pause = paused_in(result.all_messages())
+    assert pause is not None and pause["kind"] == "repeated_result"
+    assert [r["kind"] for r in reports] == ["repeated_result"]
+    assert reports[0]["run_id"] == result.run_id
 
 
-@pytest.mark.asyncio
-async def test_loop_state_resets_on_continuation_run():
-    config = SpiralConfig(repeat_note=2, repeat_pause=3)
-    guard = SpiralGuard(config=config, report=lambda _: None)
+async def test_polling_with_changing_results_is_not_a_loop():
+    reports: list[dict] = []
+    pending = [f"pending {i}" for i in range(10)]
+    agent, calls = scripted(pending, SpiralConfig(repeat_note=2), reports, until=7)
 
-    # Simulate run 1 detecting a nudge
-    guard._nudged = True
-    guard._requests_count = 5
-    guard._steps.append(MagicMock())
+    result = await agent.run("Wait for the report.")
 
-    ctx = make_ctx(run_id="run-continuation")
-    fresh_guard = await guard.for_run(ctx)
-
-    assert fresh_guard._nudged is False
-    assert fresh_guard._paused is False
-    assert fresh_guard._requests_count == 0
-    assert len(fresh_guard._steps) == 0
+    assert result.output == "ready"
+    assert len(calls) == 7
+    assert reports == []
+    assert nudges(result.all_messages()) == []
 
 
-@pytest.mark.asyncio
-async def test_progress_judge_triggers_when_probability_below_threshold():
-    reported = []
-    config = SpiralConfig(
-        progress_first=1,
-        progress_every=1,
-        progress_threshold=0.2,
-    )
-    mock_judge = MagicMock(spec=ProgressJudge)
-    mock_judge.progress_probability = AsyncMock(return_value=0.05)  # low progress
+class NoProgress:
+    """A judge that always answers that the run is stuck."""
 
-    guard = SpiralGuard(config=config, report=reported.append, judge=mock_judge)
-    ctx = make_ctx()
+    def __init__(self) -> None:
+        self.asked = 0
 
-    req = ModelRequest(parts=[UserPromptPart(content="solve tough problem")])
-    req_ctx = MagicMock()
-    req_ctx.messages = [req]
-    req_ctx.model_request_parameters.instruction_parts = []
-    req_ctx.model_request_parameters.output_tools = []
-    req_ctx.model_request_parameters.allow_text_output = True
-    req_ctx.model_settings = {}
-
-    # Turn 1: Progress check triggers nudge
-    await guard.before_model_request(ctx, req_ctx)
-    assert guard._nudged is True
-    assert guard._paused is False
-    assert len(reported) == 0
-
-    enqueued_parts = [
-        part for pending in ctx.pending_messages for msg in pending.messages for part in msg.parts
-    ]
-    system_parts = [p for p in enqueued_parts if isinstance(p, SystemPromptPart)]
-    assert len(system_parts) >= 1
-    assert system_parts[0].metadata.get("pattern") == "no_progress"
-
-    # Turn 2: Second check triggers pause
-    req_ctx2 = MagicMock()
-    req_ctx2.messages = [req]
-    req_ctx2.model_request_parameters.instruction_parts = []
-    req_ctx2.model_request_parameters.output_tools = []
-    req_ctx2.model_request_parameters.allow_text_output = True
-    req_ctx2.model_settings = {}
-
-    res_ctx = await guard.before_model_request(ctx, req_ctx2)
-    assert guard._paused is True
-    assert len(reported) == 1
-    assert reported[0]["kind"] == "no_progress"
-    assert res_ctx.model_settings["tool_choice"] == "none"
+    async def progress_probability(self, request: str, log: str, total_steps: int) -> float:
+        self.asked += 1
+        return 0.0
 
 
-@pytest.mark.asyncio
-async def test_alternating_calls_cycle_detection():
-    reported = []
-    config = SpiralConfig(cycle_repeats=2)
-    guard = SpiralGuard(config=config, report=reported.append)
-    ctx = make_ctx()
+async def test_the_progress_judge_climbs_the_same_ladder():
+    # Results always change, so only the judge can see the run is stuck.
+    reports: list[dict] = []
+    judge = NoProgress()
+    config = SpiralConfig(progress_first=2, progress_every=2)
+    pages = [f"page {i}" for i in range(50)]
+    agent, _ = scripted(pages, config, reports, judge=judge)
 
-    history = [ModelRequest(parts=[UserPromptPart(content="alternating cycle")])]
-    # 2 cycles of toolA, toolB = 4 calls
-    calls = [("toolA", "c1"), ("toolB", "c2"), ("toolA", "c3"), ("toolB", "c4")]
-    for tool_name, call_id in calls:
-        resp = ModelResponse(
-            parts=[ToolCallPart(tool_name=tool_name, args={"arg": 1}, tool_call_id=call_id)],
-            timestamp=now(),
-        )
-        await guard.after_model_request(ctx, request_context=MagicMock(), response=resp)
+    result = await agent.run("Find the invoice.")
 
-        req = ModelRequest(
-            parts=[ToolReturnPart(tool_name=tool_name, content="res", tool_call_id=call_id)]
-        )
-        history.extend([resp, req])
-        req_ctx = MagicMock()
-        req_ctx.messages = list(history)
-        req_ctx.model_request_parameters.instruction_parts = []
-        req_ctx.model_request_parameters.output_tools = []
-        req_ctx.model_request_parameters.allow_text_output = True
-        req_ctx.model_settings = {}
-
-        await guard.before_model_request(ctx, req_ctx)
-
-    assert guard._nudged is True
-    assert guard._paused is False
-    enqueued_parts = [
-        part for pending in ctx.pending_messages for msg in pending.messages for part in msg.parts
-    ]
-    system_parts = [p for p in enqueued_parts if isinstance(p, SystemPromptPart)]
-    assert len(system_parts) >= 1
-    assert system_parts[0].metadata.get("pattern") == "alternating_calls"
+    assert result.output == HANDOFF_TEXT
+    assert judge.asked == 2
+    assert [n["kind"] for n in nudges(result.all_messages())] == ["no_progress"]
+    assert [r["kind"] for r in reports] == ["no_progress"]
+    assert reports[0]["confidence"] == 1.0
 
 
-@pytest.mark.asyncio
-async def test_repeated_text_chanting_detection():
-    reported = []
-    config = SpiralConfig(chant_repeats=2)
-    guard = SpiralGuard(config=config, report=reported.append)
-    ctx = make_ctx()
+async def test_a_new_run_starts_the_ladder_again():
+    reports: list[dict] = []
+    agent, _ = scripted(["pending"], SpiralConfig(repeat_note=2), reports)
 
-    # 2 consecutive text responses with same text
-    for _ in range(2):
-        resp = ModelResponse(
-            parts=[TextPart("I am waiting for your response.")],
-            timestamp=now(),
-        )
-        await guard.after_model_request(ctx, request_context=MagicMock(), response=resp)
+    first = await agent.run("Get me the report.")
+    second = await agent.run("Try once more.", message_history=first.all_messages())
 
-        req_ctx = MagicMock()
-        req_ctx.messages = [resp]
-        req_ctx.model_request_parameters.instruction_parts = []
-        req_ctx.model_request_parameters.output_tools = []
-        req_ctx.model_request_parameters.allow_text_output = True
-        req_ctx.model_settings = {}
+    new = second.new_messages()
+    assert [n["kind"] for n in nudges(new)] == ["repeated_result"]
+    assert paused_in(new) is not None
+    assert len(reports) == 2
 
-        await guard.before_model_request(ctx, req_ctx)
 
-    assert guard._nudged is True
-    assert guard._paused is False
-    enqueued_parts = [
-        part for pending in ctx.pending_messages for msg in pending.messages for part in msg.parts
-    ]
-    system_parts = [p for p in enqueued_parts if isinstance(p, SystemPromptPart)]
-    assert len(system_parts) >= 1
-    assert system_parts[0].metadata.get("pattern") == "repeated_text"
+async def test_the_durable_runner_reports_the_pause_and_keeps_the_handoff(tmp_path):
+    ids = count()
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if (info.model_settings or {}).get("tool_choice") == "none":
+            return reply(HANDOFF_TEXT)
+        call = ToolCallPart("list_skills", {}, tool_call_id=f"l{next(ids)}")
+        return ModelResponse(parts=[call])
+
+    async with running_bud(tmp_path, model, spiral=SpiralConfig(repeat_note=2)) as bud:
+        bud.log.append("owner", "session.created")
+        bud.runner.start("owner", "List my notes until one appears.", "message-1")
+        await bud.settle()
+        events = bud.log.read("owner")
+
+    loops = [e.data for e in events if e.type == "run.loop_detected"]
+    assert [loop["kind"] for loop in loops] == ["repeated_result"]
+    completed = [e for e in events if e.type == "run.completed"]
+    assert len(completed) == 1
+    assert HANDOFF_TEXT in json.dumps(completed[0].data["messages"])

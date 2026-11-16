@@ -29,7 +29,13 @@ from bud.harness.live import LiveState, LiveTools
 from bud.harness.memory import MEMORY_RULES
 from bud.harness.results import SqliteResultStore, build_output_limits
 from bud.harness.review import Describer, SessionGrants, ToolReviewer
-from bud.harness.spiral import LoopReport, SpiralConfig, SpiralGuard, build_judge
+from bud.harness.spiral import (
+    LoopReport,
+    SpiralConfig,
+    SpiralGuard,
+    build_judge,
+    loop_detector,
+)
 from bud.skills import GUIDANCE as SKILL_GUIDANCE
 from bud.skills import RULES as SKILL_RULES
 from bud.skills import SkillMethods, SkillStore
@@ -162,6 +168,11 @@ class Harness:
                 self.output_limits,
                 self.code_mode,
                 context,
+                *(
+                    [loop_detector(self.spiral, loop_report or (lambda _: None))]
+                    if self.spiral.enabled
+                    else []
+                ),
                 SpiralGuard(
                     config=self.spiral,
                     report=loop_report or (lambda _: None),

@@ -30,6 +30,7 @@ from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
 from bud.harness.recall import Recall, embedder
 from bud.harness.review import ToolReviewer, build_reviewer
+from bud.harness.spiral import NUDGE
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
 from bud.web import Cassette
 from bud.web import build_tools as build_web_tools
@@ -313,11 +314,10 @@ def loop_notes(events: list[Event]) -> list[str]:
     for event in events:
         if event.type in ("run.completed", "run.waiting"):
             for message in event.data.get("messages", []):
-                mark = (message.get("metadata") or {}).get("bud_spiral") or {}
                 found.extend(
-                    f"{note['kind']}: {note['detail']}"
-                    for note in mark.get("notes", [])
-                    if note.get("phase") == "note"
+                    f"{mark['kind']}: {mark['detail']}"
+                    for part in message.get("parts", [])
+                    if (mark := part.get("metadata") or {}).get("origin") == NUDGE
                 )
     return found
 

@@ -20,6 +20,7 @@ from bud.gateway.router import Gateway
 from bud.harness.actions import Action, Policy
 from bud.harness.agent import Harness
 from bud.harness.ask import ask_user
+from bud.harness.spiral import SpiralConfig
 from bud.workspace import READ_TOOLS, WRITE_TOOLS, build_tools
 
 ResponseFunction = Callable[[list[ModelMessage], AgentInfo], ModelResponse]
@@ -61,7 +62,12 @@ class RunningBud:
 
 @asynccontextmanager
 async def running_bud(
-    directory: Path, function: ResponseFunction, *, jobs: bool = False, ask: bool = False
+    directory: Path,
+    function: ResponseFunction,
+    *,
+    jobs: bool = False,
+    ask: bool = False,
+    spiral: SpiralConfig | None = None,
 ):
     directory = directory.resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -89,6 +95,8 @@ async def running_bud(
         read_tools=READ_TOOLS,
     )
     harness.clock = lambda: datetime(2026, 11, 6, 12, tzinfo=UTC)
+    if spiral is not None:
+        harness.spiral = spiral
     runner = Runner(Hub(log), gateway, harness, jobs=jobs)
     try:
         yield RunningBud(runner, log, root, claims)

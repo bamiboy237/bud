@@ -49,17 +49,14 @@ class Settings(BaseSettings):
     # Spiral detection (bud.harness.spiral). bud has no step cap, so these
     # decide when a run that is going in circles gets a nudge and then a pause.
     loop_detection: bool = True
-    # The same tool call with the same result N times in a row: a note, then a pause.
-    # Two in a row is too eager: on normal tasks the model sometimes repeats a read once
-    # (a bare `await list_events(...)` that returned nothing) and then corrects itself.
+    # The same tool call with the same result N times in a row. Two in a row is too eager:
+    # on normal tasks the model sometimes repeats a read once (a bare `await
+    # list_events(...)` that returned nothing) and then corrects itself.
     loop_repeat_note: int = Field(default=3, ge=2)
-    loop_repeat_pause: int = Field(default=4, ge=2)
-    # A cycle of 2 to N distinct calls that repeats this many times with unchanged results.
-    loop_cycle_max_period: int = Field(default=4, ge=2)
+    # Two different calls alternating (A, B, A, B) for this many cycles.
     loop_cycle_repeats: int = Field(default=3, ge=2)
-    # The same sentence in this many consecutive assistant messages.
+    # This many consecutive replies without tool calls that say the same thing.
     loop_chant_repeats: int = Field(default=3, ge=2)
-    loop_chant_min_chars: int = Field(default=30, ge=5)
     # A model judge asks "is the run making progress?" after this many model requests
     # in a run, then again every `loop_progress_every` requests.
     loop_progress_first: int = Field(default=20, ge=1)
