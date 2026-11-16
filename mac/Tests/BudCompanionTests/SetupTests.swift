@@ -6,6 +6,47 @@ import Testing
 @MainActor
 struct SetupTests {
     @Test
+    func failedSetupDropsItsExpiredSignInLink() throws {
+        let companion = Companion()
+        companion.receiveSetup([
+            "capability": "github", "label": "GitHub", "kind": "url",
+            "status": "waiting", "url": "https://example.test/expired",
+        ], replacing: true)
+        #expect(companion.setups.first?.url != nil)
+        companion.receiveSetup([
+            "capability": "github", "status": "failed", "reason": "Expired",
+        ])
+        #expect(companion.setups.first?.url == nil)
+        companion.apply(snapshot: [
+            "last_seq": 2,
+            "pending_setup": [[
+                "capability": "github", "label": "GitHub", "kind": "url",
+                "status": "failed", "url": "https://example.test/expired",
+            ]],
+        ])
+        #expect(companion.setups.first?.url == nil)
+    }
+
+    @Test
+    func automaticJobReportPreservesThePreviousAssistantTurn() throws {
+        let companion = Companion()
+        companion.apply(snapshot: [
+            "last_seq": 1,
+            "transcript": [["role": "assistant", "text": "Previous answer"]],
+        ])
+        let start = try #require(BudEvent(json:
+            #"{"seq":2,"type":"run.started","data":{"trigger":"job","run_id":"report"}}"#))
+        companion.handle(start)
+        #expect(companion.turns.map(\.text) == ["Previous answer"])
+        #expect(companion.reply.isEmpty)
+        let finish = try #require(BudEvent(json:
+            #"{"seq":3,"type":"run.completed","data":{"messages":[{"kind":"response","parts":[{"part_kind":"text","content":"Job finished"}]}]}}"#))
+        companion.handle(finish)
+        #expect(companion.turns.map(\.text) == ["Previous answer"])
+        #expect(companion.reply == "Job finished")
+    }
+
+    @Test
     func waitingSetupNeedsAttentionAndOpensTheBubble() {
         let companion = Companion()
         companion.apply(snapshot: [
@@ -41,7 +82,7 @@ struct SetupTests {
         ])
         #expect(companion.setups.first?.label == "GitHub")
         #expect(companion.setups.first?.reason == "Try again.")
-        #expect(companion.setups.first?.url != nil)
+        #expect(companion.setups.first?.url == nil)
         companion.receiveSetup(["capability": "github", "status": "connected"])
         #expect(companion.setups.isEmpty)
         #expect(companion.status == .idle)

@@ -2,6 +2,7 @@
 
 from typing import cast
 
+import pytest
 from pydantic_ai import RunContext
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RunUsage
@@ -168,6 +169,35 @@ def test_automatic_checks_do_not_fill_history_with_unchanged_status(tmp_path):
         result = check_setup(entry, journal, "session", "github", key=f"check-{index}")
         assert result["status"] == "waiting"
     assert log.read("session") == before
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_setup_check_cannot_resurrect_cancelled_or_replace_new_attempt(tmp_path, restart):
+    log = EventLog(tmp_path / "events.db")
+    journal = SetupJournal()
+    journal.bind(Hub(log))
+    data = {"capability": "github", "label": "GitHub", "status": "waiting"}
+    journal.publish("session", "capability.setup", data, key="original")
+
+    def remote_status():
+        journal.publish(
+            "session", "capability.status", {**data, "status": "cancelled"}, key="cancel"
+        )
+        if restart:
+            journal.publish("session", "capability.setup", data, key="new-attempt")
+        return SetupStatus(state="failed", reason="old attempt expired")
+
+    entry = SetupEntry(
+        label="GitHub",
+        kind="url",
+        initiate=lambda: SetupInitiation(kind="url", url="https://example.test/sign-in"),
+        status=remote_status,
+    )
+    result = check_setup(entry, journal, "session", "github", key="late-check")
+
+    assert result["status"] == ("waiting" if restart else "cancelled")
+    assert all(event.data.get("reason") != "old attempt expired" for event in log.read("session"))
+    assert bool(journal.pending("session")) == restart
 
 
 def test_model_sees_connected_and_cancelled_setups_without_sign_in_links(tmp_path):

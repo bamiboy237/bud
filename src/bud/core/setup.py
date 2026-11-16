@@ -121,6 +121,25 @@ class SetupJournal:
         events = self._live.log.read(session_id)
         return {card.capability: card for card in pending_setups(events)}
 
+    def status_version(self, session_id: str, capability: str) -> str | None:
+        return next(
+            (
+                event.id
+                for event in reversed(self._live.log.read(session_id))
+                if event.type in ("capability.setup", "capability.status")
+                and event.data.get("capability") == capability
+            ),
+            None,
+        )
+
+    def update_status(
+        self, session_id: str, data: dict[str, Any], version: str | None, *, key: str
+    ) -> bool:
+        applied = self._live.log.update_setup_status(session_id, data, version, key=key)
+        if applied:
+            self._live.wake(session_id)
+        return applied
+
 
 def check_setup(
     entry: SetupEntry,
@@ -132,6 +151,7 @@ def check_setup(
     refresh: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Recheck a card and load connected tools, without issuing another sign-in link."""
+    version = journal.status_version(session, capability)
     try:
         status = entry.status()
     except ConnectionError as exc:
@@ -153,9 +173,14 @@ def check_setup(
                 "reason": str(exc),
                 "note": "Do not reconnect the account. Follow the reason above.",
             }
-    previous = journal.pending(session).get(capability)
-    if previous is None or (previous.status, previous.reason) != (status.state, status.reason):
-        journal.publish(session, "capability.status", data, key=key)
+    if not journal.update_status(session, data, version, key=key):
+        current = journal.pending(session).get(capability)
+        return {
+            "capability": capability,
+            "label": entry.label,
+            "status": current.status if current is not None else "cancelled",
+            **({"reason": current.reason} if current is not None and current.reason else {}),
+        }
     if status.state == "waiting":
         return {
             **data,

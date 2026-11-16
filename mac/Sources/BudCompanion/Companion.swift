@@ -429,7 +429,7 @@ final class Companion {
         setups = (snapshot["pending_setup"] as? [[String: Any]] ?? []).compactMap {
             guard var setup = CapabilitySetup($0),
                   !["connected", "cancelled"].contains(setup.status) else { return nil }
-            setup.url = setup.url ?? previous[setup.id]?.url
+            setup.url = setup.status == "failed" ? nil : setup.url ?? previous[setup.id]?.url
             return setup
         }
         setupProblems = setupProblems.filter { key, _ in setups.contains { $0.id == key } }
@@ -505,6 +505,7 @@ final class Companion {
                 current.reason = incoming.reason
                 incoming = current
             }
+            if incoming.status == "failed" { incoming.url = nil }
             setups[index] = incoming
         } else {
             setups.append(incoming)
@@ -531,7 +532,7 @@ final class Companion {
         Task {
             do {
                 let result = try await connection.send(
-                    "POST", "connections/\(setup.id)/connect", json: ["resume": true])
+                    "POST", "connections/\(setup.id)/connect", json: ["resume": setup.status != "failed"])
                 guard mine == generation else { return }
                 guard let url = CapabilitySetup.signInURL(result["url"] as? String) else {
                     setupProblems[setup.id] = "The sign-in link is unavailable. Try again."
@@ -1066,7 +1067,7 @@ final class Companion {
         }
     }
 
-    private func handle(_ event: BudEvent) {
+    func handle(_ event: BudEvent) {
         if !event.live { seenSeq = max(seenSeq, event.seq) }
         switch event.type {
         case "user.message":
@@ -1090,6 +1091,17 @@ final class Companion {
             bubbleOpen = true
         case "run.started", "run.recovered":
             settle?.cancel()
+            if event.string("trigger") == "job" {
+                archiveReply()
+                reply = ""
+                showWhole()
+                question = ""
+                blocks = []
+                seenRequests = []
+                steps = []
+                lastSteps = []
+                stepsExpanded = false
+            }
             if runStart == nil { runStart = .now }
             activity = .working
         case "text.reset":

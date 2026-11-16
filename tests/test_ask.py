@@ -2,8 +2,10 @@ import pytest
 from pydantic_ai.messages import ModelResponse, ToolCallPart, ToolReturnPart
 
 from bud.composio.tools import ask_user as account_ask_user
+from bud.core.controls import approval_text
 from bud.harness.ask import AskAnswer, answer_from_text, questions_of, render_answers
 from bud.harness.ask import ask_user as shared_ask_user
+from bud.photon_ui import action_preview
 from tests.runner_support import reply, running_bud
 
 QUESTIONS = {
@@ -25,6 +27,17 @@ QUESTIONS = {
 
 def test_real_account_questions_use_the_shared_grouped_contract():
     assert account_ask_user is shared_ask_user
+
+
+@pytest.mark.parametrize("render", [approval_text, action_preview])
+def test_text_interfaces_show_grouped_questions_and_options(render):
+    text = render({"tool": "ask_user", "approval_id": "ask-1", "args": QUESTIONS})
+    assert "Which Sam do you mean?" in text
+    assert "Sam Lee (your manager)" in text
+    assert "Sam Park" in text
+    assert "Which days work? (pick any)" in text
+    assert "Wed" in text and "Thu" in text
+    assert "/answer ask-1" in text
 
 
 def test_legacy_question_reads_as_one_question_and_numbers_pick_options():

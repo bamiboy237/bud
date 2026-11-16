@@ -16,6 +16,19 @@ from pydantic_ai.messages import (
 from bud.harness.review import ReviewRequest, SessionGrants, ToolReviewer, Verdict, owner_answers
 
 
+def test_rejected_question_calls_are_not_revalidated_as_owner_answers():
+    messages = [
+        ModelResponse(parts=[ToolCallPart("ask_user", {"questions": []}, tool_call_id="bad")]),
+        ModelResponse(
+            parts=[ToolCallPart("ask_user", {"question": "Which day?"}, tool_call_id="good")]
+        ),
+        ModelRequest(parts=[ToolReturnPart("ask_user", "Friday", tool_call_id="good")]),
+    ]
+
+    answers = owner_answers(messages)
+    assert [(answer.question, answer.answer) for answer in answers] == [("Which day?", "Friday")]
+
+
 def decisions(risk=None, authorization=None, concern=None):
     return {
         "answers": [

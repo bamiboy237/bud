@@ -399,24 +399,28 @@ def owner_answers(messages: list[ModelMessage]) -> list[Clarification]:
     typed. The question comes from bud's own ask_user call; without it a bare "yes" reads
     as consent to whatever is under review, not to what was asked.
     """
-    questions: dict[str, str] = {}
+    questions: dict[str, ToolCallPart] = {}
     answers: list[Clarification] = []
     for message in messages:
         if isinstance(message, ModelResponse):
             for part in message.parts:
                 if isinstance(part, ToolCallPart) and part.tool_name == "ask_user":
-                    args = part.args_as_dict()
-                    question = ask_summary(args)
-                    questions[part.tool_call_id] = question if isinstance(question, str) else ""
+                    questions[part.tool_call_id] = part
         if not isinstance(message, ModelRequest):
             continue
         for part in message.parts:
             if isinstance(part, UserPromptPart):
                 answers = []
-            elif isinstance(part, ToolReturnPart) and part.tool_name == "ask_user":
+            elif (
+                isinstance(part, ToolReturnPart)
+                and part.tool_name == "ask_user"
+                and part.outcome == "success"
+            ):
+                call = questions.get(part.tool_call_id)
+                question = ask_summary(call.args_as_dict()) if call is not None else ""
                 answers.append(
                     Clarification(
-                        question=questions.get(part.tool_call_id, "")[:MAX_ANSWER_CHARS],
+                        question=question[:MAX_ANSWER_CHARS],
                         answer=str(part.content)[:MAX_ANSWER_CHARS],
                     )
                 )

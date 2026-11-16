@@ -17,6 +17,7 @@ from bud.core.projection import (
     Snapshot,
     message_batch,
     pause_reason,
+    pending_setups,
     queue_paused,
     queued_messages,
     runs,
@@ -116,6 +117,32 @@ class EventLog:
     ) -> Event | None:
         with self._connect() as db:
             return self._insert(db, session_id, type, data or {}, once=True, key=key)
+
+    def update_setup_status(
+        self, session_id: str, data: dict, expected_event: str | None, *, key: str
+    ) -> bool:
+        """Publish a check only if the same pending setup state still exists."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            events = self._read(db, session_id)
+            latest = next(
+                (
+                    event
+                    for event in reversed(events)
+                    if event.type in ("capability.setup", "capability.status")
+                    and event.data.get("capability") == data["capability"]
+                ),
+                None,
+            )
+            current = next(
+                (card for card in pending_setups(events) if card.capability == data["capability"]),
+                None,
+            )
+            if latest is None or latest.id != expected_event or current is None:
+                return False
+            if (current.status, current.reason) != (data["status"], data.get("reason")):
+                self._insert(db, session_id, "capability.status", data, once=True, key=key)
+            return True
 
     @staticmethod
     def _insert(
