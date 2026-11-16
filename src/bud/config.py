@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     loop_judge_model: str = "gpt-6-luna"
     loop_judge_timeout_seconds: float = Field(default=15, gt=0, allow_inf_nan=False)
 
+    # A running job with no activity for this long, or open for longer than the deadline,
+    # is reported to the owner as stalled.
+    job_idle_minutes: float = Field(default=10, gt=0, allow_inf_nan=False)
+    job_deadline_minutes: float = Field(default=60, gt=0, allow_inf_nan=False)
+
     model_config = SettingsConfigDict(
         env_file=".env",
         extra="ignore",

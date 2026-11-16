@@ -22,7 +22,7 @@ from bud.core.projection import (
     runs,
     snapshot,
     undecided_approvals,
-    unreported_job_ends,
+    unreported_job_news,
 )
 from bud.limits import MAX_QUEUED_MESSAGES
 
@@ -528,7 +528,7 @@ class EventLog:
             if (
                 queue_paused(events)
                 or queued_messages(events)
-                or not unreported_job_ends(events)
+                or not unreported_job_news(events)
                 or (
                     states
                     and states[-1].status in ("queued", "running", "stopping", "awaiting_approval")

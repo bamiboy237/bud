@@ -59,6 +59,8 @@ struct RunningTask: Identifiable, Equatable, Sendable {
             return .done
         } else if status == "failed" || status == "cancelled" {
             return .failed
+        } else if status == "stalled" {
+            return .needsYou
         } else if status == "paused" {
             return .idle
         } else {
@@ -236,8 +238,11 @@ final class Companion {
     private(set) var retryingHeldMessage = false
     /// Short job milestones (started, needs you, finished). Progress notes never come here.
     var notices: [String] = []
-    /// Active background tasks/jobs and their helper pups (capped at max 4).
-    private(set) var activeTasks: [RunningTask] = []
+    /// Active background tasks/jobs and their helper pups (capped at max 4). A stalled job
+    /// turns the pet to "needs you", like an open approval.
+    private(set) var activeTasks: [RunningTask] = [] {
+        didSet { showStatus() }
+    }
     var visiblePups: [RunningTask] { Array(activeTasks.prefix(4)) }
     /// Send to first streamed text, for the latency baseline.
     var lastFirstText: Duration?
@@ -414,7 +419,8 @@ final class Companion {
 
     private func showStatus() {
         running = activity == .working
-        status = openApprovals.isEmpty && setups.isEmpty ? activity : .needsYou
+        let stalled = activeTasks.contains { $0.status == "stalled" }
+        status = openApprovals.isEmpty && setups.isEmpty && !stalled ? activity : .needsYou
     }
 
     /// The snapshot's pending list is the authority. Events alone can't tell: a parked
@@ -440,7 +446,8 @@ final class Companion {
         let now = Date()
         activeTasks = rawTasks.compactMap { dict in
             guard let id = dict["task_id"] as? Int,
-                  let status = dict["status"] as? String else { return nil }
+                  var status = dict["status"] as? String else { return nil }
+            if let stalled = dict["stalled"] as? String, !stalled.isEmpty { status = "stalled" }
             if let existing = activeTasks.first(where: { $0.id == id }) {
                 if !["completed", "failed", "cancelled"].contains(status) {
                     var updated = existing
@@ -1187,6 +1194,12 @@ final class Companion {
             }
             notice(event)
             refreshApprovals()
+        case "task.stalled":
+            if let id = event.data["task_id"] as? Int,
+               let index = activeTasks.firstIndex(where: { $0.id == id }) {
+                activeTasks[index].status = "stalled"
+            }
+            notice(event)
         case "task.paused":
             if let id = event.data["task_id"] as? Int,
                let index = activeTasks.firstIndex(where: { $0.id == id }) {
@@ -1278,6 +1291,9 @@ final class Companion {
             default: "Job"
             }
             text = "\(happened) “\(title)”"
+        }
+        if event.type == "task.stalled", !title.isEmpty {
+            text = "“\(title)” looks stuck. \(text)"
         }
         guard !text.isEmpty else { return }
         notices.append(String(text.prefix(160)))

@@ -1,5 +1,8 @@
 """A job that ends gets a bud turn that tells the owner, without waiting for their next message."""
 
+import asyncio
+from datetime import UTC, datetime, timedelta
+
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -93,3 +96,48 @@ async def test_the_next_message_does_not_repeat_a_reported_job(tmp_path):
     ]
     assert prompts[-1].startswith("Thanks. Anything else?")
     assert "3 March" not in prompts[-1]
+
+
+async def test_a_quiet_job_is_reported_once_per_reason(tmp_path, monkeypatch):
+    prompts: list[str] = []
+    async with running_bud(tmp_path, bud_with_one_job(prompts), jobs=True) as bud:
+        launch = bud.runner._launch
+
+        def owner_runs_only(run, **kwargs):
+            # The job's own run never starts, so the job stays queued and quiet.
+            if run["session_id"] == "owner":
+                launch(run, **kwargs)
+
+        monkeypatch.setattr(bud.runner, "_launch", owner_runs_only)
+        bud.log.append("owner", "session.created")
+        bud.runner.start("owner", "When does my lease renew?", "message-1")
+        await bud.settle()
+        now = datetime.now(UTC)
+
+        async def watch(minutes: int) -> None:
+            bud.runner.watch_jobs(now + timedelta(minutes=minutes))
+            await asyncio.sleep(0)  # the drain it schedules runs on the next loop pass
+            await bud.settle()
+
+        await watch(5)
+        assert not [e for e in bud.log.read("owner") if e.type == "task.stalled"]
+
+        await watch(11)
+        await watch(12)
+        assert bud.runner.snapshot("owner").tasks[0].stalled == "idle"
+        stalls = [e.data for e in bud.log.read("owner") if e.type == "task.stalled"]
+        assert [stall["reason"] for stall in stalls] == ["idle"]
+        assert prompts[-1].startswith(JOB_REPORT)
+        assert "No activity for 11 minutes." in prompts[-1]
+
+        await watch(61)
+        events = bud.log.read("owner")
+
+    stalls = [e.data for e in events if e.type == "task.stalled"]
+    assert [stall["reason"] for stall in stalls] == ["idle", "overdue"]
+    assert [e.data["trigger"] for e in events if e.type == "run.queued"] == [
+        "message",
+        "job",
+        "job",
+    ]
+    assert "past its deadline" in prompts[-1]

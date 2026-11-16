@@ -112,6 +112,8 @@ class TaskView(BaseModel):
     result: str | None = None
     # The job's filed outcome; "completed" alone only means it stopped working.
     outcome: str | None = None
+    # Why a running job looks stuck ("idle" or "overdue"), until it shows activity again.
+    stalled: str | None = None
 
 
 class Snapshot(BaseModel):
@@ -511,20 +513,21 @@ def _failure_note(
     return ModelRequest(parts=[UserPromptPart(note)])
 
 
-# Job ends bud reports without being asked. The owner cancelled the others themselves.
-JOB_ENDS = ("task.completed", "task.failed", "task.paused")
+# Job news bud reports without being asked. The owner cancelled the others themselves.
+JOB_NEWS = ("task.completed", "task.failed", "task.paused", "task.stalled")
 # Runs that start a turn in the conversation: the owner's message, or a job report.
 PROMPTED = ("message", "job")
 JOB_REPORT = (
-    "[bud system note] A job you started has ended. Tell the owner, in a few sentences, what "
-    "it delivered, or why it stopped and what they can do next. Do not start new work."
+    "[bud system note] A job you started has ended or looks stuck. Tell the owner, in a few "
+    "sentences, what it delivered, why it stopped, or that it seems stuck and they can ask you "
+    "to stop it. Do not start new work."
 )
 
 
-def unreported_job_ends(events: list[Event]) -> list[Event]:
-    """Job ends logged after the latest turn started, so no turn has told the owner yet."""
+def unreported_job_news(events: list[Event]) -> list[Event]:
+    """Job news logged after the latest turn started, so no turn has told the owner yet."""
     lower, _ = since_last_prompt(events, {"run_id": None})
-    return [e for e in events if e.type in JOB_ENDS and e.seq > lower]
+    return [e for e in events if e.type in JOB_NEWS and e.seq > lower]
 
 
 def since_last_prompt(events: list[Event], run: dict) -> tuple[int, int]:

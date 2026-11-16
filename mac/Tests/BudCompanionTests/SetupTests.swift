@@ -140,6 +140,24 @@ struct SetupTests {
     }
 
     @Test
+    func aStalledJobNeedsTheOwner() {
+        let companion = Companion()
+        companion.apply(snapshot: [
+            "last_seq": 1,
+            "tasks": [["task_id": 1, "title": "Index repo", "status": "running"]],
+        ])
+        #expect(companion.status != .needsYou)
+
+        companion.apply(snapshot: [
+            "last_seq": 2,
+            "tasks": [["task_id": 1, "title": "Index repo", "status": "running", "stalled": "idle"]],
+        ])
+        #expect(companion.activeTasks.map(\.status) == ["stalled"])
+        #expect(companion.activeTasks[0].move == .needsYou)
+        #expect(companion.status == .needsYou)
+    }
+
+    @Test
     func childPupsAreCappedAtFour() {
         let companion = Companion()
         companion.apply(snapshot: [

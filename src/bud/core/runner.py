@@ -5,7 +5,7 @@ import json
 import logging
 from collections.abc import AsyncIterable
 from contextvars import Context, ContextVar
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -40,6 +40,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
 
+from bud.config import get_settings
 from bud.core.events import RUN_END_EVENTS, Event, EventType
 from bud.core.hub import Hub
 from bud.core.log import StopRequested
@@ -59,7 +60,7 @@ from bud.core.projection import (
     runs,
     since_last_prompt,
     undecided_approvals,
-    unreported_job_ends,
+    unreported_job_news,
     waiting_batch,
 )
 from bud.core.runtime import replay_version
@@ -432,16 +433,30 @@ class Runner(DBOSConfiguredInstance):
             self._launch(run)
 
     def _report_jobs(self, session_id: str, events: list[Event]) -> None:
-        """Start a turn that tells the owner about jobs that ended since they last heard."""
-        ended = unreported_job_ends(events)
-        if not ended:
+        """Start a turn that tells the owner about jobs that ended or stalled since they last
+        heard."""
+        news = unreported_job_news(events)
+        if not news:
             return
         run = self._inputs(
-            session_id, JOB_REPORT, origin=ended[-1].data.get("origin"), trigger="job"
+            session_id, JOB_REPORT, origin=news[-1].data.get("origin"), trigger="job"
         )
         if self.hub.log.dispatch_job_report(session_id, run):
             self.hub.wake(session_id)
             self._launch(run)
+
+    def watch_jobs(self, now: datetime | None = None) -> None:
+        """Tell the owner about running jobs that look stuck. Safe to call from any thread."""
+        if self.work_items is None:
+            return
+        settings = get_settings()
+        stalled = self.work_items.watch(
+            now or datetime.now(UTC),
+            idle=timedelta(minutes=settings.job_idle_minutes),
+            deadline=timedelta(minutes=settings.job_deadline_minutes),
+        )
+        for feed_id in stalled:
+            self._kick(feed_id)
 
     async def stop_session(self, session_id: str) -> dict:
         timer = self._bursts.pop(session_id, None)
@@ -1275,7 +1290,14 @@ def _parked_note(approval_id: str) -> str:
 
 
 JOB_UPDATE_CHARS = 600
-JOB_UPDATES = ("task.completed", "task.failed", "task.paused", "task.cancelled", "task.approval")
+JOB_UPDATES = (
+    "task.completed",
+    "task.failed",
+    "task.paused",
+    "task.cancelled",
+    "task.stalled",
+    "task.approval",
+)
 
 
 def job_updates_note(events: list[Event], run: dict) -> str:

@@ -352,7 +352,7 @@ def _create_app(
     )
     runner = Runner(hub, gateway, harness, durable=True, jobs=True, learner=learner, recall=recall)
 
-    async def cleanup_results() -> None:
+    async def every_minute() -> None:
         while True:
             try:
                 deleted = await harness.results.prune()
@@ -360,6 +360,10 @@ def _create_app(
                     logger.info("Removed %d expired temporary tool results", deleted)
             except Exception:
                 logger.exception("Temporary tool-result cleanup failed")
+            try:
+                await asyncio.to_thread(runner.watch_jobs)
+            except Exception:
+                logger.exception("Checking for stalled jobs failed")
             await asyncio.sleep(60)
 
     @asynccontextmanager
@@ -409,7 +413,7 @@ def _create_app(
                         "and restart bud. "
                         "The authenticated core remains available; sends were not retried."
                     )
-            cleanup = asyncio.create_task(cleanup_results())
+            cleanup = asyncio.create_task(every_minute())
             yield
         finally:
             try:
