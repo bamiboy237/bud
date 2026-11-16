@@ -538,23 +538,30 @@ JOB_REPORT = (
 
 
 def unreported_job_news(events: list[Event]) -> list[Event]:
-    """Job news logged after the latest turn started, so no turn has told the owner yet."""
+    """Job news not covered by a turn that completed or delivered an approval prompt."""
     lower, _ = since_last_prompt(events, {"run_id": None})
     return [e for e in events if e.type in JOB_NEWS and e.seq > lower]
 
 
 def since_last_prompt(events: list[Event], run: dict) -> tuple[int, int]:
-    """The log window (exclusive) from the previous owner-prompted run's start to this one's.
+    """The window from the last delivered turn's start to the current run's start.
 
-    Anything in it happened since the owner's last message, so a note built from it shows
-    each update exactly once, including ones that arrived during an approval resume.
+    Failed turns do not consume updates. The lower boundary is the delivered turn's start,
+    not its end, so updates arriving while it ran remain available to the next turn.
     """
     prompted = {
         e.data["run_id"]
         for e in events
         if e.type == "run.queued" and e.data.get("trigger") in PROMPTED
     }
-    starts = [e.seq for e in events if e.type == "run.started" and e.data.get("run_id") in prompted]
+    delivered = {
+        event.data["run_id"] for event in events if event.type in ("run.completed", "run.waiting")
+    }
+    starts = [
+        event.seq
+        for event in events
+        if event.type == "run.started" and event.data.get("run_id") in prompted & delivered
+    ]
     current = next(
         (
             e.seq

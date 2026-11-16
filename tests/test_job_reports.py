@@ -28,7 +28,7 @@ BRIEF = {
 def last_prompt(messages: list[ModelMessage]) -> str:
     for message in reversed(messages):
         if isinstance(message, ModelRequest):
-            for part in message.parts:
+            for part in reversed(message.parts):
                 if isinstance(part, UserPromptPart) and isinstance(part.content, str):
                     return part.content
     return ""
@@ -132,6 +132,28 @@ async def test_the_next_message_does_not_repeat_a_reported_job(tmp_path):
     ]
     assert prompts[-1].startswith("Thanks. Anything else?")
     assert "3 March" not in prompts[-1]
+
+
+async def test_failed_report_does_not_consume_the_job_update(tmp_path):
+    prompts: list[str] = []
+    base_model = bud_with_one_job(prompts)
+
+    def model(messages, info):
+        if last_prompt(messages).startswith(JOB_REPORT):
+            raise RuntimeError("Synthetic report provider failure")
+        return base_model(messages, info)
+
+    async with running_bud(tmp_path, model, jobs=True) as bud:
+        bud.log.append("owner", "session.created")
+        bud.runner.start("owner", "When does my lease renew?", "message-1")
+        await bud.settle()
+        assert any(event.type == "run.failed" for event in bud.log.read("owner"))
+
+        bud.runner.start("owner", "Please retry that report.", "message-2")
+        await bud.settle()
+        assert prompts[-1].startswith("Please retry that report.")
+        assert "The lease renews on 3 March." in prompts[-1]
+        assert bud.runner.snapshot("owner").recent_runs[-1].status == "completed"
 
 
 async def test_a_quiet_job_is_reported_once_per_reason(tmp_path, monkeypatch):
