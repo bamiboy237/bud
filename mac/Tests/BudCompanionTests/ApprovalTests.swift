@@ -198,21 +198,13 @@ struct ApprovalTests {
         }
     }
 
-    @Test @MainActor
-    func oneRowOpensAtATime() {
-        let expansion = ApprovalExpansion()
-        expansion.sync(["a", "b"])
-        #expect(expansion.open.isEmpty)
-        expansion.toggle("a")
-        #expect(expansion.open == ["a"])
-        expansion.toggle("b")
-        #expect(expansion.open == ["b"])
-        expansion.toggle("b")
-        #expect(expansion.open.isEmpty)
-        expansion.sync(["b"])
-        #expect(expansion.open == ["b"])
-        expansion.sync([])
-        #expect(expansion.open.isEmpty)
+    @Test
+    func onlyDeliberateHorizontalSwipesMakeDecisions() {
+        #expect(DecisionDirection.swipe(CGSize(width: 100, height: 20)) == .approve)
+        #expect(DecisionDirection.swipe(CGSize(width: -100, height: 20)) == .deny)
+        #expect(DecisionDirection.swipe(CGSize(width: 79, height: 0)) == nil)
+        #expect(DecisionDirection.swipe(CGSize(width: 100, height: 120)) == nil)
+        #expect(DecisionDirection.swipe(CGSize(width: 100, height: 100)) == nil)
     }
 
     @Test @MainActor

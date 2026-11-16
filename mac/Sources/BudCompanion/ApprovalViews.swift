@@ -8,6 +8,12 @@ final class ApprovalLayout: ObservableObject {
 enum DecisionDirection: Equatable {
     case approve
     case deny
+
+    static func swipe(_ translation: CGSize) -> Self? {
+        guard abs(translation.width) >= 80,
+              abs(translation.width) > abs(translation.height) else { return nil }
+        return translation.width > 0 ? .approve : .deny
+    }
 }
 
 final class DeckState: ObservableObject {
@@ -19,22 +25,6 @@ final class DeckState: ObservableObject {
     @Published var isAnimating: Bool = false
 }
 
-final class ApprovalExpansion: ObservableObject {
-    @Published private(set) var open: Set<String> = []
-    private var ids: [String] = []
-
-    func sync(_ current: [String]) {
-        guard current != ids else { return }
-        ids = current
-        open.formIntersection(current)
-        if current.count == 1, open.isEmpty, let only = current.first { open = [only] }
-    }
-
-    func toggle(_ id: String) {
-        open = open.contains(id) ? [] : [id]
-    }
-}
-
 /// A stacked deck of pending approvals. Cards sit directly on top of each other with subtle
 /// depth offsets, keeping the vertical footprint constant regardless of how many actions wait.
 /// Deciding an action triggers a fluid flight animation (slide-right with emerald green stamp for
@@ -42,6 +32,7 @@ final class ApprovalExpansion: ObservableObject {
 struct ApprovalDeck: View {
     @Bindable var companion: Companion
     @StateObject private var deck = DeckState()
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var totalCount: Int { companion.approvals.count }
     private var safeIndex: Int {
@@ -167,7 +158,6 @@ struct ApprovalDeck: View {
 
     private var cardStack: some View {
         ZStack(alignment: .top) {
-            // Peek cards behind (up to 2 visible levels)
             if safeIndex + 2 < totalCount {
                 PeekCard(
                     approval: companion.approvals[safeIndex + 2],
@@ -183,7 +173,6 @@ struct ApprovalDeck: View {
                 )
             }
 
-            // Top active card
             if let activeApproval = currentApproval {
                 InteractiveApprovalCard(
                     companion: companion,
@@ -192,6 +181,7 @@ struct ApprovalDeck: View {
                         handleDecision(approval: activeApproval, approved: approved)
                     }
                 )
+                .id(activeApproval.id)
                 .offset(x: deck.flyOffset, y: 0)
                 .rotationEffect(.degrees(deck.flyRotation))
                 .opacity(deck.flyOpacity)
@@ -208,7 +198,7 @@ struct ApprovalDeck: View {
             HStack {
                 if decision == .approve { Spacer() }
                 VStack {
-                    Text(decision == .approve ? "APPROVED" : "DENIED")
+                    Text(decision == .approve ? "APPROVE" : "DENY")
                         .font(.system(size: 18, weight: .black, design: .rounded))
                         .tracking(1.5)
                         .foregroundStyle(decision == .approve ? Color(red: 0.14, green: 0.62, blue: 0.35) : Color(red: 0.82, green: 0.24, blue: 0.24))
@@ -234,10 +224,13 @@ struct ApprovalDeck: View {
 
     private func handleDecision(approval: Approval, approved: Bool) {
         guard !deck.isAnimating else { return }
+        if reduceMotion {
+            companion.decide(approval.id, approved: approved)
+            return
+        }
         deck.isAnimating = true
         deck.activeDecision = approved ? .approve : .deny
 
-        // Spring dismiss: Tinder physics (Approve slides right +12°, Deny slides left -12°)
         withAnimation(.spring(response: 0.30, dampingFraction: 0.75)) {
             deck.flyOffset = approved ? 360 : -360
             deck.flyRotation = approved ? 12 : -12
@@ -327,8 +320,6 @@ struct InteractiveApprovalCard: View {
     let companion: Companion
     let approval: Approval
     let onDecide: (Bool) -> Void
-    @StateObject private var layout = ApprovalLayout()
-
     private var busy: Bool {
         companion.deciding.contains(approval.id) || companion.approvingBatch || companion.link != .connected
     }
@@ -336,6 +327,17 @@ struct InteractiveApprovalCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             heading
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 24)
+                        .onEnded { value in
+                            guard !busy,
+                                  let direction = DecisionDirection.swipe(value.translation)
+                            else { return }
+                            onDecide(direction == .approve)
+                        }
+                )
+                .help("Swipe right to approve or left to deny")
             detailScroll
             actionBar
             if let problem = companion.approvalFailures[approval.id] ?? companion.decisionProblem {

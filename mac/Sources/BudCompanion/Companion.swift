@@ -50,10 +50,6 @@ struct RunningTask: Identifiable, Equatable, Sendable {
     var status: String
     var finishedAt: Date? = nil
 
-    var isWorking: Bool {
-        status == "running" || status == "queued" || status == "waiting"
-    }
-
     var move: PetMove {
         if status == "completed" || status == "done" {
             return .done
@@ -1315,22 +1311,6 @@ final class Companion {
             await MainActor.run {
                 self?.activeTasks.removeAll { $0.id == id }
             }
-        }
-    }
-
-    func addTaskForTesting(id: Int, title: String = "Test job", status: String = "running") {
-        if let idx = activeTasks.firstIndex(where: { $0.id == id }) {
-            activeTasks[idx].status = status
-            activeTasks[idx].finishedAt = nil
-        } else {
-            activeTasks.append(RunningTask(id: id, title: title, status: status))
-        }
-    }
-
-    func completeTaskForTesting(id: Int) {
-        if let idx = activeTasks.firstIndex(where: { $0.id == id }) {
-            activeTasks[idx].status = "completed"
-            activeTasks[idx].finishedAt = .now
         }
     }
 

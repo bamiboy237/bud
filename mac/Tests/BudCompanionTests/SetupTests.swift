@@ -107,11 +107,9 @@ struct SetupTests {
             "capability": "github", "status": "failed", "reason": "Sign-in expired.",
         ])
         #expect(companion.setups.first?.reason == "Sign-in expired.")
-        // When connectSetup is called (even without connection), it clears the previous problem
         companion.connectSetup(companion.setups[0])
         #expect(companion.setupProblems["github"] == nil)
 
-        // When setup completes or cancels, errors are cleaned up
         companion.receiveSetup(["capability": "github", "status": "connected"])
         #expect(companion.setups.isEmpty)
         #expect(companion.setupProblems["github"] == nil)
