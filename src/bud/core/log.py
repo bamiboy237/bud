@@ -22,6 +22,7 @@ from bud.core.projection import (
     runs,
     snapshot,
     undecided_approvals,
+    unreported_job_ends,
 )
 from bud.limits import MAX_QUEUED_MESSAGES
 
@@ -515,6 +516,25 @@ class EventLog:
                     "message.dispatched",
                     {"message_id": item.message_id, "run_id": run["run_id"]},
                 )
+            self._insert(db, session_id, "run.queued", run, key=f"{run['run_id']}:queued")
+            return True
+
+    def dispatch_job_report(self, session_id: str, run: dict) -> bool:
+        """Queue a turn that reports ended jobs, if they are still unreported and nothing waits."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            events = self._read(db, session_id)
+            states = runs(events)
+            if (
+                queue_paused(events)
+                or queued_messages(events)
+                or not unreported_job_ends(events)
+                or (
+                    states
+                    and states[-1].status in ("queued", "running", "stopping", "awaiting_approval")
+                )
+            ):
+                return False
             self._insert(db, session_id, "run.queued", run, key=f"{run['run_id']}:queued")
             return True
 

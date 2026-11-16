@@ -509,3 +509,44 @@ def _failure_note(
         f"report them as unknown without re-executing:\n{unsure}"
     )
     return ModelRequest(parts=[UserPromptPart(note)])
+
+
+# Job ends bud reports without being asked. The owner cancelled the others themselves.
+JOB_ENDS = ("task.completed", "task.failed", "task.paused")
+# Runs that start a turn in the conversation: the owner's message, or a job report.
+PROMPTED = ("message", "job")
+JOB_REPORT = (
+    "[bud system note] A job you started has ended. Tell the owner, in a few sentences, what "
+    "it delivered, or why it stopped and what they can do next. Do not start new work."
+)
+
+
+def unreported_job_ends(events: list[Event]) -> list[Event]:
+    """Job ends logged after the latest turn started, so no turn has told the owner yet."""
+    lower, _ = since_last_prompt(events, {"run_id": None})
+    return [e for e in events if e.type in JOB_ENDS and e.seq > lower]
+
+
+def since_last_prompt(events: list[Event], run: dict) -> tuple[int, int]:
+    """The log window (exclusive) from the previous owner-prompted run's start to this one's.
+
+    Anything in it happened since the owner's last message, so a note built from it shows
+    each update exactly once, including ones that arrived during an approval resume.
+    """
+    prompted = {
+        e.data["run_id"]
+        for e in events
+        if e.type == "run.queued" and e.data.get("trigger") in PROMPTED
+    }
+    starts = [e.seq for e in events if e.type == "run.started" and e.data.get("run_id") in prompted]
+    current = next(
+        (
+            e.seq
+            for e in events
+            if e.type == "run.started" and e.data.get("run_id") == run["run_id"]
+        ),
+        None,
+    )
+    upper = current if current is not None else (events[-1].seq + 1 if events else 0)
+    lower = max((seq for seq in starts if seq < upper), default=-1)
+    return lower, upper

@@ -44,6 +44,8 @@ from bud.core.events import RUN_END_EVENTS, Event, EventType
 from bud.core.hub import Hub
 from bud.core.log import StopRequested
 from bud.core.projection import (
+    JOB_REPORT,
+    PROMPTED,
     JobReport,
     Snapshot,
     decisions,
@@ -55,7 +57,9 @@ from bud.core.projection import (
     reply_text,
     request_groups,
     runs,
+    since_last_prompt,
     undecided_approvals,
+    unreported_job_ends,
     waiting_batch,
 )
 from bud.core.runtime import replay_version
@@ -225,8 +229,13 @@ class Runner(DBOSConfiguredInstance):
         )
 
     def _publish_task(self, session_id: str) -> None:
-        if self.work_items is not None:
-            self.work_items.publish(session_id)
+        if self.work_items is None:
+            return
+        self.work_items.publish(session_id)
+        item = self.work_items.for_session(session_id)
+        if item is not None:
+            # A job that just ended may need bud to tell the owner; see _report_jobs.
+            self._kick(item.feed_id)
 
     async def recover(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -269,6 +278,7 @@ class Runner(DBOSConfiguredInstance):
         results: DeferredToolResults | None = None,
         *,
         origin: dict | None = None,
+        trigger: str = "message",
     ) -> dict:
         events = self.hub.log.read(session_id)
         last = next((event for event in reversed(events) if event.type in RUN_END_EVENTS), None)
@@ -300,10 +310,10 @@ class Runner(DBOSConfiguredInstance):
             # or (set in _resume_if_ready) the original message of a resumed run. A job gets
             # the owner's words that started or steered it, never its brief: bud writes the
             # brief, possibly after reading untrusted mail.
-            "request": text if item is None else item.owner_request,
+            "request": None if trigger == "job" else (text if item is None else item.owner_request),
             # The owner's clock when this run was queued (the simulated clock in sim mode).
             "clock": self.harness.clock().isoformat(),
-            "trigger": "message" if results is None else "approval",
+            "trigger": trigger if results is None else "approval",
             "origin": origin,
             "task_id": item.task_id if item is not None else None,
             "conversation_run": last.data["run_id"] if saved and last is not None else None,
@@ -405,7 +415,10 @@ class Runner(DBOSConfiguredInstance):
         if self._run_late_approval(session_id, events):
             return
         pending = message_batch(events)
-        if queue_paused(events) or not pending:
+        if queue_paused(events):
+            return
+        if not pending:
+            self._report_jobs(session_id, events)
             return
         run = self._inputs(
             session_id,
@@ -415,6 +428,18 @@ class Runner(DBOSConfiguredInstance):
         run["message_id"] = pending[0].message_id
         run["message_ids"] = [item.message_id for item in pending]
         if self.hub.log.dispatch_message(session_id, pending[0].message_id, run):
+            self.hub.wake(session_id)
+            self._launch(run)
+
+    def _report_jobs(self, session_id: str, events: list[Event]) -> None:
+        """Start a turn that tells the owner about jobs that ended since they last heard."""
+        ended = unreported_job_ends(events)
+        if not ended:
+            return
+        run = self._inputs(
+            session_id, JOB_REPORT, origin=ended[-1].data.get("origin"), trigger="job"
+        )
+        if self.hub.log.dispatch_job_report(session_id, run):
             self.hub.wake(session_id)
             self._launch(run)
 
@@ -810,6 +835,8 @@ class Runner(DBOSConfiguredInstance):
         )
         turn = [e for e in events if start < e.seq <= end.seq]
         owner = "\n\n".join(e.data["text"] for e in turn if e.type == "user.message")
+        if not owner:
+            return  # a job report: no owner words to learn from or recall
         requests = {e.data["approval_id"]: e.data for e in turn if e.type == "approval.requested"}
         signals = [
             f"The owner denied {request['tool']} {json.dumps(request['args'])[:300]}"
@@ -1259,9 +1286,9 @@ def job_updates_note(events: list[Event], run: dict) -> str:
     agrees. The window starts where the previous prompted run started, so an update that
     arrived during that run, or during an approval resume, is shown exactly once.
     """
-    if run.get("trigger") != "message" or run.get("task_id") is not None:
+    if run.get("trigger") not in PROMPTED or run.get("task_id") is not None:
         return ""
-    lower, upper = _since_last_prompt(events, run)
+    lower, upper = since_last_prompt(events, run)
     lines = []
     for e in events:
         if e.type not in JOB_UPDATES or not lower < e.seq < upper:
@@ -1294,36 +1321,11 @@ def job_updates_note(events: list[Event], run: dict) -> str:
     )
 
 
-def _since_last_prompt(events: list[Event], run: dict) -> tuple[int, int]:
-    """The log window (exclusive) from the previous owner-prompted run's start to this one's.
-
-    Anything in it happened since the owner's last message, so a note built from it shows
-    each update exactly once, including ones that arrived during an approval resume.
-    """
-    prompted = {
-        e.data["run_id"]
-        for e in events
-        if e.type == "run.queued" and e.data.get("trigger") == "message"
-    }
-    starts = [e.seq for e in events if e.type == "run.started" and e.data.get("run_id") in prompted]
-    current = next(
-        (
-            e.seq
-            for e in events
-            if e.type == "run.started" and e.data.get("run_id") == run["run_id"]
-        ),
-        None,
-    )
-    upper = current if current is not None else (events[-1].seq + 1 if events else 0)
-    lower = max((seq for seq in starts if seq < upper), default=-1)
-    return lower, upper
-
-
 def setup_updates_note(events: list[Event], run: dict) -> str:
     """Connection outcomes since the preceding owner turn, without sign-in links."""
-    if run.get("trigger") != "message":
+    if run.get("trigger") not in PROMPTED:
         return ""
-    lower, upper = _since_last_prompt(events, run)
+    lower, upper = since_last_prompt(events, run)
     latest = {
         event.data["capability"]: event.data.get("status")
         for event in events
@@ -1352,9 +1354,9 @@ def parked_decisions_note(events: list[Event], run: dict) -> str:
     bud hears through the result; a denial has no run of its own, so it rides the next
     message like the other notes. bud's own withdrawals are left out: it already knows.
     """
-    if run.get("trigger") != "message" or run.get("task_id") is not None:
+    if run.get("trigger") not in PROMPTED or run.get("task_id") is not None:
         return ""
-    lower, upper = _since_last_prompt(events, run)
+    lower, upper = since_last_prompt(events, run)
     parked = parked_ids(events)
     requested = {e.data["approval_id"]: e.data for e in events if e.type == "approval.requested"}
     lines = []
@@ -1424,7 +1426,7 @@ STYLED_SURFACES = ("desktop", "imessage")
 def surface_note(run: dict) -> str:
     """Names the screen the reply lands on, last in the prompt like the other notes."""
     channel = (run.get("origin") or {}).get("channel")
-    if run.get("trigger") != "message" or channel not in STYLED_SURFACES:
+    if run.get("trigger") not in PROMPTED or channel not in STYLED_SURFACES:
         return ""
     return f"\n\n<surface>{channel}</surface>"
 

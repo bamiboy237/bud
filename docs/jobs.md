@@ -31,6 +31,11 @@ The conversation, job, pending decision, and saved results survive a process
 restart. A completed job posts its result back to the conversation and the
 interface where you requested it.
 
+When a job finishes, fails, or pauses because it was going in circles, Bud
+tells you in the conversation without waiting for your next message. If a
+message of yours is already waiting, Bud gets the job's result with that
+message instead. A job you cancel gets no report.
+
 Name the job for a correction or follow-up. Bud asks which one when several
 jobs could fit the request. Ask it to inspect or stop a named job. `/stop`
 also stops the current conversation's open jobs.
