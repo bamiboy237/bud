@@ -12,7 +12,9 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo
 
+from bud.core.log import EventLog
 from bud.core.projection import JOB_REPORT
+from bud.core.runner import job_updates_note
 from tests.runner_support import reply, running_bud
 
 BRIEF = {
@@ -141,3 +143,49 @@ async def test_a_quiet_job_is_reported_once_per_reason(tmp_path, monkeypatch):
         "job",
     ]
     assert "past its deadline" in prompts[-1]
+
+
+def test_owner_message_must_report_new_job_results(tmp_path):
+    log = EventLog(tmp_path / "events.db")
+    log.append(
+        "owner",
+        "task.completed",
+        {"task_id": 1, "title": "Lease renewal", "text": "Renews on 3 March."},
+    )
+    note = job_updates_note(log.read("owner"), {"run_id": "next", "trigger": "message"})
+
+    assert "Renews on 3 March." in note
+    assert "briefly report any newly completed" in note
+    assert "mention a job only if it matters" not in note
+
+
+async def test_queued_job_report_survives_runner_reconstruction(tmp_path, monkeypatch):
+    prompts: list[str] = []
+    async with running_bud(tmp_path, bud_with_one_job(prompts), jobs=True) as bud:
+        launch = bud.runner._launch
+
+        def defer_report(run, **kwargs):
+            if run["trigger"] != "job":
+                launch(run, **kwargs)
+
+        monkeypatch.setattr(bud.runner, "_launch", defer_report)
+        bud.log.append("owner", "session.created")
+        bud.runner.start("owner", "When does my lease renew?", "message-1")
+        await bud.settle()
+        pending = bud.log.pending_runs()
+        assert len(pending) == 1
+        assert pending[0]["trigger"] == "job"
+        report_id = pending[0]["run_id"]
+
+    async with running_bud(tmp_path, bud_with_one_job(prompts), jobs=True) as bud:
+        await bud.runner.recover()
+        await bud.settle()
+        events = bud.log.read("owner")
+        reports = [
+            e.data for e in events if e.type == "run.queued" and e.data["trigger"] == "job"
+        ]
+        assert [run["run_id"] for run in reports] == [report_id]
+        assert any(
+            e.type == "run.completed" and e.data["run_id"] == report_id for e in events
+        )
+        assert "The lease renews on 3 March." in prompts[-1]
