@@ -679,7 +679,13 @@ class Runner(DBOSConfiguredInstance):
         }
         results = DeferredToolResults(
             approvals={
-                request["call_id"]: ToolApproved()
+                request["call_id"]: ToolApproved(
+                    override_args={
+                        "questions": [q.model_dump() for q in questions_of(request["args"])]
+                    }
+                    if request["tool"] == "ask_user" and "questions" not in request["args"]
+                    else None
+                )
                 if decided.get(request["approval_id"])
                 # A decision outranks parking: a parked request the owner already denied is
                 # denied, not reported as still open.

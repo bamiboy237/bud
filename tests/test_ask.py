@@ -1,5 +1,14 @@
+import json
+
 import pytest
-from pydantic_ai.messages import ModelResponse, ToolCallPart, ToolReturnPart
+from pydantic_ai.messages import (
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelResponse,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 
 from bud.composio.tools import ask_user as account_ask_user
 from bud.core.controls import approval_text
@@ -70,6 +79,60 @@ def test_legacy_question_reads_as_one_question_and_numbers_pick_options():
 def test_answers_must_match_the_questions(answers):
     with pytest.raises(ValueError):
         render_answers(questions_of(QUESTIONS), answers)
+
+
+async def test_legacy_pending_question_resumes_after_upgrade(tmp_path):
+    seen = []
+    args = {"question": "Which city?", "choices": ["Tulsa", "Chicago"]}
+    messages = [
+        ModelRequest(parts=[UserPromptPart("Choose a city")]),
+        ModelResponse(parts=[ToolCallPart("ask_user", args, tool_call_id="legacy-call")]),
+    ]
+
+    def respond(messages, info):
+        seen.extend(
+            part.content
+            for message in messages
+            for part in getattr(message, "parts", [])
+            if isinstance(part, ToolReturnPart) and part.tool_name == "ask_user"
+        )
+        return reply()
+
+    async with running_bud(tmp_path, respond, ask=True) as bud:
+        bud.log.append("owner", "session.created")
+        bud.log.append(
+            "owner",
+            "run.queued",
+            {"run_id": "legacy-run", "trigger": "message", "text": "Choose a city"},
+        )
+        bud.log.append("owner", "run.started", {"run_id": "legacy-run"})
+        bud.log.finish_run(
+            "owner",
+            "legacy-run",
+            "run.waiting",
+            {
+                "run_id": "legacy-run",
+                "messages": json.loads(ModelMessagesTypeAdapter.dump_json(messages)),
+            },
+            [
+                {
+                    "run_id": "legacy-run",
+                    "approval_id": "legacy-approval",
+                    "call_id": "legacy-call",
+                    "tool": "ask_user",
+                    "args": args,
+                }
+            ],
+        )
+
+    async with running_bud(tmp_path, respond, ask=True) as bud:
+        await bud.runner.recover()
+        assert bud.runner.answer("owner", "legacy-approval", "2")
+        await bud.settle()
+        assert seen == ["Which city?\nAnswer: Chicago"]
+        state = bud.runner.snapshot("owner")
+        assert state.recent_runs[-1].status == "completed"
+        assert not state.pending_approvals
 
 
 async def test_card_answers_resume_the_run_with_each_question_beside_its_answer(tmp_path):
