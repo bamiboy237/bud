@@ -56,6 +56,21 @@ struct QuestionTests {
     }
 
     @Test @MainActor
+    func legacyNumericChoiceSubmitsSelectedLabel() throws {
+        let approval = try #require(Approval([
+            "approval_id": "question", "tool": "ask_user",
+            "args": ["question": "Which one?", "choices": ["2", "3"]],
+        ], jobs: [:]))
+        var sent: [[QuestionAnswer]] = []
+        let flow = QuestionFlow(questions: approval.questions) { sent.append($0) }
+        let cards = QuestionCards(companion: Companion(), approval: approval, flow: flow, listLimit: 200)
+
+        cards.pick("2")
+
+        #expect(sent == [[QuestionAnswer(header: "Question", selected: ["2"], custom: nil)]])
+    }
+
+    @Test @MainActor
     func backPreservesAnswersAndFinalAdvanceSubmits() {
         var sent: [[QuestionAnswer]] = []
         let flow = QuestionFlow(questions: Question.parse(Self.listArgs).questions) { sent.append($0) }

@@ -138,11 +138,7 @@ struct QuestionCards: View {
         }
     }
 
-    private func pick(_ label: String) {
-        guard approval.isQuestionList else {
-            companion.choose(label, for: approval.id)
-            return
-        }
+    func pick(_ label: String) {
         flow.answers.choose(label)
         if !answers.current.multiSelect { flow.advance() }
     }

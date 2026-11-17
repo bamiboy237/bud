@@ -917,11 +917,6 @@ final class Companion {
         inputOpen = true
     }
 
-    /// Choosing one of a question's options sends it as the answer, word for word.
-    func choose(_ choice: String, for id: String) {
-        respond(to: id, path: "answer", body: ["text": choice])
-    }
-
     @ObservationIgnored private var questionFlows: [String: QuestionFlow] = [:]
 
     func questionFlow(for approval: Approval) -> QuestionFlow {

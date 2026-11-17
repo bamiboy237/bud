@@ -81,11 +81,18 @@ def test_answers_must_match_the_questions(answers):
         render_answers(questions_of(QUESTIONS), answers)
 
 
-async def test_legacy_pending_question_resumes_after_upgrade(tmp_path):
+@pytest.mark.parametrize(
+    ("text", "answers", "expected"),
+    [
+        ("2", None, "3"),
+        (None, [AskAnswer(header="Question", selected=["2"])], "2"),
+    ],
+)
+async def test_legacy_pending_question_resumes_after_upgrade(tmp_path, text, answers, expected):
     seen = []
-    args = {"question": "Which city?", "choices": ["Tulsa", "Chicago"]}
+    args = {"question": "Which number?", "choices": ["2", "3"]}
     messages = [
-        ModelRequest(parts=[UserPromptPart("Choose a city")]),
+        ModelRequest(parts=[UserPromptPart("Choose a number")]),
         ModelResponse(parts=[ToolCallPart("ask_user", args, tool_call_id="legacy-call")]),
     ]
 
@@ -103,7 +110,7 @@ async def test_legacy_pending_question_resumes_after_upgrade(tmp_path):
         bud.log.append(
             "owner",
             "run.queued",
-            {"run_id": "legacy-run", "trigger": "message", "text": "Choose a city"},
+            {"run_id": "legacy-run", "trigger": "message", "text": "Choose a number"},
         )
         bud.log.append("owner", "run.started", {"run_id": "legacy-run"})
         bud.log.finish_run(
@@ -127,9 +134,9 @@ async def test_legacy_pending_question_resumes_after_upgrade(tmp_path):
 
     async with running_bud(tmp_path, respond, ask=True) as bud:
         await bud.runner.recover()
-        assert bud.runner.answer("owner", "legacy-approval", "2")
+        assert bud.runner.answer("owner", "legacy-approval", text, answers=answers)
         await bud.settle()
-        assert seen == ["Which city?\nAnswer: Chicago"]
+        assert seen == [f"Which number?\nAnswer: {expected}"]
         state = bud.runner.snapshot("owner")
         assert state.recent_runs[-1].status == "completed"
         assert not state.pending_approvals
