@@ -108,6 +108,18 @@ struct ApprovalTests {
     }
 
     @Test
+    func workspaceWritesShowTheFileAndProposedContent() throws {
+        for tool in ["workspace_create", "workspace_update"] {
+            let item = try approval(tool, args: [
+                "path": "notes/report.md", "content": "Proposed report\nSecond line",
+                "expected_revision": "0123456789ab",
+            ])
+            #expect(item.facts.contains { $0.label == "File" && $0.value == "notes/report.md" })
+            #expect(item.body == "Proposed report\nSecond line")
+        }
+    }
+
+    @Test
     func emailPreviewDoesNotReplaceProposedContent() throws {
         let item = try approval("draft_reply", args: ["body": "Proposed reply"], preview: [
             "kind": "email", "subject": "Invoice",

@@ -97,7 +97,7 @@ struct Approval: Identifiable, Equatable {
                 .flatMap(\.nilIfEmpty)
                 ?? Self.text(args, "body", "body_text", "text", "description").nilIfEmpty
         } else {
-            body = Self.text(args, "body", "body_text", "text", "description").nilIfEmpty
+            body = Self.text(args, "body", "body_text", "text", "description", "content").nilIfEmpty
         }
     }
 
@@ -146,7 +146,7 @@ struct Approval: Identifiable, Equatable {
             if !value.isEmpty { out.append((label, value)) }
         }
         for (key, label) in [("subject", "Subject"), ("start", "When"), ("when", "When"),
-                             ("location", "Where"), ("due", "Due")] {
+                             ("location", "Where"), ("due", "Due"), ("path", "File")] {
             let value = text(args, key)
             if !value.isEmpty, !out.contains(where: { $0.0 == label }) {
                 out.append((label, key == "start" ? readableTime(value) : value))
