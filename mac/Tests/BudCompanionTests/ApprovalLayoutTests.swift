@@ -5,6 +5,43 @@ import Testing
 
 @MainActor
 struct ApprovalLayoutTests {
+    @Test(arguments: [false, true])
+    func workspaceActionsFitWithAndWithoutStandingPermission(grantable: Bool) async throws {
+        _ = NSApplication.shared
+        let companion = Companion()
+        companion.apply(snapshot: [
+            "last_seq": 1, "pending_approvals": [[
+                "approval_id": "write", "tool": "workspace_create", "grantable": grantable,
+                "args": ["path": "report.md", "content": "Draft for approval."],
+            ]],
+        ])
+        companion.link = .connected
+        let host = NSHostingView(rootView: ApprovalCard(
+            companion: companion, approval: try #require(companion.approvals.first),
+            onDecide: { _ in }
+        ).frame(width: 288).transaction { $0.disablesAnimations = true })
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 288, height: 275),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.close() }
+        for failed in [false, true] {
+            if failed {
+                companion.completeBatch(.init(approved: [], failures: ["write": "Could not connect. Try again."]),
+                                        ids: ["write"])
+            }
+            host.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(150))
+            host.layoutSubtreeIfNeeded()
+            #expect(host.fittingSize.height <= 275)
+            #expect(host.fittingSize.width == 288)
+            if let directory = ProcessInfo.processInfo.environment["BUD_APPROVAL_SNAPSHOTS"] {
+                let name = "workspace-\(grantable ? "grantable" : "once")-\(failed ? "retry" : "ready").png"
+                try snapshot(host, to: URL(filePath: directory).appending(path: name))
+            }
+        }
+    }
+
     @Test
     func setupCardFitsThePetPanel() async throws {
         _ = NSApplication.shared

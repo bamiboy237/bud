@@ -27,8 +27,8 @@ final class DeckState: ObservableObject {
 
 /// A stacked deck of pending approvals. Cards sit directly on top of each other with subtle
 /// depth offsets, keeping the vertical footprint constant regardless of how many actions wait.
-/// Deciding an action triggers a fluid flight animation (slide-right with emerald green stamp for
-/// approve, slide-left with coral red stamp for deny) while the card behind smoothly springs forward.
+/// Deciding an action tints the card green as it slides right, or red as it slides left,
+/// while the card behind smoothly springs forward.
 struct ApprovalDeck: View {
     @Bindable var companion: Companion
     @StateObject private var deck = DeckState()
@@ -181,10 +181,10 @@ struct ApprovalDeck: View {
                     }
                 )
                 .id(activeApproval.id)
+                .overlay(decisionTintOverlay)
                 .offset(x: deck.flyOffset, y: 0)
                 .rotationEffect(.degrees(deck.flyRotation))
                 .opacity(deck.flyOpacity)
-                .overlay(decisionStampOverlay)
                 .zIndex(10)
             }
         }
@@ -192,32 +192,12 @@ struct ApprovalDeck: View {
     }
 
     @ViewBuilder
-    private var decisionStampOverlay: some View {
+    private var decisionTintOverlay: some View {
         if let decision = deck.activeDecision {
-            HStack {
-                if decision == .approve { Spacer() }
-                VStack {
-                    Text(decision == .approve ? "APPROVE" : "DENY")
-                        .font(.system(size: 18, weight: .black, design: .rounded))
-                        .tracking(1.5)
-                        .foregroundStyle(decision == .approve ? Color(red: 0.14, green: 0.62, blue: 0.35) : Color(red: 0.82, green: 0.24, blue: 0.24))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 5)
-                        .background {
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .strokeBorder(decision == .approve ? Color(red: 0.14, green: 0.62, blue: 0.35) : Color(red: 0.82, green: 0.24, blue: 0.24), lineWidth: 2.2)
-                                .background(Paper.surface.opacity(0.95), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        }
-                        .rotationEffect(.degrees(decision == .approve ? 8 : -8))
-                        .shadow(color: (decision == .approve ? Color.green : Color.red).opacity(0.3), radius: 8, y: 2)
-                    Spacer()
-                }
-                .padding(.top, 20)
-                .padding(.horizontal, 16)
-                if decision == .deny { Spacer() }
-            }
-            .allowsHitTesting(false)
-            .transition(.scale(scale: 0.8).combined(with: .opacity))
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill((decision == .approve ? Color.green : Color.red).opacity(0.12))
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
         }
     }
 

@@ -797,7 +797,7 @@ struct ApprovalCard: View {
         companion.deciding.contains(approval.id) || companion.approvingBatch || companion.link != .connected
     }
     private var detailLimit: CGFloat {
-        let height: CGFloat = approval.isQuestion ? 190 : 110
+        let height: CGFloat = approval.isQuestion ? 190 : 100
         let hasProblem = companion.approvalFailures[approval.id] != nil || companion.decisionProblem != nil
         return hasProblem ? max(80, height - 40) : height
     }
@@ -918,28 +918,33 @@ struct ApprovalCard: View {
     }
 
     private var buttons: some View {
-        VStack(alignment: .trailing, spacing: 6) {
+        VStack(spacing: 6) {
             HStack(spacing: 6) {
                 Button("Change…") { companion.write(.revise(approval.id)) }
                     .buttonStyle(CardButton(kind: .quiet))
                     .help("Tell bud what to do differently")
                 Spacer(minLength: 0)
-                Button("Deny") { onDecide(false) }
-                    .buttonStyle(CardButton(kind: .deny))
-                Button(companion.approvalFailures[approval.id] == nil ? approval.verb : "Retry") {
-                    onDecide(true)
-                }
-                    .buttonStyle(CardButton(kind: .approve))
+                if approval.grantable { alwaysAllow }
             }
-            if approval.grantable { alwaysAllow }
+            HStack(spacing: 6) {
+                Button { onDecide(false) } label: {
+                    Text("Deny").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(CardButton(kind: .secondary))
+                Button {
+                    onDecide(true)
+                } label: {
+                    Text(companion.approvalFailures[approval.id] == nil ? approval.verb : "Retry")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(CardButton(kind: .primary))
+            }
         }
     }
 
-    /// Under the decision, not beside it: three capsules in one row overrun the bubble, and a
-    /// truncated "Always al…" would hide what the click gives away.
     private var alwaysAllow: some View {
         Button("Always allow") { companion.alwaysAllow(approval) }
-            .buttonStyle(CardButton(kind: .secondary))
+            .buttonStyle(CardButton(kind: .quiet))
             .help(approval.alwaysAllowHelp)
             .accessibilityLabel("Always allow")
             .accessibilityHint(approval.alwaysAllowHelp)
@@ -998,7 +1003,7 @@ struct IconButton: ButtonStyle {
 }
 
 struct CardButton: ButtonStyle {
-    enum Kind { case primary, secondary, quiet, approve, deny }
+    enum Kind { case primary, secondary, quiet }
     let kind: Kind
 
     func makeBody(configuration: Configuration) -> some View {
@@ -1012,19 +1017,15 @@ struct CardButton: ButtonStyle {
 
         var body: some View {
             configuration.label
-                .font(.system(size: 12.5, weight: kind == .approve || kind == .deny ? .semibold : .medium))
+                .font(.system(size: 12.5, weight: .medium))
                 .foregroundStyle(ink)
-                .padding(.horizontal, kind == .quiet ? 6 : 14)
+                .padding(.horizontal, kind == .quiet ? 6 : 12)
                 .frame(height: 26)
                 .background {
                     switch kind {
                     case .primary: Capsule().fill(Paper.ink.opacity(hover.on ? 0.86 : 1))
                     case .secondary: Capsule().fill(Paper.ink.opacity(hover.on ? 0.11 : 0.07))
                     case .quiet: Capsule().fill(Paper.ink.opacity(hover.on ? 0.06 : 0))
-                    case .approve:
-                        Capsule().fill(Color(red: 0.14, green: 0.62, blue: 0.35).opacity(hover.on ? 0.88 : 1.0))
-                    case .deny:
-                        Capsule().fill(Color(red: 0.82, green: 0.24, blue: 0.24).opacity(hover.on ? 0.88 : 1.0))
                     }
                 }
                 .contentShape(Capsule())
@@ -1037,7 +1038,7 @@ struct CardButton: ButtonStyle {
 
         private var ink: AnyShapeStyle {
             switch kind {
-            case .primary, .approve, .deny: AnyShapeStyle(Color.white)
+            case .primary: AnyShapeStyle(Paper.surface)
             case .secondary: AnyShapeStyle(Paper.ink)
             case .quiet: hover.on ? AnyShapeStyle(Paper.ink) : AnyShapeStyle(.secondary)
             }
