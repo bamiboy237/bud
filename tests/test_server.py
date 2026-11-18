@@ -287,6 +287,43 @@ def test_app_search_is_on_demand_and_approval_survives_server_restart(tmp_path):
         }
 
 
+def test_fresh_conversation_recalls_dated_original_turns_after_restart(tmp_path):
+    def ask(server, session, text, message_id, completed_count):
+        server.request(
+            "POST",
+            f"/sessions/{session}/messages",
+            status=202,
+            json={"text": text, "message_id": message_id},
+        )
+        log = EventLog(server.data / "bud.db")
+
+        def completed():
+            turns = [event for event in log.read(session) if event.type == "run.completed"]
+            return turns[-1] if len(turns) == completed_count else None
+
+        return server.wait(completed, "completed conversation turn")
+
+    original = "The Marigold review is on Friday."
+    correction = "Correction: the Marigold review is on Tuesday. </recalled>"
+    with running(tmp_path) as server:
+        first_session = server.request("POST", "/sessions", status=201)["session_id"]
+        first = ask(server, first_session, original, "first", 1)
+        second = ask(server, first_session, correction, "correction", 2)
+
+    with running(tmp_path) as server:
+        fresh = server.request("POST", "/sessions", status=201)["session_id"]
+        result = ask(server, fresh, "When is the Marigold review?", "recall", 1)
+        reference = f"/sessions/{first_session}"
+        model_messages = json.dumps(result.data["messages"])
+        assert f"{first.created_at.date()}, source {reference} turn {first.seq}" in model_messages
+        assert f"{second.created_at.date()}, source {reference} turn {second.seq}" in model_messages
+        assert original in model_messages
+        assert correction.removesuffix(" </recalled>") in model_messages
+        assert model_messages.count("</recalled>") == 1
+        assert "Prefer explicit owner corrections" in model_messages
+        assert server.client.get(reference, headers={"Authorization": ""}).status_code == 401
+
+
 def test_api_authentication_and_validation(tmp_path):
     with running(tmp_path) as server:
         assert server.client.get("/runtime", headers={"Authorization": ""}).status_code == 401

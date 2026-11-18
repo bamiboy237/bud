@@ -837,7 +837,7 @@ class Runner(DBOSConfiguredInstance):
 
     def _maybe_learn(self, session_id: str, run_id: str) -> None:
         """Reflect on a completed turn in the background; the reply is already out."""
-        if (self.learner is None and self.recall is None) or self._closing:
+        if self.recall is None and (self.learner is None or self._closing):
             return
         if self.work_items is not None and self.work_items.for_session(session_id) is not None:
             return  # a job's messages are briefs written by bud, not the owner's words
@@ -869,14 +869,15 @@ class Runner(DBOSConfiguredInstance):
         ]
         reply = reply_text(end.data.get("messages", []))
         jobs = []
-        if self.learner is not None:
+        if self.learner is not None and not self._closing:
             jobs.append(self._learn(session_id, run_id, owner, reply, signals))
         if self.recall is not None:
             try:
                 self.recall.add_turn(session_id, run_id, owner, reply)
             except Exception as exc:
                 logger.warning("recall indexing skipped for run %s: %s", run_id, exc)
-            jobs.append(self._embed_pending(run_id))
+            if not self._closing:
+                jobs.append(self._embed_pending(run_id))
         for job in jobs:
             task = asyncio.create_task(job)
             self._learning.add(task)
@@ -898,10 +899,21 @@ class Runner(DBOSConfiguredInstance):
         try:
             await self.recall.index_memory()
             hits = await self.recall.search(run["text"], exclude_session=run["session_id"])
+            sources = {
+                hit.id: source
+                for hit in hits
+                if hit.session_id is not None
+                and (
+                    source := self.hub.log.completed_turn_source(
+                        hit.session_id, hit.id.removeprefix("turn:")
+                    )
+                )
+                is not None
+            }
         except Exception as exc:
             logger.warning("recall skipped for run %s: %s", run["run_id"], error_summary(exc))
             return ""
-        return render(hits)
+        return render(hits, sources)
 
     async def _learn(
         self, session_id: str, run_id: str, owner: str, reply: str, signals: list[str]
