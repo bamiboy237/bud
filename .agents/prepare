@@ -5,3 +5,6 @@ set -eu
 
 # --locked matches CI: a stale uv.lock fails here instead of drifting silently.
 uv sync --locked
+
+# Refuse commits on master in every checkout of this repository.
+git config core.hooksPath .githooks

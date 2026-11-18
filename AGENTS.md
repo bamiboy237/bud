@@ -45,6 +45,20 @@ they never run in CI.
 Isolate each test: point `DATA_DIR` at a temp directory and bind port 0. `bud serve`
 binds a fixed `127.0.0.1:8420`, so tests start their own server instead.
 
+To see a change in the Mac app, use `scripts/dev-stack`. Do not write your own
+build, serve, and `pkill` steps.
+
+```sh
+scripts/dev-stack up                 # build the app, private server with your real accounts
+scripts/dev-stack up --simulate      # simulated inbox and calendar
+scripts/dev-stack shot approval-card --rect 1020,280,420,620
+scripts/dev-stack down               # stops only this stack, deletes its data
+```
+
+Each stack gets its own data folder and a free port, so it runs beside the live
+server on 8420. Real mode copies your Composio bindings but not the ChatGPT login,
+so it uses the API keys in `.env`.
+
 Test strategy, isolation details, manual app checks, and real-model eval commands
 are in [docs/testing.md](docs/testing.md).
 

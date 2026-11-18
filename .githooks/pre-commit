@@ -1,0 +1,6 @@
+#!/bin/sh
+# master takes changes only through pull requests.
+if [ "$(git rev-parse --abbrev-ref HEAD)" = "master" ]; then
+  echo "Refusing to commit on master. Create a branch: git switch -c <type>/<short-slug>" >&2
+  exit 1
+fi
