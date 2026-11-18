@@ -56,33 +56,61 @@ def _client(data: Path) -> httpx.Client:
     )
 
 
-def start(data: Path, port: int) -> None:
-    if port == PORT:
-        sys.exit(f"Port {PORT} is the owner's live server; pick another port.")
+def launch_server(
+    data: Path, port: int, *, simulate: bool, env: dict[str, str] | None = None
+) -> int:
+    """Run `create_app` in its own process group on `port` with DATA_DIR=`data`.
+
+    Returns the pid once the server answers. Logs go to `data/server.log`.
+    """
     data.mkdir(parents=True, exist_ok=True)
     # Owner-only, like Codex and Vibe's log files.
     log = os.fdopen(
         os.open(data / "server.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a"
     )
-    env = {**os.environ, "DATA_DIR": str(data), "PYDANTIC_AI_NO_BANNER": "1"}
+    env = {**os.environ, **(env or {}), "DATA_DIR": str(data), "PYDANTIC_AI_NO_BANNER": "1"}
     code = (
         "import uvicorn; from bud.core.server import create_app; "
-        f"uvicorn.run(create_app(simulate=True), host={HOST!r}, port={port}, "
+        f"uvicorn.run(create_app(simulate={simulate}), host={HOST!r}, port={port}, "
         "log_level='warning', timeout_graceful_shutdown=3)"
     )
     process = subprocess.Popen(
         [sys.executable, "-c", code], env=env, stdout=log, stderr=log, start_new_session=True
     )
-    _save(data, {**_state(data), "port": port, "pid": process.pid})
-    for _ in range(120):
-        try:
-            if httpx.get(f"http://{HOST}:{port}/runtime", timeout=2).status_code == 401:
-                break
-        except httpx.HTTPError:
-            pass
-        time.sleep(1)
-    else:
+    try:
+        for _ in range(120):
+            if process.poll() is not None:
+                sys.exit(f"Server exited; see {data / 'server.log'}")
+            with contextlib.suppress(httpx.HTTPError):
+                if httpx.get(f"http://{HOST}:{port}/runtime", timeout=2).status_code == 401:
+                    return process.pid
+            time.sleep(1)
         sys.exit(f"Server did not start; see {data / 'server.log'}")
+    except BaseException:
+        # The caller has no pid yet, so nothing else could stop this server (Ctrl-C included).
+        stop_process_group(process.pid)
+        raise
+
+
+def stop_process_group(pid: int) -> None:
+    """Stop the process group led by `pid` and return once it is gone."""
+    # PermissionError: the id now belongs to another user's process, so ours is gone.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pid, signal.SIGTERM)
+        # Return only once the server is gone: it holds bud.lock until shutdown ends, so an
+        # immediate `start` would otherwise fail with "Another bud server is already using".
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            os.killpg(pid, 0)  # raises ProcessLookupError once the group has exited
+            time.sleep(0.2)
+        os.killpg(pid, signal.SIGKILL)
+
+
+def start(data: Path, port: int) -> None:
+    if port == PORT:
+        sys.exit(f"Port {PORT} is the owner's live server; pick another port.")
+    pid = launch_server(data, port, simulate=True)
+    _save(data, {**_state(data), "port": port, "pid": pid})
     with _client(data) as client:
         primary = client.post("/sessions/primary").json()["session_id"]
     _save(data, {**_state(data), "primary": primary})
@@ -93,16 +121,7 @@ def stop(data: Path) -> None:
     state = _state(data)
     pid = state.get("pid")
     if pid:
-        # PermissionError: the id now belongs to another user's process, so ours is gone.
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(pid, signal.SIGTERM)
-            # Return only once the server is gone: it holds bud.lock until shutdown ends, so an
-            # immediate `start` would otherwise fail with "Another bud server is already using".
-            deadline = time.monotonic() + 15
-            while time.monotonic() < deadline:
-                os.killpg(pid, 0)  # raises ProcessLookupError once the group has exited
-                time.sleep(0.2)
-            os.killpg(pid, signal.SIGKILL)
+        stop_process_group(pid)
         # Forget the id: once it is free, the system can give it to an unrelated process,
         # and a second `stop` must not signal that one.
         _save(data, {key: value for key, value in state.items() if key != "pid"})
