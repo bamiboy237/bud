@@ -39,6 +39,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import ModelRequestContext
 from pydantic_ai_harness import DetectLoops
+from pydantic_ai_harness.detect_loops import DetectedLoop
 
 from bud.harness.review import DECISIONS_URL
 
@@ -204,11 +205,11 @@ def escalate(
     kind: str,
     detail: str,
     confidence: float | None = None,
-) -> None:
-    """Climb one rung: nudge the first time, pause the second, then nothing more."""
+) -> bool:
+    """Climb one rung and return whether this call newly paused the run."""
     ladder = marks([m for m in ctx.messages if m.run_id == ctx.run_id])
     if any(mark["origin"] == PAUSE for mark in ladder):
-        return
+        return False
     if not ladder:
         ctx.enqueue(
             SystemPromptPart(
@@ -216,7 +217,7 @@ def escalate(
                 metadata={"origin": NUDGE, "kind": kind, "detail": detail},
             )
         )
-        return
+        return False
     ctx.enqueue(
         SystemPromptPart(
             f"Still going in circles: {detail} Work tools are now off.",
@@ -231,9 +232,13 @@ def escalate(
             **({"confidence": confidence} if confidence is not None else {}),
         }
     )
+    return True
 
 
 def loop_detector(config: SpiralConfig, report: LoopReport) -> DetectLoops[None]:
+    def on_loop(ctx: RunContext[None], loop: DetectedLoop) -> None:
+        escalate(ctx, report, loop.pattern, loop.message)
+
     return DetectLoops(
         window=max(10, config.repeat_note, 2 * config.cycle_repeats),
         # The same call with a changed result is polling, which must never count.
@@ -241,7 +246,7 @@ def loop_detector(config: SpiralConfig, report: LoopReport) -> DetectLoops[None]
         repeated_result_threshold=config.repeat_note,
         alternating_calls_threshold=config.cycle_repeats,
         repeated_text_threshold=config.chant_repeats,
-        action=lambda ctx, loop: escalate(ctx, report, loop.pattern, loop.message),
+        action=on_loop,
     )
 
 
@@ -366,12 +371,13 @@ class SpiralGuard(AbstractCapability[None]):
         if paused_in([m for m in messages if m.run_id == ctx.run_id]) is not None:
             # The handoff is being written (or a retry of it): keep tools off.
             return self._tools_off(request_context)
-        await self._check_progress(ctx, messages)
+        if await self._check_progress(ctx, messages):
+            return self._tools_off(request_context)
         return request_context
 
     async def _check_progress(
         self, ctx: RunContext[None], messages: Sequence[ModelMessage]
-    ) -> None:
+    ) -> bool:
         run_id = ctx.run_id or ""
         request = owner_request(messages)
         requests = sum(isinstance(m, ModelResponse) and m.run_id == ctx.run_id for m in messages)
@@ -381,7 +387,7 @@ class SpiralGuard(AbstractCapability[None]):
             or not judge_due(requests, self.config)
             or self._judged.get(run_id) == requests
         ):
-            return
+            return False
         if len(self._judged) > 256:
             self._judged.clear()
         self._judged[run_id] = requests
@@ -394,8 +400,8 @@ class SpiralGuard(AbstractCapability[None]):
             "unavailable" if probability is None else f"{probability:.2f}",
         )
         if probability is None or probability >= self.config.progress_threshold:
-            return
-        escalate(
+            return False
+        return escalate(
             ctx,
             self.report,
             "no_progress",

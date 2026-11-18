@@ -106,11 +106,12 @@ async def test_the_progress_judge_climbs_the_same_ladder():
     judge = NoProgress()
     config = SpiralConfig(progress_first=2, progress_every=2)
     pages = [f"page {i}" for i in range(50)]
-    agent, _ = scripted(pages, config, reports, judge=judge)
+    agent, calls = scripted(pages, config, reports, judge=judge)
 
     result = await agent.run("Find the invoice.")
 
     assert result.output == HANDOFF_TEXT
+    assert len(calls) == 4
     assert judge.asked == 2
     assert [n["kind"] for n in nudges(result.all_messages())] == ["no_progress"]
     assert [r["kind"] for r in reports] == ["no_progress"]
