@@ -390,10 +390,13 @@ class Runner(DBOSConfiguredInstance):
         self._validate_text(text)
         self.hub.log.edit_message(session_id, message_id, text)
         self.hub.wake(session_id)
+        self._on_loop(self._drain, session_id)
 
     def cancel_message(self, session_id: str, message_id: str) -> bool:
         changed = self.hub.log.cancel_message(session_id, message_id)
         self.hub.wake(session_id)
+        if changed:
+            self._on_loop(self._drain, session_id)
         return changed
 
     def pause_queue(self, session_id: str, paused: bool) -> bool:
