@@ -22,20 +22,29 @@ from pydantic import BaseModel, Field, SecretStr
 from pydantic_ai import ModelRetry
 from pydantic_ai.toolsets import CombinedToolset, FunctionToolset
 
+from bud.composio.binding import valid_toolkit
 from bud.composio.connection import ConnectionError, Connections
 from bud.config import Settings, get_settings
 from bud.core.auth import OwnerAuthentication, owner_token
 from bud.core.events import Event, MessageOrigin
+from bud.core.history import conversation_search
 from bud.core.hub import Hub
 from bud.core.log import EventLog, QueueFull
 from bud.core.profiles import Mode, ProfileStore, apply_mode, as_mode, mode_summary
 from bud.core.profiles import guidance as MODE_GUIDANCE
 from bud.core.projection import Snapshot
 from bud.core.runner import DecisionRejected, Runner, UnknownApproval
-from bud.core.setup import SetupJournal, build_setup_toolset, setup_registry
+from bud.core.setup import (
+    SetupJournal,
+    SetupRegistry,
+    build_setup_toolset,
+    check_setup,
+    setup_registry,
+)
 from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
+from bud.harness.ask import MAX_QUESTIONS, AskAnswer
 from bud.harness.grants import Grants
 from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
@@ -51,6 +60,7 @@ from bud.workspace import GUIDANCE as WORKSPACE_GUIDANCE
 from bud.workspace import READ_TOOLS as WORKSPACE_READ_TOOLS
 from bud.workspace import WRITE_TOOLS as WORKSPACE_WRITE_TOOLS
 from bud.workspace import build_tools as build_workspace_tools
+from bud.workspace import read_capabilities as workspace_read_capabilities
 from bud.world.describe import build_describers, build_notifies_others
 from bud.world.store import World
 from bud.world.tools import READ_TOOLS as WORLD_READ_TOOLS
@@ -92,8 +102,15 @@ class Decision(BaseModel):
 
 
 class Answer(BaseModel):
-    text: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+    """A typed reply (`text`), or one answer per question from a card (`answers`)."""
+
+    text: str | None = Field(default=None, min_length=1, max_length=MAX_MESSAGE_CHARS)
+    answers: list[AskAnswer] | None = Field(default=None, min_length=1, max_length=MAX_QUESTIONS)
     origin: MessageOrigin = Field(default_factory=MessageOrigin)
+
+
+class ConnectRequest(BaseModel):
+    resume: bool = False
 
 
 def sse_frame(event: Event) -> str:
@@ -116,10 +133,18 @@ def hold_single_server_lock(path: Path) -> TextIO:
     return lock
 
 
-def workspace_tools(directory: Path) -> FunctionToolset[None]:
-    root = directory / "workspace"
+def workspace_root(directory: Path) -> Path:
+    # The data folder is resolved once, here, because /tmp and /var are symlinks on macOS and
+    # the workspace walk refuses symlinks. The workspace root below it is not resolved, so a
+    # symlink swapped in at that level is still refused.
+    root = directory.resolve() / "workspace"
     root.mkdir(exist_ok=True, mode=0o700)
-    return FunctionToolset(build_workspace_tools(root, directory / "workspace-dispatches.jsonl"))
+    return root
+
+
+def workspace_tools(directory: Path) -> FunctionToolset[None]:
+    root = workspace_root(directory)
+    return FunctionToolset(build_workspace_tools(root, root.parent / "workspace-dispatches.jsonl"))
 
 
 def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAPI:
@@ -151,6 +176,7 @@ def _create_app(
     binding = None
     photon = None
     setup_journal = None
+    setup: SetupRegistry | None = None
     world: World | None = None
     account_scope: str | None = None
 
@@ -237,10 +263,7 @@ def _create_app(
             account_toolset(),
             tools_policy,
             gateway.registry,
-            PROFILE
-            + "\nConnected apps: "
-            + (", ".join(sorted(accounts)) or "none")
-            + "\nFor a missing or disconnected app, call discover_tools to find one, then "
+            PROFILE + "\nFor a missing or disconnected app, call discover_tools to find one, then "
             "setup_capability with its slug: the person gets a sign-in card in chat and "
             "authorizes in their browser. Never send the person to a command line "
             "(/connect remains a manual fallback). A connected app's tools load for the "
@@ -250,8 +273,12 @@ def _create_app(
             result_path=db_path,
             read_tools=READ_TOOLS | WEB_READ_TOOLS | WORKSPACE_READ_TOOLS | {"current_time"},
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
+            capabilities=workspace_read_capabilities(workspace_root(session_dir)),
         )
         tools_policy = harness.policy
+        harness.live_instructions.append(
+            lambda: "\nConnected apps: " + (", ".join(sorted(loaded["accounts"])) or "none")
+        )
     else:
         db_path = settings.data_dir / "bud.db"
         gateway = build_gateway(settings, model_id=model_id)
@@ -277,6 +304,7 @@ def _create_app(
             result_path=db_path,
             read_tools=WORLD_READ_TOOLS | WEB_READ_TOOLS | WORKSPACE_READ_TOOLS,
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
+            capabilities=workspace_read_capabilities(workspace_root(settings.data_dir)),
         )
     # One seam for both branches: memory/skill rules are unioned inside the
     # Harness, so the profile overlay lands on the composed policy. The
@@ -305,6 +333,8 @@ def _create_app(
     )
     gateway.model("fast", require_tools=True)
     log = EventLog(db_path)
+    # Before the runner builds the agent, which reads the harness's capabilities.
+    harness.capabilities.append(conversation_search(log))
     hub = Hub(log)
     if setup_journal is not None:
         # The setup toolset was built before the log and hub existed; one seam
@@ -325,7 +355,7 @@ def _create_app(
     )
     runner = Runner(hub, gateway, harness, durable=True, jobs=True, learner=learner, recall=recall)
 
-    async def cleanup_results() -> None:
+    async def every_minute() -> None:
         while True:
             try:
                 deleted = await harness.results.prune()
@@ -333,6 +363,10 @@ def _create_app(
                     logger.info("Removed %d expired temporary tool results", deleted)
             except Exception:
                 logger.exception("Temporary tool-result cleanup failed")
+            try:
+                await asyncio.to_thread(runner.watch_jobs)
+            except Exception:
+                logger.exception("Checking for stalled jobs failed")
             await asyncio.sleep(60)
 
     @asynccontextmanager
@@ -382,7 +416,7 @@ def _create_app(
                         "and restart bud. "
                         "The authenticated core remains available; sends were not retried."
                     )
-            cleanup = asyncio.create_task(cleanup_results())
+            cleanup = asyncio.create_task(every_minute())
             yield
         finally:
             try:
@@ -482,13 +516,19 @@ def _create_app(
         )
 
     @app.post("/connections/{toolkit}/connect")
-    def connect_account(toolkit: str) -> JSONResponse:
+    def connect_account(toolkit: str, request: ConnectRequest | None = None) -> JSONResponse:
         current = live_connections()
-        name = {"gmail": "gmail", "calendar": "googlecalendar"}.get(toolkit)
-        if name is None:
-            raise HTTPException(400, "Use /connect gmail or /connect calendar.")
+        name = {"calendar": "googlecalendar"}.get(toolkit, toolkit)
+        if not valid_toolkit(name):
+            raise HTTPException(400, "Use a valid app id.")
         try:
-            url = current.connect(name)
+            url = current.pending_url(name) if request is not None and request.resume else None
+            if url is None:
+                url = (
+                    current.connect(name, resume=True)
+                    if request is not None and request.resume
+                    else current.connect(name)
+                )
             restart_required = current.restart_required()
         except ConnectionError as exc:
             raise HTTPException(503, str(exc)) from None
@@ -510,6 +550,50 @@ def _create_app(
     def require_current_binding() -> None:
         if connections is not None and connections.restart_required():
             raise HTTPException(409, "Account binding changed. Restart bud and start a new chat.")
+
+    @app.post("/sessions/{session_id}/setup/{capability}/check")
+    def check_capability(session_id: str, capability: str) -> JSONResponse:
+        require_session(session_id)
+        require_current_binding()
+        if setup is None or setup_journal is None:
+            raise HTTPException(409, "Account setup is unavailable in this mode.")
+        entry = setup.entry(capability)
+        if entry is None or capability not in setup_journal.pending(session_id):
+            raise HTTPException(404, "unknown setup card")
+        result = check_setup(
+            entry,
+            setup_journal,
+            session_id,
+            capability,
+            key=f"owner-setup-check:{uuid4().hex}",
+            refresh=refresh_tools,
+        )
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+    @app.post("/sessions/{session_id}/setup/{capability}/cancel")
+    def cancel_capability(session_id: str, capability: str) -> JSONResponse:
+        require_session(session_id)
+        if setup_journal is None:
+            raise HTTPException(404, "unknown setup card")
+        card = setup_journal.pending(session_id).get(capability)
+        if card is None:
+            return JSONResponse(
+                {"capability": capability, "status": "cancelled"},
+                headers={"Cache-Control": "no-store"},
+            )
+        status = "cancelled"
+        if connections is not None:
+            name = {"calendar": "googlecalendar"}.get(capability, capability)
+            removed = connections.store.cancel_connect(name)
+            if not removed and name in connections.accounts():
+                try:
+                    refresh_tools()
+                except ConnectionError as exc:
+                    raise HTTPException(503, str(exc)) from None
+                status = "connected"
+        data = {"capability": capability, "label": card.label, "status": status}
+        hub.publish(session_id, "capability.status", data)
+        return JSONResponse(data, headers={"Cache-Control": "no-store"})
 
     @app.get("/models")
     def list_models() -> list[dict]:
@@ -599,8 +683,11 @@ def _create_app(
             "conversation": runner.snapshot(item.session_id).model_dump(),
         }
 
+    # Routes that write to the log are plain `def`, so FastAPI runs them on its thread pool and
+    # a slow write never stalls the event loop that serves every stream. The runner hands
+    # anything that launches work back to the loop itself (Runner._on_loop).
     @app.post("/sessions/{session_id}/messages", status_code=202)
-    async def post_message(session_id: str, message: NewMessage) -> dict[str, bool]:
+    def post_message(session_id: str, message: NewMessage) -> dict[str, bool]:
         require_session(session_id)
         require_current_binding()
         try:
@@ -617,7 +704,7 @@ def _create_app(
         return {"duplicate": event is None}
 
     @app.patch("/sessions/{session_id}/queue/{message_id}")
-    async def edit_queued_message(session_id: str, message_id: str, message: EditMessage) -> dict:
+    def edit_queued_message(session_id: str, message_id: str, message: EditMessage) -> dict:
         require_session(session_id)
         try:
             runner.edit_message(session_id, message_id, message.text)
@@ -626,17 +713,17 @@ def _create_app(
         return {"edited": True}
 
     @app.delete("/sessions/{session_id}/queue/{message_id}")
-    async def cancel_queued_message(session_id: str, message_id: str) -> dict:
+    def cancel_queued_message(session_id: str, message_id: str) -> dict:
         require_session(session_id)
         return {"cancelled": runner.cancel_message(session_id, message_id)}
 
     @app.post("/sessions/{session_id}/queue/pause")
-    async def pause_queue(session_id: str) -> dict:
+    def pause_queue(session_id: str) -> dict:
         require_session(session_id)
         return {"changed": runner.pause_queue(session_id, True), "queue_paused": True}
 
     @app.post("/sessions/{session_id}/queue/resume")
-    async def resume_queue(session_id: str) -> dict:
+    def resume_queue(session_id: str) -> dict:
         require_session(session_id)
         require_current_binding()
         return {"changed": runner.pause_queue(session_id, False), "queue_paused": False}
@@ -647,7 +734,7 @@ def _create_app(
         return await runner.stop_session(session_id)
 
     @app.post("/sessions/{session_id}/approvals/{approval_id}")
-    async def decide(session_id: str, approval_id: str, decision: Decision) -> dict[str, bool]:
+    def decide(session_id: str, approval_id: str, decision: Decision) -> dict[str, bool]:
         require_session(session_id)
         if decision.approved:
             require_current_binding()
@@ -690,7 +777,7 @@ def _create_app(
         return {"removed": removed}
 
     @app.post("/sessions/{session_id}/approvals/{approval_id}/revise")
-    async def revise(session_id: str, approval_id: str, message: NewMessage) -> dict[str, bool]:
+    def revise(session_id: str, approval_id: str, message: NewMessage) -> dict[str, bool]:
         require_session(session_id)
         require_current_binding()
         try:
@@ -711,13 +798,17 @@ def _create_app(
             raise HTTPException(409, str(exc)) from None
 
     @app.post("/sessions/{session_id}/approvals/{approval_id}/answer")
-    async def answer(session_id: str, approval_id: str, answer: Answer) -> dict[str, bool]:
+    def answer(session_id: str, approval_id: str, answer: Answer) -> dict[str, bool]:
         require_session(session_id)
         require_current_binding()
         try:
             return {
                 "answered": runner.answer(
-                    session_id, approval_id, answer.text, answer.origin.model_dump()
+                    session_id,
+                    approval_id,
+                    answer.text,
+                    answer.origin.model_dump(),
+                    answer.answers,
                 )
             }
         except UnknownApproval:

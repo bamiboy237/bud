@@ -15,6 +15,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from bud.core.log import EventLog
+from bud.core.projection import unreported_job_news
 from bud.limits import MAX_MESSAGE_CHARS
 from tests.server_process import DRAFT, FILENAME, REVISED
 
@@ -134,6 +136,8 @@ class ServerProcess:
         return self.wait(matching, f"workspace approval for {content!r}")
 
     def settled(self, session: str):
+        log = EventLog(self.data / "bud.db")
+
         def complete():
             state = self.snapshot(session)
             if (
@@ -145,6 +149,9 @@ class ServerProcess:
                 )
                 and not state["run_active"]
                 and not state["pending_approvals"]
+                and not unreported_job_news(
+                    [event for event in log.read(session) if event.seq <= state["last_seq"]]
+                )
             ):
                 return state
             return None

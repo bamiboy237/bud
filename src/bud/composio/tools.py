@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Self
 
 from composio import SESSION_PRESET_DIRECT_TOOLS
+from fastmcp.client.transports import StreamableHttpTransport
 from pydantic_ai import RunContext, Tool
 from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.toolsets import (
@@ -34,6 +35,10 @@ from bud.composio.connection import ConnectionError, Connections, safe_errors
 from bud.composio.discovery import search
 from bud.composio.drafts import verify_reply_body
 from bud.harness.actions import Policy
+from bud.harness.ask import ask_user
+
+# Composio returns large tool lists in one event; the transport's default is 1 MiB.
+MAX_SSE_EVENT_BYTES = 16 * 1024 * 1024
 
 READ_TOOLS = {
     "GMAIL_FETCH_EMAILS",
@@ -100,26 +105,6 @@ mismatches honestly and inspect the existing event; stop rather than repeating t
 def current_time() -> str:
     """Return the server's current date/time and offset, not the person's preferred zone."""
     return datetime.now().astimezone().isoformat()
-
-
-def ask_user(ctx: RunContext[None], question: str, choices: list[str] | None = None) -> str:
-    """Ask the person a question and wait for their answer.
-
-    Use this only when a missing preference or decision genuinely blocks the
-    task and no available tool can supply the fact: prefer reading data with
-    tools first. It pauses and returns the person's exact reply. Offer 2-5
-    concrete choices when the options are known; omit choices for a free-text
-    answer. Ask one question at a time. For risky actions, still call the
-    action tool so it goes through approval.
-
-    Args:
-        question: One complete question for the person.
-        choices: Exact option labels, 2 to 5 items, when known.
-    """
-    metadata = ctx.tool_call_metadata or {}
-    if ctx.tool_call_approved and metadata.get("question_answer"):
-        return str(metadata["question_answer"])
-    raise RuntimeError("ask_user needs an answer from the person through the question flow.")
 
 
 def single_recipient(value: str) -> str | None:
@@ -487,8 +472,11 @@ def build_toolset(
             mcp=True,
         )
         remote = MCPToolset(
-            session.mcp.url,
-            headers=session.mcp.headers,
+            StreamableHttpTransport(
+                session.mcp.url,
+                headers=session.mcp.headers,
+                max_sse_event_size=MAX_SSE_EVENT_BYTES,
+            ),
             id="composio",
             max_retries=0,
             tool_error_behavior="error",

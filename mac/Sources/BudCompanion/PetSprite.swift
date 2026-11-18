@@ -163,7 +163,7 @@ final class PetSprite {
     }
 
     /// The Codex format: rows in a fixed order, each a loop with a held last frame.
-    private static func loadCodex(_ folder: URL) -> PetSprite? {
+    static func loadCodex(_ folder: URL) -> PetSprite? {
         guard let manifest = json(folder.appending(path: "pet.json")),
               let path = manifest["spritesheetPath"] as? String,
               let sheet = image(named: path, in: folder),
@@ -262,8 +262,15 @@ final class PetSprite {
 /// Reduced motion: each pose's first frame, still.
 struct AnimatedPet: View {
     let sprite: PetSprite
+    let size: CGSize?
     let pose: () -> PetPose
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    init(sprite: PetSprite, size: CGSize? = nil, pose: @escaping () -> PetPose) {
+        self.sprite = sprite
+        self.size = size
+        self.pose = pose
+    }
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 0.04, paused: reduceMotion)) { context in
@@ -278,7 +285,7 @@ struct AnimatedPet: View {
                     .scaledToFit()
             }
         }
-        .frame(width: sprite.displaySize.width, height: sprite.displaySize.height)
+        .frame(width: size?.width ?? sprite.displaySize.width, height: size?.height ?? sprite.displaySize.height)
     }
 
     /// With reduced motion every animation starts "now", so the first frame shows and stays.

@@ -53,18 +53,48 @@ struct PetView: View {
 
     /// The stop button sits on the bubble's side of the pet.
     private var petRow: some View {
-        HStack(spacing: 10) {
-            if anchor.left { pet }
+        HStack(alignment: .bottom, spacing: 8) {
+            if anchor.left {
+                pet
+                pupStack
+            }
             if Voice.shared.state == .listening || Voice.shared.state == .transcribing {
                 VoicePill(voice: Voice.shared)
                     .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: anchor.left ? .leading : .trailing)))
-            } else if companion.status == .working {
+            } else if companion.running {
                 StopButton(action: companion.stop)
                     .transition(.opacity)
             }
-            if !anchor.left { pet }
+            if !anchor.left {
+                pupStack
+                pet
+            }
         }
         .animation(.spring(duration: 0.25, bounce: 0), value: Voice.shared.state)
+        .animation(.spring(duration: 0.35, bounce: 0), value: companion.activeTasks.isEmpty)
+    }
+
+    @ViewBuilder private var pupStack: some View {
+        if !companion.visiblePups.isEmpty {
+            let overflow = max(0, companion.activeTasks.count - companion.visiblePups.count)
+            HStack(alignment: .bottom, spacing: 4) {
+                ForEach(companion.visiblePups) { task in
+                    ChildPupView(task: task)
+                        .transition(.scale(scale: 0.6).combined(with: .opacity))
+                }
+                if overflow > 0 {
+                    Text("+\(overflow)")
+                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 2)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .help("\(overflow) more background job\(overflow == 1 ? "" : "s") running")
+                        .transition(.opacity)
+                }
+            }
+            .animation(.spring(duration: 0.35, bounce: 0), value: companion.activeTasks)
+        }
     }
 
     private var pet: some View {
@@ -77,7 +107,7 @@ struct PetView: View {
                         return
                     }
                     // Something waiting comes first: a click shows it rather than a blank field.
-                    if !companion.approvals.isEmpty && !companion.bubbleOpen {
+                    if companion.needsAttention && !companion.bubbleOpen {
                         companion.bubbleOpen = true
                         return
                     }
@@ -184,6 +214,67 @@ private struct PetButton: View {
     private var statusText: String {
         if case .problem(let detail) = companion.link { return detail }
         return companion.status.label
+    }
+}
+
+// MARK: Mini Kid Pup
+
+/// A mini kid/pup sub-agent sprite representing a background job working beside Bud.
+struct ChildPupView: View {
+    static let defaultSize = CGSize(width: 44, height: 48)
+
+    let move: PetMove
+    let title: String
+    let statusText: String
+    var size: CGSize = defaultSize
+    var since: Date = .now
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    init(task: RunningTask, size: CGSize = defaultSize) {
+        self.move = task.move
+        self.title = task.title
+        self.statusText = task.status
+        self.size = size
+        self.since = task.finishedAt ?? .now
+    }
+
+    var body: some View {
+        Button {
+            ConversationWindow.shared.show()
+        } label: {
+            if let sprite = PetSprite.named("pup") ?? PetSprite.named("dog") {
+                pupImage(sprite)
+            } else {
+                fallbackPaw
+            }
+        }
+        .buttonStyle(PressScale())
+        .help("\(title) (\(statusText))")
+        .accessibilityLabel("Helper pup for \(title)")
+        .accessibilityValue(move == .working ? "Working" : "Done")
+    }
+
+    private func pupImage(_ sprite: PetSprite) -> some View {
+        TimelineView(.animation(minimumInterval: 0.08, paused: reduceMotion)) { context in
+            let moment = reduceMotion ? Date.distantPast : context.date
+            let pose = PetPose(status: move, statusSince: reduceMotion ? Date.distantPast : since)
+            if let rect = sprite.frame(for: pose, at: moment),
+               let image = sprite.image(rect) {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .shadow(color: .black.opacity(0.18), radius: 3, y: 1.5)
+    }
+
+    private var fallbackPaw: some View {
+        Image(systemName: "pawprint.fill")
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .frame(width: size.width, height: size.height)
     }
 }
 
@@ -336,6 +427,30 @@ struct UnsentSpeech: View {
     }
 }
 
+struct UnsentMessage: View {
+    let companion: Companion
+
+    var body: some View {
+        if let message = companion.heldMessages.first {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("“\(message.text)”")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button("Retry") { companion.retryHeldMessage() }
+                    .buttonStyle(CardButton(kind: .secondary))
+                Button { companion.dropHeldMessage() } label: {
+                    Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
+                }
+                .buttonStyle(IconButton(size: 20))
+                .accessibilityLabel("Discard unsent message")
+            }
+            .disabled(companion.retryingHeldMessage)
+        }
+    }
+}
+
 // MARK: Bubble
 
 private struct Bubble: View {
@@ -344,7 +459,7 @@ private struct Bubble: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
-            if !compact, !companion.question.isEmpty {
+            if !compact, !companion.question.isEmpty, companion.setups.isEmpty {
                 // What you asked, so the answer keeps its context. One line: a reminder.
                 Text(companion.question)
                     .font(.callout)
@@ -354,10 +469,10 @@ private struct Bubble: View {
                     .padding(.top, -4)
                     .transition(.opacity)
             }
-            if companion.status == .working, companion.stepsLayout == .checklist, !companion.steps.isEmpty {
+            if companion.running, companion.stepsLayout == .checklist, !companion.steps.isEmpty {
                 StepList(steps: companion.steps, live: true)
             }
-            if companion.showStepsAfter, companion.status != .working, !companion.lastSteps.isEmpty {
+            if companion.showStepsAfter, !companion.running, !companion.lastSteps.isEmpty {
                 StepsSummary(companion: companion)
             }
             ForEach(companion.notices, id: \.self) { notice in
@@ -367,7 +482,8 @@ private struct Bubble: View {
                     .lineLimit(2)
             }
             if companion.unsentSpeech != nil { UnsentSpeech(companion: companion) }
-            if !companion.shown.isEmpty {
+            if !companion.heldMessages.isEmpty { UnsentMessage(companion: companion) }
+            if !companion.shown.isEmpty, companion.setups.isEmpty {
                 // The bubble hugs its text up to `maxReply`; longer replies scroll. Reading
                 // starts at the top, so streamed text grows below the fold instead of pulling
                 // the page away from you. Measured, because a ScrollView takes every point it's
@@ -397,6 +513,10 @@ private struct Bubble: View {
                 // that has more, and only while it does.
                 .mask(edgeFade(companion.replyMore))
                 .animation(.easeOut(duration: 0.15), value: companion.replyMore)
+            }
+            if !companion.setups.isEmpty {
+                SetupDeck(companion: companion)
+                    .transition(cardTransition)
             }
             if !companion.approvals.isEmpty {
                 ApprovalDeck(companion: companion)
@@ -433,8 +553,9 @@ private struct Bubble: View {
     }
 
     private var compact: Bool {
-        companion.shown.isEmpty && companion.notices.isEmpty && companion.approvals.isEmpty
+        companion.shown.isEmpty && companion.notices.isEmpty && !companion.needsAttention
             && companion.receipt == nil && companion.steps.isEmpty && companion.unsentSpeech == nil
+            && companion.heldMessages.isEmpty
     }
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -449,7 +570,7 @@ private struct Bubble: View {
     }
 
     /// The reply gives way when a card needs the room, so both fit above the pet.
-    private var maxReply: CGFloat { companion.approvals.isEmpty ? 260 : 60 }
+    private var maxReply: CGFloat { companion.needsAttention ? 60 : 260 }
 
     /// Who is speaking and what they're doing, like a name above a message.
     private var header: some View {
@@ -482,7 +603,7 @@ private struct Bubble: View {
 
     /// "step 3", for the counted layout while bud works.
     private var stepCount: String? {
-        guard companion.stepsLayout == .counted, companion.status == .working,
+        guard companion.stepsLayout == .counted, companion.running,
               !companion.steps.isEmpty else { return nil }
         return "step \(companion.steps.count)"
     }
@@ -524,6 +645,7 @@ private struct Bubble: View {
             }
             return ("Working on it", .secondary, true)
         case .needsYou:
+            if !companion.setups.isEmpty { return ("Needs you", .orange, false) }
             let asking = companion.hasQuestion
             return (asking ? "Has a question" : "Needs your OK", .orange, false)
         case .failed: return ("Couldn't finish", .red, false)
@@ -668,35 +790,26 @@ private struct StepsSummary: View {
 struct ApprovalCard: View {
     let companion: Companion
     let approval: Approval
-    /// Inside a collapsible row: the row draws the surface, so the card draws only its content.
-    let nested: Bool
-    let showsHeading: Bool
+    let onDecide: (Bool) -> Void
     @StateObject private var layout = ApprovalLayout()
 
     private var busy: Bool {
         companion.deciding.contains(approval.id) || companion.approvingBatch || companion.link != .connected
     }
     private var detailLimit: CGFloat {
-        // Several rows share one floating panel, so an open card gives up some height.
-        let crowded = companion.approvals.count > 2
-        let height: CGFloat = companion.windowOpen ? 300 : companion.inputOpen ? 140 : crowded ? 130 : 190
+        let height: CGFloat = approval.isQuestion ? 190 : 100
         let hasProblem = companion.approvalFailures[approval.id] != nil || companion.decisionProblem != nil
         return hasProblem ? max(80, height - 40) : height
     }
 
     var body: some View {
-        Group {
-            if nested {
-                content
-            } else {
-                content
-                    .padding(12)
-                    .background(Paper.ink.opacity(0.035),
-                                in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(Paper.hairline, lineWidth: 0.5))
-            }
-        }
+        content
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Paper.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .strokeBorder(Paper.hairline, lineWidth: 1))
+        .shadow(color: .black.opacity(0.12), radius: 8, x: 0, y: 3)
         .disabled(busy)
         .opacity(busy ? 0.55 : 1)
         .animation(.easeOut(duration: 0.12), value: busy)
@@ -704,12 +817,37 @@ struct ApprovalCard: View {
 
     private var content: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if showsHeading { heading }
+            heading
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 24)
+                        .onEnded { value in
+                            guard !busy, !approval.isQuestion,
+                                  let direction = DecisionDirection.swipe(value.translation)
+                            else { return }
+                            onDecide(direction == .approve)
+                        }
+                )
+            if approval.isQuestion {
+                QuestionCards(companion: companion, approval: approval,
+                              flow: companion.questionFlow(for: approval), listLimit: detailLimit)
+            } else {
+                detail
+                buttons
+            }
+            if let problem = companion.approvalFailures[approval.id] ?? companion.decisionProblem {
+                Text(problem)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var detail: some View {
+        VStack(alignment: .leading, spacing: 10) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    if approval.isQuestion {
-                        Text(approval.title).font(.callout).fixedSize(horizontal: false, vertical: true)
-                    }
                     if !approval.facts.isEmpty { facts }
                     if let text = approval.body, !approval.isQuestion { EmailBody(text: text) }
                     if let email = approval.emailPreview,
@@ -738,13 +876,6 @@ struct ApprovalCard: View {
                 Text("Scroll to read more")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            }
-            if approval.isQuestion { choices } else { buttons }
-            if let problem = companion.approvalFailures[approval.id] ?? companion.decisionProblem {
-                Text(problem)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -787,60 +918,38 @@ struct ApprovalCard: View {
     }
 
     private var buttons: some View {
-        VStack(alignment: .trailing, spacing: 6) {
+        VStack(spacing: 6) {
             HStack(spacing: 6) {
                 Button("Change…") { companion.write(.revise(approval.id)) }
                     .buttonStyle(CardButton(kind: .quiet))
                     .help("Tell bud what to do differently")
                 Spacer(minLength: 0)
-                Button("Deny") { companion.decide(approval.id, approved: false) }
-                    .buttonStyle(CardButton(kind: .secondary))
-                Button(companion.approvalFailures[approval.id] == nil ? approval.verb : "Retry") {
-                    companion.decide(approval.id, approved: true)
-                }
-                    .buttonStyle(CardButton(kind: .primary))
+                if approval.grantable { alwaysAllow }
             }
-            if approval.grantable { alwaysAllow }
+            HStack(spacing: 6) {
+                Button { onDecide(false) } label: {
+                    Text("Deny").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(CardButton(kind: .secondary))
+                Button {
+                    onDecide(true)
+                } label: {
+                    Text(companion.approvalFailures[approval.id] == nil ? approval.verb : "Retry")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(CardButton(kind: .primary))
+            }
         }
     }
 
-    /// Under the decision, not beside it: three capsules in one row overrun the bubble, and a
-    /// truncated "Always al…" would hide what the click gives away.
     private var alwaysAllow: some View {
         Button("Always allow") { companion.alwaysAllow(approval) }
-            .buttonStyle(CardButton(kind: .secondary))
+            .buttonStyle(CardButton(kind: .quiet))
             .help(approval.alwaysAllowHelp)
             .accessibilityLabel("Always allow")
             .accessibilityHint(approval.alwaysAllowHelp)
     }
 
-    private var choices: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach(Array(approval.choices.enumerated()), id: \.offset) { index, choice in
-                Button { companion.choose(choice, for: approval.id) } label: {
-                    row(choice, symbol: "arrow.right", tone: .primary)
-                }
-                .buttonStyle(ChoiceRow())
-                .modifier(Stagger(index: index))
-            }
-            Button { companion.write(.answer(approval.id)) } label: {
-                row(approval.choices.isEmpty ? "Answer…" : "Something else…", symbol: "pencil", tone: .secondary)
-            }
-            .buttonStyle(ChoiceRow())
-            .modifier(Stagger(index: approval.choices.count))
-        }
-    }
-
-    private func row(_ text: String, symbol: String, tone: HierarchicalShapeStyle) -> some View {
-        HStack(spacing: 8) {
-            Text(text)
-                .foregroundStyle(tone)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-            RowSymbol(name: symbol)
-        }
-        .font(.callout)
-    }
 }
 
 /// Per-view state without `@State` (a macro whose plugin ships only with Xcode): an
@@ -939,7 +1048,7 @@ struct CardButton: ButtonStyle {
 
 /// One option of a question: a full-width row, so the whole line is the target. On hover the
 /// row darkens and its arrow nudges forward, pointing at what a click will do.
-private struct ChoiceRow: ButtonStyle {
+struct ChoiceRow: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         Face(configuration: configuration)
     }
@@ -977,7 +1086,7 @@ extension EnvironmentValues {
 }
 
 /// The row's trailing symbol, which steps forward while its row is hovered.
-private struct RowSymbol: View {
+struct RowSymbol: View {
     let name: String
     @Environment(\.choiceHovered) private var hovered
 
@@ -990,7 +1099,7 @@ private struct RowSymbol: View {
 }
 
 /// Items of a set arriving one after another, 40 ms apart: read as a list, not a block.
-private struct Stagger: ViewModifier {
+struct Stagger: ViewModifier {
     let index: Int
     @StateObject private var shown = Flag()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion

@@ -35,8 +35,8 @@ struct Approval: Identifiable, Equatable {
     let facts: [(label: String, value: String)]
     /// The text that will go out, when there is one, so you can read before approving.
     let body: String?
-    /// For a question: the options bud offered. Empty means a free answer.
-    let choices: [String]
+    let questions: [Question]
+    let isQuestionList: Bool
 
     var isQuestion: Bool { tool == "ask_user" }
 
@@ -53,14 +53,6 @@ struct Approval: Identifiable, Equatable {
     var menuTitle: String {
         let subject = facts.first { $0.label == "Subject" }?.value ?? emailPreview?.subject
         return subject.map { "\(verb): \($0)" } ?? title
-    }
-
-    /// The one line under a collapsed row: what the action is about, in the fewest words.
-    var rowDetail: String? {
-        if let subject = emailPreview?.subject { return subject }
-        if let job { return "For the job “\(job)”" }
-        if let first = facts.first { return "\(first.label): \(first.value)" }
-        return body?.split(separator: "\n").first.map(String.init)
     }
 
     func batch(in approvals: [Approval]) -> [Approval] {
@@ -90,9 +82,11 @@ struct Approval: Identifiable, Equatable {
         expectsOriginalEmail = ["archive_email", "mark_read", "draft_reply"].contains(tool)
             || args["thread_id"] != nil || args["draft_id"] != nil
         job = (raw["task_id"] as? Int).flatMap { jobs[$0] }
-        choices = (args["choices"] as? [String]) ?? []
+        let parsed = Question.parse(args)
+        questions = parsed.questions
+        isQuestionList = parsed.isList
         let words = Self.describe(tool.lowercased(), args)
-        title = tool == "ask_user" ? Self.text(args, "question") : words.title
+        title = tool == "ask_user" ? (questions.first?.text ?? "") : words.title
         verb = words.verb
         symbol = words.symbol
         facts = Self.facts(args)
@@ -103,7 +97,7 @@ struct Approval: Identifiable, Equatable {
                 .flatMap(\.nilIfEmpty)
                 ?? Self.text(args, "body", "body_text", "text", "description").nilIfEmpty
         } else {
-            body = Self.text(args, "body", "body_text", "text", "description").nilIfEmpty
+            body = Self.text(args, "body", "body_text", "text", "description", "content").nilIfEmpty
         }
     }
 
@@ -152,7 +146,7 @@ struct Approval: Identifiable, Equatable {
             if !value.isEmpty { out.append((label, value)) }
         }
         for (key, label) in [("subject", "Subject"), ("start", "When"), ("when", "When"),
-                             ("location", "Where"), ("due", "Due")] {
+                             ("location", "Where"), ("due", "Due"), ("path", "File")] {
             let value = text(args, key)
             if !value.isEmpty, !out.contains(where: { $0.0 == label }) {
                 out.append((label, key == "start" ? readableTime(value) : value))
@@ -185,6 +179,57 @@ struct Approval: Identifiable, Equatable {
             return parser.date(from: value)
         }() else { return value }
         return date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().hour().minute())
+    }
+}
+
+struct Question: Equatable, Sendable {
+    let header: String
+    let text: String
+    let options: [QuestionOption]
+    let multiSelect: Bool
+
+    static func parse(_ args: [String: Any]) -> (questions: [Question], isList: Bool) {
+        if let raw = args["questions"] as? [[String: Any]] {
+            let parsed = raw.compactMap(Question.init)
+            if !parsed.isEmpty { return (parsed, true) }
+        }
+        let text = args["question"] as? String ?? ""
+        let choices = (args["choices"] as? [String]) ?? []
+        return ([Question(header: "Question", text: text.isEmpty ? "bud has a question" : text,
+                          options: choices.filter { !$0.isEmpty }.map { QuestionOption(label: $0) },
+                          multiSelect: false)], false)
+    }
+
+    private init?(_ raw: [String: Any]) {
+        guard let header = (raw["header"] as? String)?.nilIfEmpty,
+              let text = (raw["question"] as? String)?.nilIfEmpty else { return nil }
+        self.header = header
+        self.text = text
+        options = (raw["options"] as? [[String: Any]] ?? []).compactMap(QuestionOption.init)
+        multiSelect = raw["multi_select"] as? Bool ?? false
+    }
+
+    private init(header: String, text: String, options: [QuestionOption], multiSelect: Bool) {
+        self.header = header
+        self.text = text
+        self.options = options
+        self.multiSelect = multiSelect
+    }
+}
+
+struct QuestionOption: Equatable, Sendable {
+    let label: String
+    let description: String?
+
+    fileprivate init?(_ raw: [String: Any]) {
+        guard let label = (raw["label"] as? String)?.nilIfEmpty else { return nil }
+        self.label = label
+        description = (raw["description"] as? String)?.nilIfEmpty
+    }
+
+    fileprivate init(label: String) {
+        self.label = label
+        description = nil
     }
 }
 

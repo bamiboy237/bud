@@ -3,7 +3,7 @@ from dataclasses import replace
 
 import httpx
 import pytest
-from pydantic_ai import RunContext, models
+from pydantic_ai import RunContext, Tool, models
 from pydantic_ai.exceptions import ApprovalRequired
 from pydantic_ai.messages import ModelRequest, ToolReturnPart, UserPromptPart
 from pydantic_ai.models.test import TestModel
@@ -47,8 +47,16 @@ async def actions(tmp_path, monkeypatch):
     root.mkdir()
     world = World(tmp_path / "world.sqlite")
     skills = SkillStore(tmp_path / "skills")
+
+    def read_file(path: str) -> str:
+        """Stands in for the harness FileSystem read tool, which needs a run workspace."""
+        return (root / path).read_text()
+
     toolset = FunctionToolset(
-        build_tools(root, tmp_path / "claims.jsonl") + world_tools(world) + skills.tools()
+        build_tools(root, tmp_path / "claims.jsonl")
+        + world_tools(world)
+        + skills.tools()
+        + [Tool(read_file)]
     )
     policy = load_policy()
     policy.tools.update(dict.fromkeys(READ_TOOLS, "allow"))
@@ -317,10 +325,8 @@ async def test_reads_run_without_approval_or_reviewer(actions, mode):
     gateway, ctx, tools, root, _, records, requests, _ = actions
     apply_mode(gateway.policy, mode, reviewer=True)
     (root / "note.md").write_text("existing note")
-    result = await gateway.call_tool(
-        "workspace_read", {"path": "note.md"}, ctx, tools["workspace_read"]
-    )
-    assert result["text"] == "existing note"
+    result = await gateway.call_tool("read_file", {"path": "note.md"}, ctx, tools["read_file"])
+    assert result == "existing note"
     assert records[-1]["outcome"] == "allowed"
     assert requests == []
 

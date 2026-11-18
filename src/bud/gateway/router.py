@@ -122,7 +122,11 @@ def provider_model_factory(settings: Settings, chatgpt: ChatGPTStore) -> ModelFa
         if spec.max_tokens is not None:
             options["max_tokens"] = spec.max_tokens
         if spec.reasoning_effort is not None:
-            options["openai_reasoning_effort"] = spec.reasoning_effort
+            # The unified setting: pydantic-ai maps it to the closest effort this model's
+            # profile accepts (or sends none), where a raw provider field could be rejected.
+            options["thinking"] = (
+                False if spec.reasoning_effort == "none" else spec.reasoning_effort
+            )
         if spec.service_tier is not None:
             options["openai_service_tier"] = spec.service_tier
         profile = None

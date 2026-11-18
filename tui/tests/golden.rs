@@ -149,8 +149,8 @@ fn tools(expanded: bool) -> App {
     ));
     run_started(&mut a);
     for (i, name) in ["notes.md", "plan.md", "todo.md"].iter().enumerate() {
-        a.on_event(&ev("tool.call", json!({"run_id": "r1", "call_id": format!("c{i}"), "tool": "workspace_read", "args": {"path": name}})));
-        a.on_event(&ev("tool.result", json!({"run_id": "r1", "call_id": format!("c{i}"), "tool": "workspace_read", "result": "{\"text\": \"line one\\nline two\"}", "outcome": "success"})));
+        a.on_event(&ev("tool.call", json!({"run_id": "r1", "call_id": format!("c{i}"), "tool": "read_file", "args": {"path": name}})));
+        a.on_event(&ev("tool.result", json!({"run_id": "r1", "call_id": format!("c{i}"), "tool": "read_file", "result": "{\"text\": \"line one\\nline two\"}", "outcome": "success"})));
     }
     a.on_event(&ev("tool.call", json!({"run_id": "r1", "call_id": "w", "tool": "workspace_update", "args": {"path": "locked.md"}})));
     a.on_event(&ev("tool.result", json!({"run_id": "r1", "call_id": "w", "tool": "workspace_update", "result": "read only", "outcome": "failure"})));

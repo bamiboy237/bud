@@ -19,7 +19,7 @@ struct Anchor: Equatable {
 final class PetPanel: NSPanel {
     /// Tall enough for a full bubble, an approval card and the input beside the pet, so nothing
     /// is ever cut off. The empty part is transparent, and clicks there reach the app below.
-    static let size = NSSize(width: 380, height: 600)
+    static let size = NSSize(width: 380, height: 740)
     /// The pet's size and its gap from the panel's edge (the views' padding).
     static let pet = NSSize(width: 96, height: 104)
     static let inset: CGFloat = 12

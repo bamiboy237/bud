@@ -108,6 +108,18 @@ struct ApprovalTests {
     }
 
     @Test
+    func workspaceWritesShowTheFileAndProposedContent() throws {
+        for tool in ["workspace_create", "workspace_update"] {
+            let item = try approval(tool, args: [
+                "path": "notes/report.md", "content": "Proposed report\nSecond line",
+                "expected_revision": "0123456789ab",
+            ])
+            #expect(item.facts.contains { $0.label == "File" && $0.value == "notes/report.md" })
+            #expect(item.body == "Proposed report\nSecond line")
+        }
+    }
+
+    @Test
     func emailPreviewDoesNotReplaceProposedContent() throws {
         let item = try approval("draft_reply", args: ["body": "Proposed reply"], preview: [
             "kind": "email", "subject": "Invoice",
@@ -198,21 +210,26 @@ struct ApprovalTests {
         }
     }
 
+    @Test
+    func onlyDeliberateHorizontalSwipesMakeDecisions() {
+        #expect(DecisionDirection.swipe(CGSize(width: 100, height: 20)) == .approve)
+        #expect(DecisionDirection.swipe(CGSize(width: -100, height: 20)) == .deny)
+        #expect(DecisionDirection.swipe(CGSize(width: 79, height: 0)) == nil)
+        #expect(DecisionDirection.swipe(CGSize(width: 100, height: 120)) == nil)
+        #expect(DecisionDirection.swipe(CGSize(width: 100, height: 100)) == nil)
+    }
+
     @Test @MainActor
-    func oneRowOpensAtATime() {
-        let expansion = ApprovalExpansion()
-        expansion.sync(["a", "b"])
-        #expect(expansion.open.isEmpty)
-        expansion.toggle("a")
-        #expect(expansion.open == ["a"])
-        expansion.toggle("b")
-        #expect(expansion.open == ["b"])
-        expansion.toggle("b")
-        #expect(expansion.open.isEmpty)
-        expansion.sync(["b"])
-        #expect(expansion.open == ["b"])
-        expansion.sync([])
-        #expect(expansion.open.isEmpty)
+    func savedLegacyLoopNotesStayOutOfReplies() {
+        let data: [String: Any] = ["messages": [[
+            "kind": "response",
+            "metadata": ["bud_spiral": ["notes": [["text": "Legacy internal note"]]]],
+            "parts": [
+                ["part_kind": "text", "content": "Legacy internal note"],
+                ["part_kind": "text", "content": "Here is the result."],
+            ],
+        ]]]
+        #expect(Companion.replyText(data) == "Here is the result.")
     }
 
     @Test @MainActor
@@ -275,5 +292,26 @@ struct ApprovalTests {
         #expect(companion.approvalFailures.isEmpty)
         let remaining = try #require(companion.approvals.first)
         #expect(companion.failedApprovals(for: remaining).isEmpty)
+    }
+
+    @Test @MainActor
+    func switchingAndClosingInputPreservesDrafts() {
+        let companion = Companion()
+        companion.apply(snapshot: [
+            "last_seq": 1,
+            "pending_approvals": [
+                ["approval_id": "a", "tool": "ask_user", "args": [:], "run_id": "run"]
+            ],
+        ])
+        companion.draft = "unfinished message"
+        companion.write(.answer("a"))
+        companion.draft = "unfinished answer"
+        companion.write(.ask)
+        #expect(companion.draft == "unfinished message")
+        companion.write(.answer("a"))
+        #expect(companion.draft == "unfinished answer")
+        companion.apply(snapshot: ["last_seq": 2, "pending_approvals": []])
+        #expect(companion.inputPurpose == .ask)
+        #expect(companion.draft == "unfinished message\n\nunfinished answer")
     }
 }

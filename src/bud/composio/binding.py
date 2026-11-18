@@ -143,14 +143,14 @@ class BindingStore:
                 "SELECT scope FROM session_scopes WHERE generation = ?", (binding.generation,)
             ).fetchone()[0]
 
-    def begin_connect(self, toolkit: str) -> AccountBinding:
+    def begin_connect(self, toolkit: str, *, resume: bool = False) -> AccountBinding:
         if not valid_toolkit(toolkit):
             raise ConnectionError("Unsupported toolkit name.")
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             current, pending = self._read(db)
             # Fence even an explicit reconnect to exactly the same remote ID.
-            if toolkit in current.accounts or toolkit in pending:
+            if toolkit in current.accounts or (toolkit in pending and not resume):
                 db.execute("UPDATE binding_state SET generation = generation + 1 WHERE id = 1")
             db.execute("DELETE FROM accounts WHERE toolkit = ?", (toolkit,))
             db.execute("INSERT OR REPLACE INTO pending_accounts VALUES (?, NULL)", (toolkit,))
@@ -170,6 +170,15 @@ class BindingStore:
                 "UPDATE pending_accounts SET account_id = ? WHERE toolkit = ?",
                 (account_id, toolkit),
             )
+
+    def cancel_connect(self, toolkit: str) -> bool:
+        """Stop tracking an unfinished sign-in without disconnecting an active account."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            removed = db.execute(
+                "DELETE FROM pending_accounts WHERE toolkit = ?", (toolkit,)
+            ).rowcount
+            return removed == 1
 
     def accept_verified(
         self,

@@ -1,11 +1,15 @@
-"""Small POSIX-only text workspace; no general filesystem or shell access.
+"""bud's text workspace: harness FileSystem reads, and approved writes with a claim ledger.
+
+Reads go through the harness `FileSystem` over a read-only `LocalWorkspace`. Writes stay
+here, because each approved write must happen once even when a durable run replays.
 
 The caller provisions an existing, dedicated root and an existing parent for
 `dispatch_path` (an append-only claim file outside root). Neither path may contain
 symlinks. Keep both under trusted ownership; do not share root with hostile local
-processes. Hidden paths, credential-like names, non-text extensions, special files,
-and hard links are refused. This is not a content-secret detector: only put material
-approved for the agent in root. Visible text can itself contain private information.
+processes. Hidden paths and credential-like names are refused for reads and writes;
+special files and hard links are refused for writes. This is not a content-secret
+detector: only put material approved for the agent in root. Visible text can itself
+contain private information.
 
 Claims are fsynced BEFORE writing. A crash can consume approval without saving;
 recovery requires inspection and fresh approval, never automatic redispatch. A
@@ -30,22 +34,48 @@ from pathlib import Path
 from typing import Any
 
 from pydantic_ai import RunContext, Tool, ToolReturn
+from pydantic_ai.capabilities import AbstractCapability, LocalWorkspace
+from pydantic_ai_harness import FileSystem
 
-READ_TOOLS = {"workspace_list", "workspace_read", "workspace_search"}
+READ_TOOLS = {"read_file", "list_directory", "search_files", "find_files", "file_info"}
 WRITE_TOOLS = {"workspace_create", "workspace_update"}
-GUIDANCE = """Manage plain-text (.md and .txt) files in the dedicated workspace using
-relative paths.
-Reading files provides their SHA-256 revision hash. File updates require the revision hash
-from the latest read. File creations and updates require user approval.
+GUIDANCE = """Manage text files in the dedicated workspace using relative paths.
+read_file shows each file's content hash. workspace_update needs the hash from the latest
+read. Creating and updating files require user approval.
 """
 
 _MAX_BYTES = 128 * 1024
-_MAX_ENTRIES = 500
-_PRIVATE = re.compile(
-    r"(^|[._\- ])(env|credentials?|secrets?|tokens?|passwords?|passwd|shadow|"
-    r"private|id_rsa|id_ed25519|agents|claude|course|progress)([._\- ]|$)",
-    re.I,
-)
+# Path segments that name credentials or bud's own instruction files, as whole words.
+_PRIVATE_WORDS = [
+    "env",
+    "credential",
+    "credentials",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+    "password",
+    "passwords",
+    "passwd",
+    "shadow",
+    "private",
+    "id_rsa",
+    "id_ed25519",
+    "key",
+    "pem",
+    "agents",
+    "claude",
+    "course",
+    "progress",
+]
+_PRIVATE = re.compile(rf"(^|[._\- ])({'|'.join(_PRIVATE_WORDS)})([._\- ]|$)", re.I)
+# The same rule as FileSystem globs, which match the whole relative path, case-insensitively.
+_DENIED = [".?*", "*/.?*"] + [
+    pattern
+    for word in _PRIVATE_WORDS
+    for prefix in ("", "*/", "*[._ -]")
+    for pattern in (f"{prefix}{word}", f"{prefix}{word}[._ -]*")
+]
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
@@ -53,9 +83,7 @@ class _Refused(Exception):
     pass
 
 
-def _parts(path: str, *, directory: bool = False) -> list[str]:
-    if directory and path == "":
-        return []
+def _parts(path: str) -> list[str]:
     parts = path.split("/")
     if (
         len(path) > 512
@@ -70,8 +98,6 @@ def _parts(path: str, *, directory: bool = False) -> list[str]:
         )
     ):
         raise _Refused("Path is not an allowed visible relative workspace path.")
-    if not directory and Path(parts[-1]).suffix.lower() not in {".md", ".txt"}:
-        raise _Refused("Only .md and .txt files are supported.")
     return parts
 
 
@@ -144,6 +170,11 @@ def _revision(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _matches(data: bytes, expected_revision: str | None) -> bool:
+    """FileSystem shows the first 12 hex digits of the SHA-256; a full digest also matches."""
+    return expected_revision is not None and _revision(data).startswith(expected_revision)
+
+
 def _saved(path: str, data: bytes, expected_revision: str | None) -> dict[str, Any]:
     return {
         "ok": True,
@@ -177,119 +208,16 @@ def _safe(call) -> dict[str, Any]:
         return {"ok": False, "error": "Workspace operation refused or unavailable."}
 
 
-def build_tools(root: Path, dispatch_path: Path) -> list[Tool]:
-    """Build five tools; provision root/ledger parent first. Directory creation is omitted.
+def build_tools(root: Path, dispatch_path: Path) -> list[Tool[None]]:
+    """Build the two write tools; provision root/ledger parent first.
 
     dispatch_path is a trusted persistent file, not a model-controlled argument.
-    All results are bounded. List/search scan at most 500 entries in one directory;
-    callers explicitly choose subdirectories. No recursive scan or pagination.
     """
     root, dispatch_path = root.absolute(), dispatch_path.absolute()
     if dispatch_path.is_relative_to(root):
         raise ValueError("Dispatch claims must live outside the workspace.")
     with _directory(root), _directory(dispatch_path.parent):
         pass
-
-    def workspace_list(directory: str = "") -> dict[str, Any]:
-        """List up to 100 safe text files/directories in one relative directory."""
-
-        def run():
-            entries = []
-            scanned = 0
-            with (
-                _parent(root, _parts(directory, directory=True)) as fd,
-                os.scandir(fd) as iterator,
-            ):
-                for entry in iterator:
-                    scanned += 1
-                    if scanned > _MAX_ENTRIES or len(entries) >= 100:
-                        break
-                    try:
-                        info = entry.stat(follow_symlinks=False)
-                        is_dir = stat.S_ISDIR(info.st_mode)
-                        _parts(entry.name, directory=is_dir)
-                        if not is_dir and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
-                            continue
-                        entries.append(
-                            {
-                                "path": "/".join(filter(None, [directory, entry.name])),
-                                "kind": "directory" if is_dir else "file",
-                            }
-                        )
-                    except (_Refused, OSError):
-                        continue
-            return {
-                "ok": True,
-                "entries": entries,
-                "truncated": scanned > _MAX_ENTRIES or len(entries) >= 100,
-            }
-
-        return _safe(run)
-
-    def workspace_read(path: str, limit: int = 16000, offset: int = 0) -> dict[str, Any]:
-        """Read a text slice and whole-file SHA-256 revision. Follow next_offset for more."""
-
-        def run():
-            if offset < 0 or not 1 <= limit <= 32000:
-                raise _Refused("Use a nonnegative offset and a limit from 1 to 32,000.")
-            parts = _parts(path)
-            with _parent(root, parts[:-1]) as fd:
-                data, _ = _read(fd, parts[-1])
-            text = data.decode("utf-8")
-            if offset > len(text):
-                raise _Refused("Offset exceeds the text length.")
-            end = min(offset + limit, len(text))
-            return {
-                "ok": True,
-                "path": path,
-                "text": text[offset:end],
-                "revision": _revision(data),
-                "truncated": end < len(text),
-                "next_offset": end if end < len(text) else None,
-            }
-
-        return _safe(run)
-
-    def workspace_search(query: str, directory: str = "") -> dict[str, Any]:
-        """Find literal case-sensitive text in one directory; at most 50 snippets."""
-
-        def run():
-            if not query or len(query) > 256:
-                raise _Refused("Search needs 1 to 256 characters.")
-            listing = workspace_list(directory)
-            if not listing["ok"]:
-                return listing
-            matches = []
-            skipped = 0
-            for entry in listing["entries"]:
-                if entry["kind"] != "file":
-                    continue
-                parts = _parts(entry["path"])
-                try:
-                    with _parent(root, parts[:-1]) as fd:
-                        data, _ = _read(fd, parts[-1])
-                    text = data.decode("utf-8")
-                    offset = text.find(query)
-                    if offset >= 0:
-                        matches.append(
-                            {
-                                "path": entry["path"],
-                                "offset": offset,
-                                "snippet": text[max(0, offset - 80) : offset + 240],
-                            }
-                        )
-                    if len(matches) == 50:
-                        break
-                except (_Refused, OSError, UnicodeError):
-                    skipped += 1
-            return {
-                "ok": True,
-                "matches": matches,
-                "skipped": skipped,
-                "truncated": listing["truncated"] or len(matches) == 50,
-            }
-
-        return _safe(run)
 
     def write(
         ctx: RunContext[None], path: str, content: str, expected_revision: str | None
@@ -308,9 +236,9 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool]:
             if len(data) > _MAX_BYTES or "\x00" in content:
                 raise _Refused("Content must be UTF-8 text of at most 128 KiB.")
             if expected_revision is not None and not re.fullmatch(
-                "[0-9a-f]{64}", expected_revision
+                "[0-9a-f]{12}|[0-9a-f]{64}", expected_revision
             ):
-                raise _Refused("Expected revision must be a SHA-256 hex digest.")
+                raise _Refused("Expected revision must be the content hash from read_file.")
             claim = _revision(approval.encode())
             fingerprint = _revision(
                 json.dumps(
@@ -356,7 +284,7 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool]:
                         previous = None
                         if expected_revision is not None:
                             old, previous = _read(fd, parts[-1])
-                            if _revision(old) != expected_revision:
+                            if not _matches(old, expected_revision):
                                 raise _Refused(
                                     "Revision conflict; read again and request approval."
                                 )
@@ -384,7 +312,7 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool]:
                             else:
                                 current, info = _read(fd, parts[-1])
                                 if _identity(previous) != _identity(info) or (
-                                    _revision(current) != expected_revision
+                                    not _matches(current, expected_revision)
                                 ):
                                     raise _Refused("Revision conflict; file changed before save.")
                                 os.replace(temporary, parts[-1], src_dir_fd=fd, dst_dir_fd=fd)
@@ -412,16 +340,15 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool]:
     def workspace_update(
         ctx: RunContext[None], path: str, content: str, expected_revision: str
     ) -> dict[str, Any] | ToolReturn:
-        """Replace a text file after approval, only if its SHA-256 revision still matches."""
+        """Replace a text file after approval, only if its content hash still matches."""
         return write(ctx, path, content, expected_revision)
 
+    return [Tool[None](workspace_create), Tool[None](workspace_update)]
+
+
+def read_capabilities(root: Path) -> list[AbstractCapability[None]]:
+    """Harness file reading over the workspace. Its files are data, never instructions."""
     return [
-        Tool(fn)
-        for fn in (
-            workspace_list,
-            workspace_read,
-            workspace_search,
-            workspace_create,
-            workspace_update,
-        )
+        LocalWorkspace(root, read_only=True, authority="none"),
+        FileSystem(tools=sorted(READ_TOOLS), denied_patterns=_DENIED),
     ]

@@ -4,6 +4,7 @@ import json
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Annotated
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -15,7 +16,7 @@ from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
 
-from bud.core.events import EventType
+from bud.core.events import Event, EventType
 from bud.core.hub import Hub
 from bud.core.log import QueueFull
 from bud.core.projection import (
@@ -27,7 +28,6 @@ from bud.core.projection import (
     reply_text,
     report_text,
     runs,
-    snapshot,
 )
 from bud.harness.actions import Policy
 from bud.harness.spiral import work_tools_off
@@ -39,6 +39,8 @@ MAX_PENDING_UPDATES = 3
 
 CONTROL_TOOLS = {"start_task", "update_task", "inspect_task", "stop_task", "withdraw_request"}
 FINISHED = {"completed", "failed", "cancelled"}
+# Statuses where the job itself should be making progress, not waiting on the owner.
+WORKING = {"queued", "running"}
 
 
 def job_output(verifier: JobVerifier | None) -> list:
@@ -425,7 +427,7 @@ class WorkItems:
 
     def view(self, item: WorkItem) -> TaskView:
         events = self.log.read(item.session_id)
-        state = snapshot(item.session_id, events)
+        state = self.log.snapshot(item.session_id, events)
         references = self.references(item)
         status = state.recent_runs[-1].status if state.recent_runs else "queued"
         if state.queued_messages and status in FINISHED:
@@ -455,7 +457,59 @@ class WorkItems:
             and state.transcript[-1].role == "assistant"
             else None,
             outcome=_last_report(events).get("outcome") if status == "completed" else None,
+            stalled=self._stalled(item, events) if status in WORKING else None,
         )
+
+    def _stalled(self, item: WorkItem, events: list[Event]) -> str | None:
+        """The reason of a stall notice the job has not answered with activity since."""
+        notice = next(
+            (
+                e
+                for e in reversed(self.log.read(item.feed_id))
+                if e.type == "task.stalled" and e.data["task_id"] == item.task_id
+            ),
+            None,
+        )
+        if notice is None or (events and events[-1].created_at > notice.created_at):
+            return None
+        return notice.data["reason"]
+
+    def watch(self, now: datetime, *, idle: timedelta, deadline: timedelta) -> set[str]:
+        """Post one stall notice per job and reason; return the conversations that got one.
+
+        A job is stalled when it has logged nothing for `idle`, or has been open longer than
+        `deadline`. A job waiting on the owner's approval is not stalled.
+        """
+        feeds = set()
+        for item in self.items():
+            events = self.log.read(item.session_id)
+            if not events or self.view(item).status not in WORKING:
+                continue
+            open_for, quiet_for = now - events[0].created_at, now - events[-1].created_at
+            if open_for >= deadline:
+                reason, text = "overdue", f"Open for {_minutes(open_for)}, past its deadline."
+            elif quiet_for >= idle:
+                reason, text = "idle", f"No activity for {_minutes(quiet_for)}."
+            else:
+                continue
+            notice = self.log.append_once_if_unchanged(
+                item.feed_id,
+                "task.stalled",
+                {
+                    "task_id": item.task_id,
+                    "title": item.title,
+                    "reason": reason,
+                    "text": text,
+                    "origin": item.origin,
+                },
+                key=f"task:{item.task_id}:stalled:{reason}",
+                observed_session=item.session_id,
+                observed_seq=events[-1].seq,
+            )
+            if notice is not None:
+                self.hub.wake(item.feed_id)
+                feeds.add(item.feed_id)
+        return feeds
 
     def progress(self, item: WorkItem) -> dict:
         """Where the job is, read only from its log: no model call, nothing sent to it."""
@@ -538,6 +592,11 @@ class WorkItems:
             {"task_id": item.task_id, "title": item.title, "text": text, "origin": item.origin},
             key=f"task:{item.task_id}:terminal:{terminal.id}",
         )
+
+
+def _minutes(span: timedelta) -> str:
+    minutes = int(span.total_seconds() // 60)
+    return f"{minutes} minute{'s' if minutes != 1 else ''}"
 
 
 @dataclass(kw_only=True)

@@ -14,12 +14,19 @@ from uuid import uuid4
 from bud.core.events import RUN_END_EVENTS, Event, EventType
 from bud.core.projection import (
     AUTO_PAUSES,
+    Snapshot,
+    decisions,
     message_batch,
     pause_reason,
+    pending_setups,
     queue_paused,
     queued_messages,
     runs,
+    setup_status_version,
+    snapshot,
     undecided_approvals,
+    unreported_job_news,
+    waiting_batch,
 )
 from bud.limits import MAX_QUEUED_MESSAGES
 
@@ -71,6 +78,7 @@ CREATE INDEX IF NOT EXISTS events_by_type_session ON events (type, session_id);
 # Recovery replays one run, which needs its predecessor's snapshot; keep a spare.
 KEEP_CONVERSATIONS = 2
 CACHED_SESSIONS = 32
+FOLDED_SESSIONS = 128
 
 
 class EventLog:
@@ -80,6 +88,8 @@ class EventLog:
         # cached prefix plus a fetch of later rows equals a full read.
         self._cache: OrderedDict[str, list[Event]] = OrderedDict()
         self._cache_lock = threading.Lock()
+        # The latest fold of each session, tagged with the last seq it covers.
+        self._folded: OrderedDict[str, tuple[int, Snapshot]] = OrderedDict()
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.execute("PRAGMA journal_mode=WAL")
@@ -110,6 +120,68 @@ class EventLog:
     ) -> Event | None:
         with self._connect() as db:
             return self._insert(db, session_id, type, data or {}, once=True, key=key)
+
+    def append_once_if_unchanged(
+        self,
+        session_id: str,
+        type: EventType,
+        data: dict,
+        *,
+        key: str,
+        observed_session: str,
+        observed_seq: int,
+    ) -> Event | None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?",
+                (observed_session,),
+            ).fetchone()[0]
+            if current != observed_seq:
+                return None
+            return self._insert(db, session_id, type, data, once=True, key=key)
+
+    def update_setup_status(
+        self, session_id: str, data: dict, expected_event: str | None, *, key: str
+    ) -> bool:
+        """Publish a check only if the same pending setup state still exists."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            events = self._read(db, session_id)
+            version = setup_status_version(events, data["capability"])
+            current = next(
+                (card for card in pending_setups(events) if card.capability == data["capability"]),
+                None,
+            )
+            if version is None or version != expected_event or current is None:
+                return False
+            if (current.status, current.reason) != (data["status"], data.get("reason")):
+                self._insert(db, session_id, "capability.status", data, once=True, key=key)
+            return True
+
+    def answer_question(
+        self, session_id: str, approval_id: str, text: str, origin: dict | None = None
+    ) -> Event | None:
+        """Answer only a still-pending question, atomically with message supersession."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            events = self._read(db, session_id)
+            if approval_id in decisions(events):
+                return None
+            request = next(
+                (item for item in waiting_batch(events) if item["approval_id"] == approval_id),
+                None,
+            )
+            if request is None or request["tool"] != "ask_user":
+                return None
+            return self._insert(
+                db,
+                session_id,
+                "question.answered",
+                {"approval_id": approval_id, "text": text, "origin": origin},
+                once=True,
+                key=f"{session_id}:answer:{approval_id}",
+            )
 
     @staticmethod
     def _insert(
@@ -198,6 +270,36 @@ class EventLog:
                     while len(self._cache) > CACHED_SESSIONS:
                         self._cache.popitem(last=False)
         return [event for event in cached or [] if event.seq > after] + fresh
+
+    def snapshot(self, session_id: str, events: list[Event]) -> Snapshot:
+        """Fold a session's events into its snapshot, reusing the last fold while no event has
+        been appended since. The log is append-only, so the events up to a given seq never
+        change and the fold is a pure function of them; the log stays the only source of truth.
+
+        `events` must be the whole session, as `read` returns it. The copy's lists are its own
+        to change; the turns and approvals inside are shared and must not be mutated.
+        """
+        last = events[-1].seq if events else 0
+        with self._cache_lock:
+            hit = self._folded.get(session_id)
+            if hit is not None and hit[0] == last:
+                self._folded.move_to_end(session_id)
+                folded = hit[1]
+            else:
+                folded = None
+        if folded is None:
+            folded = snapshot(session_id, events)
+            with self._cache_lock:
+                self._folded[session_id] = (last, folded)
+                self._folded.move_to_end(session_id)
+                while len(self._folded) > FOLDED_SESSIONS:
+                    self._folded.popitem(last=False)
+        return folded.model_copy(
+            update={
+                "pending_approvals": list(folded.pending_approvals),
+                "tasks": list(folded.tasks),
+            }
+        )
 
     def last_seq(self, session_id: str) -> int:
         """Capture a stored-event boundary without reading the event payloads."""
@@ -389,7 +491,11 @@ class EventLog:
     def revise_approval(
         self, session_id: str, approval_id: str, text: str, message_id: str, origin: dict
     ) -> Event | None:
-        """Retire one pending permission and accept its correction atomically."""
+        """Retire one pending permission and accept its correction atomically.
+
+        Other proposals waiting in the same step are handled as for any new message: parked
+        in the owner's conversation, retired in a job's session.
+        """
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             event = self._accept_message(db, session_id, text, message_id, origin)
@@ -397,14 +503,15 @@ class EventLog:
                 # A repeated transport request cannot decline a later proposal.
                 return None
             pending = undecided_approvals(self._read(db, session_id))
-            if len(pending) != 1 or pending[0]["approval_id"] != approval_id:
-                raise ValueError("The exact action must be the only pending approval to revise.")
+            if approval_id not in {request["approval_id"] for request in pending}:
+                raise ValueError("That action is no longer waiting for approval.")
             self._insert(
                 db,
                 session_id,
                 "approval.denied",
                 {"approval_id": approval_id, "origin": origin, "revision_message_id": message_id},
             )
+            self._supersede(db, session_id, message_id, origin)
             return event
 
     def edit_message(self, session_id: str, message_id: str, text: str) -> None:
@@ -475,6 +582,25 @@ class EventLog:
                     "message.dispatched",
                     {"message_id": item.message_id, "run_id": run["run_id"]},
                 )
+            self._insert(db, session_id, "run.queued", run, key=f"{run['run_id']}:queued")
+            return True
+
+    def dispatch_job_report(self, session_id: str, run: dict) -> bool:
+        """Queue a turn that reports ended jobs, if they are still unreported and nothing waits."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            events = self._read(db, session_id)
+            states = runs(events)
+            if (
+                queue_paused(events)
+                or queued_messages(events)
+                or not unreported_job_news(events)
+                or (
+                    states
+                    and states[-1].status in ("queued", "running", "stopping", "awaiting_approval")
+                )
+            ):
+                return False
             self._insert(db, session_id, "run.queued", run, key=f"{run['run_id']}:queued")
             return True
 
@@ -652,6 +778,29 @@ class EventLog:
                 ) ORDER BY queued.created_at"""
             ).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def saved_runs(self) -> list[tuple[str, str, datetime]]:
+        """Each run with saved messages: session, run id, and when its messages were first
+        saved, oldest first."""
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT session_id, json_extract(data, '$.run_id'), MIN(created_at)
+                FROM events WHERE type IN ('run.waiting', 'run.completed')
+                GROUP BY session_id, json_extract(data, '$.run_id')
+                ORDER BY MIN(created_at), MIN(seq)"""
+            ).fetchall()
+        return [(row[0], row[1], datetime.fromisoformat(row[2])) for row in rows]
+
+    def run_messages(self, run_id: str) -> list[dict]:
+        """The messages a run saved, in order, across its approval pauses."""
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT json_extract(data, '$.messages') FROM events
+                WHERE type IN ('run.waiting', 'run.completed')
+                AND json_extract(data, '$.run_id') = ? ORDER BY created_at, seq""",
+                (run_id,),
+            ).fetchall()
+        return [message for row in rows for message in json.loads(row[0])]
 
     def unfinished_runs(self) -> list[tuple[str, str]]:
         placeholders = ", ".join("?" for _ in RUN_END_EVENTS)

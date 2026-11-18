@@ -30,6 +30,31 @@ def pending_write(log, session="owner", run="run-1", approval="approval-1"):
     )
 
 
+def test_snapshot_cache_reuses_the_fold_and_observes_another_writer(tmp_path, monkeypatch):
+    import bud.core.log as log_module
+
+    path = tmp_path / "events.db"
+    log = EventLog(path)
+    pending_write(log)
+    fold = log_module.snapshot
+    calls = []
+
+    def counted(*args):
+        calls.append(True)
+        return fold(*args)
+
+    monkeypatch.setattr(log_module, "snapshot", counted)
+    first = log.snapshot("owner", log.read("owner"))
+    first.pending_approvals.clear()
+    second = log.snapshot("owner", log.read("owner"))
+    assert len(second.pending_approvals) == 1
+    assert len(calls) == 1
+    EventLog(path).append("owner", "approval.denied", {"approval_id": "approval-1"})
+    third = log.snapshot("owner", log.read("owner"))
+    assert not third.pending_approvals
+    assert len(calls) == 2
+
+
 def test_concurrent_duplicate_message_is_accepted_once_and_survives_reopen(tmp_path):
     path = tmp_path / "events.db"
     logs = [EventLog(path), EventLog(path)]
@@ -90,7 +115,7 @@ def test_invalid_revision_rolls_back_both_message_and_decision(tmp_path):
     log = EventLog(tmp_path / "events.db")
     pending_write(log)
     before = log.read("owner")
-    with pytest.raises(ValueError, match="exact action"):
+    with pytest.raises(ValueError, match="no longer waiting"):
         log.revise_approval("owner", "wrong-approval", "replace this", "correction", {})
     assert log.read("owner") == before
     assert not queued_messages(log.read("owner"))
@@ -158,3 +183,17 @@ def test_job_correction_retires_only_its_approval_while_chat_preserves_actions(t
     assert [item["approval_id"] for item in undecided_approvals(log.read(second.session_id))] == [
         "approval-second"
     ]
+
+
+def test_snapshot_is_reused_until_an_event_arrives_and_never_shared_by_callers(tmp_path):
+    log = EventLog(tmp_path / "events.db")
+    log.append("owner", "user.message", {"text": "first", "message_id": "m1"})
+    first = log.snapshot("owner", log.read("owner"))
+    first.pending_approvals.append("mutation")  # ty: ignore[invalid-argument-type]
+    again = log.snapshot("owner", log.read("owner"))
+    assert again.pending_approvals == []
+    assert [turn.text for turn in again.transcript] == ["first"]
+    log.append("owner", "user.message", {"text": "second", "message_id": "m2"})
+    latest = log.snapshot("owner", log.read("owner"))
+    assert [turn.text for turn in latest.transcript] == ["first", "second"]
+    assert latest.last_seq == again.last_seq + 1

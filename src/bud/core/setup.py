@@ -23,7 +23,7 @@ from bud.composio.binding import ConnectionError, valid_toolkit
 from bud.composio.connection import Connections
 from bud.core.events import EventType
 from bud.core.hub import Hub
-from bud.core.projection import PendingSetup, pending_setups
+from bud.core.projection import PendingSetup, pending_setups, setup_status_version
 
 SetupState = Literal["waiting", "connected", "failed"]
 
@@ -112,10 +112,80 @@ class SetupJournal:
     def publish(self, session_id: str, type: EventType, data: dict[str, Any], *, key: str) -> None:
         self._live.publish_once(session_id, type, data, key=key)
 
+    def show_live(self, session_id: str, type: EventType, data: dict[str, Any]) -> None:
+        """Deliver data to the streams open now and store nothing."""
+        self._live.broadcast(session_id, type, data)
+
     def pending(self, session_id: str) -> dict[str, PendingSetup]:
         """The session's setup cards that still need the person, by id."""
         events = self._live.log.read(session_id)
         return {card.capability: card for card in pending_setups(events)}
+
+    def status_version(self, session_id: str, capability: str) -> str | None:
+        return setup_status_version(self._live.log.read(session_id), capability)
+
+    def update_status(
+        self, session_id: str, data: dict[str, Any], version: str | None, *, key: str
+    ) -> bool:
+        applied = self._live.log.update_setup_status(session_id, data, version, key=key)
+        if applied:
+            self._live.wake(session_id)
+        return applied
+
+
+def check_setup(
+    entry: SetupEntry,
+    journal: SetupJournal,
+    session: str,
+    capability: str,
+    *,
+    key: str,
+    refresh: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Recheck a card and load connected tools, without issuing another sign-in link."""
+    version = journal.status_version(session, capability)
+    try:
+        status = entry.status()
+    except ConnectionError as exc:
+        status = SetupStatus(state="failed", reason=str(exc))
+    data: dict[str, Any] = {
+        "capability": capability,
+        "label": entry.label,
+        "status": status.state,
+    }
+    if status.reason:
+        data["reason"] = status.reason
+    if status.state == "connected" and refresh is not None:
+        try:
+            refresh()
+        except ConnectionError as exc:
+            return {
+                **data,
+                "status": "failed",
+                "reason": str(exc),
+                "note": "Do not reconnect the account. Follow the reason above.",
+            }
+    if not journal.update_status(session, data, version, key=key):
+        current = journal.pending(session).get(capability)
+        return {
+            "capability": capability,
+            "label": entry.label,
+            "status": current.status if current is not None else "cancelled",
+            **({"reason": current.reason} if current is not None and current.reason else {}),
+        }
+    if status.state == "waiting":
+        return {
+            **data,
+            "note": "The person has not finished the sign-in yet. The card keeps "
+            "its link; ask them to finish in their browser, then check again.",
+        }
+    if status.state == "connected":
+        return {
+            **data,
+            "note": "The capability is connected. Its tools load for the next "
+            "message. End this turn and continue when the person sends a message.",
+        }
+    return data
 
 
 def setup_tool(
@@ -152,53 +222,7 @@ def setup_tool(
         card = journal.pending(session).get(capability)
         if card is not None and card.status == "waiting":
             # The card is up: a new call rechecks it, never hands out a second link.
-            try:
-                status = entry.status()
-            except ConnectionError as exc:
-                status = SetupStatus(state="failed", reason=str(exc))
-            data: dict[str, Any] = {
-                "capability": capability,
-                "label": entry.label,
-                "status": status.state,
-            }
-            if status.reason:
-                data["reason"] = status.reason
-            if status.state == "waiting":
-                journal.publish(session, "capability.status", data, key=key)
-                return {
-                    "capability": capability,
-                    "label": entry.label,
-                    "status": "waiting",
-                    "note": "The person has not finished the sign-in yet. The card keeps "
-                    "its link; ask them to finish in their browser, then check again.",
-                }
-            if status.state == "connected":
-                if refresh is not None:
-                    try:
-                        refresh()
-                    except ConnectionError as exc:
-                        return {
-                            "capability": capability,
-                            "label": entry.label,
-                            "status": "failed",
-                            "reason": str(exc),
-                            "note": "Do not reconnect the account. Follow the reason above.",
-                        }
-                journal.publish(session, "capability.status", data, key=key)
-                return {
-                    "capability": capability,
-                    "label": entry.label,
-                    "status": "connected",
-                    "note": "The capability is connected. Its tools load for the next "
-                    "message. End this turn and continue when the person sends a message.",
-                }
-            journal.publish(session, "capability.status", data, key=key)
-            return {
-                "capability": capability,
-                "label": entry.label,
-                "status": "failed",
-                "reason": status.reason,
-            }
+            return check_setup(entry, journal, session, capability, key=key, refresh=refresh)
         try:
             initiation = entry.initiate()
         except ConnectionError as exc:
@@ -226,10 +250,14 @@ def setup_tool(
         else:
             data["steps"] = list(initiation.steps)
         data["status"] = "waiting"
-        # The link reaches the person's card, never the model: bud's sign-in
-        # links appear only in the owner-authenticated event stream and the card
-        # it renders, not in model input, history, or status metadata.
+        # The sign-in link is single-use and grants access to an account, so it never enters
+        # the journal, the model's input, or status metadata. The journaled card says a link
+        # is waiting; the link itself goes once, live, to the owner's open streams. A client
+        # that connects later gets the card without it, and /connect issues a fresh link.
+        link = data.pop("url", None)
         journal.publish(session, "capability.setup", data, key=key)
+        if link is not None:
+            journal.show_live(session, "capability.setup", {**data, "url": link})
         note = (
             "The person's chat shows a setup card with the sign-in link. Ask them to "
             "finish the sign-in in their browser, then check again."

@@ -22,6 +22,35 @@ def responses(*items):
     return respond
 
 
+@pytest.mark.parametrize("edit", [True, False], ids=["edit", "cancel"])
+async def test_queue_mutation_during_dispatch_keeps_the_queue_moving(tmp_path, monkeypatch, edit):
+    async with running_bud(tmp_path, responses(reply())) as bud:
+        session = "owner"
+        bud.log.append(session, "session.created")
+        bud.runner.pause_queue(session, True)
+        bud.runner.start(session, "Original first message", "first")
+        bud.runner.start(session, "Second message", "second")
+        dispatch = bud.log.dispatch_message
+
+        def mutate_before_dispatch(session_id, message_id, run):
+            monkeypatch.setattr(bud.log, "dispatch_message", dispatch)
+            if edit:
+                bud.runner.edit_message(session, "first", "Edited first message")
+            else:
+                assert bud.runner.cancel_message(session, "first")
+            assert not dispatch(session_id, message_id, run)
+            return False
+
+        monkeypatch.setattr(bud.log, "dispatch_message", mutate_before_dispatch)
+        bud.runner.pause_queue(session, False)
+        await bud.settle()
+        owner_turns = [
+            turn.text for turn in bud.runner.snapshot(session).transcript if turn.role == "user"
+        ]
+        expected = ["Edited first message", "Second message"] if edit else ["Second message"]
+        assert owner_turns == expected
+
+
 @pytest.mark.parametrize("approved", [False, True], ids=["deny", "approve"])
 async def test_write_waits_for_exact_decision_and_duplicate_is_noop(tmp_path, approved):
     async with running_bud(tmp_path, responses(create_note(), reply())) as bud:

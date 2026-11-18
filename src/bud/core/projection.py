@@ -112,6 +112,8 @@ class TaskView(BaseModel):
     result: str | None = None
     # The job's filed outcome; "completed" alone only means it stopped working.
     outcome: str | None = None
+    # Why a running job looks stuck ("idle" or "overdue"), until it shows activity again.
+    stalled: str | None = None
 
 
 class Snapshot(BaseModel):
@@ -195,6 +197,19 @@ def pause_reason(events: list[Event]) -> str | None:
     return last.data.get("reason", "owner")
 
 
+def setup_status_version(events: list[Event], capability: str) -> str | None:
+    """The last event that changed one setup card, used for status compare-and-set."""
+    return next(
+        (
+            event.id
+            for event in reversed(events)
+            if event.type in ("capability.setup", "capability.status")
+            and event.data.get("capability") == capability
+        ),
+        None,
+    )
+
+
 def pending_setups(events: list[Event]) -> list[PendingSetup]:
     """Fold capability cards: one per capability, kept until it connects.
 
@@ -218,7 +233,7 @@ def pending_setups(events: list[Event]) -> list[PendingSetup]:
                 update={"status": incoming.status, "reason": incoming.reason}
             )
         cards[incoming.capability] = incoming
-    return [card for card in cards.values() if card.status != "connected"]
+    return [card for card in cards.values() if card.status not in {"connected", "cancelled"}]
 
 
 def runs(events: list[Event], *, summaries: bool = False) -> list[RunView]:
@@ -509,3 +524,52 @@ def _failure_note(
         f"report them as unknown without re-executing:\n{unsure}"
     )
     return ModelRequest(parts=[UserPromptPart(note)])
+
+
+# Job news bud reports without being asked. The owner cancelled the others themselves.
+JOB_NEWS = ("task.completed", "task.failed", "task.paused", "task.stalled")
+# Runs that start a turn in the conversation: the owner's message, or a job report.
+PROMPTED = ("message", "job")
+JOB_REPORT = (
+    "[bud system note] A job you started has ended or looks stuck. Tell the owner, in a few "
+    "sentences, what it delivered, why it stopped, or that it seems stuck and they can ask you "
+    "to stop it. Do not start new work."
+)
+
+
+def unreported_job_news(events: list[Event]) -> list[Event]:
+    """Job news not covered by a turn that completed or delivered an approval prompt."""
+    lower, _ = since_last_prompt(events, {"run_id": None})
+    return [e for e in events if e.type in JOB_NEWS and e.seq > lower]
+
+
+def since_last_prompt(events: list[Event], run: dict) -> tuple[int, int]:
+    """The window from the last delivered turn's start to the current run's start.
+
+    Failed turns do not consume updates. The lower boundary is the delivered turn's start,
+    not its end, so updates arriving while it ran remain available to the next turn.
+    """
+    prompted = {
+        e.data["run_id"]
+        for e in events
+        if e.type == "run.queued" and e.data.get("trigger") in PROMPTED
+    }
+    delivered = {
+        event.data["run_id"] for event in events if event.type in ("run.completed", "run.waiting")
+    }
+    starts = [
+        event.seq
+        for event in events
+        if event.type == "run.started" and event.data.get("run_id") in prompted & delivered
+    ]
+    current = next(
+        (
+            e.seq
+            for e in events
+            if e.type == "run.started" and e.data.get("run_id") == run["run_id"]
+        ),
+        None,
+    )
+    upper = current if current is not None else (events[-1].seq + 1 if events else 0)
+    lower = max((seq for seq in starts if seq < upper), default=-1)
+    return lower, upper

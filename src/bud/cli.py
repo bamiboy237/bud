@@ -14,7 +14,7 @@ from pydantic_settings.exceptions import SettingsError
 
 from bud import __version__
 from bud.composio.binding import ConnectionError
-from bud.config import get_settings
+from bud.config import HOST, LOCAL_URL, PORT, get_settings
 from bud.core.auth import OwnerAuthError
 from bud.core.client import chat
 from bud.evals.runner import evaluate
@@ -23,12 +23,10 @@ from bud.gateway.chatgpt import ChatGPTError, ChatGPTStore, login, refresh_model
 from bud.gateway.errors import error_summary
 from bud.gateway.registry import ModelConfigurationError, Tier, load_registry
 from bud.photon_config import PhotonSetupError
+from bud.tracing import TracingSetupError
 from bud.world.store import World
 
-HOST = "127.0.0.1"
-PORT = 8420
 SHUTDOWN_SECONDS = 3
-DEFAULT_URL = f"http://{HOST}:{PORT}"
 
 
 async def ask(prompt: str, tier: Tier, model_id: str | None) -> None:
@@ -151,7 +149,7 @@ def connections() -> None:
     print("Refresh connections in bud serve to load account tools.")
 
 
-def grants(action: str, tool: str | None, url: str = DEFAULT_URL) -> None:
+def grants(action: str, tool: str | None, url: str = LOCAL_URL) -> None:
     """List or revoke standing tool permissions, through the running server when it answers."""
     import httpx
 
@@ -233,7 +231,7 @@ def _main(argv: list[str] | None = None) -> None:
     )
     grants_parser.add_argument("action", nargs="?", choices=["list", "revoke"], default="list")
     grants_parser.add_argument("tool", nargs="?", help="tool name to revoke")
-    grants_parser.add_argument("--url", default=DEFAULT_URL)
+    grants_parser.add_argument("--url", default=LOCAL_URL)
     eval_parser = commands.add_parser("eval", help="run the task suite on the simulated world")
     eval_parser.add_argument("--trials", type=int, default=3)
     eval_parser.add_argument("--task", help="run one task by id")
@@ -260,7 +258,7 @@ def _main(argv: list[str] | None = None) -> None:
     chat_parser = commands.add_parser("chat", help="open or attach to a session")
     chat_parser.add_argument("session", nargs="?", help="session id to attach to")
     chat_parser.add_argument("--new", action="store_true", help="start a separate conversation")
-    chat_parser.add_argument("--url", default=DEFAULT_URL)
+    chat_parser.add_argument("--url", default=LOCAL_URL)
     args = parser.parse_args(argv)
     if args.command == "ask":
         asyncio.run(ask(args.prompt, args.tier, args.model))
@@ -290,13 +288,16 @@ def _main(argv: list[str] | None = None) -> None:
             evaluate(args.trials, args.task, args.mode)
     elif args.command == "serve":
         from bud.core.server import create_app
+        from bud.tracing import tracing
 
         mode = "simulated tools" if args.simulate else "real accounts"
-        print(f"Starting bud with {mode} at {DEFAULT_URL}.", flush=True)
-        app = create_app(simulate=args.simulate, model_id=args.model)
-        # Event streams never end on their own; without a limit, one connected client (TUI, Mac
-        # app) keeps a stopped server alive forever, holding bud.lock. Clients resume by seq.
-        uvicorn.run(app, host=HOST, port=PORT, timeout_graceful_shutdown=SHUTDOWN_SECONDS)
+        print(f"Starting bud with {mode} at {LOCAL_URL}.", flush=True)
+        with tracing(get_settings()):
+            app = create_app(simulate=args.simulate, model_id=args.model)
+            # Event streams never end on their own; without a limit, one connected client (TUI,
+            # Mac app) keeps a stopped server alive forever, holding bud.lock.
+            # Clients resume by seq.
+            uvicorn.run(app, host=HOST, port=PORT, timeout_graceful_shutdown=SHUTDOWN_SECONDS)
     elif args.command == "chat":
         if args.new and args.session:
             parser.error("Use either a session ID or --new, not both.")
@@ -319,6 +320,7 @@ def main(argv: list[str] | None = None) -> None:
         ConnectionError,
         PhotonSetupError,
         ModelConfigurationError,
+        TracingSetupError,
     ) as exc:
         raise SystemExit(str(exc)) from None
     except httpx.HTTPStatusError as exc:

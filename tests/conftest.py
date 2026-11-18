@@ -19,6 +19,7 @@ def isolated_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(tmp_path.resolve() / "data"))
     monkeypatch.setenv("APPROVAL_REVIEW", "false")
     monkeypatch.setenv("LOOP_DETECTION", "false")
+    monkeypatch.delenv("BUD_DAILY_USD", raising=False)
     get_settings.cache_clear()
     with offline_requests():
         yield

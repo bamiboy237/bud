@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 import os
@@ -18,7 +19,7 @@ enum PetStatus: String {
 }
 
 /// What the text you type is for: a new message, or a reply to something bud is waiting on.
-enum InputPurpose: Equatable {
+enum InputPurpose: Hashable {
     case ask
     /// Your own answer to a question, when none of its options fit.
     case answer(String)
@@ -30,6 +31,36 @@ enum InputPurpose: Equatable {
         case .ask: "Ask bud…"
         case .answer: "Your answer…"
         case .revise: "What should change?"
+        }
+    }
+}
+
+struct HeldMessage: Identifiable {
+    let id: String
+    let text: String
+    let payload: String
+    let session: String
+    let base: URL
+    let scope: String
+}
+
+struct RunningTask: Identifiable, Equatable, Sendable {
+    let id: Int
+    let title: String
+    var status: String
+    var finishedAt: Date? = nil
+
+    var move: PetMove {
+        if status == "completed" || status == "done" {
+            return .done
+        } else if status == "failed" || status == "cancelled" {
+            return .failed
+        } else if status == "stalled" {
+            return .needsYou
+        } else if status == "paused" {
+            return .idle
+        } else {
+            return .working
         }
     }
 }
@@ -110,6 +141,9 @@ final class Companion {
             }
         }
     }
+    /// Whether a run is in progress. Stop and the live work views gate on this, not on
+    /// `status`: a job's approval turns the pet to "needs you" while the main run still works.
+    private(set) var running = false
     /// What bud is doing, from run events.
     @ObservationIgnored private var activity: PetStatus = .idle {
         didSet { showStatus() }
@@ -164,6 +198,16 @@ final class Companion {
     var windowOpen = false
     /// What's waiting on the owner, oldest first, with enough detail to decide in the bubble.
     private(set) var approvals: [Approval] = []
+    private(set) var setups: [CapabilitySetup] = [] {
+        didSet {
+            showStatus()
+            monitorSetups()
+        }
+    }
+    @ObservationIgnored private var setupMonitor: Task<Void, Never>?
+    private(set) var updatingSetups: Set<String> = []
+    private(set) var setupProblems: [String: String] = [:]
+    var needsAttention: Bool { !approvals.isEmpty || !setups.isEmpty }
     /// Decisions sent and not yet confirmed: their buttons stay disabled, so one click is one call.
     private(set) var deciding: Set<String> = []
     /// True while a batch approval is running, so single decisions wait for it.
@@ -185,8 +229,20 @@ final class Companion {
     var replyMore: ReplyMore = .init()
     var inputOpen = false
     var draft = ""
+    @ObservationIgnored private var savedDrafts: [InputPurpose: String] = [:]
+    private(set) var heldMessages: [HeldMessage] = []
+    private(set) var retryingHeldMessage = false
     /// Short job milestones (started, needs you, finished). Progress notes never come here.
     var notices: [String] = []
+    /// Active background tasks/jobs and their helper pups (capped at max 4). A stalled job
+    /// turns the pet to "needs you", like an open approval.
+    private(set) var activeTasks: [RunningTask] = [] {
+        didSet { showStatus() }
+    }
+    var visiblePups: [RunningTask] { Array(activeTasks.prefix(4)) }
+    var requiresSnapshotRefresh: Bool {
+        !openApprovals.isEmpty || activeTasks.contains { $0.status == "stalled" }
+    }
     /// Send to first streamed text, for the latency baseline.
     var lastFirstText: Duration?
 
@@ -201,7 +257,7 @@ final class Companion {
     /// The newest stored event handled, so an older snapshot can't undo a newer event.
     @ObservationIgnored private var seenSeq = 0
     /// A message that failed to send, kept with its id so resending it can't run it twice.
-    @ObservationIgnored private var unsent: (text: String, id: String)?
+    @ObservationIgnored private var unsent: HeldMessage?
     @ObservationIgnored private var blocks: [(id: String, text: String)] = []
     /// Model requests already streamed. A second text.reset for one means bud is replaying that
     /// step after a restart, so its partial text is dropped instead of shown twice.
@@ -219,14 +275,40 @@ final class Companion {
     /// A short gesture the pet plays over its status (a wave, a hop), then drops.
     @ObservationIgnored private var reaction: (move: PetMove, since: Date)?
     @ObservationIgnored private var reactionAtStatusStart: (move: PetMove, since: Date)?
+    @ObservationIgnored private nonisolated(unsafe) var activationObserver: (any NSObjectProtocol)?
+
+    init() {
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.refreshSetupStatus()
+            }
+        }
+    }
+
+    deinit {
+        if let activationObserver {
+            NotificationCenter.default.removeObserver(activationObserver)
+        }
+    }
 
     /// Connect (or reconnect after a settings change): handshake, primary session, snapshot, stream.
     func start() {
         generation += 1
+        setupMonitor?.cancel()
+        setupMonitor = nil
+        fastPollRemaining = 0
         batchTask?.cancel()
         approvingBatch = false
         deciding.removeAll()
         approvalFailures = [:]
+        setups = []
+        updatingSetups = []
+        setupProblems = [:]
+        activeTasks = []
         connection = nil
         let mine = generation
         handshake?.cancel()
@@ -305,7 +387,7 @@ final class Companion {
         // An old reply isn't news: it appears whole.
         showWhole()
         // Something already waiting on you is shown, not left behind the dot.
-        if !approvals.isEmpty { bubbleOpen = true }
+        if needsAttention { bubbleOpen = true }
     }
 
     /// Moves `shown` toward `reply`. The step grows with the backlog, so a long burst eases in
@@ -335,7 +417,9 @@ final class Companion {
     }
 
     private func showStatus() {
-        status = openApprovals.isEmpty ? activity : .needsYou
+        running = activity == .working
+        let stalled = activeTasks.contains { $0.status == "stalled" }
+        status = openApprovals.isEmpty && setups.isEmpty && !stalled ? activity : .needsYou
     }
 
     /// The snapshot's pending list is the authority. Events alone can't tell: a parked
@@ -344,22 +428,51 @@ final class Companion {
         let at = snapshot["last_seq"] as? Int ?? 0
         guard at >= seenSeq else { return }
         seenSeq = at
+        let previous = Dictionary(uniqueKeysWithValues: setups.map { ($0.id, $0) })
+        setups = (snapshot["pending_setup"] as? [[String: Any]] ?? []).compactMap {
+            guard var setup = CapabilitySetup($0),
+                  !["connected", "cancelled"].contains(setup.status) else { return nil }
+            setup.url = setup.status == "failed" ? nil : setup.url ?? previous[setup.id]?.url
+            return setup
+        }
+        setupProblems = setupProblems.filter { key, _ in setups.contains { $0.id == key } }
         let pending = snapshot["pending_approvals"] as? [[String: Any]] ?? []
         var jobs: [Int: String] = [:]
-        for task in snapshot["tasks"] as? [[String: Any]] ?? [] {
+        let rawTasks = snapshot["tasks"] as? [[String: Any]] ?? []
+        for task in rawTasks {
             if let id = task["task_id"] as? Int { jobs[id] = task["title"] as? String }
+        }
+        let now = Date()
+        activeTasks = rawTasks.compactMap { dict in
+            guard let id = dict["task_id"] as? Int,
+                  var status = dict["status"] as? String else { return nil }
+            if let stalled = dict["stalled"] as? String, !stalled.isEmpty { status = "stalled" }
+            if let existing = activeTasks.first(where: { $0.id == id }) {
+                if !["completed", "failed", "cancelled"].contains(status) {
+                    var updated = existing
+                    updated.status = status
+                    return updated
+                } else if let finishedAt = existing.finishedAt, now.timeIntervalSince(finishedAt) < 3.5 {
+                    return existing
+                }
+                return nil
+            }
+            if ["completed", "failed", "cancelled"].contains(status) { return nil }
+            let title = dict["title"] as? String ?? "Task \(id)"
+            return RunningTask(id: id, title: title.isEmpty ? "Task \(id)" : title, status: status)
         }
         approvals = pending.compactMap { Approval($0, jobs: jobs) }
         closeStaleInput()
         if !Set(approvals.map(\.id)).isSubset(of: openApprovals) { arrivals += 1 }
         openApprovals = Set(approvals.map(\.id))
+        questionFlows = questionFlows.filter { openApprovals.contains($0.key) }
         deciding.formIntersection(openApprovals)
         approvalFailures = approvalFailures.filter { openApprovals.contains($0.key) }
         if approvals.isEmpty { decisionProblem = nil }
         approvalPoll?.cancel()
-        // A job approval answered in another interface sends nothing to this stream, so
-        // check again while one is open.
-        if !openApprovals.isEmpty {
+        // Child-session activity is not streamed here. Refresh until open decisions and
+        // stalled jobs no longer need the owner.
+        if requiresSnapshotRefresh {
             approvalPoll = Task {
                 try? await Task.sleep(for: .seconds(10))
                 if !Task.isCancelled { refreshApprovals() }
@@ -380,6 +493,153 @@ final class Companion {
 
     // MARK: Actions
 
+    func receiveSetup(_ data: [String: Any], replacing: Bool = false) {
+        guard var incoming = CapabilitySetup(data) else { return }
+        if ["connected", "cancelled"].contains(incoming.status) {
+            setups.removeAll { $0.id == incoming.id }
+            updatingSetups.remove(incoming.id)
+            setupProblems.removeValue(forKey: incoming.id)
+            return
+        }
+        if let index = setups.firstIndex(where: { $0.id == incoming.id }) {
+            if !replacing {
+                var current = setups[index]
+                current.status = incoming.status
+                current.reason = incoming.reason
+                incoming = current
+            }
+            if incoming.status == "failed" { incoming.url = nil }
+            setups[index] = incoming
+        } else {
+            setups.append(incoming)
+            arrivals += 1
+        }
+        bubbleOpen = true
+    }
+
+    @ObservationIgnored var fastPollRemaining = 0
+
+    func connectSetup(_ setup: CapabilitySetup) {
+        guard let connection, !updatingSetups.contains(setup.id) else { return }
+        setupProblems.removeValue(forKey: setup.id)
+        if let url = setups.first(where: { $0.id == setup.id })?.url {
+            if !NSWorkspace.shared.open(url) {
+                setupProblems[setup.id] = "Could not open your browser. Try again."
+            } else {
+                triggerFastPolling()
+            }
+            return
+        }
+        updatingSetups.insert(setup.id)
+        let mine = generation
+        Task {
+            do {
+                let result = try await connection.send(
+                    "POST", "connections/\(setup.id)/connect", json: ["resume": true])
+                guard mine == generation else { return }
+                guard let url = CapabilitySetup.signInURL(result["url"] as? String) else {
+                    setupProblems[setup.id] = "The sign-in link is unavailable. Try again."
+                    updatingSetups.remove(setup.id)
+                    return
+                }
+                if let index = setups.firstIndex(where: { $0.id == setup.id }) {
+                    setups[index].url = url
+                    if !NSWorkspace.shared.open(url) {
+                        setupProblems[setup.id] = "Could not open your browser. Try again."
+                    } else {
+                        triggerFastPolling()
+                    }
+                }
+            } catch {
+                guard mine == generation else { return }
+                setupProblems[setup.id] = "\(error)"
+            }
+            updatingSetups.remove(setup.id)
+        }
+    }
+
+    func cancelSetup(_ setup: CapabilitySetup) {
+        guard let connection, !updatingSetups.contains(setup.id) else { return }
+        updatingSetups.insert(setup.id)
+        setupProblems.removeValue(forKey: setup.id)
+        let mine = generation
+        let route = "sessions/\(session)/setup/\(setup.id)/cancel"
+        Task {
+            do {
+                let result = try await connection.send("POST", route)
+                guard mine == generation else { return }
+                receiveSetup(result)
+            } catch {
+                guard mine == generation else { return }
+                setupProblems[setup.id] = "\(error)"
+            }
+            updatingSetups.remove(setup.id)
+        }
+    }
+
+    func triggerFastPolling() {
+        fastPollRemaining = 3
+        refreshSetupStatus()
+    }
+
+    func refreshSetupStatus() {
+        setupMonitor?.cancel()
+        setupMonitor = nil
+        monitorSetups()
+    }
+
+    private func monitorSetups() {
+        if setups.isEmpty {
+            setupMonitor?.cancel()
+            setupMonitor = nil
+            fastPollRemaining = 0
+            return
+        }
+        guard setupMonitor == nil, let connection else { return }
+        let mine = generation
+        setupMonitor = Task {
+            while !Task.isCancelled, mine == generation, !setups.isEmpty {
+                if link == .connected {
+                    for setup in setups {
+                        await refreshSetup(setup, connection: connection, generation: mine)
+                    }
+                }
+                let delay: Duration
+                if fastPollRemaining > 1 {
+                    delay = .seconds(1)
+                    fastPollRemaining -= 1
+                } else if fastPollRemaining == 1 {
+                    delay = .seconds(2)
+                    fastPollRemaining = 0
+                } else {
+                    delay = .seconds(5)
+                }
+                do {
+                    try await Task.sleep(for: delay)
+                } catch {
+                    break
+                }
+            }
+        }
+    }
+
+    private func refreshSetup(
+        _ setup: CapabilitySetup, connection: BudConnection, generation mine: Int
+    ) async {
+        guard !Task.isCancelled, setups.contains(where: { $0.id == setup.id }) else { return }
+        do {
+            let result = try await connection.send(
+                "POST", "sessions/\(session)/setup/\(setup.id)/check")
+            guard mine == generation, !Task.isCancelled, setups.contains(where: { $0.id == setup.id }) else { return }
+            receiveSetup(result)
+            setupProblems[setup.id] = result["status"] as? String == "failed"
+                ? result["reason"] as? String : nil
+        } catch {
+            guard mine == generation, !Task.isCancelled, setups.contains(where: { $0.id == setup.id }) else { return }
+            setupProblems[setup.id] = "\(error)"
+        }
+    }
+
     /// Sends what's in the field, or `spoken` words. Spoken words sent as a message leave the
     /// field as it was; spoken words answering bud's question are added to the field instead,
     /// for you to send with Return.
@@ -392,6 +652,11 @@ final class Companion {
             if spoken != nil { holdSpeech(text, because: "bud isn't connected, so that wasn't sent.") }
             return
         }
+        if spoken == nil, inputPurpose == .ask, let unsent, unsent.text == text,
+           (unsent.session != session || unsent.base != connection.base || unsent.scope != connection.scope) {
+            nudge("Reconnect to the original bud session to retry this message.")
+            return
+        }
         // An answer to bud's question is yours to confirm: spoken words join the field, after
         // anything already typed, and Return sends them like a typed answer.
         if spoken != nil, inputPurpose != .ask {
@@ -401,7 +666,11 @@ final class Companion {
         }
         switch inputPurpose {
         case .answer(let id):
-            respond(to: id, path: "answer", body: ["text": text])
+            if let approval = approvals.first(where: { $0.id == id }), approval.isQuestionList {
+                answerQuestionText(text, for: approval)
+            } else {
+                respond(to: id, path: "answer", body: ["text": text])
+            }
             return
         case .revise(let id):
             respond(to: id, path: "revise", body: [
@@ -420,15 +689,17 @@ final class Companion {
         reply = ""
         question = text
         // A reply to something bud said carries it as a markdown quote, so bud sees what you mean.
-        let message = replyingTo.map { Self.quote($0) + "\n\n" + text } ?? text
+        let message = spoken == nil && unsent?.text == text
+            ? unsent!.payload : replyingTo.map { Self.quote($0) + "\n\n" + text } ?? text
         replyingTo = nil
         blocks = []
         bubbleOpen = true
         // The pet starts working when bud says so (user.message), not on a hopeful send.
         sentAt = .now
         lastFirstText = nil
-        let messageID = heldID ?? (unsent?.text == text
+        let messageID = heldID ?? (spoken == nil && unsent?.text == text
             ? unsent!.id : UUID().uuidString.replacingOccurrences(of: "-", with: ""))
+        let destination = session
         // A typed message waiting for its retry keeps its id; speech never clears it.
         if spoken == nil { unsent = nil }
         Task {
@@ -437,23 +708,54 @@ final class Companion {
                 let body: [String: Any] = [
                     "text": message, "message_id": messageID, "origin": BudConnection.origin,
                 ]
-                _ = try await connection.send("POST", "sessions/\(session)/messages", json: body)
+                _ = try await connection.send("POST", "sessions/\(destination)/messages", json: body)
             } catch {
                 // Keep what was typed: put it back in the field so one Return resends it. The
                 // request may have arrived before the error, so the resend reuses its id and
                 // bud runs it at most once.
-                activity = .failed
-                reply = "Couldn't send: \(error)"
-                showWhole()
+                nudge("Couldn't send: \(error)")
                 if spoken != nil {
                     holdSpeech(text, id: messageID, because: "That didn't send.")
-                } else if draft.isEmpty {
+                } else if draft.isEmpty, inputPurpose == .ask, session == destination,
+                          self.connection?.base == connection.base,
+                          self.connection?.scope == connection.scope {
                     draft = text
-                    unsent = (text, messageID)
+                    unsent = HeldMessage(
+                        id: messageID, text: text, payload: message, session: destination,
+                        base: connection.base, scope: connection.scope)
                     inputOpen = true
+                } else {
+                    heldMessages.append(HeldMessage(
+                        id: messageID, text: text, payload: message, session: destination,
+                        base: connection.base, scope: connection.scope))
                 }
             }
         }
+    }
+
+    func retryHeldMessage() {
+        guard let connection, let held = heldMessages.first, !retryingHeldMessage else { return }
+        guard held.session == session, held.base == connection.base, held.scope == connection.scope else {
+            nudge("Reconnect to the original bud session to retry this message.")
+            return
+        }
+        retryingHeldMessage = true
+        Task {
+            do {
+                _ = try await connection.send("POST", "sessions/\(held.session)/messages", json: [
+                    "text": held.payload, "message_id": held.id, "origin": BudConnection.origin,
+                ])
+                heldMessages.removeAll { $0.id == held.id }
+            } catch {
+                nudge("Couldn't send: \(error)")
+            }
+            retryingHeldMessage = false
+        }
+    }
+
+    func dropHeldMessage() {
+        guard !heldMessages.isEmpty, !retryingHeldMessage else { return }
+        heldMessages.removeFirst()
     }
 
     /// Spoken words that couldn't go out, held apart from the field, which keeps what you typed.
@@ -552,8 +854,9 @@ final class Companion {
     }
 
     /// Yes or no on an action. A job's approval goes through this session too: bud finds the job.
-    func decide(_ id: String, approved: Bool) {
-        respond(to: id, path: nil, body: ApprovalDecision(approved: approved).body)
+    @discardableResult
+    func decide(_ id: String, approved: Bool, after delay: Duration? = nil) -> Bool {
+        respond(to: id, path: nil, body: ApprovalDecision(approved: approved).body, after: delay)
     }
 
     /// Yes now, and yes to this tool from now on: bud records the standing grant, then applies.
@@ -609,14 +912,34 @@ final class Companion {
 
     /// Opens the field to answer a question in your own words, or to say what should change.
     func write(_ purpose: InputPurpose) {
+        savedDrafts[inputPurpose] = draft
         inputPurpose = purpose
-        draft = ""
+        draft = savedDrafts.removeValue(forKey: purpose) ?? ""
         inputOpen = true
     }
 
-    /// Choosing one of a question's options sends it as the answer, word for word.
-    func choose(_ choice: String, for id: String) {
-        respond(to: id, path: "answer", body: ["text": choice])
+    @ObservationIgnored private var questionFlows: [String: QuestionFlow] = [:]
+
+    func questionFlow(for approval: Approval) -> QuestionFlow {
+        if let flow = questionFlows[approval.id] { return flow }
+        let id = approval.id
+        let flow = QuestionFlow(questions: approval.questions) { [weak self] answers in
+            self?.answerQuestions(id, answers)
+        }
+        questionFlows[id] = flow
+        return flow
+    }
+
+    private func answerQuestions(_ id: String, _ answers: [QuestionAnswer]) {
+        respond(to: id, path: "answer", body: ["answers": answers])
+    }
+
+    func answerQuestionText(_ text: String, for approval: Approval) {
+        savedDrafts.removeValue(forKey: .answer(approval.id))
+        draft = savedDrafts.removeValue(forKey: .ask) ?? ""
+        inputOpen = !draft.isEmpty
+        inputPurpose = .ask
+        questionFlow(for: approval).answerTyped(text)
     }
 
     /// A field opened to answer or revise something that's since been settled (in another
@@ -627,9 +950,11 @@ final class Companion {
         case .ask: nil
         }
         guard let target, !approvals.contains(where: { $0.id == target }) else { return }
+        let unfinished = draft
         inputPurpose = .ask
-        inputOpen = false
-        draft = ""
+        let previous = savedDrafts.removeValue(forKey: .ask) ?? ""
+        draft = [previous, unfinished].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        inputOpen = !draft.isEmpty
     }
 
     private func showReceipt(
@@ -664,8 +989,11 @@ final class Companion {
         }
     }
 
-    private func respond(to id: String, path: String?, body: [String: any Sendable]) {
-        guard let connection, !approvingBatch, !deciding.contains(id) else { return }
+    @discardableResult
+    private func respond(
+        to id: String, path: String?, body: [String: any Sendable], after delay: Duration? = nil
+    ) -> Bool {
+        guard let connection, !approvingBatch, !deciding.contains(id) else { return false }
         deciding.insert(id)
         decisionProblem = nil
         let route = "sessions/\(session)/approvals/\(id)" + (path.map { "/\($0)" } ?? "")
@@ -677,14 +1005,18 @@ final class Companion {
         }
         let typed = targetsThis ? draft : ""
         if targetsThis {
-            draft = ""
-            inputOpen = false
+            draft = savedDrafts.removeValue(forKey: .ask) ?? ""
+            inputOpen = !draft.isEmpty
             inputPurpose = .ask
         }
         let approval = approvals.first { $0.id == id }
-        let answer = (body["text"] as? String) ?? typed
+        let answer = (body["text"] as? String)
+            ?? (body["answers"] as? [QuestionAnswer]).map(QuestionAnswer.summary)
+            ?? typed
         let mine = generation
         Task {
+            if let delay { try? await Task.sleep(for: delay) }
+            guard mine == generation else { return }
             do {
                 let response = try await connection.send("POST", route, json: Self.payload(body))
                 guard mine == generation else { return }
@@ -708,6 +1040,7 @@ final class Companion {
                 }
                 if !typed.isEmpty {
                     // Keep what was typed, so trying again is one Return.
+                    savedDrafts[inputPurpose] = draft
                     inputPurpose = path == "answer" ? .answer(id) : .revise(id)
                     draft = typed
                     inputOpen = true
@@ -716,6 +1049,7 @@ final class Companion {
             deciding.remove(id)
             refreshApprovals()
         }
+        return true
     }
 
     // MARK: Events
@@ -738,7 +1072,7 @@ final class Companion {
         }
     }
 
-    private func handle(_ event: BudEvent) {
+    func handle(_ event: BudEvent) {
         if !event.live { seenSeq = max(seenSeq, event.seq) }
         switch event.type {
         case "user.message":
@@ -762,6 +1096,17 @@ final class Companion {
             bubbleOpen = true
         case "run.started", "run.recovered":
             settle?.cancel()
+            if event.string("trigger") == "job" {
+                archiveReply()
+                reply = ""
+                showWhole()
+                question = ""
+                blocks = []
+                seenRequests = []
+                steps = []
+                lastSteps = []
+                stepsExpanded = false
+            }
             if runStart == nil { runStart = .now }
             activity = .working
         case "text.reset":
@@ -778,6 +1123,8 @@ final class Companion {
             for index in steps.indices where steps[index].id.hasPrefix(call) { steps[index].done = true }
         case "text.delta":
             appendDelta(block: event.string("block"), text: event.string("text"))
+        case "capability.setup", "capability.status":
+            receiveSetup(event.data, replacing: event.type == "capability.setup")
         case "run.completed":
             finish(with: Self.replyText(event.data))
             closeSteps()
@@ -832,9 +1179,48 @@ final class Companion {
             closeSteps()
             activity = .idle
             refreshApprovals()
-        case "task.created", "task.completed", "task.failed", "task.cancelled", "task.paused":
+        case "task.created":
+            if let id = event.data["task_id"] as? Int {
+                let title = event.string("title")
+                if !activeTasks.contains(where: { $0.id == id }) {
+                    activeTasks.append(RunningTask(id: id, title: title.isEmpty ? "Task \(id)" : title, status: "running"))
+                }
+            }
             notice(event)
-            if event.type != "task.created" { refreshApprovals() }
+        case "task.completed":
+            if let id = event.data["task_id"] as? Int,
+               let index = activeTasks.firstIndex(where: { $0.id == id }) {
+                activeTasks[index].status = "completed"
+                activeTasks[index].finishedAt = .now
+                scheduleTaskRemoval(id: id, delay: 3.5)
+            }
+            notice(event)
+            refreshApprovals()
+        case "task.failed", "task.cancelled":
+            if let id = event.data["task_id"] as? Int,
+               let index = activeTasks.firstIndex(where: { $0.id == id }) {
+                activeTasks[index].status = event.type == "task.failed" ? "failed" : "cancelled"
+                activeTasks[index].finishedAt = .now
+                scheduleTaskRemoval(id: id, delay: 2.5)
+            } else if let id = event.data["task_id"] as? Int {
+                activeTasks.removeAll { $0.id == id }
+            }
+            notice(event)
+            refreshApprovals()
+        case "task.stalled":
+            if let id = event.data["task_id"] as? Int,
+               let index = activeTasks.firstIndex(where: { $0.id == id }) {
+                activeTasks[index].status = "stalled"
+            }
+            notice(event)
+            refreshApprovals()
+        case "task.paused":
+            if let id = event.data["task_id"] as? Int,
+               let index = activeTasks.firstIndex(where: { $0.id == id }) {
+                activeTasks[index].status = "paused"
+            }
+            notice(event)
+            refreshApprovals()
         default:
             break
         }
@@ -920,6 +1306,9 @@ final class Companion {
             }
             text = "\(happened) “\(title)”"
         }
+        if event.type == "task.stalled", !title.isEmpty {
+            text = "“\(title)” looks stuck. \(text)"
+        }
         guard !text.isEmpty else { return }
         notices.append(String(text.prefix(160)))
         notices = Array(notices.suffix(3))
@@ -934,22 +1323,44 @@ final class Companion {
         }
     }
 
+    private func scheduleTaskRemoval(id: Int, delay: Double) {
+        guard let finishedAt = activeTasks.first(where: { $0.id == id })?.finishedAt else { return }
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Int(delay * 1000)))
+            await MainActor.run {
+                self?.activeTasks.removeAll {
+                    $0.id == id && $0.finishedAt == finishedAt
+                        && ["completed", "failed", "cancelled"].contains($0.status)
+                }
+            }
+        }
+    }
+
     /// A decision's body, with the origin bud records for it. Built outside the main actor, so
     /// the dictionary is free to hand to the connection under Swift 6 checking.
     nonisolated private static func payload(_ body: [String: any Sendable]) -> [String: Any] {
         var json: [String: Any] = body.mapValues { $0 as Any }
+        if let answers = body["answers"] as? [QuestionAnswer] {
+            json["answers"] = answers.map(\.json)
+        }
         json["origin"] = BudConnection.origin
         return json
     }
 
-    /// The assistant's text from a stored run end, the same rule the TUI uses.
+    /// Matches projection.reply_text, including filtering legacy self-check notes in saved runs.
     static func replyText(_ data: [String: Any]) -> String {
         let messages = data["messages"] as? [[String: Any]] ?? []
         return messages
             .filter { $0["kind"] as? String == "response" }
-            .flatMap { $0["parts"] as? [[String: Any]] ?? [] }
-            .filter { $0["part_kind"] as? String == "text" }
-            .compactMap { $0["content"] as? String }
+            .flatMap { message -> [String] in
+                let spiral = (message["metadata"] as? [String: Any])?["bud_spiral"] as? [String: Any]
+                let notes = Set(
+                    (spiral?["notes"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String })
+                return (message["parts"] as? [[String: Any]] ?? [])
+                    .filter { $0["part_kind"] as? String == "text" }
+                    .compactMap { $0["content"] as? String }
+                    .filter { !notes.contains($0) }
+            }
             .joined()
     }
 }

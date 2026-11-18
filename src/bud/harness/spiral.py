@@ -1,38 +1,29 @@
 """Spiral detection: notice a run going in circles, nudge it once, then pause it cleanly.
 
 bud has no step limit and no money cap, so a long job may legitimately run for an hour.
-What it must not do is run for an hour while repeating itself. This capability watches
-one run for four signs of a spiral and answers them with a two-step ladder.
+What it must not do is run for an hour while repeating itself. Two signals feed one ladder:
 
-The signs, each a pure function of the run's own messages:
+- harness `DetectLoops` reports repeated results, alternating calls, and repeated text.
+  Repeated calls whose results change are polling, so that check stays off.
+- a progress judge asks, after a set number of model requests and every few after, whether
+  the run is still moving toward the owner's request.
 
-- repeat: the same tool call with the same arguments returned the same result several
-  times in a row. The same call with a changed result is polling and never counts.
-- cycle: a short sequence of different calls (A, B, A, B, A, B) repeats with unchanged
-  results.
-- chanting: the same sentence appears in consecutive assistant messages.
-- no_progress: after a set number of model requests, and every few requests after, a
-  small model judge answers whether the run is still moving toward the owner's request.
+The ladder: the first signal adds a system nudge to change approach. A signal after that
+pauses the run: tools are switched off and the model writes a handoff. The run then ends
+normally, not as a failure, and `run.loop_detected` tells the clients why.
 
-The ladder: the first sign puts a note in the assistant's own voice into history, so the
-model reads it as its own thought and changes approach. A second sign after that note
-pauses the run: tools are switched off and the model writes a handoff. The run then
-ends normally, not as a failure, and `run.loop_detected` tells the clients why.
-
-All per-run state lives in the messages, never in the capability, so a recovered durable
-run replays to the same decisions. The only side effect is the judge call, which is a
-durable operation so a replay reuses its answer.
+The ladder's state is the nudge and pause parts in the run's own messages, so a recovered
+durable run replays to the same decisions. The judge call is a durable operation, so a
+replay reuses its answer.
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import math
-import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
-from typing import Any, Literal
+from dataclasses import dataclass, field, replace
+from typing import Any
 
 import httpx
 from pydantic_ai import RunContext
@@ -42,22 +33,23 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
-    TextPart,
+    SystemPromptPart,
     ToolCallPart,
     UserPromptPart,
 )
 from pydantic_ai.models import ModelRequestContext
+from pydantic_ai_harness import DetectLoops
+from pydantic_ai_harness.detect_loops import DetectedLoop
 
 from bud.harness.review import DECISIONS_URL
 
 logger = logging.getLogger(__name__)
 
-LoopKind = Literal["repeat", "cycle", "chanting", "no_progress"]
 LoopReport = Callable[[dict[str, Any]], None]
 
-# Key in ModelResponse.metadata. Metadata is saved with the conversation but never sent
-# to the model, so it is where a run's own earlier decisions are remembered.
-MARK = "bud_spiral"
+# `origin` values in the metadata of the system parts the ladder adds.
+NUDGE = "bud.spiral.nudge"
+PAUSE = "bud.spiral.pause"
 
 JUDGE_RULES = (
     "You watch one run of a personal AI assistant and judge whether it is still making "
@@ -86,11 +78,8 @@ REQUEST_CHARS = 4_000
 class SpiralConfig:
     enabled: bool = True
     repeat_note: int = 3
-    repeat_pause: int = 4
-    cycle_max_period: int = 4
     cycle_repeats: int = 3
     chant_repeats: int = 3
-    chant_min_chars: int = 30
     progress_first: int = 20
     progress_every: int = 10
     progress_threshold: float = 0.2
@@ -106,11 +95,8 @@ class SpiralConfig:
         return cls(
             enabled=settings.loop_detection,
             repeat_note=settings.loop_repeat_note,
-            repeat_pause=max(settings.loop_repeat_pause, settings.loop_repeat_note),
-            cycle_max_period=settings.loop_cycle_max_period,
             cycle_repeats=settings.loop_cycle_repeats,
             chant_repeats=settings.loop_chant_repeats,
-            chant_min_chars=settings.loop_chant_min_chars,
             progress_first=settings.loop_progress_first,
             progress_every=settings.loop_progress_every,
             progress_threshold=settings.loop_progress_threshold,
@@ -123,43 +109,12 @@ class SpiralConfig:
 
 
 @dataclass(frozen=True)
-class Detection:
-    kind: LoopKind
-    detail: str
-    confidence: float | None = None
-
-
-@dataclass(frozen=True)
 class Step:
-    """One tool call that has come back with a result."""
+    """One tool call that has come back with a result, as the judge's log shows it."""
 
     tool: str
-    call: str  # fingerprint of name and canonical arguments
-    result: str  # fingerprint of the canonical result
     args: str
-    shown: str  # the result, clipped for the judge's log
-
-    @property
-    def outcome_key(self) -> tuple[str, str]:
-        return (self.call, self.result)
-
-
-@dataclass
-class RunState:
-    """Everything the detectors need, read from the run's messages."""
-
-    steps: list[Step]
-    # One entry per assistant message that has text; each holds its normalized sentences.
-    sentences: list[tuple[int, set[str]]]
-    requests: int
-    notes: list[dict[str, Any]]
-    paused: bool
-    request_text: str
-
-
-def _digest(value: Any) -> str:
-    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True, default=str)
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
+    shown: str
 
 
 def _canonical_args(call: ToolCallPart) -> str:
@@ -174,84 +129,29 @@ def _content_text(content: Any) -> str:
     return content if isinstance(content, str) else json.dumps(content, sort_keys=True, default=str)
 
 
-def _sentences(text: str, minimum: int) -> set[str]:
-    found = set()
-    for raw in re.split(r"(?<=[.!?])\s+|\n+", text):
-        sentence = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", raw.lower())).strip()
-        if len(sentence) >= minimum:
-            found.add(sentence)
-    return found
-
-
-def _marks(response: ModelResponse) -> list[dict[str, Any]]:
-    mark = (response.metadata or {}).get(MARK)
-    return list(mark["notes"]) if isinstance(mark, dict) else []
-
-
-def read_state(run_id: str | None, messages: Sequence[ModelMessage], minimum: int) -> RunState:
-    """Fold this run's messages into steps, sentences, notes, and the request count."""
-    mine = [m for m in messages if m.run_id == run_id] if run_id else list(messages)
-    calls: dict[str, ToolCallPart] = {}
+def run_steps(run_id: str | None, messages: Sequence[ModelMessage]) -> list[Step]:
+    """This run's tool calls that have results, in call order."""
+    mine = [m for m in messages if m.run_id == run_id]
     results: dict[str, str] = {}
     for message in mine:
-        if isinstance(message, ModelResponse):
-            for part in message.parts:
-                if isinstance(part, ToolCallPart):
-                    calls[part.tool_call_id] = part
-        elif isinstance(message, ModelRequest):
+        if isinstance(message, ModelRequest):
             for part in message.parts:
                 # A rejected call comes back as a retry prompt; it is still the call's result.
                 if part.part_kind in ("tool-return", "retry-prompt"):
                     call_id = getattr(part, "tool_call_id", None)
                     if call_id:
                         results[call_id] = _content_text(getattr(part, "content", ""))
-
-    steps: list[Step] = []
-    sentences: list[tuple[int, set[str]]] = []
-    notes: list[dict[str, Any]] = []
-    requests = 0
-    emitted: set[str] = set()
-    for message in mine:
-        if not isinstance(message, ModelResponse):
-            continue
-        requests += 1
-        marks = _marks(message)
-        notes.extend(marks)
-        own = {note["text"] for note in marks}
-        text = "\n".join(
-            part.content
-            for part in message.parts
-            if isinstance(part, TextPart) and part.content not in own
+    return [
+        Step(
+            tool=part.tool_name,
+            args=_canonical_args(part),
+            shown=results[part.tool_call_id][:SUMMARY_FIELD_CHARS].replace("\n", " "),
         )
-        found = _sentences(text, minimum)
-        if found:
-            sentences.append((requests, found))
-        for part in message.parts:
-            if (
-                isinstance(part, ToolCallPart)
-                and part.tool_call_id in results
-                and part.tool_call_id not in emitted
-            ):
-                emitted.add(part.tool_call_id)
-                result = results[part.tool_call_id]
-                args = _canonical_args(part)
-                steps.append(
-                    Step(
-                        tool=part.tool_name,
-                        call=_digest(f"{part.tool_name}\0{args}"),
-                        result=_digest(result),
-                        args=args,
-                        shown=result[:SUMMARY_FIELD_CHARS].replace("\n", " "),
-                    )
-                )
-    return RunState(
-        steps=steps,
-        sentences=sentences,
-        requests=requests,
-        notes=notes,
-        paused=any(note.get("phase") == "pause" for note in notes),
-        request_text=owner_request(messages),
-    )
+        for message in mine
+        if isinstance(message, ModelResponse)
+        for part in message.parts
+        if isinstance(part, ToolCallPart) and part.tool_call_id in results
+    ]
 
 
 def owner_request(messages: Sequence[ModelMessage]) -> str:
@@ -281,79 +181,72 @@ def work_tools_off(request_context: ModelRequestContext) -> ModelRequestContext:
     )
 
 
+def marks(messages: Sequence[ModelMessage]) -> list[dict[str, Any]]:
+    """The metadata of the nudge and pause parts in these messages, in order."""
+    return [
+        part.metadata
+        for message in messages
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, SystemPromptPart)
+        and isinstance(part.metadata, dict)
+        and part.metadata.get("origin") in (NUDGE, PAUSE)
+    ]
+
+
 def paused_in(messages: Sequence[ModelMessage]) -> dict[str, Any] | None:
     """The pause a finished run carries, if any. Used to pause a job after its handoff."""
-    for message in messages:
-        if isinstance(message, ModelResponse):
-            for note in _marks(message):
-                if note.get("phase") == "pause":
-                    return note
-    return None
+    return next((mark for mark in marks(messages) if mark["origin"] == PAUSE), None)
 
 
-# Detectors. Each takes the steps or sentences it should look at and returns a detection.
-
-
-def detect_repeat(steps: list[Step], config: SpiralConfig, noted: int | None) -> Detection | None:
-    """The same call and the same result back to back. A call whose result changed is polling."""
-    if not steps or (noted is not None and len(steps) <= noted):
-        return None
-    last = steps[-1].outcome_key
-    length = 0
-    for step in reversed(steps):
-        if step.outcome_key != last:
-            break
-        length += 1
-    started = len(steps) - length
-    # After a note, a streak that began before it needs the higher bar: the model was
-    # already warned about the first two. A fresh streak after the note only needs the
-    # lower bar.
-    needed = config.repeat_pause if noted is not None and started < noted else config.repeat_note
-    if length < needed:
-        return None
-    tool = steps[-1].tool
-    return Detection(
-        "repeat",
-        f"{tool} was called {length} times in a row with the same arguments and the same "
-        f"result ({steps[-1].args[:160]}).",
-    )
-
-
-def detect_cycle(steps: list[Step], config: SpiralConfig, noted: int | None) -> Detection | None:
-    """A block of two to N different calls that keeps coming back with unchanged results."""
-    window = steps if noted is None else steps[noted:]
-    repeats = config.cycle_repeats if noted is None else max(2, config.cycle_repeats - 1)
-    keys = [step.outcome_key for step in window]
-    for period in range(2, config.cycle_max_period + 1):
-        span = period * repeats
-        if len(keys) < span:
-            continue
-        tail = keys[-span:]
-        block = tail[:period]
-        if len(set(block)) < 2 or tail != block * repeats:
-            continue
-        names = " -> ".join(step.tool for step in window[-period:])
-        return Detection(
-            "cycle",
-            f"the sequence {names} repeated {repeats} times and kept returning the same results.",
+def escalate(
+    ctx: RunContext[None],
+    report: LoopReport,
+    kind: str,
+    detail: str,
+    confidence: float | None = None,
+) -> bool:
+    """Climb one rung and return whether this call newly paused the run."""
+    ladder = marks([m for m in ctx.messages if m.run_id == ctx.run_id])
+    if any(mark["origin"] == PAUSE for mark in ladder):
+        return False
+    if not ladder:
+        ctx.enqueue(
+            SystemPromptPart(
+                f"Self-check: {detail}",
+                metadata={"origin": NUDGE, "kind": kind, "detail": detail},
+            )
         )
-    return None
+        return False
+    ctx.enqueue(
+        SystemPromptPart(
+            f"Still going in circles: {detail} Work tools are now off.",
+            metadata={"origin": PAUSE, "kind": kind, "detail": detail},
+        )
+    )
+    report(
+        {
+            "run_id": ctx.run_id,
+            "kind": kind,
+            "detail": detail,
+            **({"confidence": confidence} if confidence is not None else {}),
+        }
+    )
+    return True
 
 
-def detect_chanting(
-    sentences: list[tuple[int, set[str]]], config: SpiralConfig, noted_request: int | None
-) -> Detection | None:
-    """One sentence in the last few assistant messages that had text."""
-    window = sentences if noted_request is None else [s for s in sentences if s[0] > noted_request]
-    repeats = config.chant_repeats if noted_request is None else max(2, config.chant_repeats - 1)
-    if len(window) < repeats:
-        return None
-    common = set.intersection(*(found for _, found in window[-repeats:]))
-    if not common:
-        return None
-    sentence = max(common, key=len)
-    return Detection(
-        "chanting", f'the assistant said "{sentence[:160]}" in {repeats} consecutive messages.'
+def loop_detector(config: SpiralConfig, report: LoopReport) -> DetectLoops[None]:
+    def on_loop(ctx: RunContext[None], loop: DetectedLoop) -> None:
+        escalate(ctx, report, loop.pattern, loop.message)
+
+    return DetectLoops(
+        window=max(10, config.repeat_note, 2 * config.cycle_repeats),
+        # The same call with a changed result is polling, which must never count.
+        repeated_call_threshold=None,
+        repeated_result_threshold=config.repeat_note,
+        alternating_calls_threshold=config.cycle_repeats,
+        repeated_text_threshold=config.chant_repeats,
+        action=on_loop,
     )
 
 
@@ -443,20 +336,6 @@ def build_judge(config: SpiralConfig) -> ProgressJudge | None:
     )
 
 
-NOTE_TEXT = (
-    "Self-check: {detail} Going again the same way will not get a different answer. "
-    "I need to change approach now: use a different tool or different inputs, rely on what "
-    "I have already gathered, or stop and tell the owner what is blocking me."
-)
-
-PAUSE_TEXT = (
-    "I am still going in circles: {detail} I am stopping here and will not call any more "
-    "tools. My next message is a short handoff to the owner with three parts: Done (what "
-    "I have confirmed so far), Stuck on (what keeps blocking me and why), and Next step "
-    "(what I or the owner should try next)."
-)
-
-
 JOB_HANDOFF = (
     "This job is paused because it was going in circles, and its work tools are now off. "
     "End it with finish_job: outcome not_delivered or partly_delivered; summary says what "
@@ -475,13 +354,13 @@ HANDOFF = (
 
 @dataclass(kw_only=True)
 class SpiralGuard(AbstractCapability[None]):
+    """Runs the progress judge, and turns tools off once the run is paused."""
+
     config: SpiralConfig
     report: LoopReport
     judge: ProgressJudge | None = None
     id: str | None = "bud_spiral_guard"
-
-    def __post_init__(self) -> None:
-        self._judged: dict[str, int] = {}
+    _judged: dict[str, int] = field(default_factory=dict, init=False, repr=False)
 
     async def before_model_request(
         self, ctx: RunContext[None], request_context: ModelRequestContext
@@ -489,70 +368,45 @@ class SpiralGuard(AbstractCapability[None]):
         if not self.config.enabled:
             return request_context
         messages = request_context.messages
-        state = read_state(ctx.run_id, messages, self.config.chant_min_chars)
-        if state.paused:
+        if paused_in([m for m in messages if m.run_id == ctx.run_id]) is not None:
             # The handoff is being written (or a retry of it): keep tools off.
             return self._tools_off(request_context)
-        noted = state.notes[-1] if state.notes else None
-        detection = self._detect(state, noted)
-        if detection is None:
-            detection = await self._progress(ctx, messages, state)
-        if detection is None:
-            return request_context
-        if noted is None:
-            self._write(ctx, messages, state, detection, phase="note", text=NOTE_TEXT)
-            return request_context
-        self._write(ctx, messages, state, detection, phase="pause", text=PAUSE_TEXT)
-        self.report(
-            {
-                "run_id": ctx.run_id,
-                "kind": detection.kind,
-                "detail": detection.detail,
-                **(
-                    {"confidence": detection.confidence} if detection.confidence is not None else {}
-                ),
-            }
-        )
-        return self._tools_off(request_context)
+        if await self._check_progress(ctx, messages):
+            return self._tools_off(request_context)
+        return request_context
 
-    def _detect(self, state: RunState, noted: dict[str, Any] | None) -> Detection | None:
-        steps_before = noted["steps"] if noted is not None else None
-        request_before = noted["request"] if noted is not None else None
-        return (
-            detect_repeat(state.steps, self.config, steps_before)
-            or detect_cycle(state.steps, self.config, steps_before)
-            or detect_chanting(state.sentences, self.config, request_before)
-        )
-
-    async def _progress(
-        self, ctx: RunContext[None], messages: Sequence[ModelMessage], state: RunState
-    ) -> Detection | None:
+    async def _check_progress(
+        self, ctx: RunContext[None], messages: Sequence[ModelMessage]
+    ) -> bool:
         run_id = ctx.run_id or ""
+        request = owner_request(messages)
+        requests = sum(isinstance(m, ModelResponse) and m.run_id == ctx.run_id for m in messages)
         if (
             self.judge is None
-            or not state.request_text
-            or not judge_due(state.requests, self.config)
-            or self._judged.get(run_id) == state.requests
+            or not request
+            or not judge_due(requests, self.config)
+            or self._judged.get(run_id) == requests
         ):
-            return None
+            return False
         if len(self._judged) > 256:
             self._judged.clear()
-        self._judged[run_id] = state.requests
-        probability = await self._ask(
-            ctx, state.request_text, step_log(state.steps), len(state.steps)
-        )
+        self._judged[run_id] = requests
+        steps = run_steps(ctx.run_id, messages)
+        probability = await self._ask(ctx, request, step_log(steps), len(steps))
         logger.info(
             "progress check in run %s after %d requests: probability of progress %s",
             run_id,
-            state.requests,
+            requests,
             "unavailable" if probability is None else f"{probability:.2f}",
         )
         if probability is None or probability >= self.config.progress_threshold:
-            return None
-        return Detection(
+            return False
+        return escalate(
+            ctx,
+            self.report,
             "no_progress",
-            f"a progress check after {state.requests} model requests judged that the run is "
-            f"not moving toward the request (probability of progress {probability:.2f}).",
+            f"a progress check after {requests} model requests judged that the run is not "
+            f"moving toward the request (probability of progress {probability:.2f}).",
             confidence=round(1 - probability, 2),
         )
 
@@ -574,43 +428,3 @@ class SpiralGuard(AbstractCapability[None]):
                 params, instruction_parts=InstructionPart.sorted([*params.instruction_parts, note])
             )
         return work_tools_off(replace(request_context, model_request_parameters=params))
-
-    @staticmethod
-    def _write(
-        ctx: RunContext[None],
-        messages: Sequence[ModelMessage],
-        state: RunState,
-        detection: Detection,
-        *,
-        phase: str,
-        text: str,
-    ) -> None:
-        """Put the note in the assistant's last message, where the model reads it as its own.
-
-        It is a leading text part of that message, never a user prompt: an earlier bud note
-        in the owner's voice was once mistaken for the owner's own words. The message is
-        edited in place so the note stays in the run's history and in its saved reply.
-        """
-        response = next(
-            (
-                m
-                for m in reversed(messages)
-                if isinstance(m, ModelResponse) and m.run_id == ctx.run_id
-            ),
-            None,
-        )
-        if response is None:
-            return
-        note = text.format(detail=detection.detail[:300].rstrip())
-        mark = {
-            "phase": phase,
-            "kind": detection.kind,
-            "detail": detection.detail,
-            "text": note,
-            "steps": len(state.steps),
-            "request": state.requests,
-        }
-        existing = (response.metadata or {}).get(MARK)
-        notes = [*existing["notes"], mark] if isinstance(existing, dict) else [mark]
-        response.metadata = {**(response.metadata or {}), MARK: {"notes": notes}}
-        response.parts = [TextPart(note), *response.parts]

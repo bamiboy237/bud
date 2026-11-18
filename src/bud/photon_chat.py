@@ -10,9 +10,10 @@ import httpx
 from pydantic import SecretStr, ValidationError
 from starlette.types import ASGIApp
 
-from bud.config import Settings
+from bud.config import LOCAL_URL, Settings
 from bud.core.controls import session_snapshot, submit
 from bud.core.events import MessageOrigin
+from bud.core.projection import spiral_notes
 from bud.photon_config import PhotonConfig, owner_message
 from bud.photon_store import (
     TransportError,
@@ -57,10 +58,12 @@ def notification(event: dict, origin: MessageOrigin) -> str | None:
                 return None
             for message in reversed(data["messages"]):
                 if message.get("kind") == "response":
+                    # Saved runs from before DetectLoops can contain assistant self-check notes.
+                    notes = spiral_notes(message)
                     body = "\n".join(
                         part["content"]
                         for part in message.get("parts", [])
-                        if part.get("part_kind") == "text"
+                        if part.get("part_kind") == "text" and part["content"] not in notes
                     )
                     if body:
                         return body
@@ -555,7 +558,7 @@ async def messaging(
 
     async with (
         httpx.AsyncClient(
-            base_url="http://127.0.0.1:8420",
+            base_url=LOCAL_URL,
             transport=httpx.ASGITransport(app),
             headers={
                 "Authorization": f"Bearer {token.get_secret_value()}",

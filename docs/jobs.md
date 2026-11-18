@@ -31,6 +31,18 @@ The conversation, job, pending decision, and saved results survive a process
 restart. A completed job posts its result back to the conversation and the
 interface where you requested it.
 
+When a job finishes, fails, or pauses because it was going in circles, Bud
+tells you in the conversation without waiting for your next message. If a
+message of yours is already waiting, Bud gets the job's result with that
+message instead. A job you cancel gets no report.
+
+Bud also tells you when a running job looks stuck. A job is stuck when it has
+logged nothing for `JOB_IDLE_MINUTES` (default 10), or has been open longer
+than `JOB_DEADLINE_MINUTES` (default 60). A job waiting for your approval is
+not stuck. Each reason is reported once per job. The Mac companion shows
+"needs you" until the job shows activity again. Ask Bud to stop the job, or
+let it continue.
+
 Name the job for a correction or follow-up. Bud asks which one when several
 jobs could fit the request. Ask it to inspect or stop a named job. `/stop`
 also stops the current conversation's open jobs.

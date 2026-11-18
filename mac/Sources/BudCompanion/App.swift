@@ -30,7 +30,7 @@ private struct MenuContent: View {
         Button("Ask bud…") { delegate.ask() }
             .keyboardShortcut("k")
         Button(delegate.petVisible ? "Hide pet" : "Show pet") { delegate.togglePet() }
-        if companion.status == .working { Button("Stop", action: companion.stop) }
+        if companion.running { Button("Stop", action: companion.stop) }
         Divider()
         Picker("Steps", selection: $companion.stepsLayout) {
             ForEach(StepsLayout.allCases, id: \.self) { Text($0.title).tag($0) }
@@ -94,6 +94,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.panel = panel
         companion.start()
         Voice.shared.start()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        Companion.shared.refreshSetupStatus()
     }
 
     func ask() {

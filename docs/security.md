@@ -10,6 +10,25 @@ Bud operates under a strict principle of least surprise: **Read is automatic; Wr
 
 An email action also carries a readable preview of the original message: subject, recipients, and the full body, captured from Bud's own records when the action is held. The preview is presentation only. The decision still names one exact approval ID, and the tool arguments do not change. A preview that cannot be read marks itself unavailable and never blocks the decision. Previews apply to new approvals; older pending approvals keep their original shape.
 
+## Workspace files
+
+Bud reads and writes text files in one workspace folder: `DATA_DIR/workspace`, or the
+account's session folder in account mode.
+
+- Reads use the harness `FileSystem` tools (`read_file`, `list_directory`, `search_files`,
+  `find_files`, `file_info`) over a read-only workspace. They run without approval.
+- Workspace file content reaches the model as data with no authority, like a tool result.
+- Hidden paths and names that look like credentials are refused for reads and writes. For
+  example, `.env`, `.git`, `api-key.txt`, `secrets.md`, `id_rsa`, `cert.pem`, and `AGENTS.md`.
+- Paths that leave the folder, through `..`, an absolute path, or a symlink, are refused.
+- `workspace_create` and `workspace_update` need approval. Each approved write runs once:
+  its claim is saved before the file changes, so a recovered run never writes it twice.
+- `workspace_update` needs the content hash from the latest `read_file`. A file that changed
+  since that read is not overwritten.
+
+These checks are guardrails, not isolation. Only put material in the workspace that Bud may
+read.
+
 ## Standing permissions
 
 An approval card offers **Always allow** for a tool that may be granted. Choosing it applies the approval and, only when the approval actually applied, records a standing permission for that tool. A denied decision, a duplicate, or a decision the runner could not apply records nothing. Later calls of the same tool run without asking, across restarts, until you revoke them.

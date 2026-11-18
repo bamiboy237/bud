@@ -5,17 +5,39 @@ import SwiftUI
 /// them and list items hang off their markers. Inline styling (bold, code, links) becomes an
 /// attributed string inside each block, so text wraps and links stay clickable.
 ///
-/// The whole reply is parsed again on every streamed delta. Replies are short, and a fresh
-/// parse means a half-written construct (an unclosed `**`) settles as soon as it closes.
+/// Changed text is parsed afresh, so an unfinished construct settles as soon as it closes.
+/// Unchanged replies reuse their parse when the conversation is rebuilt.
 struct MarkdownView: View {
     let blocks: [any Markup]
 
     init(_ text: String) {
-        blocks = Array(Document(parsing: text).children)
+        blocks = ParsedMarkdown.blocks(text)
     }
 
     var body: some View {
         Blocks(blocks: blocks, spacing: Metrics.paragraph)
+    }
+}
+
+@MainActor
+private enum ParsedMarkdown {
+    private final class Entry {
+        let blocks: [any Markup]
+        init(_ blocks: [any Markup]) { self.blocks = blocks }
+    }
+
+    private static let cache: NSCache<NSString, Entry> = {
+        let cache = NSCache<NSString, Entry>()
+        cache.countLimit = 256
+        return cache
+    }()
+
+    static func blocks(_ text: String) -> [any Markup] {
+        let key = text as NSString
+        if let entry = cache.object(forKey: key) { return entry.blocks }
+        let blocks = Array(Document(parsing: text).children)
+        cache.setObject(Entry(blocks), forKey: key)
+        return blocks
     }
 }
 

@@ -12,7 +12,7 @@ dependencies = [
     "photonhq-api>=0.6.0,<0.7",
     "prompt-toolkit>=3.0.40",
     "pydantic>=2.14.3",
-    "pydantic-ai-harness[skills]>=0.66.0",
+    "pydantic-ai-harness[skills,repair-tool-arguments]>=0.66.0",
     "pydantic-ai-slim[dbos,mcp,openai]>=2.61.0",
     "pydantic-monty>=1.0.0,<2",
     "pydantic-settings>=2.16.2",
@@ -23,6 +23,11 @@ dependencies = [
 
 [project.scripts]
 bud = "bud.cli:main"
+
+[project.optional-dependencies]
+tracing = [
+    "logfire>=5.3",
+]
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
@@ -37,6 +42,7 @@ select = ["E", "F", "I", "B", "UP", "SIM"]
 
 [dependency-groups]
 dev = [
+    "logfire>=5.3",
     "pytest>=9.2.0",
     "pytest-asyncio>=1.5.0",
     "pytest-timeout>=2.4.0",
