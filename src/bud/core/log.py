@@ -121,6 +121,26 @@ class EventLog:
         with self._connect() as db:
             return self._insert(db, session_id, type, data or {}, once=True, key=key)
 
+    def append_once_if_unchanged(
+        self,
+        session_id: str,
+        type: EventType,
+        data: dict,
+        *,
+        key: str,
+        observed_session: str,
+        observed_seq: int,
+    ) -> Event | None:
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?",
+                (observed_session,),
+            ).fetchone()[0]
+            if current != observed_seq:
+                return None
+            return self._insert(db, session_id, type, data, once=True, key=key)
+
     def update_setup_status(
         self, session_id: str, data: dict, expected_event: str | None, *, key: str
     ) -> bool:

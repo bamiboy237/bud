@@ -201,6 +201,43 @@ async def test_a_quiet_job_is_reported_once_per_reason(tmp_path, monkeypatch):
     assert "past its deadline" in prompts[-1]
 
 
+async def test_completion_during_stall_check_does_not_report_a_stale_stall(tmp_path, monkeypatch):
+    prompts: list[str] = []
+    async with running_bud(tmp_path, bud_with_one_job(prompts), jobs=True) as bud:
+        launch = bud.runner._launch
+
+        def owner_runs_only(run, **kwargs):
+            if run["session_id"] == "owner":
+                launch(run, **kwargs)
+
+        monkeypatch.setattr(bud.runner, "_launch", owner_runs_only)
+        bud.log.append("owner", "session.created")
+        bud.runner.start("owner", "When does my lease renew?", "message-1")
+        await bud.settle()
+        items = bud.runner.work_items
+        assert items is not None
+        item = items.items()[0]
+        run = next(e.data for e in bud.log.read(item.session_id) if e.type == "run.queued")
+        view = items.view
+
+        def finish_after_check(checked_item):
+            state = view(checked_item)
+            monkeypatch.setattr(items, "view", view)
+            bud.runner._finish(run, "run.completed", {"run_id": run["run_id"], "messages": []}, [])
+            return state
+
+        monkeypatch.setattr(items, "view", finish_after_check)
+        bud.runner.watch_jobs(datetime.now(UTC) + timedelta(minutes=11))
+        await asyncio.sleep(0)
+        await bud.settle()
+        events = bud.log.read("owner")
+        assert [e.type for e in events if e.type in {"task.completed", "task.stalled"}] == [
+            "task.completed"
+        ]
+        reports = [e for e in events if e.type == "run.queued" and e.data["trigger"] == "job"]
+        assert len(reports) == 1
+
+
 def test_owner_message_must_report_new_job_results(tmp_path):
     log = EventLog(tmp_path / "events.db")
     log.append(

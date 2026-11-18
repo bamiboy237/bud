@@ -492,7 +492,7 @@ class WorkItems:
                 reason, text = "idle", f"No activity for {_minutes(quiet_for)}."
             else:
                 continue
-            notice = self.hub.publish_once(
+            notice = self.log.append_once_if_unchanged(
                 item.feed_id,
                 "task.stalled",
                 {
@@ -503,8 +503,11 @@ class WorkItems:
                     "origin": item.origin,
                 },
                 key=f"task:{item.task_id}:stalled:{reason}",
+                observed_session=item.session_id,
+                observed_seq=events[-1].seq,
             )
             if notice is not None:
+                self.hub.wake(item.feed_id)
                 feeds.add(item.feed_id)
         return feeds
 
