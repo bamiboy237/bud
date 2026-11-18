@@ -78,15 +78,19 @@ def launch_server(
     process = subprocess.Popen(
         [sys.executable, "-c", code], env=env, stdout=log, stderr=log, start_new_session=True
     )
-    for _ in range(120):
-        if process.poll() is not None:
-            sys.exit(f"Server exited; see {data / 'server.log'}")
-        with contextlib.suppress(httpx.HTTPError):
-            if httpx.get(f"http://127.0.0.1:{port}/runtime", timeout=2).status_code == 401:
-                return process.pid
-        time.sleep(1)
-    stop_process_group(process.pid)
-    sys.exit(f"Server did not start; see {data / 'server.log'}")
+    try:
+        for _ in range(120):
+            if process.poll() is not None:
+                sys.exit(f"Server exited; see {data / 'server.log'}")
+            with contextlib.suppress(httpx.HTTPError):
+                if httpx.get(f"http://127.0.0.1:{port}/runtime", timeout=2).status_code == 401:
+                    return process.pid
+            time.sleep(1)
+        sys.exit(f"Server did not start; see {data / 'server.log'}")
+    except BaseException:
+        # The caller has no pid yet, so nothing else could stop this server (Ctrl-C included).
+        stop_process_group(process.pid)
+        raise
 
 
 def stop_process_group(pid: int) -> None:
