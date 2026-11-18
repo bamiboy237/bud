@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run python
 """Run a private bud server and Mac app from this checkout, screenshot it, and tear it down.
 
-    scripts/dev-stack up              real accounts: copies your Composio bindings
+    scripts/dev-stack up              real accounts: snapshots your Composio bindings
     scripts/dev-stack up --simulate   simulated inbox and calendar
     scripts/dev-stack up --no-app     server only, no Mac build
     scripts/dev-stack shot idle       full screen to data/tmp/dev-stack/shots/idle.png
@@ -12,23 +12,25 @@
 Each stack gets its own data folder and a free port, so it runs beside the live server on
 8420 and beside stacks in other checkouts. `down` stops only the processes it started.
 
-The ChatGPT login is not copied: bud lets one process at a time use it, and a copy that
-refreshed its token could sign out the live server. Real mode uses the API keys in `.env`.
+Real mode copies only the account bindings, never the live sessions or pending runs, so
+nothing the live server owes can run twice. It leaves out the ChatGPT login, since a copy
+that refreshed its token could sign out the live server, and uses the API keys in `.env`.
+iMessage (Photon) stays off, so owner messages keep going to the live server.
 """
 
 import argparse
-import contextlib
 import json
 import os
 import shutil
-import signal
 import socket
+import sqlite3
 import subprocess
 import sys
-import time
+from contextlib import closing
 from pathlib import Path
 
-import httpx
+from bud.config import Settings
+from bud.evals.sim import launch_server, stop_process_group
 
 ROOT = Path(__file__).resolve().parent.parent
 STACK = ROOT / "data" / "tmp" / "dev-stack"
@@ -36,16 +38,36 @@ STATE = STACK / "state.json"
 DATA = STACK / "data"
 SHOTS = STACK / "shots"
 APP = ROOT / "mac" / "build" / "bud.app" / "Contents" / "MacOS" / "bud"
+NO_PHOTON = {
+    "PHOTON_API_KEY": "",
+    "PHOTON_PROJECT_ID": "",
+    "PHOTON_OWNER_HANDLE": "",
+    "PHOTON_AGENT_HANDLE": "",
+}
 
 
-def real_data_dir() -> Path:
-    """The owner's data folder: DATA_DIR, else data/ in the main checkout.
+def live_data_dir() -> Path:
+    """The live server's data folder, read the way the server reads it.
 
-    Managed checkouts link `.env` to the main checkout, so its real location finds it.
+    Managed checkouts link `.env` to the main checkout, where the live server runs, so a
+    relative DATA_DIR is resolved from there.
     """
-    if os.environ.get("DATA_DIR"):
-        return Path(os.environ["DATA_DIR"]).expanduser()
-    return (ROOT / ".env").resolve().parent / "data"
+    main_checkout = (ROOT / ".env").resolve().parent
+    data_dir = Settings(_env_file=main_checkout / ".env").data_dir.expanduser()
+    return data_dir if data_dir.is_absolute() else main_checkout / data_dir
+
+
+def snapshot_bindings(target: Path) -> None:
+    source = live_data_dir() / "composio" / "connections.db"
+    if not source.is_file():
+        sys.exit(f"No Composio bindings at {source}. Connect accounts with `bud serve` first.")
+    target.mkdir(mode=0o700)
+    # The backup API gives a consistent copy while the live server has the database open.
+    with (
+        closing(sqlite3.connect(f"file:{source}?mode=ro", uri=True)) as live,
+        closing(sqlite3.connect(target / "connections.db")) as copy,
+    ):
+        live.backup(copy)
 
 
 def alive(pid: int | None) -> bool:
@@ -62,18 +84,14 @@ def load() -> dict:
     return json.loads(STATE.read_text()) if STATE.exists() else {}
 
 
+def save(state: dict) -> None:
+    STATE.write_text(json.dumps(state, indent=1))
+
+
 def free_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         return probe.getsockname()[1]
-
-
-def spawn(command: list[str], env: dict[str, str], log: Path) -> int:
-    out = os.fdopen(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a")
-    process = subprocess.Popen(
-        command, cwd=ROOT, env=env, stdout=out, stderr=out, start_new_session=True
-    )
-    return process.pid
 
 
 def up(simulate: bool, app: bool) -> None:
@@ -84,42 +102,27 @@ def up(simulate: bool, app: bool) -> None:
         shutil.rmtree(DATA)
     DATA.mkdir(parents=True, mode=0o700)
     if not simulate:
-        source = real_data_dir() / "composio"
-        if not source.is_dir():
-            sys.exit(f"No Composio bindings at {source}. Connect accounts with `bud serve` first.")
-        shutil.copytree(source, DATA / "composio")
+        snapshot_bindings(DATA / "composio")
     if app:
         subprocess.run([str(ROOT / "mac" / "build.sh")], cwd=ROOT, check=True)
 
     port = free_port()
-    env = {**os.environ, "DATA_DIR": str(DATA), "PYDANTIC_AI_NO_BANNER": "1"}
-    code = (
-        "import uvicorn; from bud.core.server import create_app; "
-        f"uvicorn.run(create_app(simulate={simulate}), host='127.0.0.1', port={port}, "
-        "log_level='warning', timeout_graceful_shutdown=3)"
-    )
-    server = spawn([sys.executable, "-c", code], env, DATA / "server.log")
+    server = launch_server(DATA, port, simulate=simulate, env=NO_PHOTON)
     state = {"port": port, "server_pid": server, "mode": "simulate" if simulate else "real"}
-    STATE.write_text(json.dumps(state, indent=1))
-    for _ in range(120):
-        if not alive(server):
-            sys.exit(f"Server exited; see {DATA / 'server.log'}")
-        with contextlib.suppress(httpx.HTTPError):
-            if httpx.get(f"http://127.0.0.1:{port}/runtime", timeout=2).status_code == 401:
-                break
-        time.sleep(1)
-    else:
-        stop_group(server)
-        STATE.unlink()
-        sys.exit(f"Server did not start; see {DATA / 'server.log'}")
+    save(state)
+    print(f"up: {state['mode']} server on http://127.0.0.1:{port}, data {DATA}")
 
     if app:
-        app_env = {**env, "BUD_URL": f"http://127.0.0.1:{port}", "BUD_HOME": str(ROOT)}
-        state["app_pid"] = spawn([str(APP)], app_env, DATA / "app.log")
-        STATE.write_text(json.dumps(state, indent=1))
-    print(f"up: {state['mode']} server on http://127.0.0.1:{port}, data {DATA}")
-    if app:
-        print(f"app: pid {state['app_pid']}, log {DATA / 'app.log'}")
+        env = {**os.environ, "BUD_URL": f"http://127.0.0.1:{port}", "BUD_HOME": str(ROOT)}
+        env["DATA_DIR"] = str(DATA)
+        log = os.open(DATA / "app.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        process = subprocess.Popen(
+            [str(APP)], cwd=ROOT, env=env, stdout=log, stderr=log, start_new_session=True
+        )
+        os.close(log)
+        state["app_pid"] = process.pid
+        save(state)
+        print(f"app: pid {process.pid}, log {DATA / 'app.log'}")
 
 
 def shot(name: str, rect: str | None) -> None:
@@ -130,23 +133,11 @@ def shot(name: str, rect: str | None) -> None:
     print(path)
 
 
-def stop_group(pid: int | None) -> None:
-    if not alive(pid):
-        return
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(pid, signal.SIGTERM)
-        # The server holds bud.lock until shutdown ends; wait so the next `up` can start.
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            os.killpg(pid, 0)
-            time.sleep(0.2)
-        os.killpg(pid, signal.SIGKILL)
-
-
 def down() -> None:
     state = load()
-    stop_group(state.get("app_pid"))
-    stop_group(state.get("server_pid"))
+    for key in ("app_pid", "server_pid"):
+        if alive(state.get(key)):
+            stop_process_group(state[key])
     STATE.unlink(missing_ok=True)
     if DATA.exists():
         shutil.rmtree(DATA)
