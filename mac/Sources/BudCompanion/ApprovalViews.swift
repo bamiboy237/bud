@@ -23,6 +23,14 @@ final class DeckState: ObservableObject {
     @Published var flyOpacity: Double = 1.0
     @Published var activeDecision: DecisionDirection? = nil
     @Published var isAnimating: Bool = false
+
+    func finishDecision() {
+        flyOffset = 0
+        flyRotation = 0
+        flyOpacity = 1
+        activeDecision = nil
+        isAnimating = false
+    }
 }
 
 /// A stacked deck of pending approvals. Cards sit directly on top of each other with subtle
@@ -203,10 +211,9 @@ struct ApprovalDeck: View {
 
     private func handleDecision(approval: Approval, approved: Bool) {
         guard !deck.isAnimating else { return }
-        if reduceMotion {
-            companion.decide(approval.id, approved: approved)
-            return
-        }
+        let flight = Duration.milliseconds(220)
+        guard companion.decide(approval.id, approved: approved, after: reduceMotion ? nil : flight),
+              !reduceMotion else { return }
         deck.isAnimating = true
         deck.activeDecision = approved ? .approve : .deny
 
@@ -217,13 +224,8 @@ struct ApprovalDeck: View {
         }
 
         Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(220))
-            companion.decide(approval.id, approved: approved)
-            deck.flyOffset = 0
-            deck.flyRotation = 0
-            deck.flyOpacity = 1.0
-            deck.activeDecision = nil
-            deck.isAnimating = false
+            try? await Task.sleep(for: flight)
+            deck.finishDecision()
             clampIndex()
         }
     }

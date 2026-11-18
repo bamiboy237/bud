@@ -854,8 +854,9 @@ final class Companion {
     }
 
     /// Yes or no on an action. A job's approval goes through this session too: bud finds the job.
-    func decide(_ id: String, approved: Bool) {
-        respond(to: id, path: nil, body: ApprovalDecision(approved: approved).body)
+    @discardableResult
+    func decide(_ id: String, approved: Bool, after delay: Duration? = nil) -> Bool {
+        respond(to: id, path: nil, body: ApprovalDecision(approved: approved).body, after: delay)
     }
 
     /// Yes now, and yes to this tool from now on: bud records the standing grant, then applies.
@@ -988,8 +989,11 @@ final class Companion {
         }
     }
 
-    private func respond(to id: String, path: String?, body: [String: any Sendable]) {
-        guard let connection, !approvingBatch, !deciding.contains(id) else { return }
+    @discardableResult
+    private func respond(
+        to id: String, path: String?, body: [String: any Sendable], after delay: Duration? = nil
+    ) -> Bool {
+        guard let connection, !approvingBatch, !deciding.contains(id) else { return false }
         deciding.insert(id)
         decisionProblem = nil
         let route = "sessions/\(session)/approvals/\(id)" + (path.map { "/\($0)" } ?? "")
@@ -1011,6 +1015,8 @@ final class Companion {
             ?? typed
         let mine = generation
         Task {
+            if let delay { try? await Task.sleep(for: delay) }
+            guard mine == generation else { return }
             do {
                 let response = try await connection.send("POST", route, json: Self.payload(body))
                 guard mine == generation else { return }
@@ -1043,6 +1049,7 @@ final class Companion {
             deciding.remove(id)
             refreshApprovals()
         }
+        return true
     }
 
     // MARK: Events
