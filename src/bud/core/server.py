@@ -57,6 +57,7 @@ from bud.photon_config import PhotonConfig
 from bud.web import GUIDANCE as WEB_GUIDANCE
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
 from bud.web import build_tools as build_web_tools
+from bud.workspace import DOCUMENT_TOOL, document_tool
 from bud.workspace import GUIDANCE as WORKSPACE_GUIDANCE
 from bud.workspace import READ_TOOLS as WORKSPACE_READ_TOOLS
 from bud.workspace import WRITE_TOOLS as WORKSPACE_WRITE_TOOLS
@@ -68,6 +69,8 @@ from bud.world.tools import READ_TOOLS as WORLD_READ_TOOLS
 from bud.world.tools import build_tools
 
 logger = logging.getLogger(__name__)
+# Workspace reads that never ask: the harness FileSystem tools and read_document.
+FILE_READS = WORKSPACE_READ_TOOLS | {DOCUMENT_TOOL}
 
 
 def _noop() -> None:
@@ -144,7 +147,12 @@ def workspace_root(directory: Path) -> Path:
 
 
 def workspace_tools(root: Path, state_dir: Path) -> FunctionToolset[None]:
-    return FunctionToolset(build_workspace_tools(root, state_dir / "workspace-dispatches.jsonl"))
+    return FunctionToolset(
+        [
+            *build_workspace_tools(root, state_dir / "workspace-dispatches.jsonl"),
+            document_tool(root),
+        ]
+    )
 
 
 def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAPI:
@@ -227,7 +235,7 @@ def _create_app(
             model_id=model_id,
         )
         tools_policy = policy()
-        tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS | WORKSPACE_READ_TOOLS, "allow"))
+        tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS | FILE_READS, "allow"))
         tools_policy.tools["setup_capability"] = "allow"
         setup = setup_registry(connections)
         setup_journal = SetupJournal()
@@ -278,7 +286,10 @@ def _create_app(
             memory=build_memory(session_dir / "memory.db", namespace="owner"),
             state_dir=session_dir,
             result_path=db_path,
-            read_tools=READ_TOOLS | WEB_READ_TOOLS | WORKSPACE_READ_TOOLS | {"current_time"},
+            read_tools=READ_TOOLS
+            | WEB_READ_TOOLS
+            | WORKSPACE_READ_TOOLS
+            | {DOCUMENT_TOOL, "current_time"},
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
             capabilities=workspace_read_capabilities(workspace, deferred=True),
         )
@@ -294,7 +305,7 @@ def _create_app(
         tools_policy = load_policy()
         # The simulated world gets the production web tools: research is read-only, and a
         # mock search engine would teach habits that break against the real web.
-        tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS | WORKSPACE_READ_TOOLS, "allow"))
+        tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS | FILE_READS, "allow"))
         tools_policy.tools.update(dict.fromkeys(WORKSPACE_WRITE_TOOLS, "ask"))
         harness = Harness(
             CombinedToolset(
@@ -310,7 +321,7 @@ def _create_app(
             memory=build_memory(settings.data_dir / "world-memory.db", namespace="world"),
             state_dir=settings.data_dir,
             result_path=db_path,
-            read_tools=WORLD_READ_TOOLS | WEB_READ_TOOLS | WORKSPACE_READ_TOOLS,
+            read_tools=WORLD_READ_TOOLS | WEB_READ_TOOLS | FILE_READS,
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
             capabilities=workspace_read_capabilities(workspace, deferred=True),
         )
