@@ -491,7 +491,7 @@ private struct Bubble: View {
                 let overflows = companion.replyHeight > maxReply
                 ScrollView {
                     // Measured before the padding, so adding it can't flip `overflows` back.
-                    MarkdownView(companion.shown)
+                    MarkdownView(Citations.linked(companion.shown, sources: companion.replySources))
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
                             companion.replyHeight = $0
@@ -537,6 +537,10 @@ private struct Bubble: View {
         .fixedSize(horizontal: compact, vertical: false)
         .surface(BubbleShape(anchor: companion.anchor))
         .onHover { companion.bubbleHovered = $0 }
+        // A cited date opens the conversation window at that message.
+        .environment(\.openURL, OpenURLAction { url in
+            companion.openSource(url) ? .handled : .systemAction
+        })
         .animation(.easeOut(duration: 0.15), value: companion.approvals.first?.id)
         .animation(.easeOut(duration: 0.2), value: companion.receipt)
     }

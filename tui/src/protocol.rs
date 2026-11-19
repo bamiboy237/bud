@@ -91,6 +91,9 @@ pub struct Turn {
     pub role: String,
     #[serde(default)]
     pub text: String,
+    /// What the reply's `[S1]` tags cite; shown here as dates.
+    #[serde(default)]
+    pub sources: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -141,5 +144,36 @@ pub fn reply_text(data: &Value) -> String {
             }
         }
     }
+    plain_citations(&out, data.get("sources"))
+}
+
+/// A reply cites earlier messages by tags like `[S1]`; the run's `sources` give each a date.
+/// The terminal can't open a source, so a tag reads as its date, and a tag the run doesn't
+/// know (the model made it up) is dropped with the space before it.
+pub fn plain_citations(text: &str, sources: Option<&Value>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("[S") {
+        let after = &rest[start + 2..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        if !(1..=2).contains(&digits) || !after[digits..].starts_with(']') {
+            out.push_str(&rest[..start + 2]);
+            rest = after;
+            continue;
+        }
+        let before = &rest[..start];
+        out.push_str(before.strip_suffix(' ').unwrap_or(before));
+        let label = sources
+            .and_then(|all| all.get(&rest[start + 1..start + 2 + digits]))
+            .and_then(|source| source.get("label"))
+            .and_then(Value::as_str);
+        if let Some(label) = label {
+            out.push_str(" (");
+            out.push_str(label);
+            out.push(')');
+        }
+        rest = &after[digits + 1..];
+    }
+    out.push_str(rest);
     out
 }

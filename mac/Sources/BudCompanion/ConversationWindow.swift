@@ -97,7 +97,7 @@ private struct ConversationView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(companion.turns.enumerated()), id: \.element.id) { index, turn in
-                            TurnView(turn: turn, companion: companion)
+                            TurnView(turn: turn, companion: companion, focused: companion.focus == .turn(turn.id))
                                 .padding(.top, index == 0 ? 0 : turn.fromOwner ? Rhythm.exchange - Rhythm.actions : Rhythm.answer)
                         }
                         latest
@@ -145,7 +145,19 @@ private struct ConversationView: View {
                     // anchor short of the end; settle on the latest message once they have.
                     Task {
                         try? await Task.sleep(for: .milliseconds(120))
-                        proxy.scrollTo("end", anchor: .bottom)
+                        if let focus = companion.focus { scrollTo(focus, proxy) } else {
+                            proxy.scrollTo("end", anchor: .bottom)
+                        }
+                    }
+                }
+                // A source link pointed into this conversation: bring that message into view,
+                // marked for a moment so your eye lands on it.
+                .onChange(of: companion.focus) { _, focus in
+                    guard let focus else { return }
+                    withAnimation(.spring(duration: 0.4, bounce: 0)) { scrollTo(focus, proxy) }
+                    Task {
+                        try? await Task.sleep(for: .seconds(2))
+                        if companion.focus == focus { companion.focus = nil }
                     }
                 }
             }
@@ -154,6 +166,18 @@ private struct ConversationView: View {
         .foregroundStyle(Paper.ink)
         .background(Paper.surface)
         .environment(\.replyType, pageType)
+        .environment(\.openURL, OpenURLAction { url in
+            companion.openSource(url) ? .handled : .systemAction
+        })
+        .inspector(isPresented: Binding(
+            get: { companion.sourcePanel != nil },
+            set: { if !$0 { companion.sourcePanel = nil } }
+        )) {
+            if let panel = companion.sourcePanel {
+                SourcePanelView(panel: panel, companion: companion)
+                    .inspectorColumnWidth(min: 240, ideal: 300, max: 420)
+            }
+        }
         .overlay(alignment: .topTrailing) { pin }
         .onAppear { typing = true }
         .onChange(of: companion.inputPurpose) { _, purpose in
@@ -161,6 +185,13 @@ private struct ConversationView: View {
         }
         .onChange(of: companion.replyingTo) { _, quote in
             if quote != nil { typing = true }
+        }
+    }
+
+    private func scrollTo(_ focus: Focus, _ proxy: ScrollViewProxy) {
+        switch focus {
+        case .turn(let id): proxy.scrollTo(id, anchor: .center)
+        case .latest: proxy.scrollTo("end", anchor: .bottom)
         }
     }
 
@@ -184,7 +215,9 @@ private struct ConversationView: View {
                 UnsentMessage(companion: companion).frame(maxWidth: 420)
             }
             if !companion.shown.isEmpty {
-                Reply(text: companion.shown, companion: companion, finished: !companion.running)
+                Reply(
+                    text: companion.shown, sources: companion.replySources, companion: companion,
+                    finished: !companion.running)
             }
             if !companion.setups.isEmpty {
                 SetupDeck(companion: companion)
@@ -292,8 +325,20 @@ private struct ConversationView: View {
 private struct TurnView: View {
     let turn: Turn
     let companion: Companion
+    /// A source link pointed here; the message is marked until the moment passes.
+    var focused = false
 
     var body: some View {
+        content
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Paper.ink.opacity(focused ? 0.06 : 0))
+                    .padding(-8)
+            )
+            .animation(.easeOut(duration: 0.3), value: focused)
+    }
+
+    @ViewBuilder private var content: some View {
         if turn.fromOwner {
             let parts = Companion.unquoted(turn.text)
             HStack {
@@ -321,7 +366,7 @@ private struct TurnView: View {
         } else {
             VStack(alignment: .leading, spacing: 12) {
                 if let work = turn.work { WorkLine(work: work) }
-                Reply(text: turn.text, companion: companion, finished: true)
+                Reply(text: turn.text, sources: turn.sources, companion: companion, finished: true)
             }
         }
     }
@@ -331,6 +376,8 @@ private struct TurnView: View {
 /// are there when you reach for them and out of the way when you read.
 private struct Reply: View {
     let text: String
+    /// What the reply's `[S1]` tags cite; they show as dates that open the cited message.
+    var sources: [String: Source] = [:]
     let companion: Companion
     /// A reply still streaming has no actions yet.
     let finished: Bool
@@ -339,12 +386,13 @@ private struct Reply: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            MarkdownView(text)
+            MarkdownView(Citations.linked(text, sources: sources))
             if finished {
                 HStack(spacing: 2) {
                     action(copied.on ? "checkmark" : "doc.on.doc", label: copied.on ? "Copied" : "Copy") {
                         NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(text, forType: .string)
+                        NSPasteboard.general.setString(
+                            Citations.plain(text, sources: sources), forType: .string)
                         copied.on = true
                         Task {
                             try? await Task.sleep(for: .seconds(1.5))
@@ -353,7 +401,7 @@ private struct Reply: View {
                     }
                     action("arrowshape.turn.up.left", label: "Reply") {
                         // The words you highlighted, if any; otherwise the whole reply.
-                        companion.replyingTo = Selection.copied() ?? text
+                        companion.replyingTo = Selection.copied() ?? Citations.plain(text, sources: sources)
                     }
                 }
                 .opacity(hovered.on ? 1 : 0)
@@ -501,5 +549,96 @@ private struct RoundButton: View {
         .buttonStyle(IconButton(size: 26, highlight: false))
         .help(label)
         .accessibilityLabel(label)
+    }
+}
+
+/// A cited message from another conversation, beside this one: its date, then the exchange
+/// around it, with the cited message and the question it answered marked by a rule.
+private struct SourcePanelView: View {
+    let panel: SourcePanel
+    let companion: Companion
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Earlier conversation")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(panel.date.isEmpty ? " " : panel.date)
+                        .font(.headline)
+                }
+                Spacer()
+                Button { companion.sourcePanel = nil } label: {
+                    Image(systemName: "xmark").font(.system(size: 10, weight: .semibold))
+                }
+                .buttonStyle(IconButton(size: 24))
+                .help("Close")
+                .accessibilityLabel("Close source")
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 12)
+            Divider().overlay(Paper.hairline)
+            if let problem = panel.problem {
+                Text(problem)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(16)
+                Spacer()
+            } else if panel.loading {
+                ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(24)
+                Spacer()
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 18) {
+                            ForEach(panel.turns) { turn in
+                                SourceTurn(turn: turn, cited: cited.contains(turn.id))
+                                    .id(turn.id)
+                            }
+                        }
+                        .padding(16)
+                    }
+                    .onAppear {
+                        if let anchor = panel.turns.first(where: { $0.seq == panel.seq }) {
+                            proxy.scrollTo(anchor.id, anchor: .center)
+                        }
+                    }
+                }
+            }
+        }
+        .foregroundStyle(Paper.ink)
+        .background(Paper.surface)
+    }
+
+    /// The cited reply and the message it answered.
+    private var cited: Set<UUID> {
+        guard let index = panel.turns.firstIndex(where: { $0.seq == panel.seq }) else { return [] }
+        var marked: Set<UUID> = [panel.turns[index].id]
+        if index > 0, panel.turns[index - 1].fromOwner { marked.insert(panel.turns[index - 1].id) }
+        return marked
+    }
+}
+
+private struct SourceTurn: View {
+    let turn: Turn
+    let cited: Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            RoundedRectangle(cornerRadius: 1)
+                .fill(Paper.ink.opacity(cited ? 0.35 : 0))
+                .frame(width: 2)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(turn.fromOwner ? "You" : "bud")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                MarkdownView(Citations.linked(turn.text, sources: turn.sources))
+                    .textSelection(.enabled)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .opacity(cited ? 1 : 0.7)
     }
 }

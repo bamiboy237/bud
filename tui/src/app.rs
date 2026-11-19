@@ -5,7 +5,9 @@
 
 use crate::client::{Core, CoreError};
 use crate::mascot::{self, Mascot};
-use crate::protocol::{reply_text, Event, ModelInfo, PendingApproval, PendingSetup, Snapshot};
+use crate::protocol::{
+    plain_citations, reply_text, Event, ModelInfo, PendingApproval, PendingSetup, Snapshot,
+};
 use crate::sanitize::{self, Filter};
 use crate::sse::Feed;
 use crate::theme::{ColorDepth, Theme};
@@ -480,7 +482,7 @@ impl App {
     /// Seeds the transcript and pending cards from the startup snapshot.
     pub fn load_snapshot(&mut self, snap: &Snapshot) {
         for turn in &snap.transcript {
-            let text = sanitize::clean(&turn.text);
+            let text = sanitize::clean(&plain_citations(&turn.text, turn.sources.as_ref()));
             if turn.role == "user" {
                 self.entries.push(Entry::User(UserEntry {
                     id: None,
