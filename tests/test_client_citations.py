@@ -28,3 +28,11 @@ def test_an_unknown_tag_and_a_lost_stream_still_end_correctly():
     assert stream(["Tuesday [S7]."], "Tuesday [S7].", SOURCES) == "Tuesday."
     # Part of the stream never arrived: the stored reply is printed whole.
     assert stream(["Tues"], "Monday [S1].", SOURCES) == "Tues\n[complete reply]\nMonday (Nov 18)."
+
+
+def test_a_replaced_response_does_not_force_a_full_reprint():
+    streamed = StreamedReply()
+    streamed.feed("First try, abandoned ")
+    streamed.discard()  # text.reset for a retried request
+    printed = streamed.feed("Tuesday [S1].")
+    assert printed + streamed.finish("Tuesday [S1].", SOURCES) == "Tuesday (Nov 18)."

@@ -90,7 +90,8 @@ class StreamedReply:
         return text[:cut]
 
     def discard(self) -> None:
-        """A response was replaced: what it held back is never printed."""
+        """A response was replaced: its text is forgotten, and what it held is never printed."""
+        self.raw = []
         self.held = ""
         self.holding = False
 
@@ -422,6 +423,7 @@ async def headless_chat(base_url: str, session_id: str | None, *, new: bool = Fa
             # Follow events until run ends or approval required
             last_seq = 0
             piped = StreamedReply()
+            piped_requests: set[str] = set()
             state = await session_snapshot(client, session_id)
             watermark = state["last_seq"]
             pending = {item["approval_id"] for item in state["pending_approvals"]}
@@ -449,6 +451,12 @@ async def headless_chat(base_url: str, session_id: str | None, *, new: bool = Fa
                                 )
                                 sys.stderr.flush()
                                 raise SystemExit(1)
+
+                        elif etype == "text.reset":
+                            # A retried request replaces its text; drop what was held back.
+                            if data.get("request") in piped_requests:
+                                piped.discard()
+                            piped_requests.add(data.get("request"))
 
                         elif etype == "text.delta":
                             chunk = strip_ansi(data.get("text", ""))

@@ -877,6 +877,8 @@ class Runner(DBOSConfiguredInstance):
         if self.recall is None or (turn := self._completed_turn(session_id, run_id)) is None:
             return
         owner, reply, _ = turn
+        if not reply.strip():
+            return  # a turn with no reply has no message for a citation to open
         try:
             self.recall.add_turn(session_id, run_id, owner, reply)
         except Exception as exc:
