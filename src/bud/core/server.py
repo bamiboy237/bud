@@ -41,6 +41,7 @@ from bud.core.setup import (
     check_setup,
     setup_registry,
 )
+from bud.core.workspace_home import display_path, workspace_home
 from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
@@ -142,9 +143,8 @@ def workspace_root(directory: Path) -> Path:
     return root
 
 
-def workspace_tools(directory: Path) -> FunctionToolset[None]:
-    root = workspace_root(directory)
-    return FunctionToolset(build_workspace_tools(root, root.parent / "workspace-dispatches.jsonl"))
+def workspace_tools(root: Path, state_dir: Path) -> FunctionToolset[None]:
+    return FunctionToolset(build_workspace_tools(root, state_dir / "workspace-dispatches.jsonl"))
 
 
 def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAPI:
@@ -220,6 +220,7 @@ def _create_app(
         session_dir = connections.folder / "sessions" / account_scope
         session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         db_path = session_dir / "bud.db"
+        workspace = workspace_home(settings)
         gateway = build_gateway(
             settings,
             providers={"openai-chatgpt", "openai", "meta", "mistral", "deepseek"},
@@ -239,7 +240,7 @@ def _create_app(
                 [
                     build_toolset(connections, connections.accounts(), session_dir),
                     build_web_tools(settings),
-                    workspace_tools(session_dir),
+                    workspace_tools(workspace, session_dir),
                     build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
                 ]
             )
@@ -270,13 +271,16 @@ def _create_app(
             "setup_capability with its slug: the person gets a sign-in card in chat and "
             "authorizes in their browser. Never send the person to a command line "
             "(/connect remains a manual fallback). The connection is ready on the next "
-            "message; no restart is needed." + WEB_GUIDANCE + WORKSPACE_GUIDANCE,
+            "message; no restart is needed."
+            + WEB_GUIDANCE
+            + WORKSPACE_GUIDANCE
+            + f"Your workspace is the folder {display_path(workspace)} on the person's Mac.\n",
             memory=build_memory(session_dir / "memory.db", namespace="owner"),
             state_dir=session_dir,
             result_path=db_path,
             read_tools=READ_TOOLS | WEB_READ_TOOLS | WORKSPACE_READ_TOOLS | {"current_time"},
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
-            capabilities=workspace_read_capabilities(workspace_root(session_dir), deferred=True),
+            capabilities=workspace_read_capabilities(workspace, deferred=True),
         )
         tools_policy = harness.policy
         harness.live_instructions.append(
@@ -296,7 +300,7 @@ def _create_app(
                 [
                     FunctionToolset(build_tools(world)),
                     build_web_tools(settings),
-                    workspace_tools(settings.data_dir),
+                    workspace_tools(workspace_root(settings.data_dir), settings.data_dir),
                 ]
             ),
             tools_policy,

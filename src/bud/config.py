@@ -30,6 +30,8 @@ class Settings(BaseSettings):
 
     debug: bool = False
     data_dir: Path = Path("data")
+    # Bud's own folder for files it reads and writes. Unset means ~/.bud/workspace.
+    workspace_dir: Path | None = None
     models_file: Path | None = None
     default_model: str | None = None
     model_fallback: bool = True

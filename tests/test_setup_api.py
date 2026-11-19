@@ -176,3 +176,25 @@ async def test_model_instructions_reflect_apps_connected_after_startup(setup_api
     assert "Connected apps: slack" in seen[1]
     assert "SLACK_READ" not in tools_seen[0]
     assert "SLACK_READ" in tools_seen[1]
+
+
+async def test_account_mode_works_in_the_home_workspace(setup_api, tmp_path):
+    _, _, _, _, runner, _ = setup_api
+    home = tmp_path.resolve() / "bud-home" / "workspace"
+    seen = []
+
+    def respond(messages, info):
+        seen.append(info.instructions)
+        return reply()
+
+    subject = runner.harness.agent(
+        FunctionModel(respond),
+        lambda _: None,
+        context=BackgroundCompaction(record=lambda _: None),
+    )
+    await subject.run("Where do you keep files?")
+
+    assert f"Your workspace is the folder {home} on the person's Mac." in seen[0]
+    assert home.is_dir()
+    # No per-account workspace any more; the account folder keeps only Bud's own state.
+    assert not (tmp_path / "composio" / "sessions" / "scope" / "workspace").exists()

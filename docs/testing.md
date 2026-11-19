@@ -68,8 +68,10 @@ Concurrent agents and concurrent tests must not share writable state or ports.
 - **State.** Each server gets its own temporary `DATA_DIR`. Direct runner and tool tests also
   use temporary databases and workspaces. The fixture clears inherited settings and changes
   the working directory so the developer's `.env` is not loaded.
-- **Workspace paths.** The server resolves the configured data directory before setting up
-  workspace tools. The workspace root and its contents still reject symlinks.
+- **Workspace paths.** The fixture sets `WORKSPACE_DIR` to a temporary folder, and server
+  tests set `HOME` to one, so no test writes to the real `~/.bud`. Evals and `dev-stack` keep
+  their workspace in their own data folder. The workspace root and its contents reject
+  symlinks.
 - **Model config.** `create_app` needs a model for the `fast` tier and raises
   `NoModelAvailable` without one. Tests patch the gateway with a pydantic-ai `FunctionModel`, so
   no model-provider request leaves the test environment.
