@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import socket
 import threading
 from contextlib import ExitStack, contextmanager
@@ -59,9 +60,15 @@ def scripted_response(messages: list[ModelMessage], info: AgentInfo) -> ModelRes
             parts=[ToolCallPart(name, args, tool_call_id=f"script-{name}-{len(parts)}")]
         )
 
-    if prompt == "Send hello on Slack":
+    # A reply cites every recalled excerpt it was shown, plus one tag it made up.
+    cited = "".join(f" [{tag}]" for tag in re.findall(r"^- \[(S\d+)\]", prompt, re.M))
+    if prompt.startswith("When is the Marigold review?"):
+        return ModelResponse(parts=[TextPart(f"Tuesday.{cited} [S99]")])
+
+    # Recall may append earlier context after the request itself.
+    if prompt.startswith("Send hello on Slack"):
         if any(part.tool_name == "SLACK_SEND_MESSAGE" for part in returns):
-            return ModelResponse(parts=[TextPart("Sent to Slack.")])
+            return ModelResponse(parts=[TextPart(f"Sent to Slack.{cited}")])
         if "SLACK_SEND_MESSAGE" in tools:
             return call("SLACK_SEND_MESSAGE", {"text": "hello"})
         previous = next((part for part in returns if part.tool_name == "find_app_actions"), None)

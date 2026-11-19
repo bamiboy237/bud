@@ -74,7 +74,7 @@ from bud.harness.agent import Harness
 from bud.harness.ask import AskAnswer, answer_from_text, ask_summary, questions_of, render_answers
 from bud.harness.context import BackgroundCompaction
 from bud.harness.learning import Learner
-from bud.harness.recall import Recall, render
+from bud.harness.recall import CITATION, Recall, plain_citations, recalled_so_far, render
 from bud.harness.spiral import paused_in
 from bud.harness.verify import build_verifier
 from bud.limits import MAX_MESSAGE_CHARS
@@ -835,12 +835,10 @@ class Runner(DBOSConfiguredInstance):
             self._publish_task(session_id)
             self._drain(session_id)
 
-    def _maybe_learn(self, session_id: str, run_id: str) -> None:
-        """Reflect on a completed turn in the background; the reply is already out."""
-        if (self.learner is None and self.recall is None) or self._closing:
-            return
+    def _completed_turn(self, session_id: str, run_id: str) -> tuple[str, str, list[str]] | None:
+        """The owner's words, bud's reply, and any denials for a finished turn."""
         if self.work_items is not None and self.work_items.for_session(session_id) is not None:
-            return  # a job's messages are briefs written by bud, not the owner's words
+            return None  # a job's messages are briefs written by bud, not the owner's words
         events = self.hub.log.read(session_id)
         end = next(
             (
@@ -851,14 +849,14 @@ class Runner(DBOSConfiguredInstance):
             None,
         )
         if end is None:
-            return
+            return None
         start = max(
             (e.seq for e in events if e.type == "run.completed" and e.seq < end.seq), default=0
         )
         turn = [e for e in events if start < e.seq <= end.seq]
         owner = "\n\n".join(e.data["text"] for e in turn if e.type == "user.message")
         if not owner:
-            return  # a job report: no owner words to learn from or recall
+            return None  # a job report: no owner words to learn from or recall
         requests = {e.data["approval_id"]: e.data for e in turn if e.type == "approval.requested"}
         signals = [
             f"The owner denied {request['tool']} {json.dumps(request['args'])[:300]}"
@@ -867,15 +865,37 @@ class Runner(DBOSConfiguredInstance):
             and not e.data.get("revision_message_id")
             and (request := requests.get(e.data["approval_id"])) is not None
         ]
-        reply = reply_text(end.data.get("messages", []))
+        reply = plain_citations(reply_text(end.data.get("messages", [])), end.data.get("sources"))
+        return owner, reply, signals
+
+    def _index_turn(self, session_id: str, run_id: str) -> None:
+        """Make a finished turn findable before its reply is shown.
+
+        The owner can send the next message as soon as the reply appears, which is before
+        the run's monitor finishes; indexing there would miss that message.
+        """
+        if self.recall is None or (turn := self._completed_turn(session_id, run_id)) is None:
+            return
+        owner, reply, _ = turn
+        if not reply.strip():
+            return  # a turn with no reply has no message for a citation to open
+        try:
+            self.recall.add_turn(session_id, run_id, owner, reply)
+        except Exception as exc:
+            logger.warning("recall indexing skipped for run %s: %s", run_id, exc)
+
+    def _maybe_learn(self, session_id: str, run_id: str) -> None:
+        """Reflect on a completed turn and embed it in the background; the reply is out."""
+        if self._closing or (self.learner is None and self.recall is None):
+            return
+        turn = self._completed_turn(session_id, run_id)
+        if turn is None:
+            return
+        owner, reply, signals = turn
         jobs = []
         if self.learner is not None:
             jobs.append(self._learn(session_id, run_id, owner, reply, signals))
         if self.recall is not None:
-            try:
-                self.recall.add_turn(session_id, run_id, owner, reply)
-            except Exception as exc:
-                logger.warning("recall indexing skipped for run %s: %s", run_id, exc)
             jobs.append(self._embed_pending(run_id))
         for job in jobs:
             task = asyncio.create_task(job)
@@ -889,19 +909,41 @@ class Runner(DBOSConfiguredInstance):
         except Exception as exc:  # recall is best effort; the turn already succeeded
             logger.warning("recall embedding skipped for run %s: %s", run_id, error_summary(exc))
 
-    async def _recalled(self, run: dict) -> str:
-        """Background for a new message: memory lines and earlier turns that bear on it."""
+    async def _recalled(self, run: dict, in_context: list[str]) -> dict:
+        """Background for a new message: memory lines and earlier turns that bear on it.
+
+        Earlier turns of this conversation count too, except the recent ones compaction always
+        keeps in context (`in_context`, as recall chunk IDs). Older turns may still be in the
+        prompt and can be recalled again; their tag then gives the owner a source to open.
+        Returns the block and the sources it tagged.
+        """
+        nothing: dict = {"text": "", "sources": {}}
         if self.recall is None or not run.get("text") or run["trigger"] != "message":
-            return ""
+            return nothing
         if self.work_items is not None and self.work_items.for_session(run["session_id"]):
-            return ""  # a job brief is bud's own words
+            return nothing  # a job brief is bud's own words
         try:
             await self.recall.index_memory()
-            hits = await self.recall.search(run["text"], exclude_session=run["session_id"])
+            hits = await self.recall.search(run["text"], exclude_turns=in_context)
+            sources = {
+                hit.id: source
+                for hit in hits
+                if hit.session_id is not None
+                and (
+                    source := self.hub.log.completed_turn_source(
+                        hit.session_id, hit.id.removeprefix("turn:")
+                    )
+                )
+                is not None
+            }
         except Exception as exc:
             logger.warning("recall skipped for run %s: %s", run["run_id"], error_summary(exc))
-            return ""
-        return render(hits)
+            return nothing
+        clock = run.get("clock")
+        today = (datetime.fromisoformat(clock) if clock else datetime.now(UTC)).date()
+        known = recalled_so_far(self.hub.log.read(run["session_id"]))
+        text, cited = render(hits, sources, today, known)
+        return {"text": text, "sources": cited}
 
     async def _learn(
         self, session_id: str, run_id: str, owner: str, reply: str, signals: list[str]
@@ -1025,12 +1067,23 @@ class Runner(DBOSConfiguredInstance):
                     "or `bud login chatgpt`, then pick again."
                 )
             # Appended to the newest message, after the cached prefix, so prompt caching holds.
+            # Turns compaction always keeps are surely in context; recalling them repeats them.
+            in_context = [
+                f"turn:{message.run_id}"
+                for message in self.context.always_kept(
+                    conversation.messages if conversation is not None else history
+                )
+                if message.run_id
+            ]
             recalled = (
                 await DBOS.run_step_async(
-                    {"name": "bud.recall", "retries_allowed": False}, self._recalled, run
+                    {"name": "bud.recall", "retries_allowed": False},
+                    self._recalled,
+                    run,
+                    in_context,
                 )
                 if self.durable
-                else await self._recalled(run)
+                else await self._recalled(run, in_context)
             )
             # A conversation picked up on a later day must not reuse "today"/"tomorrow".
             history_events = self.hub.log.read(run["session_id"])
@@ -1041,7 +1094,16 @@ class Runner(DBOSConfiguredInstance):
             setups = setup_updates_note(history_events, run)
             surface = surface_note(run)
             result = await self.agent.run(
-                (run["text"] + recalled + gap + still_open + jobs + declined + setups + surface)
+                (
+                    run["text"]
+                    + recalled["text"]
+                    + gap
+                    + still_open
+                    + jobs
+                    + declined
+                    + setups
+                    + surface
+                )
                 if run["text"]
                 else run["text"],
                 model=(
@@ -1089,6 +1151,18 @@ class Runner(DBOSConfiguredInstance):
                 "messages": json.loads(result.new_messages_json()),
                 "conversation": ConversationTypeAdapter.dump_json(result.conversation).decode(),
             }
+            # A reply cites tags from this run's recall or any earlier one still in its history;
+            # keep what each tag it used points to.
+            known = recalled_so_far(history_events) | recalled["sources"]
+            cited = {
+                tag: known[tag]
+                for tag in CITATION.findall(reply_text(data["messages"]))
+                if tag in known
+            }
+            if recalled["sources"]:
+                data["recalled"] = recalled["sources"]
+            if cited:
+                data["sources"] = cited
             if isinstance(result.output, JobReport):
                 data["report"] = result.output.model_dump()
             deferred = result.output if isinstance(result.output, DeferredToolRequests) else None
@@ -1182,6 +1256,8 @@ class Runner(DBOSConfiguredInstance):
 
     def _finish(self, run: dict, type: EventType, data: dict, approvals: list[dict]) -> None:
         self.hub.log.finish_run(run["session_id"], run["run_id"], type, data, approvals)
+        if type == "run.completed":
+            self._index_turn(run["session_id"], run["run_id"])
         self.hub.wake(run["session_id"])
         self._publish_task(run["session_id"])
 

@@ -22,6 +22,7 @@ from bud.core.auth import OwnerAuthError, owner_token
 from bud.core.controls import approval_text, session_snapshot
 from bud.core.controls import submit as submit_control
 from bud.core.projection import reply_text
+from bud.harness.recall import CITATION, plain_citations
 
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\\\)|[@-Z\\\\-_])")
 
@@ -54,10 +55,58 @@ def tui_binary() -> str | None:
     return next((c for c in candidates if c and os.access(c, os.X_OK)), None)
 
 
+# The end of streamed text that may be the start of a citation tag, like " [S1".
+PARTIAL_CITATION = re.compile(r" ?(\[(S\d{0,6})?)?$")
+
+
+class StreamedReply:
+    """A reply as it streams to a plain terminal.
+
+    A tag like [S1] only becomes a date when the run ends and its sources arrive, so text
+    from the first tag on is held back and printed, resolved, at the end.
+    """
+
+    def __init__(self) -> None:
+        self.raw: list[str] = []
+        self.held = ""
+        # A complete tag has streamed: everything after it waits for the end.
+        self.holding = False
+
+    def feed(self, chunk: str) -> str:
+        """Takes a streamed chunk; returns the part that is safe to print now."""
+        self.raw.append(chunk)
+        text = self.held + chunk
+        if self.holding:
+            self.held = text
+            return ""
+        if (tag := CITATION.search(text)) is not None:
+            self.holding = True
+            cut = tag.start()
+        else:
+            # Always matches, at the very end if nothing there could start a tag.
+            partial = PARTIAL_CITATION.search(text)
+            cut = partial.start() if partial else len(text)
+        self.held = text[cut:]
+        return text[:cut]
+
+    def discard(self) -> None:
+        """A response was replaced: its text is forgotten, and what it held is never printed."""
+        self.raw = []
+        self.held = ""
+        self.holding = False
+
+    def finish(self, text: str, sources: dict | None) -> str:
+        """What is left to print once the stored reply and its sources arrive."""
+        raw = "".join(self.raw)
+        if text.startswith(raw):
+            return plain_citations(self.held + text[len(raw) :], sources)
+        return f"\n[complete reply]\n{plain_citations(text, sources)}" if text else ""
+
+
 def render(
     event: dict,
     seen_requests: set[str],
-    streamed: dict[str, list[str]] | None = None,
+    streamed: dict[str, StreamedReply] | None = None,
     *,
     historical_approval: bool = False,
 ) -> None:
@@ -92,6 +141,8 @@ def render(
         case "text.reset":
             request = data["request"]
             if request in seen_requests:
+                for reply in streamed.values():
+                    reply.discard()
                 print(
                     "\n[discard the partial response above; generating its replacement]\nbud: ",
                     end="",
@@ -99,9 +150,8 @@ def render(
                 )
             seen_requests.add(request)
         case "text.delta":
-            run_id = data["run_id"]
-            streamed.setdefault(run_id, []).append(data["text"])
-            print(data["text"], end="", flush="\n" in data["text"])
+            ready = streamed.setdefault(data["run_id"], StreamedReply()).feed(data["text"])
+            print(ready, end="", flush="\n" in ready)
         case "tool.call":
             print(f"\n[tool] {data['tool']}({data['args']})", flush=True)
         case "tool.result":
@@ -123,11 +173,8 @@ def render(
             # Live text can be lost on disconnect or backlog overflow. Reconcile with
             # the stored reply instead of assuming one received token means all arrived.
             text = reply_text(data.get("messages", []))
-            printed = "".join(streamed.pop(data["run_id"], []))
-            if text.startswith(printed):
-                print(text[len(printed) :], end="", flush=True)
-            elif text:
-                print(f"\n[complete reply]\n{text}", end="", flush=True)
+            reply = streamed.pop(data["run_id"], StreamedReply())
+            print(reply.finish(text, data.get("sources")), end="", flush=True)
             print(flush=True)
         case "run.failed":
             streamed.pop(data["run_id"], None)
@@ -157,7 +204,7 @@ def print_http_error(error: httpx.HTTPStatusError) -> None:
 async def follow(client: httpx.AsyncClient, session_id: str) -> None:
     last_seq = 0
     seen_requests: set[str] = set()
-    streamed: dict[str, list[str]] = {}
+    streamed: dict[str, StreamedReply] = {}
     while True:
         try:
             state = await session_snapshot(client, session_id)
@@ -375,6 +422,8 @@ async def headless_chat(base_url: str, session_id: str | None, *, new: bool = Fa
 
             # Follow events until run ends or approval required
             last_seq = 0
+            piped = StreamedReply()
+            piped_requests: set[str] = set()
             state = await session_snapshot(client, session_id)
             watermark = state["last_seq"]
             pending = {item["approval_id"] for item in state["pending_approvals"]}
@@ -403,13 +452,21 @@ async def headless_chat(base_url: str, session_id: str | None, *, new: bool = Fa
                                 sys.stderr.flush()
                                 raise SystemExit(1)
 
+                        elif etype == "text.reset":
+                            # A retried request replaces its text; drop what was held back.
+                            if data.get("request") in piped_requests:
+                                piped.discard()
+                            piped_requests.add(data.get("request"))
+
                         elif etype == "text.delta":
                             chunk = strip_ansi(data.get("text", ""))
-                            sys.stdout.write(chunk)
+                            sys.stdout.write(piped.feed(chunk))
                             sys.stdout.flush()
 
                         elif etype in ("run.completed", "run.waiting"):
-                            sys.stdout.write("\n")
+                            # Only what was held back: piped output never reprints the reply.
+                            held = plain_citations(piped.held, data.get("sources"))
+                            sys.stdout.write(held + "\n")
                             sys.stdout.flush()
                             return
 

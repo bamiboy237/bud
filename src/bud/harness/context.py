@@ -117,6 +117,10 @@ class BackgroundCompaction(AbstractCapability[None]):
         schema_tokens = (len(PARAMETERS.dump_json(request.model_request_parameters)) + 3) // 4
         return estimate_token_count(messages) + schema_tokens <= threshold
 
+    def always_kept(self, messages: list[ModelMessage]) -> list[ModelMessage]:
+        """The newest messages, which compaction never summarizes away."""
+        return messages[find_token_cutoff(messages, self.keep_tokens, None) :]
+
     async def before_model_request(
         self, ctx: RunContext[None], request_context: ModelRequestContext
     ) -> ModelRequestContext:

@@ -98,6 +98,10 @@ struct Turn: Identifiable, Equatable {
     let text: String
     /// What bud did for this reply, when it happened while the app was watching.
     var work: Work?
+    /// The stored event this turn came from, so a source link can find it.
+    var seq: Int?
+    /// What the reply's `[S1]` tags cite.
+    var sources: [String: Source] = [:]
 }
 
 /// A run's work, for the folded line above its reply: "Worked for 34s · 4 steps".
@@ -179,8 +183,15 @@ final class Companion {
         didSet { pace() }
     }
     private(set) var shown = ""
+    /// What the latest reply's `[S1]` tags cite, once its run has finished.
+    private(set) var replySources: [String: Source] = [:]
+    @ObservationIgnored private var replySeq: Int?
     /// The main conversation so far, finished turns only: the reply being written is `shown`.
     private(set) var turns: [Turn] = []
+    /// Where a source link pointed in this conversation; the window scrolls there.
+    var focus: Focus?
+    /// A cited message and its conversation, shown beside the chat.
+    var sourcePanel: SourcePanel?
     /// What you last asked, shown faded above the reply so the answer keeps its context.
     private(set) var question = ""
     /// When the current run began, for "Working for 12s"; nil when bud isn't working.
@@ -373,15 +384,21 @@ final class Companion {
         }
         turns = transcript.compactMap { turn in
             guard let text = turn["text"] as? String, !text.isEmpty else { return nil }
-            return Turn(fromOwner: turn["role"] as? String == "user", text: text)
+            return Turn(
+                fromOwner: turn["role"] as? String == "user", text: text, seq: turn["seq"] as? Int,
+                sources: Citations.sources(turn["sources"]))
         }
         question = turns.last(where: \.fromOwner)?.text ?? ""
         // Only a reply to the latest message: after a newer message, an older reply misleads.
         // It becomes the reply, not a turn: the latest reply is always `reply`, so it's drawn once.
         if let last = turns.last, !last.fromOwner {
+            replySeq = last.seq
+            replySources = last.sources
             reply = last.text
             turns.removeLast()
         } else {
+            replySeq = nil
+            replySources = [:]
             reply = ""
         }
         // An old reply isn't news: it appears whole.
@@ -492,6 +509,39 @@ final class Companion {
     }
 
     // MARK: Actions
+
+    /// Follows a source link into the side panel. Returns false for links that aren't sources.
+    func openSource(_ url: URL) -> Bool {
+        guard let target = Citations.target(url) else { return false }
+        ConversationWindow.shared.show()
+        guard let connection else { return true }
+        let mine = generation
+        sourcePanel = SourcePanel(session: target.session, seq: target.seq)
+        Task {
+            let found = try? await connection.send(
+                "GET", "sessions/\(target.session)/source/\(target.seq)")
+            // Another link was followed, or the connection changed, while this one loaded.
+            guard mine == generation, sourcePanel?.session == target.session,
+                  sourcePanel?.seq == target.seq
+            else { return }
+            sourcePanel = found.flatMap(SourcePanel.init) ?? SourcePanel(
+                session: target.session, seq: target.seq,
+                problem: "This message isn't available anymore.")
+        }
+        return true
+    }
+
+    /// Where the panel's cited message sits in the chat on screen, if it's there.
+    func chatFocus(for panel: SourcePanel) -> Focus? {
+        guard panel.session == session else { return nil }
+        if let turn = turns.first(where: { $0.seq == panel.seq }) { return .turn(turn.id) }
+        return panel.seq == replySeq ? .latest : nil
+    }
+
+    /// Scrolls the chat to the message the side panel shows.
+    func scrollToSource(_ panel: SourcePanel) {
+        focus = chatFocus(for: panel)
+    }
 
     func receiveSetup(_ data: [String: Any], replacing: Bool = false) {
         guard var incoming = CapabilitySetup(data) else { return }
@@ -1082,7 +1132,7 @@ final class Companion {
             archiveReply()
             let said = event.string("text")
             question = Self.unquoted(said).text
-            if !said.isEmpty { turns.append(Turn(fromOwner: true, text: said)) }
+            if !said.isEmpty { turns.append(Turn(fromOwner: true, text: said, seq: event.seq)) }
             runStart = .now
             blocks = []
             seenRequests = []
@@ -1126,7 +1176,7 @@ final class Companion {
         case "capability.setup", "capability.status":
             receiveSetup(event.data, replacing: event.type == "capability.setup")
         case "run.completed":
-            finish(with: Self.replyText(event.data))
+            finish(event)
             closeSteps()
             react(.hop)
             activity = .done
@@ -1134,7 +1184,7 @@ final class Companion {
             refreshApprovals()
         case "run.waiting":
             // The run is parked on the owner; the open approvals make the pet say so.
-            finish(with: Self.replyText(event.data))
+            finish(event)
             closeSteps()
             activity = .idle
             bubbleOpen = true
@@ -1170,6 +1220,8 @@ final class Companion {
         case "run.failed":
             let reason = event.string("reason")
             closeSteps()
+            replySources = [:]
+            replySeq = nil
             reply = reason.isEmpty ? "The run failed." : "The run failed: \(reason)"
             showWhole()
             activity = .failed
@@ -1249,8 +1301,13 @@ final class Companion {
 
     /// The finished reply joins the conversation, carrying the work that produced it.
     private func archiveReply() {
-        if !reply.isEmpty { turns.append(Turn(fromOwner: false, text: reply, work: lastWork)) }
+        if !reply.isEmpty {
+            turns.append(
+                Turn(fromOwner: false, text: reply, work: lastWork, seq: replySeq, sources: replySources))
+        }
         lastWork = nil
+        replySources = [:]
+        replySeq = nil
     }
 
     /// Quoted text as markdown, cut to a few hundred characters: enough to point at.
@@ -1285,10 +1342,14 @@ final class Companion {
     }
 
     /// The stored run end is the authority: it replaces whatever was streamed.
-    private func finish(with full: String) {
+    private func finish(_ event: BudEvent) {
         blocks = []
         seenRequests = []
-        if !full.isEmpty { reply = full }
+        let full = Self.replyText(event.data)
+        guard !full.isEmpty else { return }
+        replySeq = event.seq
+        replySources = Citations.sources(event.data["sources"])
+        reply = full
     }
 
     private func notice(_ event: BudEvent) {
