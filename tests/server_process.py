@@ -214,6 +214,7 @@ def fake_accounts(settings: Settings):
                     slug="SLACK_SEND_MESSAGE",
                     description="Send a message.",
                     version="20261118_00",
+                    tags=["openWorldHint"],
                     input_parameters={"type": "object", "properties": {"text": {"type": "string"}}},
                 )
             ]

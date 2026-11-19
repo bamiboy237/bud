@@ -41,6 +41,7 @@ from bud.harness.ask import ask_user
 
 APP_SEARCH = "find_app_actions"
 MAX_ACTIONS = 6
+MAX_SELECTED = 12
 MAX_ACTION_SCHEMA = 16_000
 ACTION_ARGS = SchemaValidator(core_schema.dict_schema(keys_schema=core_schema.str_schema()))
 
@@ -156,6 +157,21 @@ class CatalogAction(BaseModel):
     description: str
     schema_: dict[str, Any]
     version: str
+    # Runs without asking. Set only by reads_only when the action was found.
+    read_only: bool = False
+
+
+READ_VERBS = {"LIST", "GET", "SEARCH", "FIND", "FETCH", "READ", "RETRIEVE", "QUERY"}
+CHANGE_HINTS = {"createHint", "updateHint", "destructiveHint"}
+
+
+def reads_only(app: str, slug: str, tags: list[str]) -> bool:
+    """Composio marks the action read-only, no change hint, and its name starts with a read verb.
+
+    Both signals must agree, so one mislabeled tag cannot let a send or delete run unasked.
+    """
+    verb = slug.removeprefix(f"{app.upper()}_").split("_", 1)[0]
+    return "readOnlyHint" in tags and not CHANGE_HINTS & set(tags) and verb in READ_VERBS
 
 
 @dataclass
@@ -194,6 +210,7 @@ class AppActions(AbstractToolset[None]):
                     description=item.description[:500],
                     schema_=item.input_parameters,
                     version=item.version,
+                    read_only=reads_only(app, item.slug, item.tags or []),
                 )
             )
         return ToolReturn(
@@ -202,10 +219,7 @@ class AppActions(AbstractToolset[None]):
                     {"name": action.name, "description": action.description} for action in actions
                 ]
             },
-            metadata={
-                "app_turn": self._turn(ctx),
-                "actions": [action.model_dump() for action in actions],
-            },
+            metadata={"actions": [action.model_dump() for action in actions]},
         )
 
     def _search(self, app: str, query: str) -> list[Any]:
@@ -237,10 +251,6 @@ class AppActions(AbstractToolset[None]):
         by_slug = {item.slug: item for item in page.items}
         return [by_slug[slug] for slug in slugs if slug in by_slug]
 
-    @staticmethod
-    def _turn(ctx: RunContext[None]) -> str | None:
-        return (ctx.metadata or {}).get("bud_app_turn", ctx.run_id)
-
     def _allowed(self, app: str, name: str) -> bool:
         return (
             app in self.binding.accounts
@@ -251,26 +261,33 @@ class AppActions(AbstractToolset[None]):
         )
 
     def _selected(self, ctx: RunContext[None]) -> dict[str, CatalogAction]:
-        actions: dict[str, CatalogAction] = {}
-        for message in reversed(ctx.messages):
-            if not isinstance(message, ModelRequest):
+        """Actions found earlier in this conversation, in the order they were first found.
+
+        They stay offered on later turns, so the tool list and the prompt cache behind it
+        stay the same from one request to the next. Only the most recently found are kept.
+        """
+        found = [
+            raw
+            for message in ctx.messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, ToolReturnPart)
+            and part.tool_name == APP_SEARCH
+            and isinstance(part.metadata, dict)
+            for raw in part.metadata.get("actions", [])
+        ]
+        first: dict[str, CatalogAction] = {}
+        last_seen: dict[str, int] = {}
+        for position, raw in enumerate(found):
+            try:
+                action = CatalogAction.model_validate(raw)
+            except ValidationError:
                 continue
-            for part in reversed(message.parts):
-                if not isinstance(part, ToolReturnPart) or part.tool_name != APP_SEARCH:
-                    continue
-                metadata = part.metadata
-                if not isinstance(metadata, dict) or metadata.get("app_turn") != self._turn(ctx):
-                    continue
-                for raw in metadata.get("actions", []):
-                    try:
-                        action = CatalogAction.model_validate(raw)
-                    except ValidationError:
-                        continue
-                    if self._allowed(action.app, action.name):
-                        actions.setdefault(action.name, action)
-                    if len(actions) >= 2 * MAX_ACTIONS:
-                        return actions
-        return actions
+            if self._allowed(action.app, action.name):
+                first.setdefault(action.name, action)
+                last_seen[action.name] = position
+        recent = sorted(last_seen, key=last_seen.__getitem__)[-MAX_SELECTED:]
+        return {name: action for name, action in first.items() if name in recent}
 
     @property
     def id(self) -> str:
@@ -568,7 +585,13 @@ class ComposioTools(WrapperToolset[None]):
                 "error": "Use one plain-text reply recipient, a verified thread_id and body, "
                 "no subject or attachments, is_html=false and include_signature=false.",
             }
-        if name not in READ_TOOLS:
+        found = (tool.tool_def.metadata or {}).get(COMPOSIO_ACTION)
+        found_read = (
+            name not in self.allowed_tools
+            and isinstance(found, dict)
+            and found.get("read_only") is True
+        )
+        if name not in READ_TOOLS and not found_read:
             approval_id = (ctx.tool_call_metadata or {}).get("approval_id")
             if not ctx.tool_call_approved or not approval_id:
                 raise ConnectionError("Real-account writes require an explicit bud approval.")

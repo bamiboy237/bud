@@ -59,9 +59,14 @@ class Policy(BaseModel):
         return action
 
     def decide_tool(self, tool: ToolDefinition) -> Action:
-        """Like decide, but an app action found this turn asks and never inherits a grant."""
-        if tool.name not in self.tools and COMPOSIO_ACTION in (tool.metadata or {}):
-            return "ask"
+        """Like decide, for app actions found at run time.
+
+        A found action that only reads runs without asking. Any other found action asks
+        every time and never inherits a standing grant.
+        """
+        found = (tool.metadata or {}).get(COMPOSIO_ACTION)
+        if tool.name not in self.tools and found is not None:
+            return "allow" if isinstance(found, dict) and found.get("read_only") is True else "ask"
         return self.decide(tool.name)
 
     def grantable(self, tool: str) -> bool:

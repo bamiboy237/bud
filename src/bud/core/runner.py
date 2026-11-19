@@ -644,7 +644,6 @@ class Runner(DBOSConfiguredInstance):
             # Rebuild history from the log, then append the approved call to it.
             "conversation_run": None,
             "history_seq": events[-1].seq,
-            "app_turn": queued.get("app_turn", queued["run_id"]),
             "late_call": {
                 "approval_id": request["approval_id"],
                 "tool": request["tool"],
@@ -742,15 +741,6 @@ class Runner(DBOSConfiguredInstance):
                 None,
             )
         run = self._inputs(session_id, None, results, origin=origin)
-        source = next(
-            (
-                e.data
-                for e in events
-                if e.type == "run.queued" and e.data["run_id"] == batch[0]["run_id"]
-            ),
-            {},
-        )
-        run["app_turn"] = source.get("app_turn", batch[0]["run_id"])
         run["skills"] = next(
             (
                 event.data.get("skills", {})
@@ -1077,7 +1067,6 @@ class Runner(DBOSConfiguredInstance):
                 metadata={
                     "bud_skills": run.get("skills", {}),
                     "bud_session_id": run["session_id"],
-                    "bud_app_turn": run.get("app_turn", run["run_id"]),
                     "bud_task_id": run.get("task_id"),
                     # What the job's result is checked against when it calls finish_job.
                     "bud_brief": self._brief(run),

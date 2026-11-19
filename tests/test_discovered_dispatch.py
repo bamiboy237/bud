@@ -10,12 +10,31 @@ from pydantic_ai.models.function import FunctionModel
 
 from bud.composio.binding import AccountBinding
 from bud.composio.connection import Connections
-from bud.composio.tools import build_toolset, policy
+from bud.composio.tools import build_toolset, policy, reads_only
 from bud.harness.context import BackgroundCompaction
 from tests.test_live_tools import harness
 
+SEND = SimpleNamespace(
+    slug="SLACK_SEND_MESSAGE",
+    description="Send a Slack message.",
+    version="20261118_00",
+    tags=["openWorldHint"],
+    input_parameters={
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+    },
+)
+LIST = SimpleNamespace(
+    slug="SLACK_LIST_CHANNELS",
+    description="List Slack channels.",
+    version="20261118_00",
+    tags=["readOnlyHint", "openWorldHint"],
+    input_parameters={"type": "object", "properties": {}},
+)
 
-def app_catalog(tmp_path):
+
+def app_catalog(tmp_path, action=SEND):
     connections = Mock(spec=Connections)
     connections.settings = SimpleNamespace(composio_api_key=None)
     connections.binding = AccountBinding("owner", 1, (("slack", "account"),))
@@ -24,25 +43,13 @@ def app_catalog(tmp_path):
     client.client.tool_router.session.search.return_value = SimpleNamespace(
         results=[
             SimpleNamespace(
-                primary_tool_slugs=["SLACK_SEND_MESSAGE"], related_tool_slugs=["GMAIL_SEND_EMAIL"]
+                primary_tool_slugs=[action.slug], related_tool_slugs=["GMAIL_SEND_EMAIL"]
             )
         ]
     )
     api = client.client.tools
     api.list.return_value = SimpleNamespace(
-        items=[
-            SimpleNamespace(
-                slug="SLACK_SEND_MESSAGE",
-                description="Send a Slack message.",
-                version="20261118_00",
-                input_parameters={
-                    "type": "object",
-                    "properties": {"text": {"type": "string"}},
-                    "required": ["text"],
-                },
-            ),
-            SimpleNamespace(slug="GMAIL_SEND_EMAIL"),
-        ]
+        items=[action, SimpleNamespace(slug="GMAIL_SEND_EMAIL")]
     )
     api.execute.return_value.model_dump.return_value = {"successful": True, "data": {"id": "m1"}}
     subject = harness(tmp_path)
@@ -99,7 +106,7 @@ async def test_first_turn_search_loads_one_app_then_holds_exact_write(tmp_path):
     agent = subject.agent(
         FunctionModel(respond), lambda _: None, context=BackgroundCompaction(record=lambda _: None)
     )
-    metadata = {"bud_app_turn": "first", "bud_request": "Send hello on Slack"}
+    metadata = {"bud_request": "Send hello on Slack"}
     result = await agent.run("Send hello on Slack", metadata=metadata)
     assert isinstance(result.output, DeferredToolRequests)
     assert [call.tool_name for call in result.output.approvals] == ["SLACK_SEND_MESSAGE"]
@@ -129,3 +136,46 @@ async def test_first_turn_search_loads_one_app_then_holds_exact_write(tmp_path):
     with pytest.raises(Exception, match="already submitted"):
         await agent.run(message_history=saved, deferred_tool_results=choice, metadata=metadata)
     assert api.execute.call_count == 1
+
+
+async def test_read_only_action_runs_unasked_and_stays_offered_next_turn(tmp_path):
+    subject, _, api = app_catalog(tmp_path, LIST)
+    offered: list[list[str]] = []
+
+    def respond(messages, info):
+        offered.append([definition.name for definition in info.function_tools])
+        parts = messages[-1].parts
+        if any(getattr(part, "content", None) == "List my channels" for part in parts):
+            return ModelResponse(
+                parts=[ToolCallPart("find_app_actions", {"app": "slack", "query": "channels"})]
+            )
+        if any(getattr(part, "tool_name", None) == "find_app_actions" for part in parts):
+            return ModelResponse(parts=[ToolCallPart("SLACK_LIST_CHANNELS", {})])
+        return ModelResponse(parts=[TextPart("Done.")])
+
+    agent = subject.agent(
+        FunctionModel(respond), lambda _: None, context=BackgroundCompaction(record=lambda _: None)
+    )
+    first = await agent.run("List my channels")
+    assert first.output == "Done."
+    api.execute.assert_called_once()
+    end_of_first_turn = offered[-1]
+    assert "SLACK_LIST_CHANNELS" in end_of_first_turn
+
+    second = await agent.run("Thanks", message_history=first.all_messages())
+    assert second.output == "Done."
+    # Same tools, same order: the cached prompt prefix survives into the next turn.
+    assert offered[-1] == end_of_first_turn
+
+
+@pytest.mark.parametrize(
+    ("slug", "tags", "expected"),
+    [
+        ("SLACK_LIST_CHANNELS", ["readOnlyHint"], True),
+        ("SLACK_SEND_MESSAGE", ["readOnlyHint"], False),
+        ("SLACK_GET_MESSAGE", ["readOnlyHint", "destructiveHint"], False),
+        ("SLACK_LIST_CHANNELS", [], False),
+    ],
+)
+def test_only_agreeing_read_signals_skip_approval(slug, tags, expected):
+    assert reads_only("slack", slug, tags) is expected
