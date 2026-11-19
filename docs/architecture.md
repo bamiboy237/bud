@@ -17,3 +17,14 @@ The primary conversation and each job use separate durable sessions. A waiting
 job leaves the conversation free to answer another question. Each job keeps a
 short brief, working history, pinned skill versions, and exact approvals.
 Job approvals and results return to the conversation. See [Jobs](jobs.md).
+
+## Saved tool results
+
+A tool result over 10,000 characters is saved in the session database, and the model
+sees a short preview with a handle. Results from earlier turns are replaced the same way.
+The model reads a saved result back with `read_tool_result_chars` or `load_tool_result`.
+
+A saved result expires 24 hours after its last read (`TOOL_RESULT_RETENTION_HOURS`). It
+never expires while its session is running or waiting for approval. Inside `run_code`,
+Bud can keep a result longer with `keep_tool_result`: 1 day from now by default, 1 to 3,650
+days, or until it chooses again. Keeping never makes a result expire sooner than the default.

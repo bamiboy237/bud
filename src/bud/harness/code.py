@@ -15,6 +15,8 @@ CODE_TOOL_CALL_LIMIT = 12
 CODE_GUIDANCE = """
 Use `run_code` to process, calculate, and transform read-only tool outputs in an isolated sandbox.
 Load stored tool payloads with `load_tool_result(handle=...)` and return targeted results.
+Stored results expire a day after their last read. To keep research the person may want
+later, call `keep_tool_result(handle=..., days=...)` inside `run_code`.
 State-modifying actions (such as sending messages, scheduling, or file edits) use their
 dedicated external tools.
 """
