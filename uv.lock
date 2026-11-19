@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -292,7 +292,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "composio", specifier = ">=0.22.0" },
+    { name = "composio", specifier = ">=0.32.0" },
     { name = "fastapi", specifier = ">=0.162.0" },
     { name = "firecrawl-anydoc", specifier = ">=0.2.5,<0.3" },
     { name = "httpx", specifier = ">=0.28.1" },
@@ -614,9 +614,10 @@ wheels = [
 
 [[package]]
 name = "composio"
-version = "0.22.0"
+version = "0.32.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "certifi" },
     { name = "composio-client" },
     { name = "json-schema-to-pydantic" },
     { name = "jsonschema" },
@@ -626,27 +627,25 @@ dependencies = [
     { name = "requests" },
     { name = "typing-extensions" },
     { name = "urllib3" },
+    { name = "websocket-client" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/0e/12/3a505eba6141a1f07a251313b8b818bdaac930255453df30133823eff057/composio-0.22.0.tar.gz", hash = "sha256:9a76917a5fa2c15950923a35ee9d7bb90f16d45af7beae9622c3e5a701b76d34", size = 369319, upload-time = "2026-09-21T19:12:12.26Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ca/2b/d895c31fa216120a1d808ddba6f827a0122d3999c41d8c3a69410c842b63/composio-0.32.0.tar.gz", hash = "sha256:c92eecba4bf223cf59dc2a08320885498a86e12d09f7c1222c6b47a5fe1afe2e", size = 475123, upload-time = "2026-11-09T09:35:58.478Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8e/44/70a44acfd89ac72caa88ee29047c6162940e9f07b98c1724871a19e7a86f/composio-0.22.0-py3-none-any.whl", hash = "sha256:be5de5908b28b74206fdde29d873c7c0e73c95c7fbdd984ff07472ca7bb2a85c", size = 207533, upload-time = "2026-09-21T19:11:57.513Z" },
+    { url = "https://files.pythonhosted.org/packages/67/af/425abf5c444f09f6e7b50e71a75515bc5490fefe34d956f0303cc1de7498/composio-0.32.0-py3-none-any.whl", hash = "sha256:519ba2dd31ef26b867fb4ef2a844c01cd309a147fd8ef6b095de6d3536a86161", size = 256488, upload-time = "2026-11-09T09:35:40.945Z" },
 ]
 
 [[package]]
 name = "composio-client"
-version = "1.43.0"
+version = "2.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "anyio" },
-    { name = "distro" },
     { name = "httpx" },
     { name = "pydantic" },
-    { name = "sniffio" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b9/4b/3789f4c1347fd01349b66ecaeffb5ef623434c3b1fa4f5c5993fddb69c68/composio_client-1.43.0.tar.gz", hash = "sha256:bb96700da0c2aabc394cebc954be0ebf419557cc42b40f5d148aac52a5aff6f9", size = 246767, upload-time = "2026-07-08T09:06:02.42Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d9/ab/d3d66a62c13db1c6dfac59630ee26171d1b038f3d4894310abbf82c2d8d4/composio_client-2.1.0.tar.gz", hash = "sha256:58bfa5cd3cd6da1dd9a70692ca795f1a88074f64c5d853d1c219cce4df346234", size = 592013, upload-time = "2026-11-05T12:11:37.958Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/07/a2/3ae1f5471a52189ac558de6b0e088dc3575d695a0f91278cddf464274694/composio_client-1.43.0-py3-none-any.whl", hash = "sha256:3274d965b9efb6be90a51977f4c068ed24e2cad9160de4d40d3176d8bb4ce2d9", size = 277716, upload-time = "2026-07-08T09:06:01.007Z" },
+    { url = "https://files.pythonhosted.org/packages/c0/8f/9e64de6f670dbefbec7aaa03b3fca52c28b44b204478861475062a683be7/composio_client-2.1.0-py3-none-any.whl", hash = "sha256:6b1a57ead7fecae314b65b3f10c6f2e537e51de3c9013151f6888208d4997fe4", size = 478016, upload-time = "2026-11-05T12:11:36.218Z" },
 ]
 
 [[package]]
@@ -739,15 +738,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/2d/08/052506573c83ccc7703170bddd41eda9d9940d09d75d5062a0f6b318280f/dbos-3.4.0.tar.gz", hash = "sha256:e152a517686fd1875b6eb3d6bf83c87f700a6c244fe872b6da7955f750e18953", size = 567255, upload-time = "2026-10-28T15:25:35.464Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/00/30/cf52e34d3c6d9b852b0178d558e1d903c36b4dd97d8ab7158b4af8171f4a/dbos-3.4.0-py3-none-any.whl", hash = "sha256:78f6015dbcfffb1a981a371a37a46b1991949b3bf9b5f03d1588f53475081912", size = 269879, upload-time = "2026-10-28T15:25:33.671Z" },
-]
-
-[[package]]
-name = "distro"
-version = "1.9.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/fc/f8/98eea607f65de6527f8a2e8885fc8015d3e6f5775df186e443e0964a11c3/distro-1.9.0.tar.gz", hash = "sha256:2fa77c6fd8940f116ee1d6b94a2f90b13b5ea8d019b98bc8bafdcabcdd9bdbed", size = 60722, upload-time = "2023-12-24T09:54:32.31Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/12/b3/231ffd4ab1fc9d679809f356cebee130ac7daa00d6d6f3206dd4fd137e9e/distro-1.9.0-py3-none-any.whl", hash = "sha256:7bffd925d65168f85027d8da9af6bddab658135b840670a223589bc0c8ef02b2", size = 20277, upload-time = "2023-12-24T09:54:30.421Z" },
 ]
 
 [[package]]
