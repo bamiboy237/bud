@@ -37,8 +37,9 @@ message of yours is already waiting, Bud gets the job's result with that
 message instead. A job you cancel gets no report.
 
 A finished job also saves its result in Bud's workspace, without asking, as
-`reports/<date>-job-<id>-<title>.md`. Bud creates the `reports` folder when it
-needs it and never replaces a report that already exists, so your edits stay.
+`reports/<date>-<time>-job-<id>-<title>.md`, readable only by you. Bud creates
+the `reports` folder when it needs it, never replaces a report that already
+exists, and never writes through a link. A report you delete stays deleted.
 The Mac companion shows **Open report** beside the job's "finished" notice.
 
 Bud also tells you when a running job looks stuck. A job is stuck when it has

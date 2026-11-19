@@ -475,13 +475,13 @@ private struct Bubble: View {
             if companion.showStepsAfter, !companion.running, !companion.lastSteps.isEmpty {
                 StepsSummary(companion: companion)
             }
-            ForEach(companion.notices, id: \.self) { notice in
+            ForEach(companion.notices) { notice in
                 VStack(alignment: .leading, spacing: 4) {
-                    Label(notice, systemImage: "arrow.turn.down.right")
+                    Label(notice.text, systemImage: "arrow.turn.down.right")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
-                    if let report = companion.noticeReports[notice] { OpenReport(file: report) }
+                    if let report = notice.report { OpenReport(file: report) }
                 }
             }
             if companion.unsentSpeech != nil { UnsentSpeech(companion: companion) }

@@ -204,12 +204,12 @@ private struct ConversationView: View {
             } else if let work = companion.lastWork, !companion.shown.isEmpty {
                 WorkLine(work: work)
             }
-            ForEach(companion.notices, id: \.self) { notice in
+            ForEach(companion.notices) { notice in
                 VStack(alignment: .leading, spacing: 4) {
-                    Label(notice, systemImage: "arrow.turn.down.right")
+                    Label(notice.text, systemImage: "arrow.turn.down.right")
                         .font(.callout)
                         .foregroundStyle(.secondary)
-                    if let report = companion.noticeReports[notice] { OpenReport(file: report) }
+                    if let report = notice.report { OpenReport(file: report) }
                 }
             }
             if companion.unsentSpeech != nil {

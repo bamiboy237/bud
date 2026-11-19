@@ -342,17 +342,29 @@ async def test_a_finished_job_saves_its_report_in_the_workspace(tmp_path):
     assert task.report == str(saved)
 
 
-def test_a_saved_report_is_never_overwritten_or_written_through_a_link(tmp_path):
-    item = WorkItem.model_construct(task_id=7, title="Weekly: Q3 / Q4 numbers!")
+def test_report_names_carry_the_finish_time_and_no_private_words():
+    item = WorkItem.model_construct(task_id=7, title="Claude token usage: Q3 / Q4 numbers!")
+    finished = datetime(2026, 11, 19, 15, 30, 5, tzinfo=UTC)
+    assert report_name(item, finished) == "reports/2026-11-19-153005-job-7-usage-q3-q4-numbers.md"
+    # A job revised and finished again the same day gets its own report.
+    assert report_name(item, finished + timedelta(hours=2)) != report_name(item, finished)
+    secret = WorkItem.model_construct(task_id=8, title="Private keys")
+    assert report_name(secret, finished).endswith("-job-8-keys.md")
+
+
+def test_a_saved_report_is_private_never_overwritten_and_never_written_through_a_link(
+    tmp_path,
+):
+    item = WorkItem.model_construct(task_id=7, title="Weekly numbers")
     finished = datetime(2026, 11, 19, 15, 30, tzinfo=UTC)
     name = report_name(item, finished)
-    assert name == "reports/2026-11-19-job-7-weekly-q3-q4-numbers.md"
-
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    save_report(workspace, name, item, finished, "First version.")
+
+    assert save_report(workspace, name, item, finished, "First version.")
+    assert oct((workspace / name).stat().st_mode & 0o777) == "0o600"
     (workspace / name).write_text("The owner's edits.")
-    save_report(workspace, name, item, finished, "Replayed version.")
+    assert save_report(workspace, name, item, finished, "Replayed version.")
     assert (workspace / name).read_text() == "The owner's edits."
 
     elsewhere = tmp_path / "elsewhere"
@@ -360,5 +372,37 @@ def test_a_saved_report_is_never_overwritten_or_written_through_a_link(tmp_path)
     linked = tmp_path / "linked"
     linked.mkdir()
     (linked / "reports").symlink_to(elsewhere, target_is_directory=True)
-    save_report(linked, name, item, finished, "Should not escape.")
+    with pytest.raises(OSError):
+        save_report(linked, name, item, finished, "Should not escape.")
+    target = tmp_path / "target.md"
+    plain = tmp_path / "plain"
+    (plain / "reports").mkdir(parents=True)
+    (plain / name).symlink_to(target)
+    assert not save_report(plain, name, item, finished, "Should not follow.")
     assert list(elsewhere.iterdir()) == []
+    assert not target.exists()
+
+
+async def test_a_refused_report_is_not_claimed_and_a_deleted_one_stays_deleted(tmp_path):
+    prompts: list[str] = []
+    async with running_bud(tmp_path / "linked", bud_with_one_job(prompts), jobs=True) as bud:
+        (bud.root / "reports").symlink_to(tmp_path, target_is_directory=True)
+        bud.log.append("owner", "session.created")
+        bud.runner.start("owner", "When does my lease renew?", "message-1")
+        await bud.settle()
+        [done] = [e.data for e in bud.log.read("owner") if e.type == "task.completed"]
+        assert "report" not in done
+        assert "report_path" not in done
+        assert "Saved in your workspace" not in prompts[-1]
+        assert bud.runner.snapshot("owner").tasks[0].report is None
+
+    async with running_bud(tmp_path / "deleted", bud_with_one_job([]), jobs=True) as bud:
+        bud.log.append("owner", "session.created")
+        bud.runner.start("owner", "When does my lease renew?", "message-1")
+        await bud.settle()
+        [done] = [e.data for e in bud.log.read("owner") if e.type == "task.completed"]
+        (bud.root / done["report"]).unlink()
+        # A restart publishes finished jobs again; the deleted report is not recreated.
+        assert bud.runner.work_items is not None
+        bud.runner.work_items.publish(bud.runner.snapshot("owner").tasks[0].session_id)
+        assert not (bud.root / done["report"]).exists()

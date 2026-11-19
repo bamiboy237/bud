@@ -2,8 +2,11 @@
 
 import json
 import logging
+import os
 import re
+import stat
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -35,6 +38,7 @@ from bud.harness.actions import Policy
 from bud.harness.spiral import work_tools_off
 from bud.harness.verify import JobVerifier
 from bud.limits import MAX_MESSAGE_CHARS, MAX_OPEN_TASKS
+from bud.workspace import PRIVATE_WORDS
 
 # A job reads its queue between steps; more waiting updates than this is a flood.
 MAX_PENDING_UPDATES = 3
@@ -217,27 +221,48 @@ logger = logging.getLogger(__name__)
 
 
 def report_name(item: WorkItem, finished: datetime) -> str:
-    """Where a finished job's report goes in the workspace, fixed by the job and its end."""
-    slug = re.sub(r"[^a-z0-9]+", "-", item.title.lower()).strip("-")[:60] or "report"
-    return f"reports/{finished:%Y-%m-%d}-job-{item.task_id}-{slug}.md"
+    """Where a finished job's report goes in the workspace, fixed by the job and its end.
+
+    Words Bud's file tools treat as private are left out, so Bud can read the report back.
+    """
+    words = re.findall(r"[a-z0-9]+", item.title.lower())
+    slug = "-".join(word for word in words if word not in PRIVATE_WORDS)[:60].strip("-")
+    return f"reports/{finished:%Y-%m-%d-%H%M%S}-job-{item.task_id}-{slug or 'report'}.md"
 
 
-def save_report(workspace: Path, name: str, item: WorkItem, finished: datetime, text: str) -> None:
-    """Writes the report once. An existing file is never replaced, so a replay or an edit
-    the owner made since is safe."""
-    folder = workspace / "reports"
-    if folder.is_symlink():
-        logger.warning("Not saving job %d's report: %s is a link", item.task_id, folder)
-        return
-    folder.mkdir(exist_ok=True, mode=0o700)
-    body = (
-        f"# {item.title}\n\nJob {item.task_id}, finished {finished:%Y-%m-%d %H:%M} UTC.\n\n{text}\n"
-    )
+def save_report(workspace: Path, name: str, item: WorkItem, finished: datetime, text: str) -> bool:
+    """Writes the report once, owner-only. Returns whether the report file is there.
+
+    An existing file is never replaced, so the owner's edits are safe. Every folder is
+    opened without following links, so nothing is written outside the workspace.
+    """
+    folder, file = name.split("/")
+    stamp = f"Job {item.task_id}, finished {finished:%Y-%m-%d %H:%M} UTC."
+    body = f"# {item.title}\n\n{stamp}\n\n{text}\n".encode()
+    directory = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root = os.open(workspace, directory)
     try:
-        with open(workspace / name, "x", encoding="utf-8") as file:
-            file.write(body)
-    except FileExistsError:
-        pass
+        with suppress(FileExistsError):
+            os.mkdir(folder, 0o700, dir_fd=root)
+        reports = os.open(folder, directory, dir_fd=root)
+        try:
+            try:
+                fd = os.open(
+                    file,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=reports,
+                )
+            except FileExistsError:
+                found = os.stat(file, dir_fd=reports, follow_symlinks=False)
+                return stat.S_ISREG(found.st_mode)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(body)
+            return True
+        finally:
+            os.close(reports)
+    finally:
+        os.close(root)
 
 
 def _last_report(events: list) -> dict:
@@ -498,7 +523,7 @@ class WorkItems:
         if self.workspace is None or end is None:
             return None
         path = self.workspace / report_name(item, end.created_at)
-        return str(path) if path.is_file() else None
+        return str(path) if path.is_file() and not path.is_symlink() else None
 
     def _stalled(self, item: WorkItem, events: list[Event]) -> str | None:
         """The reason of a stall notice the job has not answered with activity since."""
@@ -626,18 +651,30 @@ class WorkItems:
             "failed": "task.failed",
             "cancelled": "task.cancelled",
         }
+        key = f"task:{item.task_id}:terminal:{terminal.id}"
+        if self._published(item.feed_id, key):
+            return  # announced before a restart; a report deleted since stays deleted
         data = {"task_id": item.task_id, "title": item.title, "text": text, "origin": item.origin}
         if notices[kind] == "task.completed" and self.workspace is not None and text.strip():
             name = report_name(item, terminal.created_at)
             try:
-                save_report(self.workspace, name, item, terminal.created_at, text)
+                saved = save_report(self.workspace, name, item, terminal.created_at, text)
+            except OSError as exc:
+                saved = False
+                logger.warning("Could not save job %d's report: %s", item.task_id, exc)
+            if saved:
                 data["report"] = name
                 data["report_path"] = str(self.workspace / name)
-            except OSError as exc:
-                logger.warning("Could not save job %d's report: %s", item.task_id, exc)
-        self.hub.publish_once(
-            item.feed_id, notices[kind], data, key=f"task:{item.task_id}:terminal:{terminal.id}"
-        )
+        self.hub.publish_once(item.feed_id, notices[kind], data, key=key)
+
+    def _published(self, feed_id: str, key: str) -> bool:
+        with self.log._connect() as db:
+            return (
+                db.execute(
+                    "SELECT 1 FROM events WHERE session_id = ? AND event_key = ?", (feed_id, key)
+                ).fetchone()
+                is not None
+            )
 
 
 def _minutes(span: timedelta) -> str:
