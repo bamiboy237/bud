@@ -553,8 +553,8 @@ private struct RoundButton: View {
     }
 }
 
-/// A cited message from another conversation, beside this one: its date, then the exchange
-/// around it, with the cited message and the question it answered marked by a rule.
+/// A cited message beside the chat: its date, then its whole conversation, opened at the cited
+/// message, which is marked by a rule with the question it answered.
 private struct SourcePanelView: View {
     let panel: SourcePanel
     let companion: Companion
@@ -563,7 +563,7 @@ private struct SourcePanelView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Earlier conversation")
+                    Text(companion.chatFocus(for: panel) == nil ? "Earlier conversation" : "This conversation")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text(panel.date.isEmpty ? " " : panel.date)

@@ -64,7 +64,7 @@ enum Focus: Equatable {
     case latest
 }
 
-/// A cited message from another conversation, with the exchange around it.
+/// A cited message and the whole conversation it belongs to, opened at that message.
 struct SourcePanel: Equatable {
     let session: String
     let seq: Int

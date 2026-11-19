@@ -190,7 +190,7 @@ final class Companion {
     private(set) var turns: [Turn] = []
     /// Where a source link pointed in this conversation; the window scrolls there.
     var focus: Focus?
-    /// A cited message from another conversation, shown beside this one.
+    /// A cited message and its conversation, shown beside the chat.
     var sourcePanel: SourcePanel?
     /// What you last asked, shown faded above the reply so the answer keeps its context.
     private(set) var question = ""
