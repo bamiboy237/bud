@@ -43,17 +43,21 @@ from bud.core.setup import (
 )
 from bud.core.workspace_home import display_path, workspace_home
 from bud.gateway import build_gateway
-from bud.harness.actions import load_policy
+from bud.harness.actions import Policy, load_policy
 from bud.harness.agent import Harness
 from bud.harness.ask import MAX_QUESTIONS, AskAnswer
 from bud.harness.grants import Grants
 from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
 from bud.harness.recall import Recall, embedder
-from bud.harness.review import build_reviewer
+from bud.harness.review import ToolReviewer, build_reviewer
 from bud.limits import MAX_MESSAGE_CHARS
 from bud.logs import guard_logs
 from bud.photon_config import PhotonConfig
+from bud.shell import GUIDANCE as SHELL_GUIDANCE
+from bud.shell import NETWORK_TOOL, SHELL_TOOLS, NetworkGrants
+from bud.shell import available as shell_available
+from bud.shell import build_tools as build_shell_tools
 from bud.web import GUIDANCE as WEB_GUIDANCE
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
 from bud.web import build_tools as build_web_tools
@@ -146,13 +150,32 @@ def workspace_root(directory: Path) -> Path:
     return root
 
 
-def workspace_tools(root: Path, state_dir: Path) -> FunctionToolset[None]:
+def workspace_tools(
+    root: Path, state_dir: Path, reviewer: Callable[[], ToolReviewer | None]
+) -> FunctionToolset[None]:
+    """File tools, and on macOS the sandboxed shell, whose network checks use `reviewer`."""
+    shell = (
+        build_shell_tools(root, NetworkGrants(state_dir / "network-grants.json"), reviewer)
+        if shell_available()
+        else []
+    )
     return FunctionToolset(
         [
             *build_workspace_tools(root, state_dir / "workspace-dispatches.jsonl"),
             document_tool(root),
+            *shell,
         ]
     )
+
+
+def file_guidance() -> str:
+    return WORKSPACE_GUIDANCE + (SHELL_GUIDANCE if shell_available() else "")
+
+
+def allow_file_tools(policy: Policy) -> None:
+    """Reads and sandboxed commands run unasked; writes and new network sites ask."""
+    policy.tools.update(dict.fromkeys(FILE_READS | SHELL_TOOLS, "allow"))
+    policy.tools.update(dict.fromkeys(WORKSPACE_WRITE_TOOLS | {NETWORK_TOOL}, "ask"))
 
 
 def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAPI:
@@ -235,11 +258,11 @@ def _create_app(
             model_id=model_id,
         )
         tools_policy = policy()
-        tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS | FILE_READS, "allow"))
+        tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS, "allow"))
+        allow_file_tools(tools_policy)
         tools_policy.tools["setup_capability"] = "allow"
         setup = setup_registry(connections)
         setup_journal = SetupJournal()
-        tools_policy.tools.update(dict.fromkeys(WORKSPACE_WRITE_TOOLS, "ask"))
         loaded = {"accounts": frozenset(accounts)}
         refresh_lock = Lock()
 
@@ -248,7 +271,7 @@ def _create_app(
                 [
                     build_toolset(connections, connections.accounts(), session_dir),
                     build_web_tools(settings),
-                    workspace_tools(workspace, session_dir),
+                    workspace_tools(workspace, session_dir, lambda: harness.reviewer),
                     build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
                 ]
             )
@@ -281,7 +304,7 @@ def _create_app(
             "(/connect remains a manual fallback). The connection is ready on the next "
             "message; no restart is needed."
             + WEB_GUIDANCE
-            + WORKSPACE_GUIDANCE
+            + file_guidance()
             + f"Your workspace is the folder {display_path(workspace)} on the person's Mac.\n",
             memory=build_memory(session_dir / "memory.db", namespace="owner"),
             state_dir=session_dir,
@@ -305,19 +328,19 @@ def _create_app(
         tools_policy = load_policy()
         # The simulated world gets the production web tools: research is read-only, and a
         # mock search engine would teach habits that break against the real web.
-        tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS | FILE_READS, "allow"))
-        tools_policy.tools.update(dict.fromkeys(WORKSPACE_WRITE_TOOLS, "ask"))
+        tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS, "allow"))
+        allow_file_tools(tools_policy)
         harness = Harness(
             CombinedToolset(
                 [
                     FunctionToolset(build_tools(world)),
                     build_web_tools(settings),
-                    workspace_tools(workspace, settings.data_dir),
+                    workspace_tools(workspace, settings.data_dir, lambda: harness.reviewer),
                 ]
             ),
             tools_policy,
             gateway.registry,
-            world.profile() + WEB_GUIDANCE + WORKSPACE_GUIDANCE,
+            world.profile() + WEB_GUIDANCE + file_guidance(),
             memory=build_memory(settings.data_dir / "world-memory.db", namespace="world"),
             state_dir=settings.data_dir,
             result_path=db_path,
