@@ -80,6 +80,8 @@ class Harness:
             ("load_tool_result", "run_code", "search_tools", "search_conversation_history"),
             "allow",
         )
+        # It only changes how long Bud's own saved copy of a result lasts.
+        reads["keep_tool_result"] = "allow"
         self.policy = Policy(
             tools=reads
             | tools_policy
@@ -191,6 +193,7 @@ class Harness:
                     tools=[
                         Tool(self.results.read_tool_result_chars),
                         Tool(self.results.load_tool_result),
+                        Tool(self.results.keep_tool_result),
                     ],
                 ),
                 *([self.memory] if self.memory is not None else []),

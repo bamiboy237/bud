@@ -1,4 +1,8 @@
-"""Temporary tool results, retained while their session is running or awaiting approval."""
+"""Saved tool results.
+
+A result expires `retention` after its last read, unless Bud chose to keep it longer, and
+never while its session is running or awaiting approval.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +13,7 @@ import time
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any
@@ -52,7 +56,8 @@ async def spill_old_results(
                 part,
                 content=(
                     f"Earlier {part.tool_name} result ({len(text):,} characters) saved as "
-                    f"{handle}. Use read_tool_result_chars or load_tool_result to read it."
+                    f"{handle}. Use read_tool_result_chars or load_tool_result to read it, "
+                    "and keep_tool_result to keep it past its expiry."
                 ),
             )
         projected.append(message if parts == message.parts else replace(message, parts=parts))
@@ -77,6 +82,10 @@ class SqliteResultStore:
                 )"""
             )
             db.execute("CREATE INDEX IF NOT EXISTS result_last_used ON tool_results(last_used)")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(tool_results)")}
+            if "keep_until" not in columns:
+                # Unix time Bud chose to keep the result until; NULL means the default retention.
+                db.execute("ALTER TABLE tool_results ADD COLUMN keep_until REAL")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -99,7 +108,8 @@ class SqliteResultStore:
             if owner is None:
                 raise ValueError("Cannot store a tool result without an accepted run")
             db.execute(
-                """INSERT INTO tool_results VALUES (?, ?, ?, ?, ?)
+                """INSERT INTO tool_results (handle, run_id, session_id, payload, last_used)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(handle) DO UPDATE SET
                     payload = excluded.payload, last_used = excluded.last_used""",
                 (key, run_id, owner[0], data, time.time()),
@@ -176,6 +186,33 @@ class SqliteResultStore:
         except json.JSONDecodeError:
             return text
 
+    async def keep_tool_result(
+        self, handle: str, days: Annotated[int, Field(ge=1, le=3650)] | None = 30
+    ) -> str:
+        """Keep a saved result longer than its default expiry, so it can be read later.
+
+        Use it for research or data the person may want again in a later conversation.
+        Calling it again replaces the earlier choice.
+
+        Args:
+            handle: Exact handle from a saved tool result.
+            days: Days to keep it, from 1 to 3,650. None keeps it until you call this again.
+        """
+        until = float("inf") if days is None else time.time() + timedelta(days=days).total_seconds()
+        kept = await asyncio.to_thread(self._keep, handle, until)
+        if not kept:
+            return "Stored result expired or is unavailable. Repeat the original lookup."
+        if days is None:
+            return f"Kept {handle} until you choose another expiry."
+        return f"Kept {handle} until {datetime.fromtimestamp(until, UTC):%Y-%m-%d}."
+
+    def _keep(self, handle: str, until: float) -> bool:
+        with self._connect() as db:
+            changed = db.execute(
+                "UPDATE tool_results SET keep_until = ? WHERE handle = ?", (until, handle)
+            )
+            return changed.rowcount == 1
+
     async def prune(self) -> int:
         return await asyncio.to_thread(self._prune)
 
@@ -192,14 +229,16 @@ class SqliteResultStore:
                         'run.stop_requested', 'run.cancelled'
                     )
                 )
-                DELETE FROM tool_results WHERE last_used < ? AND NOT EXISTS (
+                DELETE FROM tool_results WHERE (
+                    CASE WHEN keep_until IS NULL THEN last_used < ? ELSE keep_until < ? END
+                ) AND NOT EXISTS (
                     SELECT 1 FROM latest WHERE latest.session_id = tool_results.session_id
                     AND latest.rank = 1
                     AND latest.type IN (
                         'run.queued', 'run.started', 'run.waiting', 'run.stop_requested'
                     )
                 ) RETURNING handle""",
-                (time.time() - self.retention.total_seconds(),),
+                (time.time() - self.retention.total_seconds(), time.time()),
             ).fetchall()
         return len(deleted)
 
