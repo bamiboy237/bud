@@ -656,7 +656,7 @@ class TaskFlow(AbstractCapability[None]):
             if (
                 tool.name not in CONTROL_TOOLS
                 if worker
-                else self.policy.decide(tool.name) in ("allow", "ask", "review")
+                else self.policy.decide_tool(tool) in ("allow", "ask", "review")
             )
         ]
 

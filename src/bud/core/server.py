@@ -237,7 +237,7 @@ def _create_app(
         def account_toolset() -> CombinedToolset[None]:
             return CombinedToolset(
                 [
-                    build_toolset(connections, connections.accounts(), session_dir, tools_policy),
+                    build_toolset(connections, connections.accounts(), session_dir),
                     build_web_tools(settings),
                     workspace_tools(session_dir),
                     build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
@@ -263,17 +263,20 @@ def _create_app(
             account_toolset(),
             tools_policy,
             gateway.registry,
-            PROFILE + "\nFor a missing or disconnected app, call discover_tools to find one, then "
+            PROFILE + "\nComposio is your library of app integrations. Use discover_tools to check "
+            "whether the library supports an app and whether it is connected. Use find_app_actions "
+            "to load only the actions you need from a connected app. When no app is needed, "
+            "answer without searching the library. To connect a supported app, call "
             "setup_capability with its slug: the person gets a sign-in card in chat and "
             "authorizes in their browser. Never send the person to a command line "
-            "(/connect remains a manual fallback). A connected app's tools load for the "
-            "next message; no restart is needed." + WEB_GUIDANCE + WORKSPACE_GUIDANCE,
+            "(/connect remains a manual fallback). The connection is ready on the next "
+            "message; no restart is needed." + WEB_GUIDANCE + WORKSPACE_GUIDANCE,
             memory=build_memory(session_dir / "memory.db", namespace="owner"),
             state_dir=session_dir,
             result_path=db_path,
             read_tools=READ_TOOLS | WEB_READ_TOOLS | WORKSPACE_READ_TOOLS | {"current_time"},
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
-            capabilities=workspace_read_capabilities(workspace_root(session_dir)),
+            capabilities=workspace_read_capabilities(workspace_root(session_dir), deferred=True),
         )
         tools_policy = harness.policy
         harness.live_instructions.append(
@@ -304,7 +307,9 @@ def _create_app(
             result_path=db_path,
             read_tools=WORLD_READ_TOOLS | WEB_READ_TOOLS | WORKSPACE_READ_TOOLS,
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
-            capabilities=workspace_read_capabilities(workspace_root(settings.data_dir)),
+            capabilities=workspace_read_capabilities(
+                workspace_root(settings.data_dir), deferred=True
+            ),
         )
     # One seam for both branches: memory/skill rules are unioned inside the
     # Harness, so the profile overlay lands on the composed policy. The
@@ -334,7 +339,7 @@ def _create_app(
     gateway.model("fast", require_tools=True)
     log = EventLog(db_path)
     # Before the runner builds the agent, which reads the harness's capabilities.
-    harness.capabilities.append(conversation_search(log))
+    harness.capabilities.append(conversation_search(log, deferred=True))
     hub = Hub(log)
     if setup_journal is not None:
         # The setup toolset was built before the log and hub existed; one seam

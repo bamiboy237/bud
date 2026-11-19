@@ -88,7 +88,7 @@ class Harness:
             no_grants=policy.no_grants,
         )
         self.results = SqliteResultStore(result_path, retention=result_retention)
-        self.output_limits = build_output_limits(self.results, read_tools)
+        self.output_limits = build_output_limits(self.results)
         self.registry = registry
         self.code_mode = build_code_mode(
             {

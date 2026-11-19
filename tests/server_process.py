@@ -1,12 +1,14 @@
 """Offline entry point for the real HTTP server used by test_server."""
 
 import argparse
+import json
 import os
 import socket
 import threading
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import uvicorn
 from pydantic_ai.messages import (
@@ -19,6 +21,8 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
+from bud.composio.binding import AccountBinding
+from bud.composio.connection import Connections
 from bud.config import Settings, get_settings
 from bud.core import server
 from bud.gateway.ledger import Ledger
@@ -54,6 +58,16 @@ def scripted_response(messages: list[ModelMessage], info: AgentInfo) -> ModelRes
         return ModelResponse(
             parts=[ToolCallPart(name, args, tool_call_id=f"script-{name}-{len(parts)}")]
         )
+
+    if prompt == "Send hello on Slack":
+        if any(part.tool_name == "SLACK_SEND_MESSAGE" for part in returns):
+            return ModelResponse(parts=[TextPart("Sent to Slack.")])
+        if "SLACK_SEND_MESSAGE" in tools:
+            return call("SLACK_SEND_MESSAGE", {"text": "hello"})
+        previous = next((part for part in returns if part.tool_name == "find_app_actions"), None)
+        if previous is not None:
+            raise AssertionError(f"Slack action not exposed after discovery: {previous!r}")
+        return call("find_app_actions", {"app": "slack", "query": "send message"})
 
     if "finish_job" in outputs:
         written = next(
@@ -175,6 +189,57 @@ def checkpoint_dispatch(stack: ExitStack, data_dir: Path, checkpoint: str) -> No
         raise ValueError(checkpoint)
 
 
+def fake_accounts(settings: Settings):
+    binding = AccountBinding("owner", 1, (("slack", "fake-slack-account"),))
+    connections = Mock(spec=Connections)
+    connections.settings = settings
+    connections.folder = settings.data_dir / "composio"
+    connections.capture_binding.return_value = binding
+    connections.binding = binding
+    connections.accounts.return_value = binding.accounts
+    connections.store = Mock()
+    connections.store.session_scope.return_value = "offline-scope"
+    connections.restart_required.return_value = False
+    calls = settings.data_dir / "app-calls.jsonl"
+
+    def record(method, **values):
+        with calls.open("a") as log:
+            log.write(json.dumps({"method": method, **values}) + "\n")
+
+    def search(**values):
+        record("search", **values)
+        return SimpleNamespace(
+            items=[
+                SimpleNamespace(
+                    slug="SLACK_SEND_MESSAGE",
+                    description="Send a message.",
+                    version="20261118_00",
+                    input_parameters={"type": "object", "properties": {"text": {"type": "string"}}},
+                )
+            ]
+        )
+
+    def execute(name, **values):
+        record("execute", name=name, **values)
+        return SimpleNamespace(model_dump=lambda **_: {"successful": True, "data": {"id": "one"}})
+
+    def rank(session, queries):
+        record("rank", session=session, queries=queries)
+        return SimpleNamespace(
+            results=[
+                SimpleNamespace(primary_tool_slugs=["SLACK_SEND_MESSAGE"], related_tool_slugs=[])
+            ]
+        )
+
+    client = connections.client.return_value
+    client.create.return_value = SimpleNamespace(session_id="offline-search")
+    client.client.tool_router.session.search.side_effect = rank
+    api = client.client.tools
+    api.list.side_effect = search
+    api.execute.side_effect = execute
+    return connections
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fd", type=int, required=True)
@@ -186,7 +251,10 @@ def main() -> None:
         Settings.model_config["env_file"] = None
         get_settings.cache_clear()
         stack.enter_context(patch.object(server, "build_gateway", offline_gateway))
-        app = server.create_app(simulate=True)
+        accounts = os.environ.get("BUD_TEST_ACCOUNTS") == "1"
+        if accounts:
+            stack.enter_context(patch.object(server, "Connections", fake_accounts))
+        app = server.create_app(simulate=not accounts)
         if args.checkpoint:
             checkpoint_dispatch(stack, get_settings().data_dir, args.checkpoint)
         with socket.socket(fileno=args.fd) as listener:
