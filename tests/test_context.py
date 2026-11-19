@@ -91,7 +91,7 @@ async def test_small_history_is_unchanged_without_a_model_call():
     assert not calls
 
 
-async def test_old_app_results_stay_available_without_refilling_the_prompt(tmp_path):
+async def test_old_app_results_stay_available_without_refilling_the_prompt(tmp_path, monkeypatch):
     log = EventLog(tmp_path / "events.db")
     log.append_once("session", "run.queued", {}, key="old-run:queued")
     log.append_once("session", "run.queued", {}, key="new-run:queued")
@@ -127,6 +127,13 @@ async def test_old_app_results_stay_available_without_refilling_the_prompt(tmp_p
     original = messages[2].parts[0]
     assert isinstance(original, ToolReturnPart)
     assert original.content == payload
+
+    # A later step finds the stored copy and does not lock the database to write it again.
+    writes = []
+    monkeypatch.setattr(store, "write", lambda *args: writes.append(args))
+    await agent.run("Again", message_history=messages, conversation_id="session", run_id="new-run")
+    assert received[-1].content == result.content
+    assert writes == []
 
 
 async def test_compaction_summarizes_when_recent_results_cannot_be_cleared():

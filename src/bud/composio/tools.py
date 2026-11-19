@@ -17,12 +17,17 @@ from typing import Any, Self
 from composio import SESSION_PRESET_DIRECT_TOOLS
 from pydantic import BaseModel, ValidationError
 from pydantic_ai import RunContext, Tool
-from pydantic_ai.messages import ModelRequest, ToolReturn, ToolReturnPart
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    ToolCallPart,
+    ToolReturn,
+    ToolReturnPart,
+)
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import (
     AbstractToolset,
     CombinedToolset,
-    DeferredLoadingToolset,
     FunctionToolset,
     ToolsetTool,
     WrapperToolset,
@@ -31,8 +36,10 @@ from pydantic_core import SchemaValidator, core_schema
 
 from bud.composio.binding import AccountBinding, valid_toolkit
 from bud.composio.calendar import CREATE as CALENDAR_CREATE
+from bud.composio.calendar import GET as CALENDAR_GET
+from bud.composio.calendar import GET_CALENDAR, execute_calendar, operation_schema
+from bud.composio.calendar import LIST as CALENDAR_LIST
 from bud.composio.calendar import PATCH as CALENDAR_PATCH
-from bud.composio.calendar import execute_calendar, operation_schema
 from bud.composio.connection import ConnectionError, Connections, safe_errors
 from bud.composio.discovery import search
 from bud.composio.drafts import verify_reply_body
@@ -42,6 +49,8 @@ from bud.harness.ask import ask_user
 APP_SEARCH = "find_app_actions"
 MAX_ACTIONS = 6
 MAX_SELECTED = 12
+# Schema characters kept from earlier searches. Bounds what one search adds to later requests.
+MAX_SELECTED_SCHEMA = 48_000
 MAX_ACTION_SCHEMA = 16_000
 ACTION_ARGS = SchemaValidator(core_schema.dict_schema(keys_schema=core_schema.str_schema()))
 
@@ -64,6 +73,14 @@ WRITE_TOOLS = {
     "GOOGLECALENDAR_PATCH_EVENT",
 }
 ALLOWED_TOOLS = READ_TOOLS | WRITE_TOOLS
+# Reads Bud runs itself to preview, verify, or check a write. Search loads them with the write,
+# each with its own definition and version.
+COMPANION_READS = {
+    "GMAIL_CREATE_EMAIL_DRAFT": ("GMAIL_FETCH_MESSAGE_BY_THREAD_ID", "GMAIL_GET_DRAFT"),
+    "GMAIL_SEND_EMAIL": ("GMAIL_FETCH_MESSAGE_BY_THREAD_ID",),
+    CALENDAR_CREATE: (CALENDAR_LIST, CALENDAR_GET, GET_CALENDAR),
+    CALENDAR_PATCH: (CALENDAR_LIST, CALENDAR_GET, GET_CALENDAR),
+}
 
 PROFILE = """
 Public web research cannot read private accounts. Find the connected app action instead.
@@ -174,6 +191,24 @@ def reads_only(app: str, slug: str, tags: list[str]) -> bool:
     return "readOnlyHint" in tags and not CHANGE_HINTS & set(tags) and verb in READ_VERBS
 
 
+def pending_calls(messages: list[Any]) -> set[str]:
+    """Tool names called in these messages that have no result yet."""
+    answered = {
+        part.tool_call_id
+        for message in messages
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    }
+    return {
+        part.tool_name
+        for message in messages
+        if isinstance(message, ModelResponse)
+        for part in message.parts
+        if isinstance(part, ToolCallPart) and part.tool_call_id not in answered
+    }
+
+
 @dataclass
 class AppActions(AbstractToolset[None]):
     connections: Connections
@@ -245,6 +280,8 @@ class AppActions(AbstractToolset[None]):
                 if slug not in slugs and self._allowed(app, slug):
                     slugs.append(slug)
         slugs = slugs[:MAX_ACTIONS]
+        for slug in list(slugs):
+            slugs += [read for read in COMPANION_READS.get(slug, ()) if read not in slugs]
         if not slugs:
             return []
         page = client.client.tools.list(tool_slugs=",".join(slugs), limit=len(slugs))
@@ -264,7 +301,8 @@ class AppActions(AbstractToolset[None]):
         """Actions found earlier in this conversation, in the order they were first found.
 
         They stay offered on later turns, so the tool list and the prompt cache behind it
-        stay the same from one request to the next. Only the most recently found are kept.
+        stay the same from one request to the next. Only the most recently found are kept,
+        within a schema budget.
         """
         found = [
             raw
@@ -286,8 +324,17 @@ class AppActions(AbstractToolset[None]):
             if self._allowed(action.app, action.name):
                 first.setdefault(action.name, action)
                 last_seen[action.name] = position
-        recent = sorted(last_seen, key=last_seen.__getitem__)[-MAX_SELECTED:]
-        return {name: action for name, action in first.items() if name in recent}
+        # A call waiting for approval keeps its definition, or the approved call could not run.
+        pending = pending_calls(ctx.messages)
+        keep: set[str] = set()
+        budget = MAX_SELECTED_SCHEMA
+        for name in sorted(last_seen, key=last_seen.__getitem__, reverse=True):
+            size = len(json.dumps(first[name].schema_, ensure_ascii=False))
+            if name in pending or (len(keep) < MAX_SELECTED and size <= budget):
+                keep.add(name)
+                budget -= size
+        keep |= {read for name in keep for read in COMPANION_READS.get(name, ())}
+        return {name: action for name, action in first.items() if name in keep}
 
     @property
     def id(self) -> str:
@@ -343,14 +390,13 @@ class ComposioTools(WrapperToolset[None]):
     allowed_tools: frozenset[str] = field(kw_only=True)
     connections: Connections = field(kw_only=True)
     binding: AccountBinding = field(kw_only=True)
-    tool_accounts: dict[str, str] = field(kw_only=True, default_factory=dict)
 
     async def _check_binding(self, name: str, tool: ToolsetTool[None] | None = None) -> None:
         selected = (tool.tool_def.metadata or {}).get(COMPOSIO_ACTION) if tool else None
         app = (
             CatalogAction.model_validate(selected).app
             if selected
-            else self.tool_accounts.get(name, name.split("_", 1)[0].lower())
+            else name.split("_", 1)[0].lower()
         )
         await asyncio.to_thread(
             self.connections.assert_current_binding,
@@ -473,18 +519,8 @@ class ComposioTools(WrapperToolset[None]):
                 if name in self.allowed_tools or COMPOSIO_ACTION in (tool.tool_def.metadata or {})
             }
 
-    async def _read(
-        self,
-        name: str,
-        args: dict[str, Any],
-        ctx: RunContext[None],
-        selected: ToolsetTool[None] | None = None,
-    ) -> Any:
-        metadata = (selected.tool_def.metadata or {}).get(COMPOSIO_ACTION) if selected else None
-        if isinstance(self.wrapped, AppActions) and name in READ_TOOLS and metadata:
-            action = CatalogAction.model_validate(metadata)
-            await self._check_binding(name, selected)
-            return await self.wrapped.execute(name, args, action.app, action.version)
+    async def _read(self, name: str, args: dict[str, Any], ctx: RunContext[None]) -> Any:
+        """Run a read Bud needs for a write, with the read's own definition and version."""
         tools = await self.get_tools(ctx)
         if name not in READ_TOOLS or name not in tools:
             raise ConnectionError("Required verification tool is unavailable.")
@@ -497,7 +533,6 @@ class ComposioTools(WrapperToolset[None]):
             "GMAIL_FETCH_MESSAGE_BY_THREAD_ID",
             {"thread_id": args["thread_id"], "user_id": "me"},
             ctx,
-            tool,
         )
         if (
             not isinstance(thread, dict)
@@ -517,7 +552,6 @@ class ComposioTools(WrapperToolset[None]):
                 "GMAIL_GET_DRAFT",
                 {"draft_id": draft_id, "format": "full", "user_id": "me"},
                 ctx,
-                tool,
             )
             message = saved.get("data", {}).get("message", {})
             recipients = message.get("to", [])
@@ -607,7 +641,7 @@ class ComposioTools(WrapperToolset[None]):
                 return await execute_calendar(
                     name,
                     tool_args,
-                    read=lambda read_name, args: self._read(read_name, args, ctx, tool),
+                    read=lambda read_name, args: self._read(read_name, args, ctx),
                     write=lambda write_name, args: self._dispatch(write_name, args, ctx, tool),
                     confirm=lambda receipt: self._record_confirmation(
                         (ctx.tool_call_metadata or {})["approval_id"],
@@ -616,11 +650,6 @@ class ComposioTools(WrapperToolset[None]):
                     ),
                 )
             return await self._dispatch(name, tool_args, ctx, tool)
-
-
-def compose_tools(remote: AbstractToolset[None], base: list[Tool[None]]) -> CombinedToolset[None]:
-    """Bud's own tools stay visible; an app's large tool list loads on demand."""
-    return CombinedToolset([DeferredLoadingToolset(remote), FunctionToolset(base)])
 
 
 def build_toolset(

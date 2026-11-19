@@ -43,10 +43,11 @@ async def spill_old_results(
             if len(text) <= SPILL_CHARS:
                 continue
             data = text.encode()
-            digest = sha256(data).hexdigest()
             # Keyed by the run that produced it, so later turns resend identical text and
-            # the prompt cache survives.
-            handle = await store.write(f"{message.run_id or run_id}/history-{digest}", data)
+            # the prompt cache survives. Stored once; later steps only check that it is there.
+            handle = f"{message.run_id or run_id}/history-{sha256(data).hexdigest()}"
+            if not await store.exists(handle):
+                await store.write(handle, data)
             parts[i] = replace(
                 part,
                 content=(
@@ -105,6 +106,16 @@ class SqliteResultStore:
             )
         return key
 
+    async def exists(self, handle: str) -> bool:
+        return await asyncio.to_thread(self._exists, handle)
+
+    def _exists(self, handle: str) -> bool:
+        with self._connect() as db:
+            return (
+                db.execute("SELECT 1 FROM tool_results WHERE handle = ?", (handle,)).fetchone()
+                is not None
+            )
+
     async def read(self, handle: str) -> bytes:
         return await asyncio.to_thread(self._read, handle)
 
@@ -135,7 +146,7 @@ class SqliteResultStore:
         """Read a stored result by character offset, including oversized single-line JSON.
 
         Args:
-            handle: Exact handle from a spilled read-only tool result.
+            handle: Exact handle from a saved tool result.
             offset: Characters to skip from the start, or the end when from_end is true.
             limit: Characters to return, from 1 to 4,000.
             from_end: Read a slice near the end instead of the start.
