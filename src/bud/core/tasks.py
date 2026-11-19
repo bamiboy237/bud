@@ -1,10 +1,12 @@
 """Jobs reuse ordinary sessions; the feed receives their approvals and results."""
 
 import json
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Annotated
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -211,6 +213,33 @@ def _owner_words(ctx: RunContext[None]) -> str | None:
     return request if isinstance(request, str) and request.strip() else None
 
 
+logger = logging.getLogger(__name__)
+
+
+def report_name(item: WorkItem, finished: datetime) -> str:
+    """Where a finished job's report goes in the workspace, fixed by the job and its end."""
+    slug = re.sub(r"[^a-z0-9]+", "-", item.title.lower()).strip("-")[:60] or "report"
+    return f"reports/{finished:%Y-%m-%d}-job-{item.task_id}-{slug}.md"
+
+
+def save_report(workspace: Path, name: str, item: WorkItem, finished: datetime, text: str) -> None:
+    """Writes the report once. An existing file is never replaced, so a replay or an edit
+    the owner made since is safe."""
+    folder = workspace / "reports"
+    if folder.is_symlink():
+        logger.warning("Not saving job %d's report: %s is a link", item.task_id, folder)
+        return
+    folder.mkdir(exist_ok=True, mode=0o700)
+    body = (
+        f"# {item.title}\n\nJob {item.task_id}, finished {finished:%Y-%m-%d %H:%M} UTC.\n\n{text}\n"
+    )
+    try:
+        with open(workspace / name, "x", encoding="utf-8") as file:
+            file.write(body)
+    except FileExistsError:
+        pass
+
+
 def _last_report(events: list) -> dict:
     """The report filed by the job's latest finished run, if it filed one."""
     for event in reversed(events):
@@ -220,9 +249,11 @@ def _last_report(events: list) -> dict:
 
 
 class WorkItems:
-    def __init__(self, hub: Hub) -> None:
+    def __init__(self, hub: Hub, workspace: Path | None = None) -> None:
         self.hub = hub
         self.log = hub.log
+        # Finished jobs save their report here, without asking. None keeps reports in chat.
+        self.workspace = workspace
         with self.log._connect() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -457,8 +488,17 @@ class WorkItems:
             and state.transcript[-1].role == "assistant"
             else None,
             outcome=_last_report(events).get("outcome") if status == "completed" else None,
+            report=self._report(item, events) if status == "completed" else None,
             stalled=self._stalled(item, events) if status in WORKING else None,
         )
+
+    def _report(self, item: WorkItem, events: list[Event]) -> str | None:
+        """The saved report of the job's latest finished run, as an absolute path."""
+        end = next((e for e in reversed(events) if e.type == "run.completed"), None)
+        if self.workspace is None or end is None:
+            return None
+        path = self.workspace / report_name(item, end.created_at)
+        return str(path) if path.is_file() else None
 
     def _stalled(self, item: WorkItem, events: list[Event]) -> str | None:
         """The reason of a stall notice the job has not answered with activity since."""
@@ -586,11 +626,17 @@ class WorkItems:
             "failed": "task.failed",
             "cancelled": "task.cancelled",
         }
+        data = {"task_id": item.task_id, "title": item.title, "text": text, "origin": item.origin}
+        if notices[kind] == "task.completed" and self.workspace is not None and text.strip():
+            name = report_name(item, terminal.created_at)
+            try:
+                save_report(self.workspace, name, item, terminal.created_at, text)
+                data["report"] = name
+                data["report_path"] = str(self.workspace / name)
+            except OSError as exc:
+                logger.warning("Could not save job %d's report: %s", item.task_id, exc)
         self.hub.publish_once(
-            item.feed_id,
-            notices[kind],
-            {"task_id": item.task_id, "title": item.title, "text": text, "origin": item.origin},
-            key=f"task:{item.task_id}:terminal:{terminal.id}",
+            item.feed_id, notices[kind], data, key=f"task:{item.task_id}:terminal:{terminal.id}"
         )
 
 

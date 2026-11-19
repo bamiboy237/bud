@@ -7,6 +7,7 @@ from collections.abc import AsyncIterable
 from contextvars import Context, ContextVar
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from pathlib import Path
 from typing import cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -117,6 +118,7 @@ class Runner(DBOSConfiguredInstance):
         jobs: bool = False,
         learner: Learner | None = None,
         recall: Recall | None = None,
+        workspace: Path | None = None,
     ) -> None:
         self.hub = hub
         self.gateway = gateway
@@ -131,7 +133,7 @@ class Runner(DBOSConfiguredInstance):
         self._closing = False
         self._current: ContextVar[dict] = ContextVar("bud_run")
         self.session_models: dict[str, str] = {}
-        self.work_items = WorkItems(hub) if jobs else None
+        self.work_items = WorkItems(hub, workspace) if jobs else None
         # Checks each finished job's deliverable; without it, reports say "not checked".
         self.verifier = build_verifier() if jobs else None
         self.job_output = job_output(self.verifier)
@@ -1414,7 +1416,12 @@ def job_updates_note(events: list[Event], run: dict) -> str:
                 if len(text) > limit
                 else ""
             )
-            lines.append(f"- {job} {e.type.removeprefix('task.')}: {json.dumps(text[:limit])}{cut}")
+            saved = (
+                f" Saved in your workspace as {e.data['report']}." if e.data.get("report") else ""
+            )
+            lines.append(
+                f"- {job} {e.type.removeprefix('task.')}: {json.dumps(text[:limit])}{cut}{saved}"
+            )
     ended = {
         e.data["task_id"]
         for e in events

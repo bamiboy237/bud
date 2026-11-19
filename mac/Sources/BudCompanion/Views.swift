@@ -476,10 +476,13 @@ private struct Bubble: View {
                 StepsSummary(companion: companion)
             }
             ForEach(companion.notices, id: \.self) { notice in
-                Label(notice, systemImage: "arrow.turn.down.right")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(notice, systemImage: "arrow.turn.down.right")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    if let report = companion.noticeReports[notice] { OpenReport(file: report) }
+                }
             }
             if companion.unsentSpeech != nil { UnsentSpeech(companion: companion) }
             if !companion.heldMessages.isEmpty { UnsentMessage(companion: companion) }
@@ -1260,5 +1263,19 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 460)
         .onAppear { draft.settings = BudSettings.load() }
+    }
+}
+
+/// Opens a finished job's saved report in the app the owner uses for that file type.
+struct OpenReport: View {
+    let file: URL
+
+    var body: some View {
+        Button("Open report") { NSWorkspace.shared.open(file) }
+            .buttonStyle(.link)
+            .font(.callout)
+            .padding(.leading, 22)
+            .help(file.path)
+            .accessibilityLabel("Open report \(file.lastPathComponent)")
     }
 }

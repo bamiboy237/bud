@@ -205,9 +205,12 @@ private struct ConversationView: View {
                 WorkLine(work: work)
             }
             ForEach(companion.notices, id: \.self) { notice in
-                Label(notice, systemImage: "arrow.turn.down.right")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(notice, systemImage: "arrow.turn.down.right")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    if let report = companion.noticeReports[notice] { OpenReport(file: report) }
+                }
             }
             if companion.unsentSpeech != nil {
                 UnsentSpeech(companion: companion).frame(maxWidth: 420)

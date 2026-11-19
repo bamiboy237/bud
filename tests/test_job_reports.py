@@ -16,6 +16,7 @@ from pydantic_ai.models.function import AgentInfo
 from bud.core.log import EventLog
 from bud.core.projection import JOB_REPORT
 from bud.core.runner import job_updates_note
+from bud.core.tasks import WorkItem, report_name, save_report
 from tests.runner_support import reply, running_bud
 
 BRIEF = {
@@ -316,3 +317,48 @@ def test_a_result_too_long_for_the_report_points_to_the_whole_one(tmp_path):
     note = job_updates_note(log.read("owner"), {"run_id": "next", "trigger": "message"})
 
     assert "cut at 4,000 of 5,000 characters; inspect_task(3) shows all of it" in note
+
+
+async def test_a_finished_job_saves_its_report_in_the_workspace(tmp_path):
+    prompts: list[str] = []
+    async with running_bud(tmp_path, bud_with_one_job(prompts), jobs=True) as bud:
+        bud.log.append("owner", "session.created")
+        bud.runner.start("owner", "When does my lease renew?", "message-1")
+        await bud.settle()
+        events = bud.log.read("owner")
+        [task] = bud.runner.snapshot("owner").tasks
+
+    [done] = [e.data for e in events if e.type == "task.completed"]
+    assert done["report"].startswith("reports/") and done["report"].endswith(
+        "-job-1-find-the-renewal-date.md"
+    )
+    saved = bud.root / done["report"]
+    assert done["report_path"] == str(saved)
+    text = saved.read_text()
+    assert text.startswith("# Find the renewal date\n\nJob 1, finished ")
+    assert "The lease renews on 3 March." in text
+    # The report turn tells bud where it is, and clients can open it.
+    assert f"Saved in your workspace as {done['report']}." in prompts[-1]
+    assert task.report == str(saved)
+
+
+def test_a_saved_report_is_never_overwritten_or_written_through_a_link(tmp_path):
+    item = WorkItem.model_construct(task_id=7, title="Weekly: Q3 / Q4 numbers!")
+    finished = datetime(2026, 11, 19, 15, 30, tzinfo=UTC)
+    name = report_name(item, finished)
+    assert name == "reports/2026-11-19-job-7-weekly-q3-q4-numbers.md"
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    save_report(workspace, name, item, finished, "First version.")
+    (workspace / name).write_text("The owner's edits.")
+    save_report(workspace, name, item, finished, "Replayed version.")
+    assert (workspace / name).read_text() == "The owner's edits."
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    linked = tmp_path / "linked"
+    linked.mkdir()
+    (linked / "reports").symlink_to(elsewhere, target_is_directory=True)
+    save_report(linked, name, item, finished, "Should not escape.")
+    assert list(elsewhere.iterdir()) == []
