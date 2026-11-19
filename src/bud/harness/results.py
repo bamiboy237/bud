@@ -1,7 +1,8 @@
 """Saved tool results.
 
-A result expires `retention` after its last read, unless Bud chose to keep it longer, and
-never while its session is running or awaiting approval.
+A result expires `retention` after its last read, or later when Bud chose to keep it longer.
+Keeping never shortens that. Nothing expires while its session is running or awaiting
+approval.
 """
 
 from __future__ import annotations
@@ -230,9 +231,8 @@ class SqliteResultStore:
                         'run.stop_requested', 'run.cancelled'
                     )
                 )
-                DELETE FROM tool_results WHERE (
-                    CASE WHEN keep_until IS NULL THEN last_used < ? ELSE keep_until < ? END
-                ) AND NOT EXISTS (
+                DELETE FROM tool_results WHERE last_used < ?
+                AND (keep_until IS NULL OR keep_until < ?) AND NOT EXISTS (
                     SELECT 1 FROM latest WHERE latest.session_id = tool_results.session_id
                     AND latest.rank = 1
                     AND latest.type IN (

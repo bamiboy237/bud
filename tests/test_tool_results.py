@@ -30,9 +30,12 @@ def age(store, handle, seconds):
         )
 
 
+REAL_TIME = time.time
+
+
 def shift_clock(monkeypatch, seconds):
-    real = time.time
-    monkeypatch.setattr("bud.harness.results.time.time", lambda: real() + seconds)
+    """Moves the clock to `seconds` from the real now; shifts do not add up."""
+    monkeypatch.setattr("bud.harness.results.time.time", lambda: REAL_TIME() + seconds)
 
 
 async def test_an_unkept_result_expires_after_the_default(tmp_path):
@@ -73,6 +76,36 @@ async def test_the_default_keep_is_one_day_and_none_keeps_it_until_changed(tmp_p
     await store.keep_tool_result("run/always", days=1)
     shift_clock(monkeypatch, 3652 * DAY)
     assert await store.prune() == 1
+
+
+async def test_keeping_never_shortens_the_default_and_a_read_still_extends_it(
+    tmp_path, monkeypatch
+):
+    log = EventLog(tmp_path / "events.db")
+    log.append_once("session", "run.queued", {}, key="run:queued")
+    log.append("session", "run.completed", {"run_id": "run"})
+    store = SqliteResultStore(log.path, retention=timedelta(hours=72))
+    store._write("run/long", b"notes")
+    await store.keep_tool_result("run/long", days=1)
+
+    shift_clock(monkeypatch, 2 * DAY)
+    assert await store.prune() == 0  # the 72-hour default still holds
+    await store.read("run/long")  # read on day 2: the default now runs to day 5
+    shift_clock(monkeypatch, 4 * DAY)
+    assert await store.prune() == 0
+    shift_clock(monkeypatch, 6 * DAY)
+    assert await store.prune() == 1
+
+
+async def test_a_running_session_protects_a_kept_result_past_its_date(tmp_path, monkeypatch):
+    log = EventLog(tmp_path / "events.db")
+    log.append_once("session", "run.queued", {"run_id": "run"}, key="run:queued")
+    store = SqliteResultStore(log.path, retention=timedelta(hours=24))
+    store._write("run/live", b"notes")
+    await store.keep_tool_result("run/live", days=1)
+
+    shift_clock(monkeypatch, 3 * DAY)
+    assert await store.prune() == 0
 
 
 async def test_keeping_an_expired_result_says_so(tmp_path):
