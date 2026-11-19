@@ -1,7 +1,11 @@
-from pydantic_ai import RunContext
+import re
+from datetime import timedelta
+
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
+    TextPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -11,7 +15,9 @@ from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.usage import RunUsage
 from pydantic_ai_harness.compaction import estimate_token_count
 
+from bud.core.log import EventLog
 from bud.harness.context import BackgroundCompaction
+from bud.harness.results import SqliteResultStore
 
 
 def history(count, size):
@@ -83,6 +89,51 @@ async def test_small_history_is_unchanged_without_a_model_call():
     result, calls, _ = await compact(messages)
     assert result == messages
     assert not calls
+
+
+async def test_old_app_results_stay_available_without_refilling_the_prompt(tmp_path, monkeypatch):
+    log = EventLog(tmp_path / "events.db")
+    log.append_once("session", "run.queued", {}, key="old-run:queued")
+    log.append_once("session", "run.queued", {}, key="new-run:queued")
+    store = SqliteResultStore(log.path, retention=timedelta(hours=1))
+    payload = "A repository row.\n" * 12_000
+    messages = [
+        ModelRequest(parts=[UserPromptPart("List the repositories")]),
+        ModelResponse(parts=[ToolCallPart("GITHUB_LIST_REPOSITORIES", {}, tool_call_id="repos")]),
+        ModelRequest(
+            parts=[ToolReturnPart("GITHUB_LIST_REPOSITORIES", payload, tool_call_id="repos")],
+            run_id="old-run",
+        ),
+        ModelResponse(parts=[TextPart("I listed the repositories.")]),
+    ]
+    received = []
+
+    def respond(messages, _):
+        received.extend(p for m in messages for p in m.parts if isinstance(p, ToolReturnPart))
+        return ModelResponse(parts=[TextPart("Hello.")])
+
+    agent = Agent(
+        FunctionModel(respond),
+        capabilities=[BackgroundCompaction(record=lambda _: None, result_store=store)],
+    )
+    await agent.run("Hi", message_history=messages, conversation_id="session", run_id="new-run")
+    [result] = received
+    assert len(result.content) < 300
+    assert "Earlier GITHUB_LIST_REPOSITORIES result" in result.content
+    # Named after the run that produced it, so every later turn sends the same text.
+    handle = re.search(r"old-run/history-[0-9a-f]{64}", result.content)
+    assert handle is not None
+    assert await store.load_tool_result(handle[0]) == payload
+    original = messages[2].parts[0]
+    assert isinstance(original, ToolReturnPart)
+    assert original.content == payload
+
+    # A later step finds the stored copy and does not lock the database to write it again.
+    writes = []
+    monkeypatch.setattr(store, "write", lambda *args: writes.append(args))
+    await agent.run("Again", message_history=messages, conversation_id="session", run_id="new-run")
+    assert received[-1].content == result.content
+    assert writes == []
 
 
 async def test_compaction_summarizes_when_recent_results_cannot_be_cleared():

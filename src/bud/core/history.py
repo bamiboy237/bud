@@ -26,6 +26,11 @@ class EventLogHistory:
         return ModelMessagesTypeAdapter.validate_python(self.log.run_messages(run_id))
 
 
-def conversation_search(log: EventLog) -> ConversationSearch[None]:
+class EarlierTurns(ConversationSearch[None]):
+    def get_description(self) -> str:
+        return "Search earlier turns in this conversation."
+
+
+def conversation_search(log: EventLog, *, deferred: bool = False) -> ConversationSearch[None]:
     """Search this conversation's earlier runs, including turns compaction dropped."""
-    return ConversationSearch(EventLogHistory(log), scope="conversation")
+    return EarlierTurns(EventLogHistory(log), scope="conversation", defer_loading=deferred)

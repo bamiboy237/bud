@@ -25,10 +25,11 @@ TOKEN = "offline-process-test-owner-" + "x" * 32
 
 
 class ServerProcess:
-    def __init__(self, root: Path, checkpoint: str | None = None):
+    def __init__(self, root: Path, checkpoint: str | None = None, *, accounts: bool = False):
         self.root = root.resolve()
         self.data = self.root / "data"
         self.checkpoint = checkpoint
+        self.accounts = accounts
         self.process = None
         self.client = None
         self.last_snapshot = None
@@ -56,6 +57,8 @@ class ServerProcess:
                 "PYTHONUNBUFFERED": "1",
                 "DBOS_DISABLE_OTLP": "true",
             }
+            if self.accounts:
+                env["BUD_TEST_ACCOUNTS"] = "1"
             command = [
                 sys.executable,
                 str(ROOT / "tests" / "server_process.py"),
@@ -190,8 +193,8 @@ class ServerProcess:
 
 
 @contextmanager
-def running(root: Path, checkpoint: str | None = None):
-    process = ServerProcess(root, checkpoint)
+def running(root: Path, checkpoint: str | None = None, *, accounts: bool = False):
+    process = ServerProcess(root, checkpoint, accounts=accounts)
     try:
         yield process.start()
     finally:
@@ -230,6 +233,58 @@ def assert_claim(server: ServerProcess, approval: dict):
     assert [event["approval_id"] for event in server.events("approval.granted")] == [
         approval["approval_id"]
     ]
+
+
+def test_app_search_is_on_demand_and_approval_survives_server_restart(tmp_path):
+    def ask(server, session, text, message_id):
+        server.request(
+            "POST",
+            f"/sessions/{session}/messages",
+            status=202,
+            json={"text": text, "message_id": message_id},
+        )
+
+    def reply_arrived(server, session, text):
+        return any(t["text"] == text for t in server.snapshot(session)["transcript"])
+
+    with running(tmp_path, accounts=True) as server:
+        session = server.request("POST", "/sessions", status=201)["session_id"]
+        calls = server.data / "app-calls.jsonl"
+        ask(server, session, "Hi", "hi")
+        server.wait(lambda: reply_arrived(server, session, "Offline reply."), "plain reply")
+        assert not calls.exists()
+        ask(server, session, "Send hello on Slack", "slack")
+        approval = server.wait(
+            lambda: next(iter(server.snapshot(session)["pending_approvals"]), None),
+            "Slack approval",
+        )
+        assert approval["tool"] == "SLACK_SEND_MESSAGE"
+        assert approval["args"] == {"text": "hello"}
+        assert not approval["grantable"]
+        assert [json.loads(line) for line in calls.read_text().splitlines()] == [
+            {
+                "method": "rank",
+                "session": "offline-search",
+                "queries": [{"use_case": "send message"}],
+            },
+            {"method": "search", "tool_slugs": "SLACK_SEND_MESSAGE", "limit": 1},
+        ]
+
+    with running(tmp_path, accounts=True) as server:
+        assert decide(server, session, approval, True)["applied"]
+        server.wait(
+            lambda: reply_arrived(server, session, "Sent to Slack."), "confirmed Slack reply"
+        )
+        log = [json.loads(line) for line in calls.read_text().splitlines()]
+        assert [entry["method"] for entry in log] == ["rank", "search", "execute"]
+        assert log[-1] == {
+            "method": "execute",
+            "name": "SLACK_SEND_MESSAGE",
+            "arguments": {"text": "hello"},
+            "user_id": "owner",
+            "connected_account_id": "fake-slack-account",
+            "version": "20261118_00",
+        }
 
 
 def test_api_authentication_and_validation(tmp_path):

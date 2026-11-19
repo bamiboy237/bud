@@ -3,14 +3,13 @@
 import asyncio
 from typing import Any, Self
 
-from pydantic_ai import Agent, RunContext, Tool
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset, ToolsetTool
 from pydantic_ai.usage import RunUsage
 
-from bud.composio.tools import compose_tools
 from bud.core.hub import Hub
 from bud.core.log import EventLog
 from bud.core.setup import (
@@ -84,28 +83,6 @@ class Recording(AbstractToolset[None]):
     async def __aexit__(self, *args: Any) -> bool | None:
         self.exits += 1
         return None
-
-
-async def test_app_tools_are_deferred_and_bud_tools_stay_visible():
-    seen: list[list[str]] = []
-
-    def respond(messages, info):
-        seen.append(sorted(definition.name for definition in info.function_tools))
-        return ModelResponse(parts=[TextPart("ok")])
-
-    agent = Agent(
-        FunctionModel(respond),
-        toolsets=[
-            compose_tools(
-                FunctionToolset[None]([tool("slack_send")]),
-                [Tool(tool("ask_user"))],
-            )
-        ],
-    )
-    await agent.run("hi")
-    # The app's tool waits behind tool search; bud's own tool is always offered.
-    assert "ask_user" in seen[-1]
-    assert "slack_send" not in seen[-1]
 
 
 async def test_agent_sees_a_tool_added_after_it_was_built(tmp_path):

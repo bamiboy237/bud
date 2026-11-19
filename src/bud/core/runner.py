@@ -181,7 +181,9 @@ class Runner(DBOSConfiguredInstance):
             if durable
             else None
         )
-        self.context = BackgroundCompaction(record=self._record_context)
+        self.context = BackgroundCompaction(
+            record=self._record_context, result_store=harness.results
+        )
         self.agent = harness.agent(
             gateway.model(tier, require_tools=True),
             self._record_decision,

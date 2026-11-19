@@ -1,17 +1,22 @@
 """Temporary tool results, retained while their session is running or awaiting approval."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import sqlite3
 import time
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
+from dataclasses import replace
 from datetime import timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any
 
 from pydantic import Field
 from pydantic_ai import RunContext
+from pydantic_ai.messages import ModelMessage, ModelRequest, ToolReturnPart
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai_harness import ToolOutputLimits
 from pydantic_ai_harness.tool_output_limits import Band, Spill, Truncate
@@ -20,6 +25,38 @@ from bud.harness.code import inside_code_mode
 
 SPILL_CHARS = 10_000
 PREVIEW_CHARS = 1_000
+
+
+async def spill_old_results(
+    store: SqliteResultStore, messages: list[ModelMessage], run_id: str
+) -> list[ModelMessage]:
+    projected: list[ModelMessage] = []
+    for message in messages:
+        if not isinstance(message, ModelRequest) or message.run_id == run_id:
+            projected.append(message)
+            continue
+        parts = list(message.parts)
+        for i, part in enumerate(parts):
+            if not isinstance(part, ToolReturnPart) or part.tool_name == "ask_user":
+                continue
+            text = part.model_response_str(wrap_if_error=False)
+            if len(text) <= SPILL_CHARS:
+                continue
+            data = text.encode()
+            # Keyed by the run that produced it, so later turns resend identical text and
+            # the prompt cache survives. Stored once; later steps only check that it is there.
+            handle = f"{message.run_id or run_id}/history-{sha256(data).hexdigest()}"
+            if not await store.exists(handle):
+                await store.write(handle, data)
+            parts[i] = replace(
+                part,
+                content=(
+                    f"Earlier {part.tool_name} result ({len(text):,} characters) saved as "
+                    f"{handle}. Use read_tool_result_chars or load_tool_result to read it."
+                ),
+            )
+        projected.append(message if parts == message.parts else replace(message, parts=parts))
+    return projected
 
 
 class SqliteResultStore:
@@ -69,6 +106,16 @@ class SqliteResultStore:
             )
         return key
 
+    async def exists(self, handle: str) -> bool:
+        return await asyncio.to_thread(self._exists, handle)
+
+    def _exists(self, handle: str) -> bool:
+        with self._connect() as db:
+            return (
+                db.execute("SELECT 1 FROM tool_results WHERE handle = ?", (handle,)).fetchone()
+                is not None
+            )
+
     async def read(self, handle: str) -> bytes:
         return await asyncio.to_thread(self._read, handle)
 
@@ -99,7 +146,7 @@ class SqliteResultStore:
         """Read a stored result by character offset, including oversized single-line JSON.
 
         Args:
-            handle: Exact handle from a spilled read-only tool result.
+            handle: Exact handle from a saved tool result.
             offset: Characters to skip from the start, or the end when from_end is true.
             limit: Characters to return, from 1 to 4,000.
             from_end: Read a slice near the end instead of the start.
@@ -157,12 +204,10 @@ class SqliteResultStore:
         return len(deleted)
 
 
-def build_output_limits(store: SqliteResultStore, read_tools: set[str]) -> ToolOutputLimits[None]:
-    limited = read_tools | {"read_memory", "search_memory", "load_tool_result"}
-
+def build_output_limits(store: SqliteResultStore) -> ToolOutputLimits[None]:
     def model_visible_result(ctx: RunContext[None], tool: ToolDefinition) -> bool:
         # Inner data stays whole; only the sandbox's public answer enters model context.
-        return tool.name == "run_code" or (tool.name in limited and not inside_code_mode.get())
+        return tool.name == "run_code" or (tool.name != "ask_user" and not inside_code_mode.get())
 
     return ToolOutputLimits(
         store=store,

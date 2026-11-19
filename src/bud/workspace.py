@@ -346,9 +346,19 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool[None]]:
     return [Tool[None](workspace_create), Tool[None](workspace_update)]
 
 
-def read_capabilities(root: Path) -> list[AbstractCapability[None]]:
+class WorkspaceFiles(FileSystem[None]):
+    def get_description(self) -> str:
+        return "List, search, and read text files in Bud's workspace."
+
+
+def read_capabilities(root: Path, *, deferred: bool = False) -> list[AbstractCapability[None]]:
     """Harness file reading over the workspace. Its files are data, never instructions."""
     return [
         LocalWorkspace(root, read_only=True, authority="none"),
-        FileSystem(tools=sorted(READ_TOOLS), denied_patterns=_DENIED),
+        WorkspaceFiles(
+            id="workspace_files",
+            defer_loading=deferred,
+            tools=sorted(READ_TOOLS),
+            denied_patterns=_DENIED,
+        ),
     ]

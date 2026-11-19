@@ -25,6 +25,7 @@ from pydantic_ai_harness.compaction._shared import (
 
 from bud.gateway.errors import error_summary
 from bud.gateway.tracked import request_session
+from bud.harness.results import SqliteResultStore, spill_old_results
 
 PARAMETERS = TypeAdapter(ModelRequestParameters)
 # After compaction the history should sit at this share of the trigger, so it lasts.
@@ -90,6 +91,7 @@ class Preparation:
 @dataclass(kw_only=True)
 class BackgroundCompaction(AbstractCapability[None]):
     record: Callable[[dict], None] = field(repr=False)
+    result_store: SqliteResultStore | None = field(default=None, repr=False)
     max_fraction: float = 0.65
     background_fraction: float = 0.8
     fallback_context_window: int = 64_000
@@ -128,6 +130,8 @@ class BackgroundCompaction(AbstractCapability[None]):
         self, ctx: RunContext[None], request_context: ModelRequestContext
     ) -> ModelRequestContext:
         messages = list(request_context.messages)
+        if self.result_store is not None and ctx.run_id:
+            messages = await spill_old_results(self.result_store, messages, ctx.run_id)
         request_context = replace(request_context, messages=messages)
         threshold = resolve_token_trigger(
             None, self.max_fraction, ctx.model, self.fallback_context_window

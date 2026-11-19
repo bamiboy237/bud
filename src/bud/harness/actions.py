@@ -36,6 +36,7 @@ from bud.harness.writes import never_reviewed, reviewable_tools, self_hosted_wri
 
 Action = Literal["allow", "ask", "deny", "review"]
 RecordDecision = Callable[[dict[str, Any]], None]
+COMPOSIO_ACTION = "bud_composio_action"
 
 
 class Policy(BaseModel):
@@ -56,6 +57,17 @@ class Policy(BaseModel):
         if tool in self.grants and tool not in self.no_grants and not never_reviewed(tool):
             return "allow"
         return action
+
+    def decide_tool(self, tool: ToolDefinition) -> Action:
+        """Like decide, for app actions found at run time.
+
+        A found action that only reads runs without asking. Any other found action asks
+        every time and never inherits a standing grant.
+        """
+        found = (tool.metadata or {}).get(COMPOSIO_ACTION)
+        if tool.name not in self.tools and found is not None:
+            return "allow" if isinstance(found, dict) and found.get("read_only") is True else "ask"
+        return self.decide(tool.name)
 
     def grantable(self, tool: str) -> bool:
         """True when the owner may make this tool run without asking again."""
@@ -101,7 +113,7 @@ class ActionGateway(WrapperToolset[None]):
                         (
                             "Submit this change for review. A reviewer lets it run now or "
                             "the system asks the user first. "
-                            if self.policy.decide(name) == "review"
+                            if self.policy.decide_tool(tool.tool_def) == "review"
                             else "Submit this change for approval. "
                             "The system asks the user before execution. "
                         )
@@ -110,11 +122,11 @@ class ActionGateway(WrapperToolset[None]):
                 ),
             )
             # ask_user asks for information, not permission; it needs no prefix.
-            if self.policy.decide(name) in ("ask", "review") and name != "ask_user"
+            if self.policy.decide_tool(tool.tool_def) in ("ask", "review") and name != "ask_user"
             else tool
             for name, tool in tools.items()
             # A denied tool is never offered: the model cannot waste a turn on it.
-            if self.policy.decide(name) != "deny"
+            if self.policy.decide_tool(tool.tool_def) != "deny"
         }
 
     def _request(
@@ -184,7 +196,7 @@ class ActionGateway(WrapperToolset[None]):
         ctx: RunContext[None],
         tool: ToolsetTool[None],
     ) -> Any:
-        action = self.policy.decide(name)
+        action = self.policy.decide_tool(tool.tool_def)
         if action == "review" and self._notifies_others(name, tool_args):
             action = "ask"  # hard rule: other people would be notified
         rule: str = action
