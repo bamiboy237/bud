@@ -51,7 +51,7 @@ enum Citations {
         _ text: String, _ sources: [String: Source], with render: (Source) -> String
     ) -> String {
         guard text.contains("[S") else { return text }
-        return text.replacing(#/ ?\[(S\d{1,2})\]/#) { match in
+        return text.replacing(#/ ?\[(S\d{1,6})\]/#) { match in
             sources[String(match.output.1)].map(render) ?? ""
         }
     }

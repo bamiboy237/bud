@@ -54,3 +54,22 @@ def test_plain_clients_see_dates_and_never_an_invented_tag():
 def test_labels_name_the_year_only_when_it_differs():
     assert source_label(date(2026, 1, 5), date(2026, 11, 19)) == "Jan 5"
     assert source_label(date(2025, 12, 31), date(2026, 1, 2)) == "Dec 31, 2025"
+
+
+def test_tags_stay_unique_across_a_conversation():
+    known = {"S1": {"session_id": "chat", "seq": 7, "date": "2026-11-18", "label": "Nov 18"}}
+    hits = [
+        Hit("turn:new", "conversation", "other", "Owner: A new decision", 1.0),
+        Hit("turn:a", "conversation", "chat", "Owner: We chose Postgres", 0.9),
+    ]
+    sources = {
+        "turn:new": (3, datetime(2026, 11, 19, 9, tzinfo=UTC)),
+        "turn:a": (7, datetime(2026, 11, 18, 9, tzinfo=UTC)),
+    }
+
+    text, cited = render(hits, sources, date(2026, 11, 19), known)
+
+    # A source seen before keeps its tag; a new one never reuses an older reply's tag.
+    assert cited["S1"]["seq"] == 7
+    assert cited["S2"]["session_id"] == "other"
+    assert "- [S2] (earlier conversation, 2026-11-19) Owner: A new decision" in text

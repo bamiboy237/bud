@@ -156,7 +156,7 @@ pub fn plain_citations(text: &str, sources: Option<&Value>) -> String {
     while let Some(start) = rest.find("[S") {
         let after = &rest[start + 2..];
         let digits = after.bytes().take_while(u8::is_ascii_digit).count();
-        if !(1..=2).contains(&digits) || !after[digits..].starts_with(']') {
+        if !(1..=6).contains(&digits) || !after[digits..].starts_with(']') {
             out.push_str(&rest[..start + 2]);
             rest = after;
             continue;

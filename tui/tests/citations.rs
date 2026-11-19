@@ -11,8 +11,8 @@ fn known_tags_read_as_dates_and_invented_ones_disappear() {
         "We chose SQLite (Nov 18), not Postgres."
     );
     assert_eq!(
-        plain_citations("No tags [Sx] or [S123] here.", Some(&sources)),
-        "No tags [Sx] or [S123] here."
+        plain_citations("No tags [Sx] or [S1234567] here.", Some(&sources)),
+        "No tags [Sx] or [S1234567] here."
     );
     assert_eq!(plain_citations("Lost [S1].", None), "Lost.");
 }

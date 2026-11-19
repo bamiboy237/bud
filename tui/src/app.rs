@@ -482,7 +482,12 @@ impl App {
     /// Seeds the transcript and pending cards from the startup snapshot.
     pub fn load_snapshot(&mut self, snap: &Snapshot) {
         for turn in &snap.transcript {
-            let text = sanitize::clean(&plain_citations(&turn.text, turn.sources.as_ref()));
+            // Only bud's replies cite sources; your own words stay exactly as typed.
+            let text = if turn.role == "user" {
+                sanitize::clean(&turn.text)
+            } else {
+                sanitize::clean(&plain_citations(&turn.text, turn.sources.as_ref()))
+            };
             if turn.role == "user" {
                 self.entries.push(Entry::User(UserEntry {
                     id: None,

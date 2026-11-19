@@ -12,7 +12,7 @@ import math
 import re
 import sqlite3
 import struct
-from collections.abc import Collection, Generator
+from collections.abc import Collection, Generator, Iterable
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -25,6 +25,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai_harness import Memory
 
 from bud.config import Settings
+from bud.core.events import Event
 
 DIMENSIONS = 256  # text-embedding-3 vectors shortened; plenty for short notes, fast to scan
 RRF_K = 60
@@ -40,7 +41,7 @@ MAX_CONVERSATION_CHUNKS = 3_000
 # turns stay reachable by keyword.
 DENSE_TURNS = 1_000
 # A reply cites an excerpt by its tag, like [S1]. Bud, not the model, turns it into a source.
-CITATION = re.compile(r" ?\[(S\d{1,2})\]")
+CITATION = re.compile(r" ?\[(S\d{1,6})\]")
 WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9'@.-]{2,}")
 STOP = frozenset(
     [
@@ -268,7 +269,7 @@ class Recall:
             self._upsert([(cid, "memory", None, line) for cid, line in new], vectors)
 
     async def search(self, query: str, *, exclude_turns: Collection[str] = ()) -> list[Hit]:
-        """Fused lexical + dense ranking, skipping turns that are still in the model's context."""
+        """Fused lexical + dense ranking, skipping the given turns (for example, recent ones)."""
         lexical: list[str] = []
         match = _match_query(query)
         skip = ",".join("?" * len(exclude_turns))
@@ -323,13 +324,22 @@ def source_label(day: date, today: date) -> str:
 
 
 def render(
-    hits: list[Hit], turn_sources: dict[str, tuple[int, datetime]], today: date
+    hits: list[Hit],
+    turn_sources: dict[str, tuple[int, datetime]],
+    today: date,
+    known: dict[str, dict] | None = None,
 ) -> tuple[str, dict[str, dict]]:
     """A labeled block of background facts, capped, never instructions.
 
     Each earlier turn gets a short tag, like S1. The model cites the tag; the returned map
-    lets Bud show it as a date that opens the original message.
+    lets Bud show it as a date that opens the original message. `known` holds the tags this
+    conversation already used: a source seen before keeps its tag, and a new one is numbered
+    after them, so a tag in an older reply never comes to mean another message.
     """
+    known = known or {}
+    existing = {(s["session_id"], s["seq"]): tag for tag, s in known.items()}
+    numbers = [int(tag[1:]) for tag in known if tag[1:].isdigit()]
+    next_number = max(numbers, default=0) + 1
     lines: list[str] = []
     sources: dict[str, dict] = {}
     used = 0
@@ -339,7 +349,7 @@ def render(
             tag = None
         elif hit.session_id is not None and (source := turn_sources.get(hit.id)):
             seq, when = source
-            tag = f"S{len(sources) + 1}"
+            tag = existing.get((hit.session_id, seq)) or f"S{next_number}"
             label = f"[{tag}] (earlier conversation, {when.date()})"
         else:
             continue  # The cached excerpt has no matching original in this account's log.
@@ -348,6 +358,8 @@ def render(
         if used + len(line) > MAX_CHARS:
             continue
         if tag is not None:
+            if tag == f"S{next_number}":
+                next_number += 1
             sources[tag] = {
                 "session_id": hit.session_id,
                 "seq": seq,
@@ -368,6 +380,15 @@ def render(
         + "\n</recalled>",
         sources,
     )
+
+
+def recalled_so_far(events: Iterable[Event]) -> dict[str, dict]:
+    """Every source a conversation's recall has tagged, by tag."""
+    known: dict[str, dict] = {}
+    for event in events:
+        if event.type in ("run.waiting", "run.completed"):
+            known.update(event.data.get("recalled") or {})
+    return known
 
 
 def plain_citations(text: str, sources: dict[str, dict] | None) -> str:

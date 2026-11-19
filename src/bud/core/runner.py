@@ -74,7 +74,7 @@ from bud.harness.agent import Harness
 from bud.harness.ask import AskAnswer, answer_from_text, ask_summary, questions_of, render_answers
 from bud.harness.context import BackgroundCompaction
 from bud.harness.learning import Learner
-from bud.harness.recall import Recall, plain_citations, render
+from bud.harness.recall import CITATION, Recall, plain_citations, recalled_so_far, render
 from bud.harness.spiral import paused_in
 from bud.harness.verify import build_verifier
 from bud.limits import MAX_MESSAGE_CHARS
@@ -910,8 +910,10 @@ class Runner(DBOSConfiguredInstance):
     async def _recalled(self, run: dict, in_context: list[str]) -> dict:
         """Background for a new message: memory lines and earlier turns that bear on it.
 
-        Earlier turns of this conversation count too, except those still in the model's
-        context (`in_context`, as recall chunk IDs). Returns the block and its cited sources.
+        Earlier turns of this conversation count too, except the recent ones compaction always
+        keeps in context (`in_context`, as recall chunk IDs). Older turns may still be in the
+        prompt and can be recalled again; their tag then gives the owner a source to open.
+        Returns the block and the sources it tagged.
         """
         nothing: dict = {"text": "", "sources": {}}
         if self.recall is None or not run.get("text") or run["trigger"] != "message":
@@ -937,7 +939,8 @@ class Runner(DBOSConfiguredInstance):
             return nothing
         clock = run.get("clock")
         today = (datetime.fromisoformat(clock) if clock else datetime.now(UTC)).date()
-        text, cited = render(hits, sources, today)
+        known = recalled_so_far(self.hub.log.read(run["session_id"]))
+        text, cited = render(hits, sources, today, known)
         return {"text": text, "sources": cited}
 
     async def _learn(
@@ -1062,7 +1065,7 @@ class Runner(DBOSConfiguredInstance):
                     "or `bud login chatgpt`, then pick again."
                 )
             # Appended to the newest message, after the cached prefix, so prompt caching holds.
-            # Turns compaction always keeps are already in context; recalling them repeats them.
+            # Turns compaction always keeps are surely in context; recalling them repeats them.
             in_context = [
                 f"turn:{message.run_id}"
                 for message in self.context.always_kept(
@@ -1082,19 +1085,6 @@ class Runner(DBOSConfiguredInstance):
             )
             # A conversation picked up on a later day must not reuse "today"/"tomorrow".
             history_events = self.hub.log.read(run["session_id"])
-            # A continuation answers the reply it resumes, so it cites that reply's sources.
-            sources = (
-                recalled["sources"]
-                if run["trigger"] == "message"
-                else next(
-                    (
-                        event.data.get("sources", {})
-                        for event in reversed(history_events)
-                        if event.type in ("run.waiting", "run.completed")
-                    ),
-                    {},
-                )
-            )
             gap = time_gap_note(history_events, run)
             still_open = superseded_note(history_events, run)
             jobs = job_updates_note(history_events, run)
@@ -1159,8 +1149,18 @@ class Runner(DBOSConfiguredInstance):
                 "messages": json.loads(result.new_messages_json()),
                 "conversation": ConversationTypeAdapter.dump_json(result.conversation).decode(),
             }
-            if sources:
-                data["sources"] = sources
+            # A reply cites tags from this run's recall or any earlier one still in its history;
+            # keep what each tag it used points to.
+            known = recalled_so_far(history_events) | recalled["sources"]
+            cited = {
+                tag: known[tag]
+                for tag in CITATION.findall(reply_text(data["messages"]))
+                if tag in known
+            }
+            if recalled["sources"]:
+                data["recalled"] = recalled["sources"]
+            if cited:
+                data["sources"] = cited
             if isinstance(result.output, JobReport):
                 data["report"] = result.output.model_dump()
             deferred = result.output if isinstance(result.output, DeferredToolRequests) else None
