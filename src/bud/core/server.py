@@ -41,15 +41,7 @@ from bud.core.setup import (
     check_setup,
     setup_registry,
 )
-from bud.core.workspace_home import (
-    RECORD,
-    MigrationError,
-    display_path,
-    forget,
-    legacy_workspaces,
-    migrate,
-    workspace_home,
-)
+from bud.core.workspace_home import display_path, workspace_home
 from bud.gateway import build_gateway
 from bud.harness.actions import load_policy
 from bud.harness.agent import Harness
@@ -155,24 +147,6 @@ def workspace_tools(root: Path, state_dir: Path) -> FunctionToolset[None]:
     return FunctionToolset(build_workspace_tools(root, state_dir / "workspace-dispatches.jsonl"))
 
 
-def owner_workspace(settings: Settings, session_dir: Path) -> Path:
-    """Bud's home workspace, after moving in the files older versions kept elsewhere.
-
-    If a copy fails to verify, Bud keeps this account's old workspace until the next start.
-    """
-    home = workspace_home(settings)
-    try:
-        moved = migrate(legacy_workspaces(settings.data_dir), home, settings.data_dir / RECORD)
-    except (MigrationError, OSError) as exc:
-        logger.warning("Kept the old workspace; moving it to %s failed: %s", home, exc)
-        old = workspace_root(session_dir)
-        forget(old, settings.data_dir / RECORD)  # what is written there now moves in later
-        return old
-    for source in moved:
-        logger.info("Copied workspace files from %s to %s", source, home)
-    return home
-
-
 def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAPI:
     settings = get_settings()
     token = owner_token(settings)
@@ -246,7 +220,7 @@ def _create_app(
         session_dir = connections.folder / "sessions" / account_scope
         session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         db_path = session_dir / "bud.db"
-        workspace = owner_workspace(settings, session_dir)
+        workspace = workspace_home(settings)
         gateway = build_gateway(
             settings,
             providers={"openai-chatgpt", "openai", "meta", "mistral", "deepseek"},

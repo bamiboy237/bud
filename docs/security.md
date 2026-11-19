@@ -15,16 +15,6 @@ An email action also carries a readable preview of the original message: subject
 Bud reads and writes text files in one workspace folder, `~/.bud/workspace`. Set
 `WORKSPACE_DIR` to use another folder. Simulate mode uses `DATA_DIR/workspace` instead.
 
-Older versions kept one workspace per account binding inside `DATA_DIR`. On first start,
-Bud copies those files into the new folder:
-
-- It never deletes or overwrites a file. The originals stay where they were.
-- It checks each copy's SHA-256 against the original before it places the copy.
-- When a name is already taken, the copy gets a dated name, such as `notes (from 2026-11-18).md`.
-- It records each finished folder in `DATA_DIR/workspace-migration.json` and never copies that
-  folder again. An interrupted copy resumes on the next start without duplicates.
-- When a copy fails its check, Bud keeps using the account's old workspace and logs why.
-
 - Reads use the harness `FileSystem` tools (`read_file`, `list_directory`, `search_files`,
   `find_files`, `file_info`) over a read-only workspace. They run without approval.
 - Workspace file content reaches the model as data with no authority, like a tool result.
