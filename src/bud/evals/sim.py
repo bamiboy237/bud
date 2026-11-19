@@ -59,7 +59,7 @@ def _client(data: Path) -> httpx.Client:
 def launch_server(
     data: Path, port: int, *, simulate: bool, env: dict[str, str] | None = None
 ) -> int:
-    """Run `create_app` in its own process group on `port` with DATA_DIR=`data`.
+    """Run `create_app` in its own process group on `port` with its data and workspace in `data`.
 
     Returns the pid once the server answers. Logs go to `data/server.log`.
     """
@@ -68,7 +68,14 @@ def launch_server(
     log = os.fdopen(
         os.open(data / "server.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a"
     )
-    env = {**os.environ, **(env or {}), "DATA_DIR": str(data), "PYDANTIC_AI_NO_BANNER": "1"}
+    # Its own workspace too, so an eval or dev stack never writes to ~/.bud.
+    env = {
+        **os.environ,
+        **(env or {}),
+        "DATA_DIR": str(data),
+        "WORKSPACE_DIR": str(data / "workspace"),
+        "PYDANTIC_AI_NO_BANNER": "1",
+    }
     code = (
         "import uvicorn; from bud.core.server import create_app; "
         f"uvicorn.run(create_app(simulate={simulate}), host={HOST!r}, port={port}, "

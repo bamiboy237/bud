@@ -17,6 +17,8 @@ def isolated_environment(tmp_path, monkeypatch):
             monkeypatch.delenv(name)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("DATA_DIR", str(tmp_path.resolve() / "data"))
+    # Never the developer's real ~/.bud/workspace.
+    monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path.resolve() / "bud-home" / "workspace"))
     monkeypatch.setenv("APPROVAL_REVIEW", "false")
     monkeypatch.setenv("LOOP_DETECTION", "false")
     monkeypatch.delenv("BUD_DAILY_USD", raising=False)
