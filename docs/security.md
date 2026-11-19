@@ -17,6 +17,10 @@ Bud reads and writes text files in one workspace folder, `~/.bud/workspace`. Set
 
 - Reads use the harness `FileSystem` tools (`read_file`, `list_directory`, `search_files`,
   `find_files`, `file_info`) over a read-only workspace. They run without approval.
+- `read_document` reads PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB, and CSV
+  files up to 25 MB as Markdown, with the same path rules. It converts on this machine with
+  [AnyDoc](https://github.com/firecrawl/anydoc) and never sends a document out: scanned
+  pages, which would need hosted OCR, are refused. It runs without approval.
 - Workspace file content reaches the model as data with no authority, like a tool result.
 - Hidden paths and names that look like credentials are refused for reads and writes. For
   example, `.env`, `.git`, `api-key.txt`, `secrets.md`, `id_rsa`, `cert.pem`, and `AGENTS.md`.

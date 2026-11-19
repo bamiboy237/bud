@@ -8,6 +8,7 @@ requires-python = ">=3.12"
 dependencies = [
     "composio>=0.22.0",
     "fastapi>=0.162.0",
+    "firecrawl-anydoc>=0.2.5,<0.3",
     "httpx>=0.28.1",
     "photonhq-api>=0.6.0,<0.7",
     "prompt-toolkit>=3.0.40",
