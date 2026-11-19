@@ -7,7 +7,7 @@ import asyncio
 import fcntl
 import hashlib
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -151,14 +151,15 @@ def workspace_root(directory: Path) -> Path:
 
 
 def workspace_tools(
-    root: Path, state_dir: Path, reviewer: Callable[[], ToolReviewer | None]
+    root: Path,
+    state_dir: Path,
+    reviewer: Callable[[], ToolReviewer | None],
+    private: Sequence[Path] = (),
 ) -> FunctionToolset[None]:
-    """File tools, and on macOS the sandboxed shell, whose network checks use `reviewer`."""
-    shell = (
-        build_shell_tools(root, NetworkGrants(state_dir / "network-grants.json"), reviewer)
-        if shell_available()
-        else []
-    )
+    """File tools, and on macOS the sandboxed shell, whose network checks use `reviewer`.
+    Shell commands cannot read `private` folders, such as Bud's data and its .env."""
+    grants = NetworkGrants(state_dir / "network-grants.json")
+    shell = build_shell_tools(root, grants, reviewer, private) if shell_available() else []
     return FunctionToolset(
         [
             *build_workspace_tools(root, state_dir / "workspace-dispatches.jsonl"),
@@ -166,6 +167,11 @@ def workspace_tools(
             *shell,
         ]
     )
+
+
+def private_folders(settings: Settings) -> list[Path]:
+    """Folders a shell command must never read: Bud's data and the folder holding its .env."""
+    return [settings.data_dir, Path.cwd()]
 
 
 def file_guidance() -> str:
@@ -176,6 +182,8 @@ def allow_file_tools(policy: Policy) -> None:
     """Reads and sandboxed commands run unasked; writes and new network sites ask."""
     policy.tools.update(dict.fromkeys(FILE_READS | SHELL_TOOLS, "allow"))
     policy.tools.update(dict.fromkeys(WORKSPACE_WRITE_TOOLS | {NETWORK_TOOL}, "ask"))
+    # Each new site needs its own yes: "always allow" would let Bud add any site unasked.
+    policy.no_grants = policy.no_grants | {NETWORK_TOOL}
 
 
 def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAPI:
@@ -271,7 +279,9 @@ def _create_app(
                 [
                     build_toolset(connections, connections.accounts(), session_dir),
                     build_web_tools(settings),
-                    workspace_tools(workspace, session_dir, lambda: harness.reviewer),
+                    workspace_tools(
+                        workspace, session_dir, lambda: harness.reviewer, private_folders(settings)
+                    ),
                     build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
                 ]
             )
@@ -335,7 +345,12 @@ def _create_app(
                 [
                     FunctionToolset(build_tools(world)),
                     build_web_tools(settings),
-                    workspace_tools(workspace, settings.data_dir, lambda: harness.reviewer),
+                    workspace_tools(
+                        workspace,
+                        settings.data_dir,
+                        lambda: harness.reviewer,
+                        private_folders(settings),
+                    ),
                 ]
             ),
             tools_policy,

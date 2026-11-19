@@ -13,14 +13,17 @@ blocked and reported, and Bud can ask the owner with allow_network, which needs 
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import logging
 import os
+import re
 import signal
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import SplitResult, urlsplit
 
 from dbos import DBOS
 from pydantic import Field
@@ -83,12 +86,19 @@ def toolchains() -> list[Path]:
     return [path.resolve() for path in found if path.exists()]
 
 
-def profile(workspace: Path, port: int) -> str:
-    """The Seatbelt rules for one command. Later rules win over earlier ones."""
+def profile(workspace: Path, port: int, private: Sequence[Path] = ()) -> str:
+    """The Seatbelt rules for one command. Later rules win over earlier ones.
+
+    `private` are folders outside the home folder a command must not read either, such as
+    Bud's data folder and the checkout holding its .env.
+    """
+    hidden = " ".join(
+        f"(subpath {_quoted(p)})" for p in [Path.home().resolve(), *map(Path.resolve, private)]
+    )
     readable = " ".join(f"(subpath {_quoted(p)})" for p in [workspace, *toolchains()])
     return f"""(version 1)
 (allow default)
-(deny file-read-data (subpath {_quoted(Path.home().resolve())}))
+(deny file-read-data {hidden})
 (allow file-read-data {readable})
 (deny file-write*)
 (allow file-write* (subpath {_quoted(workspace)}) (subpath "/private/var/folders")
@@ -98,6 +108,10 @@ def profile(workspace: Path, port: int) -> str:
 (deny appleevent-send)
 (deny process-exec (literal "/usr/bin/open") (literal "/usr/bin/osascript")
   (literal "/usr/bin/security"))
+; No starting programs outside the sandbox: LaunchServices (open, copies of it) and launchd.
+(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd")
+  (global-name-prefix "com.apple.lsd.") (global-name "com.apple.coreservices.quarantine-resolver"))
+(deny job-creation)
 """
 
 
@@ -125,6 +139,23 @@ def environment(workspace: Path, port: int) -> dict[str, str]:
         **{name: proxy for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")},
         "NO_PROXY": "",
     }
+
+
+_HOST = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*")
+
+
+def site(authority: str, default_port: int) -> tuple[str, int]:
+    """The host and port of `host[:port]`, IPv6 in brackets. Raises ValueError otherwise."""
+    parts = urlsplit("//" + authority)
+    if parts.username is not None or parts.password is not None or parts.path or parts.query:
+        raise ValueError(f"not a plain host: {authority!r}")
+    host = (parts.hostname or "").rstrip(".")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if not _HOST.fullmatch(host):
+            raise ValueError(f"not a host name: {authority!r}") from None
+    return host, parts.port or default_port
 
 
 def always_allowed(host: str) -> bool:
@@ -164,35 +195,65 @@ class Proxy:
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 30)
-            method, target, _ = head.split(b"\r\n", 1)[0].decode("latin-1").split(" ", 2)
+            lines = head.decode("latin-1").split("\r\n")
+            method, target, version = lines[0].split(" ")
             if method == "CONNECT":
-                host, _, port = target.rpartition(":")
-                forward = b""
-            elif target.startswith("http://"):
-                authority = target.removeprefix("http://").split("/", 1)[0]
-                host, _, port = authority.partition(":")
-                port = port or "80"
-                forward = head
+                host, port = site(target, 443)
             else:
-                writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                return
-            host = host.strip("[]").lower().rstrip(".")
+                url = urlsplit(target)
+                if url.scheme != "http":
+                    raise ValueError("only absolute http:// URLs and CONNECT")
+                host, port = site(url.netloc, 80)
             if not await self.allowed(host):
                 writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                 return
-            upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(host, int(port)), 30
-            )
             if method == "CONNECT":
+                upstream_reader, upstream_writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), 30
+                )
                 writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            else:
-                upstream_writer.write(forward)
-            await asyncio.gather(_pipe(reader, upstream_writer), _pipe(upstream_reader, writer))
-        except (OSError, ValueError, asyncio.IncompleteReadError, TimeoutError):
-            pass
+                await asyncio.gather(_pipe(reader, upstream_writer), _pipe(upstream_reader, writer))
+                return
+            # Plain HTTP: exactly one request per connection, so a reused connection cannot
+            # carry a second request to a site that was never checked.
+            request = await _one_request(reader, lines, method, url, version)
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), 30
+            )
+            upstream_writer.write(request)
+            await _pipe(upstream_reader, writer)
+        except (
+            OSError,
+            ValueError,
+            asyncio.IncompleteReadError,
+            asyncio.LimitOverrunError,
+            TimeoutError,
+        ):
+            with contextlib.suppress(Exception):
+                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
         finally:
             with contextlib.suppress(Exception):
                 writer.close()
+
+
+async def _one_request(
+    reader: asyncio.StreamReader, lines: list[str], method: str, url: SplitResult, version: str
+) -> bytes:
+    """The request to send upstream, with its body, asking the server to close after it."""
+    headers = [line for line in lines[1:] if line]
+    names = {line.split(":", 1)[0].strip().lower(): line for line in headers}
+    if "transfer-encoding" in names:
+        raise ValueError("chunked request bodies are not supported")
+    length = int(names["content-length"].split(":", 1)[1]) if "content-length" in names else 0
+    body = await reader.readexactly(length) if length else b""
+    kept = [
+        line
+        for line in headers
+        if line.split(":", 1)[0].strip().lower() not in {"connection", "proxy-connection"}
+    ]
+    path = (url.path or "/") + (f"?{url.query}" if url.query else "")
+    head = "\r\n".join([f"{method} {path} {version}", *kept, "Connection: close", "", ""])
+    return head.encode("latin-1") + body
 
 
 async def _pipe(source: asyncio.StreamReader, sink: asyncio.StreamWriter) -> None:
@@ -207,15 +268,27 @@ async def _pipe(source: asyncio.StreamReader, sink: asyncio.StreamWriter) -> Non
             sink.close()
 
 
-async def run(workspace: Path, command: str, timeout: float, judge: Judge) -> dict[str, Any]:
+def _kill(pid: int) -> None:
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pid, signal.SIGKILL)
+
+
+async def run(
+    workspace: Path,
+    command: str,
+    timeout: float,
+    judge: Judge,
+    private: Sequence[Path] = (),
+) -> dict[str, Any]:
     """Runs one command in the sandbox and reports its output and any blocked sites."""
+    workspace = workspace.resolve()  # Seatbelt matches real paths, not links
     proxy = Proxy(judge)
     port = await proxy.start()
     (workspace / ".tmp").mkdir(exist_ok=True)
     process = await asyncio.create_subprocess_exec(
         SANDBOX_EXEC,
         "-p",
-        profile(workspace, port),
+        profile(workspace, port, private),
         "/bin/zsh",
         "-c",
         PREPARE + command,
@@ -231,10 +304,11 @@ async def run(workspace: Path, command: str, timeout: float, judge: Judge) -> di
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout)
     except TimeoutError:
         timed_out = True
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
+        _kill(process.pid)
         stdout, stderr = await process.communicate()
     finally:
+        if process.returncode is None:
+            _kill(process.pid)  # cancelled while it ran: stop it with its children
         await proxy.close()
     result: dict[str, Any] = {
         "exit_code": process.returncode,
@@ -292,10 +366,14 @@ async def judge_site(
 
 
 def build_tools(
-    workspace: Path, grants: NetworkGrants, reviewer: Callable[[], ToolReviewer | None]
+    workspace: Path,
+    grants: NetworkGrants,
+    reviewer: Callable[[], ToolReviewer | None],
+    private: Sequence[Path] = (),
 ) -> list[Tool[None]]:
-    """run_command and allow_network. `reviewer` returns the decision model, if any."""
-    workspace = workspace.absolute()
+    """run_command and allow_network. `reviewer` returns the decision model, if any.
+    `private` are folders outside the home folder that commands must not read."""
+    workspace = workspace.resolve()
     remembered: set[str] = set()
 
     async def run_command(
@@ -322,7 +400,7 @@ def build_tools(
             return False
 
         async def execute() -> dict[str, Any]:
-            return await run(workspace, command, timeout_seconds, judge)
+            return await run(workspace, command, timeout_seconds, judge, private)
 
         if DBOS.workflow_id is not None and DBOS.step_id is None:
             # One recorded step: crash recovery returns this output instead of running the
@@ -339,10 +417,11 @@ def build_tools(
             host: The site's host name, such as api.example.com.
             reason: One sentence on why the task needs it.
         """
-        site = host.strip().lower().rstrip(".")
-        if not site or "/" in site or " " in site:
+        try:
+            name, _ = site(host.strip().lower(), 443)
+        except ValueError:
             return "Give only the host name, such as api.example.com."
-        grants.add(site)
-        return f"Shell commands may now reach {site}."
+        grants.add(name)
+        return f"Shell commands may now reach {name}."
 
     return [Tool(run_command), Tool(allow_network)]
