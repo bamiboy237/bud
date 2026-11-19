@@ -13,8 +13,13 @@ def test_a_fresh_install_gets_a_private_home(tmp_path):
 
 def test_the_default_home_is_under_the_owners_home_folder(monkeypatch, tmp_path):
     monkeypatch.delenv("WORKSPACE_DIR")
-    monkeypatch.setattr("bud.core.workspace_home.DEFAULT_HOME", tmp_path / ".bud" / "workspace")
-    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     home = workspace_home(Settings())
     assert home == tmp_path.resolve() / ".bud" / "workspace"
     assert display_path(home) == "~/.bud/workspace"
+
+
+def test_an_empty_workspace_setting_means_the_default_not_the_current_folder(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("WORKSPACE_DIR", "")
+    assert workspace_home(Settings()) == tmp_path.resolve() / ".bud" / "workspace"

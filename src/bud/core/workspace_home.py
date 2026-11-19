@@ -4,12 +4,14 @@ from pathlib import Path
 
 from bud.config import Settings
 
-DEFAULT_HOME = Path.home() / ".bud" / "workspace"
-
 
 def workspace_home(settings: Settings) -> Path:
     """The folder Bud reads and writes on the owner's behalf, created on first use."""
-    target = (settings.workspace_dir or DEFAULT_HOME).expanduser()
+    # An empty WORKSPACE_DIR means unset, not the current directory.
+    configured = settings.workspace_dir
+    if configured is None or str(configured) in ("", "."):
+        configured = Path.home() / ".bud" / "workspace"
+    target = configured.expanduser()
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # The parent is resolved because /tmp and /var are symlinks on macOS. The home itself is
     # not, so a symlink swapped in at that level is still refused by the workspace tools.
