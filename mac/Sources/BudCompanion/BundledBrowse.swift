@@ -4,32 +4,33 @@ import Foundation
 /// A copy already there is left alone: Browse updates itself in place.
 enum BundledBrowse {
     /// Copies the bundled program and its license when ~/.bud/bin has no browse yet.
-    /// Returns whether a copy was made.
+    /// Returns whether a copy was made. The copy appears whole or not at all.
     @discardableResult
     static func install(
-        from resources: URL? = Bundle.main.resourceURL,
+        from contents: URL? = Bundle.main.bundleURL.appendingPathComponent("Contents"),
         home: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> Bool {
         let files = FileManager.default
-        guard let source = resources?.appendingPathComponent("browse"),
-              files.fileExists(atPath: source.appendingPathComponent("browse").path)
-        else { return false }
+        guard let contents else { return false }
+        let program = contents.appendingPathComponent("Helpers/browse")
+        guard files.isExecutableFile(atPath: program.path) else { return false }
         let bin = home.appendingPathComponent(".bud/bin")
         let target = bin.appendingPathComponent("browse")
         guard !files.fileExists(atPath: target.path) else { return false }
+        let partial = bin.appendingPathComponent(".browse-\(UUID().uuidString)")
         do {
             try files.createDirectory(
                 at: bin, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            try files.copyItem(at: source.appendingPathComponent("browse"), to: target)
-            try files.setAttributes([.posixPermissions: 0o755], ofItemAtPath: target.path)
-            let license = bin.appendingPathComponent("browse-LICENSE")
-            if !files.fileExists(atPath: license.path) {
-                try? files.copyItem(at: source.appendingPathComponent("LICENSE"), to: license)
-            }
-            return true
+            try files.copyItem(at: program, to: partial)
+            try files.setAttributes([.posixPermissions: 0o755], ofItemAtPath: partial.path)
+            // A rename is atomic: Bud's server never sees half a program.
+            try files.moveItem(at: partial, to: target)
         } catch {
-            try? files.removeItem(at: target)  // never leave half a program behind
+            try? files.removeItem(at: partial)
             return false
         }
+        let license = contents.appendingPathComponent("Resources/browse-LICENSE")
+        try? files.copyItem(at: license, to: bin.appendingPathComponent("browse-LICENSE"))
+        return true
     }
 }

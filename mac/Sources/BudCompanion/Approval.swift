@@ -90,7 +90,10 @@ struct Approval: Identifiable, Equatable {
         verb = words.verb
         symbol = words.symbol
         facts = Self.facts(args)
-        if args["is_html"] as? Bool == true {
+        if tool == "enable_browser" {
+            // Fixed words from the app, never from the model, so the caution cannot be edited.
+            body = Self.browserCaution
+        } else if args["is_html"] as? Bool == true {
             // Approvals saved before previews existed have no proposed text; show the body
             // they carry rather than hiding what will be sent.
             body = ((raw["preview"] as? [String: Any])?["proposed_body_text"] as? String)
@@ -101,6 +104,14 @@ struct Approval: Identifiable, Equatable {
         }
     }
 
+    /// What turning the browser on allows. Kept in step with bud.browser.CAUTION.
+    static let browserCaution = "Bud will use your own Chrome, with your tabs and the sites you "
+        + "are signed in to. It can read those sites, open pages, click, type, and submit forms "
+        + "as you. Each step is checked first, and anything risky, such as paying, sending, "
+        + "deleting, or typing a password, asks you. A page Bud reads can still try to trick "
+        + "it, and a check can miss a step written to look harmless. Ask Bud to turn the "
+        + "browser off at any time."
+
     /// The same plain words the terminal uses for each kind of action.
     private static func describe(_ tool: String, _ args: [String: Any])
         -> (title: String, verb: String, symbol: String)
@@ -108,6 +119,7 @@ struct Approval: Identifiable, Equatable {
         let to = recipients(args)
         let named = text(args, "title", "summary")
         if tool == "ask_user" { return ("", "Answer", "questionmark.bubble") }
+        if tool == "enable_browser" { return ("Let Bud use your browser", "Turn on", "globe") }
         if tool == "archive_email" { return ("Archive email", "Archive", "archivebox") }
         if tool == "mark_read" { return ("Mark email read", "Mark read", "envelope.open") }
         if ["draft_reply", "gmail_create_email_draft"].contains(tool) {

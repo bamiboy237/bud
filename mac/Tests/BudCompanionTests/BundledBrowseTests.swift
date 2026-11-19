@@ -3,28 +3,33 @@ import Testing
 @testable import BudCompanion
 
 @Suite struct BundledBrowseTests {
-    private func folders() throws -> (resources: URL, home: URL) {
+    private func folders() throws -> (contents: URL, home: URL) {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("bud-browse-\(UUID().uuidString)")
-        let resources = root.appendingPathComponent("Resources")
-        let browse = resources.appendingPathComponent("browse")
-        try FileManager.default.createDirectory(at: browse, withIntermediateDirectories: true)
-        try "#!/bin/sh\n".write(to: browse.appendingPathComponent("browse"), atomically: true, encoding: .utf8)
-        try "MIT".write(to: browse.appendingPathComponent("LICENSE"), atomically: true, encoding: .utf8)
-        return (resources, root.appendingPathComponent("home"))
+        let contents = root.appendingPathComponent("Contents")
+        let helpers = contents.appendingPathComponent("Helpers")
+        let resources = contents.appendingPathComponent("Resources")
+        for folder in [helpers, resources] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        let program = helpers.appendingPathComponent("browse")
+        try "#!/bin/sh\n".write(to: program, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: program.path)
+        try "MIT".write(to: resources.appendingPathComponent("browse-LICENSE"), atomically: true, encoding: .utf8)
+        return (contents, root.appendingPathComponent("home"))
     }
 
     @Test func copiesBrowseOnceAndLeavesAnUpdatedCopyAlone() throws {
-        let (resources, home) = try folders()
+        let (contents, home) = try folders()
         let target = home.appendingPathComponent(".bud/bin/browse")
 
-        #expect(BundledBrowse.install(from: resources, home: home))
+        #expect(BundledBrowse.install(from: contents, home: home))
         let mode = try FileManager.default.attributesOfItem(atPath: target.path)[.posixPermissions]
         #expect(mode as? Int == 0o755)
         #expect(FileManager.default.fileExists(atPath: home.appendingPathComponent(".bud/bin/browse-LICENSE").path))
 
         try "updated".write(to: target, atomically: true, encoding: .utf8)
-        #expect(!BundledBrowse.install(from: resources, home: home))
+        #expect(!BundledBrowse.install(from: contents, home: home))
         #expect(try String(contentsOf: target, encoding: .utf8) == "updated")
     }
 

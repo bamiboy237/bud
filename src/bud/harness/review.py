@@ -427,6 +427,12 @@ def owner_answers(messages: list[ModelMessage]) -> list[Clarification]:
     return answers[-MAX_ANSWERS:]
 
 
+def too_long_to_review(args: dict[str, Any]) -> bool:
+    """The reviewer is shown only the first MAX_ARGS_CHARS of a call's arguments. A longer
+    call could hide its real step after that point, so it goes to the owner instead."""
+    return len(json.dumps(args, default=str, ensure_ascii=False)) > MAX_ARGS_CHARS
+
+
 class ToolReviewer:
     """Classifies one pending write through the Decisions API."""
 

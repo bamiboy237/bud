@@ -49,13 +49,6 @@ def self_hosted_writes() -> frozenset[str]:
     return frozenset((WORLD_WRITE_TOOLS | WORKSPACE_WRITE_TOOLS | memory) - PROTECTED)
 
 
-# Runs JavaScript in the owner's own browser. Not self-hosted, but each call is one concrete
-# script the reviewer can judge against the owner's request.
-BROWSER_EXECUTE = "browser_execute"
-
-
 def reviewable_tools() -> frozenset[str]:
-    """Every tool the reviewer may judge: self-hosted writes that no hard rule reserves, and
-    browser scripts."""
-    candidates = self_hosted_writes() | {BROWSER_EXECUTE}
-    return frozenset(name for name in candidates if not never_reviewed(name))
+    """Every tool the reviewer may judge: self-hosted writes that no hard rule reserves."""
+    return frozenset(name for name in self_hosted_writes() if not never_reviewed(name))

@@ -31,6 +31,7 @@ from bud.harness.review import (
     Verdict,
     held,
     owner_answers,
+    too_long_to_review,
 )
 from bud.harness.writes import never_reviewed, reviewable_tools, self_hosted_writes
 
@@ -199,6 +200,8 @@ class ActionGateway(WrapperToolset[None]):
         action = self.policy.decide_tool(tool.tool_def)
         if action == "review" and self._notifies_others(name, tool_args):
             action = "ask"  # hard rule: other people would be notified
+        if action == "review" and too_long_to_review(tool_args):
+            action = "ask"  # the reviewer would see only part of the call
         rule: str = action
         outcome = "refused" if action == "deny" else "allowed"
         review: dict[str, Any] | None = None

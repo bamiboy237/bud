@@ -56,9 +56,7 @@ def as_mode(value: object) -> Mode | None:
 
 
 def _overlay(mode: Mode, reviewer: bool) -> dict[str, Action]:
-    # Everything the reviewer may judge goes back to asking first, so leaving auto mode
-    # never leaves a tool on "review".
-    overlay: dict[str, Action] = dict.fromkeys(_SELF_HOSTED_WRITES | _REVIEWABLE, "ask")
+    overlay: dict[str, Action] = dict.fromkeys(_SELF_HOSTED_WRITES, "ask")
     if mode == "auto" and reviewer:
         overlay.update(dict.fromkeys(_REVIEWABLE, "review"))
     overlay.update(dict.fromkeys(_SKILL_WRITES, "ask"))

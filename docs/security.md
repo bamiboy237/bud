@@ -63,19 +63,29 @@ These limits are guardrails, not a virtual machine: a command runs as you, with 
 ## Browser
 
 Bud uses [OpenCode Browse](https://opencode.ai/product/browse) (MIT) to work in your own
-Chrome, with your tabs and sign-ins. The Mac app ships the `browse` program, pinned by
-version and SHA-512, and copies it to `~/.bud/bin` on first launch, where it updates itself.
-A `browse` you installed yourself is used when Bud's copy is missing. To connect Chrome, ask
-Bud: a setup card links the extension and shows a one-time pairing code. Set
-`BROWSER_TOOLS=false` to turn the browser off.
+Chrome, with your tabs and sign-ins. Browse's tools are `browser_status`, `browser_tabs`, and
+`browser_execute`, which runs JavaScript in a tab.
 
-- Reading runs without asking: tabs, opening and reading pages, screenshots, scrolling,
-  waiting, network and console capture, and handing a step to you.
-- Acting asks you, or the reviewer in auto mode: clicking, typing, filling forms, keys,
-  uploads, dialogs, running JavaScript, recordings, and Browse settings.
+- **You turn it on once.** Bud calls `enable_browser`, and the approval card explains what it
+  allows. It always asks and offers no "always allow". Until then the browser tools are
+  hidden. Ask Bud to turn the browser off at any time (`disable_browser`).
+- **Each step is checked.** `browser_status` runs unasked. Every `browser_tabs` and
+  `browser_execute` call goes to the approval reviewer. A step it judges safe and clearly
+  requested runs. Anything else, such as paying, sending, deleting, or typing a password,
+  asks you with the reviewer's reason. If the reviewer cannot answer, Bud asks you.
+- **The reviewer sees the real page.** Bud looks up the address of the tab a script drives
+  and shows it to the reviewer, so a script cannot hide where it acts.
+- **No partial checks.** The reviewer sees at most 4,000 characters of a call. A longer call
+  asks you instead.
+- **Limits of the check.** A page Bud reads can try to trick it, and a step written to look
+  harmless can pass. The approval card says so before you turn the browser on.
 - A tool a later Browse version adds is refused until Bud names it.
-- Page content is data, never instructions. After a crash, recovery returns a browser
-  action's recorded result instead of repeating it.
+
+The Mac app ships `browse` 0.1.5, pinned by SHA-512 and signed with the app, and copies it to
+`~/.bud/bin` on first launch. From there Browse updates itself with its own updater. A
+`browse` you installed (`~/.local/bin` or on `PATH`) is used when Bud's copy is missing. To
+connect Chrome, ask Bud: a setup card links the extension and shows a one-time pairing code.
+Set `BROWSER_TOOLS=false` to remove the browser entirely.
 
 ## Standing permissions
 

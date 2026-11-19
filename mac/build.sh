@@ -85,8 +85,10 @@ if [[ -f $tarball ]]; then
   fi
   unpacked=$(mktemp -d)
   tar -xzf "$tarball" -C "$unpacked" package/bin/browse package/LICENSE
-  mkdir -p "$app/Contents/Resources/browse"
-  cp "$unpacked/package/bin/browse" "$unpacked/package/LICENSE" "$app/Contents/Resources/browse/"
+  # Helpers holds nested code, which is signed before the app below.
+  mkdir -p "$app/Contents/Helpers"
+  cp "$unpacked/package/bin/browse" "$app/Contents/Helpers/browse"
+  cp "$unpacked/package/LICENSE" "$app/Contents/Resources/browse-LICENSE"
   rm -rf "$unpacked"
   echo "browse: $browse_version ($arch)"
 else
@@ -97,10 +99,13 @@ fi
 # code-signing identity in the keychain (any name; set BUD_SIGN_ID), the app keeps one.
 # Make one in Keychain Access: Certificate Assistant > Create a Certificate, type Code Signing.
 identity=${BUD_SIGN_ID:-bud companion (local)}
+helper=$app/Contents/Helpers/browse
 if security find-identity -p codesigning | grep -qF "\"$identity\""; then
+  [[ -f $helper ]] && codesign --force --sign "$identity" "$helper"
   codesign --force --sign "$identity" "$app"
   echo "signed: $identity"
 else
+  [[ -f $helper ]] && codesign --force --sign - "$helper"
   codesign --force --sign - "$app"
   echo "signed ad hoc: no \"$identity\" identity, so permissions reset each build"
 fi
