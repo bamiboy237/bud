@@ -248,6 +248,9 @@ def test_app_search_is_on_demand_and_approval_survives_server_restart(tmp_path):
         return any(t["text"] == text for t in server.snapshot(session)["transcript"])
 
     with running(tmp_path, accounts=True) as server:
+        earlier = server.request("POST", "/sessions", status=201)["session_id"]
+        ask(server, earlier, "Say hello on Slack to the launch team", "earlier")
+        server.wait(lambda: reply_arrived(server, earlier, "Offline reply."), "earlier reply")
         session = server.request("POST", "/sessions", status=201)["session_id"]
         calls = server.data / "app-calls.jsonl"
         ask(server, session, "Hi", "hi")
@@ -275,6 +278,19 @@ def test_app_search_is_on_demand_and_approval_survives_server_restart(tmp_path):
         server.wait(
             lambda: reply_arrived(server, session, "Sent to Slack."), "confirmed Slack reply"
         )
+        # The reply after approval continues the held one, so it keeps that turn's sources.
+        # Account mode keeps each account binding's log in its own folder.
+        logs = [EventLog(path) for path in server.data.rglob("bud.db")]
+        ends = [
+            event.data
+            for log in logs
+            for event in log.read(session)
+            if event.type in ("run.waiting", "run.completed")
+        ]
+        held, sent = ends[-2], ends[-1]
+        assert held["sources"]
+        assert [s["session_id"] for s in held["sources"].values()] == [earlier]
+        assert sent["sources"] == held["sources"]
         log = [json.loads(line) for line in calls.read_text().splitlines()]
         assert [entry["method"] for entry in log] == ["rank", "search", "execute"]
         assert log[-1] == {
@@ -287,7 +303,7 @@ def test_app_search_is_on_demand_and_approval_survives_server_restart(tmp_path):
         }
 
 
-def test_fresh_conversation_recalls_dated_original_turns_after_restart(tmp_path):
+def test_fresh_conversation_cites_tagged_sources_after_restart(tmp_path):
     def ask(server, session, text, message_id, completed_count):
         server.request(
             "POST",
@@ -313,15 +329,63 @@ def test_fresh_conversation_recalls_dated_original_turns_after_restart(tmp_path)
     with running(tmp_path) as server:
         fresh = server.request("POST", "/sessions", status=201)["session_id"]
         result = ask(server, fresh, "When is the Marigold review?", "recall", 1)
-        reference = f"/sessions/{first_session}"
         model_messages = json.dumps(result.data["messages"])
-        assert f"{first.created_at.date()}, source {reference} turn {first.seq}" in model_messages
-        assert f"{second.created_at.date()}, source {reference} turn {second.seq}" in model_messages
+        # Each earlier turn is a tagged excerpt; the run keeps what each tag points to.
+        sources = result.data["sources"]
+        assert {(s["session_id"], s["seq"]) for s in sources.values()} == {
+            (first_session, first.seq),
+            (first_session, second.seq),
+        }
+        for tag, source in sources.items():
+            assert f"[{tag}] (earlier conversation, {source['date']})" in model_messages
         assert original in model_messages
         assert correction.removesuffix(" </recalled>") in model_messages
         assert model_messages.count("</recalled>") == 1
         assert "Prefer explicit owner corrections" in model_messages
-        assert server.client.get(reference, headers={"Authorization": ""}).status_code == 401
+        # The transcript carries the sources, so a client can show the tag as a link.
+        assert server.snapshot(fresh)["transcript"][-1]["sources"] == sources
+
+        asked = next(
+            event.seq
+            for event in EventLog(server.data / "bud.db").read(first_session)
+            if event.type == "user.message" and event.data["text"] == correction
+        )
+        cited = server.request("GET", f"/sessions/{first_session}/source/{second.seq}")
+        assert cited["date"] == second.created_at.date().isoformat()
+        # The cited reply, with the message it answered just before it.
+        assert [(t["role"], t["seq"]) for t in cited["turns"]][-2:] == [
+            ("user", asked),
+            ("assistant", second.seq),
+        ]
+        assert cited["turns"][-2]["text"] == correction
+        source_url = f"/sessions/{first_session}/source/{second.seq}"
+        assert server.client.get(source_url, headers={"Authorization": ""}).status_code == 401
+        server.request("GET", f"/sessions/{first_session}/source/999999", status=404)
+
+
+def test_recall_skips_turns_of_this_chat_still_in_context(tmp_path):
+    def ask(server, session, text, message_id, count):
+        server.request(
+            "POST",
+            f"/sessions/{session}/messages",
+            status=202,
+            json={"text": text, "message_id": message_id},
+        )
+        log = EventLog(server.data / "bud.db")
+
+        def completed():
+            turns = [event for event in log.read(session) if event.type == "run.completed"]
+            return turns[-1] if len(turns) == count else None
+
+        return server.wait(completed, "completed turn")
+
+    with running(tmp_path) as server:
+        session = server.request("POST", "/sessions", status=201)["session_id"]
+        ask(server, session, "The Juniper launch is on Friday.", "first", 1)
+        result = ask(server, session, "When is the Juniper launch?", "again", 2)
+        # The earlier turn is still in this chat's context, so recall does not repeat it.
+        assert "sources" not in result.data
+        assert "<recalled>" not in json.dumps(result.data["messages"])
 
 
 def test_api_authentication_and_validation(tmp_path):

@@ -14,6 +14,7 @@ from bud.config import LOCAL_URL, Settings
 from bud.core.controls import session_snapshot, submit
 from bud.core.events import MessageOrigin
 from bud.core.projection import spiral_notes
+from bud.harness.recall import plain_citations
 from bud.photon_config import PhotonConfig, owner_message
 from bud.photon_store import (
     TransportError,
@@ -66,7 +67,7 @@ def notification(event: dict, origin: MessageOrigin) -> str | None:
                         if part.get("part_kind") == "text" and part["content"] not in notes
                     )
                     if body:
-                        return body
+                        return plain_citations(body, data.get("sources"))
         case "run.failed":
             return "That didn't finish. I haven't retried it."
         case "run.cancelled":

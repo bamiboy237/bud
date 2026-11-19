@@ -20,6 +20,10 @@ class Turn(BaseModel):
     role: str
     text: str
     task_id: int | None = None
+    # The event that holds this turn, so a client can jump to it.
+    seq: int | None = None
+    # What the reply's [S1]-style tags cite: session_id, seq, date, and a display label.
+    sources: dict[str, dict] | None = None
 
 
 class PendingApproval(BaseModel):
@@ -317,7 +321,7 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
     for event in events:
         match event.type:
             case "user.message":
-                transcript.append(Turn(role="user", text=event.data["text"]))
+                transcript.append(Turn(role="user", text=event.data["text"], seq=event.seq))
                 blocks = {}
             case "run.waiting" | "run.completed":
                 report = event.data.get("report")
@@ -329,6 +333,8 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
                     run_turns[run_id] = Turn(role="assistant", text="")
                     transcript.append(run_turns[run_id])
                 run_turns[run_id].text = text
+                run_turns[run_id].seq = event.seq
+                run_turns[run_id].sources = event.data.get("sources")
             case "task.completed" | "task.failed" | "task.paused" | "task.cancelled":
                 transcript.append(
                     Turn(

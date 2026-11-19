@@ -59,7 +59,8 @@ def scripted_response(messages: list[ModelMessage], info: AgentInfo) -> ModelRes
             parts=[ToolCallPart(name, args, tool_call_id=f"script-{name}-{len(parts)}")]
         )
 
-    if prompt == "Send hello on Slack":
+    # Recall may append earlier context after the request itself.
+    if prompt.startswith("Send hello on Slack"):
         if any(part.tool_name == "SLACK_SEND_MESSAGE" for part in returns):
             return ModelResponse(parts=[TextPart("Sent to Slack.")])
         if "SLACK_SEND_MESSAGE" in tools:

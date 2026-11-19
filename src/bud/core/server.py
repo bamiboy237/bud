@@ -674,6 +674,25 @@ def _create_app(
         require_session(session_id)
         return runner.snapshot(session_id)
 
+    @app.get("/sessions/{session_id}/source/{seq}")
+    def get_source(session_id: str, seq: int) -> dict:
+        """A cited message with the exchange around it, for a client's source view."""
+        require_session(session_id)
+        events = log.read(session_id)
+        chat = [
+            turn for turn in log.snapshot(session_id, events).transcript if turn.task_id is None
+        ]
+        index = next((i for i, turn in enumerate(chat) if turn.seq == seq), None)
+        if index is None:
+            raise HTTPException(404, "unknown source")
+        cited = next(event for event in events if event.seq == seq)
+        return {
+            "session_id": session_id,
+            "seq": seq,
+            "date": cited.created_at.date().isoformat(),
+            "turns": [turn.model_dump() for turn in chat[max(0, index - 3) : index + 3]],
+        }
+
     @app.get("/sessions/{session_id}/tasks/{task_id}")
     def get_task(session_id: str, task_id: int) -> dict:
         require_session(session_id)

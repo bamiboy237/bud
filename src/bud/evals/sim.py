@@ -34,6 +34,7 @@ import httpx
 
 from bud.config import HOST, PORT
 from bud.core.projection import reply_text
+from bud.harness.recall import plain_citations
 from bud.world.store import World
 
 
@@ -187,7 +188,9 @@ def _turn_summary(data: Path, session: str, after: int) -> dict:
             summary["failed"] = {k: event.get(k) for k in ("reason", "kind", "next")}
         elif kind == "run.completed" and not event.get("quiet"):
             # A quiet run closes a superseded proposal; surfaces hide it, and so does this.
-            summary["reply"] = reply_text(event.get("messages", []))
+            summary["reply"] = plain_citations(
+                reply_text(event.get("messages", [])), event.get("sources")
+            )
     return summary
 
 

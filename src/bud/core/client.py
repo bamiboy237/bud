@@ -22,6 +22,7 @@ from bud.core.auth import OwnerAuthError, owner_token
 from bud.core.controls import approval_text, session_snapshot
 from bud.core.controls import submit as submit_control
 from bud.core.projection import reply_text
+from bud.harness.recall import plain_citations
 
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\\\)|[@-Z\\\\-_])")
 
@@ -124,10 +125,11 @@ def render(
             # the stored reply instead of assuming one received token means all arrived.
             text = reply_text(data.get("messages", []))
             printed = "".join(streamed.pop(data["run_id"], []))
+            sources = data.get("sources")
             if text.startswith(printed):
-                print(text[len(printed) :], end="", flush=True)
+                print(plain_citations(text[len(printed) :], sources), end="", flush=True)
             elif text:
-                print(f"\n[complete reply]\n{text}", end="", flush=True)
+                print(f"\n[complete reply]\n{plain_citations(text, sources)}", end="", flush=True)
             print(flush=True)
         case "run.failed":
             streamed.pop(data["run_id"], None)
