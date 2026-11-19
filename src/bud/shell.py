@@ -146,9 +146,11 @@ _HOST = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9]
 
 def site(authority: str, default_port: int) -> tuple[str, int]:
     """The host and port of `host[:port]`, IPv6 in brackets. Raises ValueError otherwise."""
-    parts = urlsplit("//" + authority)
-    if parts.username is not None or parts.password is not None or parts.path or parts.query:
+    if any(mark in authority for mark in "/?#@"):
         raise ValueError(f"not a plain host: {authority!r}")
+    parts = urlsplit("//" + authority)
+    if parts.port == 0:
+        raise ValueError(f"port 0 is not a port: {authority!r}")
     host = (parts.hostname or "").rstrip(".")
     try:
         ipaddress.ip_address(host)
@@ -220,8 +222,12 @@ class Proxy:
             upstream_reader, upstream_writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port), 30
             )
-            upstream_writer.write(request)
-            await _pipe(upstream_reader, writer)
+            try:
+                upstream_writer.write(request)
+                await upstream_writer.drain()
+                await _pipe(upstream_reader, writer)
+            finally:
+                upstream_writer.close()
         except (
             OSError,
             ValueError,
@@ -241,10 +247,21 @@ async def _one_request(
 ) -> bytes:
     """The request to send upstream, with its body, asking the server to close after it."""
     headers = [line for line in lines[1:] if line]
-    names = {line.split(":", 1)[0].strip().lower(): line for line in headers}
+    if any(":" not in line for line in headers):
+        raise ValueError("a header line has no colon")
+    names = [line.split(":", 1)[0].strip().lower() for line in headers]
     if "transfer-encoding" in names:
         raise ValueError("chunked request bodies are not supported")
-    length = int(names["content-length"].split(":", 1)[1]) if "content-length" in names else 0
+    lengths = [
+        line.split(":", 1)[1].strip()
+        for line, name in zip(headers, names, strict=True)
+        if name == "content-length"
+    ]
+    if len(lengths) > 1:
+        raise ValueError("more than one Content-Length")
+    length = int(lengths[0]) if lengths else 0
+    if length < 0:
+        raise ValueError("negative Content-Length")
     body = await reader.readexactly(length) if length else b""
     kept = [
         line

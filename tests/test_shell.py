@@ -11,7 +11,8 @@ from typing import Any, cast
 import pytest
 
 from bud import shell
-from bud.core.server import allow_file_tools
+from bud.config import Settings
+from bud.core.server import allow_file_tools, private_folders
 from bud.harness.actions import Policy
 from bud.harness.review import ReviewResult, ToolReviewer, Verdict
 from bud.shell import NetworkGrants, Proxy, build_tools, judge_site, run
@@ -184,7 +185,16 @@ def test_site_reads_host_and_port(authority, expected):
 
 @pytest.mark.parametrize(
     "authority",
-    ["user:pass@example.com", "example.com?q=1", "example.com/x", "a b", ":443", "x:99999"],
+    [
+        "user:pass@example.com",
+        "example.com?q=1",
+        "example.com/x",
+        "evil.com#api.weather.gov",
+        "example.com:0",
+        "a b",
+        ":443",
+        "x:99999",
+    ],
 )
 def test_site_refuses_anything_but_a_plain_host(authority):
     with pytest.raises(ValueError):
@@ -296,3 +306,40 @@ def test_running_commands_never_asks_and_each_new_site_always_does():
     assert policy.decide("run_command") == "allow"
     assert policy.decide("allow_network") == "ask"
     assert not policy.grantable("allow_network")
+
+
+async def proxy_reply(request: bytes) -> bytes:
+    async def allow(host: str) -> bool:
+        return True
+
+    proxy = Proxy(allow)
+    port = await proxy.start()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port, limit=1 << 20)
+        writer.write(request)
+        await writer.drain()
+        reply = await asyncio.wait_for(reader.read(), 5)
+        writer.close()
+        return reply
+    finally:
+        await proxy.close()
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        "Transfer-Encoding: chunked\r\n",
+        "Content-Length: 5\r\nContent-Length: 0\r\n",
+        "Content-Length\r\n",
+        "X-Big: " + "a" * 70_000 + "\r\n",
+    ],
+    ids=["chunked", "two-lengths", "no-colon", "oversized"],
+)
+async def test_malformed_plain_http_requests_are_refused(headers):
+    request = f"POST http://127.0.0.1:9/ HTTP/1.1\r\nHost: x\r\n{headers}\r\n".encode()
+    assert (await proxy_reply(request)).startswith(b"HTTP/1.1 400")
+
+
+def test_shell_commands_cannot_read_bud_data_or_the_folder_it_runs_from(tmp_path):
+    settings = Settings(data_dir=tmp_path / "data")
+    assert private_folders(settings) == [tmp_path / "data", Path.cwd()]
