@@ -353,19 +353,21 @@ def test_fresh_conversation_cites_tagged_sources_after_restart(tmp_path):
         # The transcript carries the sources, so a client can show the tag as a link.
         assert server.snapshot(fresh)["transcript"][-1]["sources"] == sources
 
-        asked = next(
+        said, asked = [
             event.seq
             for event in EventLog(server.data / "bud.db").read(first_session)
-            if event.type == "user.message" and event.data["text"] == correction
-        )
+            if event.type == "user.message"
+        ]
         cited = server.request("GET", f"/sessions/{first_session}/source/{second.seq}")
         assert cited["date"] == second.created_at.date().isoformat()
-        # The cited reply, with the message it answered just before it.
-        assert [(t["role"], t["seq"]) for t in cited["turns"]][-2:] == [
+        # The whole conversation, so the client can open it at the cited reply.
+        assert [(t["role"], t["seq"]) for t in cited["turns"]] == [
+            ("user", said),
+            ("assistant", first.seq),
             ("user", asked),
             ("assistant", second.seq),
         ]
-        assert cited["turns"][-2]["text"] == correction
+        assert cited["turns"][2]["text"] == correction
         source_url = f"/sessions/{first_session}/source/{second.seq}"
         assert server.client.get(source_url, headers={"Authorization": ""}).status_code == 401
         server.request("GET", f"/sessions/{first_session}/source/999999", status=404)

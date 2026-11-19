@@ -169,6 +169,8 @@ private struct ConversationView: View {
         .environment(\.openURL, OpenURLAction { url in
             companion.openSource(url) ? .handled : .systemAction
         })
+        // On the chat, not the source panel, so the panel keeps its own corner.
+        .overlay(alignment: .topTrailing) { pin }
         .inspector(isPresented: Binding(
             get: { companion.sourcePanel != nil },
             set: { if !$0 { companion.sourcePanel = nil } }
@@ -178,7 +180,6 @@ private struct ConversationView: View {
                     .inspectorColumnWidth(min: 240, ideal: 300, max: 420)
             }
         }
-        .overlay(alignment: .topTrailing) { pin }
         .onAppear { typing = true }
         .onChange(of: companion.inputPurpose) { _, purpose in
             if purpose != .ask { typing = true }
@@ -569,6 +570,12 @@ private struct SourcePanelView: View {
                         .font(.headline)
                 }
                 Spacer()
+                if companion.chatFocus(for: panel) != nil {
+                    Button("Scroll to message") { companion.scrollToSource(panel) }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                        .help("Show this message in the chat")
+                }
                 Button { companion.sourcePanel = nil } label: {
                     Image(systemName: "xmark").font(.system(size: 10, weight: .semibold))
                 }

@@ -510,23 +510,10 @@ final class Companion {
 
     // MARK: Actions
 
-    /// Follows a source link: to the message itself when it's in this conversation, or into
-    /// the side panel when it's from another one. Returns false for links that aren't sources.
+    /// Follows a source link into the side panel. Returns false for links that aren't sources.
     func openSource(_ url: URL) -> Bool {
         guard let target = Citations.target(url) else { return false }
         ConversationWindow.shared.show()
-        if target.session == session {
-            if let turn = turns.first(where: { $0.seq == target.seq }) {
-                sourcePanel = nil
-                focus = .turn(turn.id)
-                return true
-            }
-            if target.seq == replySeq {
-                sourcePanel = nil
-                focus = .latest
-                return true
-            }
-        }
         guard let connection else { return true }
         let mine = generation
         sourcePanel = SourcePanel(session: target.session, seq: target.seq)
@@ -542,6 +529,18 @@ final class Companion {
                 problem: "This message isn't available anymore.")
         }
         return true
+    }
+
+    /// Where the panel's cited message sits in the chat on screen, if it's there.
+    func chatFocus(for panel: SourcePanel) -> Focus? {
+        guard panel.session == session else { return nil }
+        if let turn = turns.first(where: { $0.seq == panel.seq }) { return .turn(turn.id) }
+        return panel.seq == replySeq ? .latest : nil
+    }
+
+    /// Scrolls the chat to the message the side panel shows.
+    func scrollToSource(_ panel: SourcePanel) {
+        focus = chatFocus(for: panel)
     }
 
     func receiveSetup(_ data: [String: Any], replacing: Bool = false) {
