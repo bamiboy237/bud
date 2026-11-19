@@ -53,6 +53,7 @@ class ServerProcess:
                 "OWNER_TOKEN": TOKEN,
                 "APPROVAL_REVIEW": "false",
                 "LOOP_DETECTION": "false",
+                "BROWSER_TOOLS": "false",
                 "PYTHONPATH": os.pathsep.join((str(ROOT), str(ROOT / "src"))),
                 "PYTHONUNBUFFERED": "1",
                 "DBOS_DISABLE_OTLP": "true",

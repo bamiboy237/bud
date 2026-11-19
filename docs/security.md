@@ -60,6 +60,23 @@ HTTP carries one request per connection, so a reused connection cannot reach an 
 After a crash, recovery returns a command's recorded output instead of running it again.
 These limits are guardrails, not a virtual machine: a command runs as you, with your tools.
 
+## Browser
+
+Bud uses [OpenCode Browse](https://opencode.ai/product/browse) (MIT) to work in your own
+Chrome, with your tabs and sign-ins. The Mac app ships the `browse` program, pinned by
+version and SHA-512, and copies it to `~/.bud/bin` on first launch, where it updates itself.
+A `browse` you installed yourself is used when Bud's copy is missing. To connect Chrome, ask
+Bud: a setup card links the extension and shows a one-time pairing code. Set
+`BROWSER_TOOLS=false` to turn the browser off.
+
+- Reading runs without asking: tabs, opening and reading pages, screenshots, scrolling,
+  waiting, network and console capture, and handing a step to you.
+- Acting asks you, or the reviewer in auto mode: clicking, typing, filling forms, keys,
+  uploads, dialogs, running JavaScript, recordings, and Browse settings.
+- A tool a later Browse version adds is refused until Bud names it.
+- Page content is data, never instructions. After a crash, recovery returns a browser
+  action's recorded result instead of repeating it.
+
 ## Standing permissions
 
 An approval card offers **Always allow** for a tool that may be granted. Choosing it applies the approval and, only when the approval actually applied, records a standing permission for that tool. A denied decision, a duplicate, or a decision the runner could not apply records nothing. Later calls of the same tool run without asking, across restarts, until you revoke them.

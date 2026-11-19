@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field, SecretStr
 from pydantic_ai import ModelRetry
 from pydantic_ai.toolsets import CombinedToolset, FunctionToolset
 
+from bud import browser
 from bud.composio.binding import valid_toolkit
 from bud.composio.connection import ConnectionError, Connections
 from bud.config import Settings, get_settings
@@ -269,7 +270,10 @@ def _create_app(
         tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS, "allow"))
         allow_file_tools(tools_policy)
         tools_policy.tools["setup_capability"] = "allow"
+        browse = browser.executable() if settings.browser_tools else None
+        browser.allow_tools(tools_policy)
         setup = setup_registry(connections)
+        setup.register("browser", browser.setup_entry())
         setup_journal = SetupJournal()
         loaded = {"accounts": frozenset(accounts)}
         refresh_lock = Lock()
@@ -283,6 +287,7 @@ def _create_app(
                         workspace, session_dir, lambda: harness.reviewer, private_folders(settings)
                     ),
                     build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
+                    *([browser.toolset(browse)] if browse is not None else []),
                 ]
             )
 
@@ -315,6 +320,7 @@ def _create_app(
             "message; no restart is needed."
             + WEB_GUIDANCE
             + file_guidance()
+            + browser.GUIDANCE
             + f"Your workspace is the folder {display_path(workspace)} on the person's Mac.\n",
             memory=build_memory(session_dir / "memory.db", namespace="owner"),
             state_dir=session_dir,
