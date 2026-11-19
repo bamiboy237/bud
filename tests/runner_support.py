@@ -99,7 +99,7 @@ async def running_bud(
     harness.clock = lambda: datetime(2026, 11, 6, 12, tzinfo=UTC)
     if spiral is not None:
         harness.spiral = spiral
-    runner = Runner(Hub(log), gateway, harness, jobs=jobs)
+    runner = Runner(Hub(log), gateway, harness, jobs=jobs, workspace=root)
     try:
         yield RunningBud(runner, log, root, claims)
     finally:

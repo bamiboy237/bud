@@ -68,6 +68,8 @@ _PRIVATE_WORDS = [
     "course",
     "progress",
 ]
+# Words a file name must not contain, for code that names files in the workspace.
+PRIVATE_WORDS = frozenset(_PRIVATE_WORDS)
 _PRIVATE = re.compile(rf"(^|[._\- ])({'|'.join(_PRIVATE_WORDS)})([._\- ]|$)", re.I)
 # The same rule as FileSystem globs, which match the whole relative path, case-insensitively.
 _DENIED = [".?*", "*/.?*"] + [

@@ -44,6 +44,13 @@ struct HeldMessage: Identifiable {
     let scope: String
 }
 
+/// A short job milestone, with the saved report behind a "finished" one.
+struct Notice: Identifiable, Equatable {
+    let id = UUID()
+    let text: String
+    var report: URL? = nil
+}
+
 struct RunningTask: Identifiable, Equatable, Sendable {
     let id: Int
     let title: String
@@ -244,7 +251,7 @@ final class Companion {
     private(set) var heldMessages: [HeldMessage] = []
     private(set) var retryingHeldMessage = false
     /// Short job milestones (started, needs you, finished). Progress notes never come here.
-    var notices: [String] = []
+    var notices: [Notice] = []
     /// Active background tasks/jobs and their helper pups (capped at max 4). A stalled job
     /// turns the pet to "needs you", like an open approval.
     private(set) var activeTasks: [RunningTask] = [] {
@@ -850,7 +857,9 @@ final class Companion {
     /// A short line in the bubble, for things like "voice isn't set up yet". Cleared with the
     /// next message, like job notices.
     func nudge(_ text: String) {
-        if !notices.contains(text) { notices = Array((notices + [text]).suffix(3)) }
+        if !notices.contains(where: { $0.text == text }) {
+            notices = Array((notices + [Notice(text: text)]).suffix(3))
+        }
         bubbleOpen = true
     }
 
@@ -1371,7 +1380,11 @@ final class Companion {
             text = "“\(title)” looks stuck. \(text)"
         }
         guard !text.isEmpty else { return }
-        notices.append(String(text.prefix(160)))
+        let report = event.string("report_path")
+        notices.append(Notice(
+            text: String(text.prefix(160)),
+            report: event.type == "task.completed" && !report.isEmpty
+                ? URL(fileURLWithPath: report) : nil))
         notices = Array(notices.suffix(3))
         bubbleOpen = true
     }

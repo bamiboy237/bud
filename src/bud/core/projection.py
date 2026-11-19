@@ -118,6 +118,8 @@ class TaskView(BaseModel):
     outcome: str | None = None
     # Why a running job looks stuck ("idle" or "overdue"), until it shows activity again.
     stalled: str | None = None
+    # The finished job's report in the workspace, as an absolute path a client can open.
+    report: str | None = None
 
 
 class Snapshot(BaseModel):

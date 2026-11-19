@@ -288,6 +288,7 @@ def _create_app(
         )
     else:
         db_path = settings.data_dir / "bud.db"
+        workspace = workspace_root(settings.data_dir)
         gateway = build_gateway(settings, model_id=model_id)
         world = World(settings.data_dir / "world.db")
         tools_policy = load_policy()
@@ -300,7 +301,7 @@ def _create_app(
                 [
                     FunctionToolset(build_tools(world)),
                     build_web_tools(settings),
-                    workspace_tools(workspace_root(settings.data_dir), settings.data_dir),
+                    workspace_tools(workspace, settings.data_dir),
                 ]
             ),
             tools_policy,
@@ -311,9 +312,7 @@ def _create_app(
             result_path=db_path,
             read_tools=WORLD_READ_TOOLS | WEB_READ_TOOLS | WORKSPACE_READ_TOOLS,
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
-            capabilities=workspace_read_capabilities(
-                workspace_root(settings.data_dir), deferred=True
-            ),
+            capabilities=workspace_read_capabilities(workspace, deferred=True),
         )
     # One seam for both branches: memory/skill rules are unioned inside the
     # Harness, so the profile overlay lands on the composed policy. The
@@ -362,7 +361,16 @@ def _create_app(
         embedder=embedder(settings),
         memory=harness.memory,
     )
-    runner = Runner(hub, gateway, harness, durable=True, jobs=True, learner=learner, recall=recall)
+    runner = Runner(
+        hub,
+        gateway,
+        harness,
+        durable=True,
+        jobs=True,
+        learner=learner,
+        recall=recall,
+        workspace=workspace,
+    )
 
     async def every_minute() -> None:
         while True:
