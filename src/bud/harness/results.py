@@ -187,7 +187,7 @@ class SqliteResultStore:
             return text
 
     async def keep_tool_result(
-        self, handle: str, days: Annotated[int, Field(ge=1, le=3650)] | None = 30
+        self, handle: str, days: Annotated[int, Field(ge=1, le=3650)] | None = 1
     ) -> str:
         """Keep a saved result longer than its default expiry, so it can be read later.
 
@@ -196,7 +196,8 @@ class SqliteResultStore:
 
         Args:
             handle: Exact handle from a saved tool result.
-            days: Days to keep it, from 1 to 3,650. None keeps it until you call this again.
+            days: Days to keep it from now, from 1 to 3,650. None keeps it until you call
+                this again.
         """
         until = float("inf") if days is None else time.time() + timedelta(days=days).total_seconds()
         kept = await asyncio.to_thread(self._keep, handle, until)

@@ -102,6 +102,7 @@ class Harness:
                     "read_tool_result",
                     "read_tool_result_chars",
                     "load_tool_result",
+                    "keep_tool_result",
                 }
                 if self.policy.decide(name) == "allow"
             }

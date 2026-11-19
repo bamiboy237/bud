@@ -6,6 +6,7 @@ from datetime import timedelta
 
 from bud.core.log import EventLog
 from bud.harness.results import SqliteResultStore
+from tests.test_live_tools import harness
 
 DAY = 86_400
 
@@ -55,16 +56,14 @@ async def test_a_kept_result_lasts_the_chosen_days_then_expires(tmp_path, monkey
     assert await store.prune() == 1
 
 
-async def test_the_default_keep_is_thirty_days_and_none_keeps_it_until_changed(
-    tmp_path, monkeypatch
-):
-    store = store_with_results(tmp_path, "run/month", "run/always")
-    await store.keep_tool_result("run/month")
+async def test_the_default_keep_is_one_day_and_none_keeps_it_until_changed(tmp_path, monkeypatch):
+    store = store_with_results(tmp_path, "run/day", "run/always")
+    await store.keep_tool_result("run/day")
     assert "until you choose" in await store.keep_tool_result("run/always", days=None)
 
-    shift_clock(monkeypatch, 29 * DAY)
+    shift_clock(monkeypatch, DAY - 60)
     assert await store.prune() == 0
-    shift_clock(monkeypatch, 31 * DAY)
+    shift_clock(monkeypatch, DAY + 60)
     assert await store.prune() == 1
     shift_clock(monkeypatch, 3650 * DAY)
     assert await store.prune() == 0
@@ -72,7 +71,7 @@ async def test_the_default_keep_is_thirty_days_and_none_keeps_it_until_changed(
 
     # A new choice replaces the old one.
     await store.keep_tool_result("run/always", days=1)
-    shift_clock(monkeypatch, 2 * DAY)
+    shift_clock(monkeypatch, 3652 * DAY)
     assert await store.prune() == 1
 
 
@@ -93,3 +92,9 @@ def test_an_older_store_gains_the_expiry_column(tmp_path):
     SqliteResultStore(path, retention=timedelta(hours=1))
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT keep_until FROM tool_results").fetchone() == (None,)
+
+
+def test_keeping_runs_inside_code_mode_not_as_its_own_tool(tmp_path):
+    subject = harness(tmp_path)
+    assert "keep_tool_result" in subject.code_mode.tools
+    assert "load_tool_result" in subject.code_mode.tools
