@@ -294,3 +294,25 @@ async def test_queued_job_report_survives_runner_reconstruction(tmp_path, monkey
         assert [run["run_id"] for run in reports] == [report_id]
         assert any(e.type == "run.completed" and e.data["run_id"] == report_id for e in events)
         assert "The lease renews on 3 March." in prompts[-1]
+
+
+def test_a_finished_result_reaches_the_report_with_its_sources(tmp_path):
+    log = EventLog(tmp_path / "events.db")
+    sources = " Sources: https://modelcontextprotocol.io/docs/getting-started/intro"
+    research = "MCP is an open standard. " * 30 + sources
+    log.append("owner", "task.completed", {"task_id": 1, "title": "MCP", "text": research})
+    log.append("owner", "task.stalled", {"task_id": 2, "title": "Big", "text": "x" * 900})
+    note = job_updates_note(log.read("owner"), {"run_id": "next", "trigger": "message"})
+
+    # The result, with the link at its end, arrives whole; a long progress note is cut.
+    assert "getting-started/intro" in note
+    assert "inspect_task(2) shows all of it" in note
+    assert "inspect_task(1)" not in note
+
+
+def test_a_result_too_long_for_the_report_points_to_the_whole_one(tmp_path):
+    log = EventLog(tmp_path / "events.db")
+    log.append("owner", "task.completed", {"task_id": 3, "title": "Long", "text": "y" * 5_000})
+    note = job_updates_note(log.read("owner"), {"run_id": "next", "trigger": "message"})
+
+    assert "cut at 4,000 of 5,000 characters; inspect_task(3) shows all of it" in note

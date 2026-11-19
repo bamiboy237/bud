@@ -1297,6 +1297,9 @@ def _parked_note(approval_id: str) -> str:
 
 
 JOB_UPDATE_CHARS = 600
+# A finished job's result is the deliverable, so more of it reaches the report: sources and
+# links usually come at the end.
+JOB_RESULT_CHARS = 4_000
 JOB_UPDATES = (
     "task.completed",
     "task.failed",
@@ -1327,8 +1330,15 @@ def job_updates_note(events: list[Event], run: dict) -> str:
             reference = e.data.get("reference") or e.data.get("approval_id", "")
             lines.append(f"- {job} asked the owner to approve {e.data.get('tool')} ({reference}).")
         else:
-            text = json.dumps(str(e.data.get("text", ""))[:JOB_UPDATE_CHARS])
-            lines.append(f"- {job} {e.type.removeprefix('task.')}: {text}")
+            text = str(e.data.get("text", ""))
+            limit = JOB_RESULT_CHARS if e.type == "task.completed" else JOB_UPDATE_CHARS
+            cut = (
+                f" (cut at {limit:,} of {len(text):,} characters; "
+                f"inspect_task({e.data['task_id']}) shows all of it)"
+                if len(text) > limit
+                else ""
+            )
+            lines.append(f"- {job} {e.type.removeprefix('task.')}: {json.dumps(text[:limit])}{cut}")
     ended = {
         e.data["task_id"]
         for e in events
