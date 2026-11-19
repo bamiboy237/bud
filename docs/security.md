@@ -39,19 +39,23 @@ On macOS, Bud runs shell commands in its workspace with `run_command`, without a
 command runs under the macOS sandbox (Seatbelt) with these limits:
 
 - It writes only inside the workspace and the system temp folder.
-- It cannot read your home folder, except the workspace and the toolchains it needs
-  (`~/.local/share/uv`, `~/.local/bin`, `~/.cargo`, `~/.rustup`).
+- It cannot read your home folder, Bud's data folder, or the folder Bud runs from (which
+  holds `.env`), except the workspace and the toolchains it needs (`~/.local/share/uv`,
+  `~/.local/bin`, `~/.cargo`, `~/.rustup`).
 - It gets a minimal environment: no API keys, tokens, or other settings from Bud.
-- It cannot run `open`, `osascript`, or `security`, or send Apple events to other apps.
-- It stops after its time limit (120 seconds by default, 600 at most).
+- It cannot start programs outside the sandbox: no LaunchServices (`open`, or a copy of it),
+  no launchd jobs, no `osascript` or `security`, and no Apple events to other apps.
+- Its time limit is 120 seconds by default, 600 at most. When it runs out, or the command is
+  cancelled, its whole process group is stopped.
 - Python packages go into the workspace's own `.venv`.
 
 The sandbox blocks all network access except a local proxy that runs for each command.
 Package registries and code hosts (PyPI, npm, crates.io, GitHub, and others) pass. For any
 other site, the proxy asks the approval reviewer, with the command and your request. A site
 the reviewer allows is remembered until Bud restarts. A site it does not allow is blocked and
-listed in the result. Bud can then call `allow_network`, which asks you. A site you allow is
-kept in `network-grants.json` in Bud's state folder.
+listed in the result. Bud can then call `allow_network`, which asks you each time: it offers no
+"always allow". A site you allow is kept in `network-grants.json` in Bud's state folder. Plain
+HTTP carries one request per connection, so a reused connection cannot reach an unchecked site.
 
 After a crash, recovery returns a command's recorded output instead of running it again.
 These limits are guardrails, not a virtual machine: a command runs as you, with your tools.
