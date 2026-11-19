@@ -6,7 +6,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
-    "composio>=0.22.0",
+    "composio>=0.32.0",
     "fastapi>=0.162.0",
     "firecrawl-anydoc>=0.2.5,<0.3",
     "httpx>=0.28.1",
