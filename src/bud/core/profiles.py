@@ -2,11 +2,12 @@
 
 Two modes:
 
-- ``strict``: every write asks the owner.
-- ``auto``: every write to bud's own workspace, memory, and the simulated world is reviewed
-  per call (bud.harness.review). A call the reviewer judges safe and clearly requested runs
-  at once and is journaled; anything else asks the owner. Reads never need review. Without a
-  reviewer configured, auto behaves exactly like strict.
+- ``strict``: every write asks the owner, including writes to bud's own workspace.
+- ``auto``: writes to bud's own workspace folder run without asking, like the shell. Every
+  write to memory and the simulated world, and each browser step, is reviewed per call
+  (bud.harness.review). A call the reviewer judges safe and clearly requested runs at once
+  and is journaled; anything else asks the owner. Reads never need review. Without a
+  reviewer configured, those reviewed calls ask, as in strict.
 
 Hard rules live in code, not in the reviewer, and hold in both modes:
 
@@ -32,7 +33,7 @@ from pathlib import Path
 from typing import Literal
 
 from bud.harness.actions import Action, Policy
-from bud.harness.writes import reviewable_tools, self_hosted_writes
+from bud.harness.writes import reviewable_tools, self_hosted_writes, workspace_writes
 from bud.skills import RULES as SKILL_RULES
 
 Mode = Literal["strict", "auto"]
@@ -47,6 +48,7 @@ LEGACY_MODES = frozenset({"balanced", "autonomous"})
 SEND_TOOLS = frozenset({"send_email"})
 _SELF_HOSTED_WRITES = self_hosted_writes()
 _REVIEWABLE = reviewable_tools()
+_WORKSPACE_WRITES = workspace_writes()
 _SKILL_WRITES = {name for name, action in SKILL_RULES.items() if action == "ask"}
 
 
@@ -57,8 +59,11 @@ def as_mode(value: object) -> Mode | None:
 
 def _overlay(mode: Mode, reviewer: bool) -> dict[str, Action]:
     overlay: dict[str, Action] = dict.fromkeys(_SELF_HOSTED_WRITES | _REVIEWABLE, "ask")
-    if mode == "auto" and reviewer:
-        overlay.update(dict.fromkeys(_REVIEWABLE, "review"))
+    if mode == "auto":
+        # Bud's own workspace folder needs no approval, like the shell that writes it too.
+        overlay.update(dict.fromkeys(_WORKSPACE_WRITES, "allow"))
+        if reviewer:
+            overlay.update(dict.fromkeys(_REVIEWABLE, "review"))
     overlay.update(dict.fromkeys(_SKILL_WRITES, "ask"))
     return overlay
 
@@ -81,11 +86,12 @@ def mode_summary(mode: Mode, *, reviewer: bool = False) -> str:
         return "strict: every write (workspace, memory, simulated world, skills) asks."
     if not reviewer:
         return (
-            "auto: no reviewer is configured (it needs OPENAI_API_KEY and APPROVAL_REVIEW "
-            "on), so every write asks, like strict."
+            "auto: workspace files save without asking · no reviewer is configured (it needs "
+            "OPENAI_API_KEY and APPROVAL_REVIEW on), so every other write asks, like strict."
         )
     return (
-        "auto: each workspace, memory, and simulated-world write is reviewed and runs only "
+        "auto: workspace files save without asking · each memory, simulated-world, and "
+        "browser write is reviewed and runs only "
         "when it is judged safe and clearly what you asked for; otherwise it asks · sends, "
         "real Gmail/Calendar writes, and skill changes always ask"
     )
@@ -98,13 +104,14 @@ def guidance(mode: Mode, *, reviewer: bool = False) -> str:
         return ""
     if not reviewer:
         return (
-            "\nApproval mode is auto, but no reviewer is configured, so the owner is asked "
-            "before every write, exactly as in strict mode."
+            "\nApproval mode is auto: files in your workspace save without asking. No reviewer "
+            "is configured, so the owner is asked before every other write."
         )
     return (
-        "\nApproval mode is auto: a reviewer checks each workspace, memory, and simulated-world "
-        "write against the owner's request. It either runs at once (journaled; say plainly "
-        "what you did) or the owner is asked first; you cannot tell in advance, so call the "
+        "\nApproval mode is auto: files in your workspace save without asking. A reviewer "
+        "checks each memory, simulated-world, and browser write against the owner's request. "
+        "It either runs at once (journaled; say plainly what you did) or the owner is asked "
+        "first; you cannot tell in advance, so call the "
         "tool without asking in text. Sending email, real Gmail/Calendar writes, and skill "
         "changes always ask. The reviewer sees only the owner's request, the owner's answers "
         "to your questions, and the call itself, never what you read in emails or web pages, "

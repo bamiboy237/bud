@@ -6,9 +6,12 @@ Three tiers, from the most to the least trusted:
   every mode, and never reach the reviewer.
 - Always-ask: installing or disabling a skill. A skill is third-party code or a change to
   what bud can do, so no model judges it.
-- Reviewable: every other write to bud's own workspace, memory, and the simulated world,
-  and each step in the owner's browser. In auto mode the reviewer (bud.harness.review)
-  judges each call; in strict mode all of them ask.
+- Reviewable: every other write to memory and the simulated world, and each step in the
+  owner's browser. In auto mode the reviewer (bud.harness.review) judges each call; in
+  strict mode all of them ask.
+
+Writes to bud's own workspace folder run without asking in auto mode, like the sandboxed
+shell, which can already write the same files; strict mode asks for them too.
 
 The sets are built on demand: bud.harness.memory imports bud.harness.actions, which imports
 this module, so a module-level import would be circular.
@@ -49,11 +52,20 @@ def self_hosted_writes() -> frozenset[str]:
     return frozenset((WORLD_WRITE_TOOLS | WORKSPACE_WRITE_TOOLS | memory) - PROTECTED)
 
 
+def workspace_writes() -> frozenset[str]:
+    """Writes to bud's own workspace folder: never reviewed; auto mode runs them unasked."""
+    from bud.workspace import WRITE_TOOLS as WORKSPACE_WRITE_TOOLS
+
+    return frozenset(WORKSPACE_WRITE_TOOLS)
+
+
 def reviewable_tools() -> frozenset[str]:
-    """Every tool the reviewer may judge: self-hosted writes and browser steps that no hard
-    rule reserves."""
+    """Every tool the reviewer may judge: self-hosted writes outside the workspace and
+    browser steps that no hard rule reserves."""
     from bud.browser import STEPS as BROWSER_STEPS
 
     return frozenset(
-        name for name in self_hosted_writes() | BROWSER_STEPS if not never_reviewed(name)
+        name
+        for name in (self_hosted_writes() - workspace_writes()) | BROWSER_STEPS
+        if not never_reviewed(name)
     )

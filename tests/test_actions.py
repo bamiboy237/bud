@@ -12,15 +12,21 @@ from pydantic_ai.usage import RunUsage
 
 from bud.composio.tools import policy as account_policy
 from bud.core.profiles import apply_mode
+from bud.core.server import allow_file_tools
 from bud.harness.actions import ActionGateway, Policy, load_policy
 from bud.harness.review import ToolReviewer
-from bud.harness.writes import self_hosted_writes
+from bud.harness.writes import self_hosted_writes, workspace_writes
 from bud.skills import RULES as SKILL_RULES
 from bud.skills import SkillStore
 from bud.workspace import READ_TOOLS, WRITE_TOOLS, build_tools
 from bud.world.describe import build_notifies_others
 from bud.world.store import World
 from bud.world.tools import build_tools as world_tools
+
+
+def titles(world: World) -> list[str]:
+    """The to-do titles, sorted: a reviewed write's visible effect."""
+    return sorted(task["title"] for task in world.snapshot()["tasks"])
 
 
 def safe_decision():
@@ -108,10 +114,14 @@ def test_modes_keep_hard_rules_and_reads_unchanged(mode, has_reviewer):
     policy = Policy.model_validate(
         {"tools": load_policy().tools | account_policy().tools | SKILL_RULES}
     )
+    allow_file_tools(policy)
     apply_mode(policy, mode, reviewer=has_reviewer)
-    for name in self_hosted_writes():
+    for name in self_hosted_writes() - workspace_writes():
         expected = "review" if mode == "auto" and has_reviewer else "ask"
         assert policy.decide(name) == expected, name
+    # Bud's own workspace never asks in auto mode, like the shell that can write it too.
+    for name in workspace_writes():
+        assert policy.decide(name) == ("allow" if mode == "auto" else "ask"), name
     for name in [
         "send_email",
         "GMAIL_SEND_EMAIL",
@@ -129,18 +139,19 @@ def test_modes_keep_hard_rules_and_reads_unchanged(mode, has_reviewer):
 
 @pytest.mark.parametrize("mode, has_reviewer", [("strict", True), ("auto", False)])
 async def test_writes_pause_without_review_or_file_effects(actions, mode, has_reviewer):
-    gateway, ctx, tools, root, _, _, requests, _ = actions
+    gateway, ctx, tools, root, world, _, requests, _ = actions
     apply_mode(gateway.policy, mode, reviewer=has_reviewer)
     if not has_reviewer:
         gateway.reviewer = None
+    before = titles(world)
     with pytest.raises(ApprovalRequired):
         await gateway.call_tool(
-            "workspace_create",
-            {"path": "note.md", "content": "note"},
+            "add_task",
+            {"title": "note"},
             ctx,
-            tools["workspace_create"],
+            tools["add_task"],
         )
-    assert not (root / "note.md").exists()
+    assert titles(world) == before
     assert requests == []
 
 
@@ -162,31 +173,64 @@ async def test_exact_owner_approval_runs_strict_write_without_reviewer(actions):
 
 
 async def test_auto_allow_records_decision_before_real_write_and_replay_is_once_only(actions):
-    gateway, ctx, tools, root, _, records, requests, _ = actions
+    gateway, ctx, tools, root, world, records, requests, _ = actions
     apply_mode(gateway.policy, "auto", reviewer=True)
+    before = titles(world)
 
     def record_before_write(record):
-        assert not (root / "note.md").exists()
+        assert titles(world) == before
         records.append(record)
 
     gateway.record = record_before_write
-    args = {"path": "note.md", "content": "auto-approved"}
-    await gateway.call_tool("workspace_create", args, ctx, tools["workspace_create"])
-    assert (root / "note.md").read_text() == "auto-approved"
+    args = {"title": "auto-approved"}
+    await gateway.call_tool("add_task", args, ctx, tools["add_task"])
+    assert titles(world) == sorted([*before, "auto-approved"])
     assert records[-1]["rule"] == "auto-allow"
     assert records[-1]["review"]["verdict"] == "allow"
     assert len(requests) == 1
 
+    # The same dispatch replayed adds nothing.
     gateway.record = records.append
+    await gateway.call_tool("add_task", args, ctx, tools["add_task"])
+    assert titles(world) == sorted([*before, "auto-approved"])
+
+
+async def test_auto_mode_saves_a_workspace_file_unasked_and_once(actions):
+    gateway, ctx, tools, root, _, records, requests, _ = actions
+    allow_file_tools(gateway.policy)
+    apply_mode(gateway.policy, "auto", reviewer=True)
+    args = {"path": "note.md", "content": "saved"}
+    await gateway.call_tool("workspace_create", args, ctx, tools["workspace_create"])
+    assert (root / "note.md").read_text() == "saved"
+    assert records[-1]["rule"] == "allow"
+    # Bud's own folder never reaches the reviewer.
+    assert requests == []
+    # A recovered run replays the same dispatch without writing again.
     replay = await gateway.call_tool("workspace_create", args, ctx, tools["workspace_create"])
     assert replay.return_value["replayed"] is True
-    assert (root / "note.md").read_text() == "auto-approved"
+    assert (root / "note.md").read_text() == "saved"
+
+
+async def test_strict_mode_asks_before_a_workspace_file_even_with_a_reviewer(actions):
+    gateway, ctx, tools, root, _, _, requests, _ = actions
+    allow_file_tools(gateway.policy)
+    apply_mode(gateway.policy, "strict", reviewer=True)
+    with pytest.raises(ApprovalRequired):
+        await gateway.call_tool(
+            "workspace_create",
+            {"path": "note.md", "content": "held"},
+            ctx,
+            tools["workspace_create"],
+        )
+    assert not (root / "note.md").exists()
+    assert requests == []
 
 
 @pytest.mark.parametrize("failure", ["refusal", "malformed", "timeout", "concern"])
 async def test_reviewer_failures_hold_write_without_effects(actions, failure):
-    gateway, ctx, tools, root, _, records, requests, response = actions
+    gateway, ctx, tools, root, world, records, requests, response = actions
     apply_mode(gateway.policy, "auto", reviewer=True)
+    before = titles(world)
     if failure == "timeout":
         response["timeout"] = True
     elif failure == "refusal":
@@ -200,12 +244,12 @@ async def test_reviewer_failures_hold_write_without_effects(actions, failure):
 
     with pytest.raises(ApprovalRequired):
         await gateway.call_tool(
-            "workspace_create",
-            {"path": "note.md", "content": "held"},
+            "add_task",
+            {"title": "held"},
             ctx,
-            tools["workspace_create"],
+            tools["add_task"],
         )
-    assert not (root / "note.md").exists()
+    assert titles(world) == before
     assert records[-1]["outcome"] == "asked"
     assert records[-1]["review"]["verdict"] == ("prompt" if failure == "concern" else "error")
     assert len(requests) == 1
@@ -213,17 +257,18 @@ async def test_reviewer_failures_hold_write_without_effects(actions, failure):
 
 @pytest.mark.parametrize("owner_request", [None, "", "   ", 123])
 async def test_auto_without_owner_request_does_not_review_or_write(actions, owner_request):
-    gateway, ctx, tools, root, _, records, requests, _ = actions
+    gateway, ctx, tools, root, world, records, requests, _ = actions
     apply_mode(gateway.policy, "auto", reviewer=True)
+    before = titles(world)
     ctx = replace(ctx, metadata={"bud_request": owner_request})
     with pytest.raises(ApprovalRequired):
         await gateway.call_tool(
-            "workspace_create",
-            {"path": "note.md", "content": "held"},
+            "add_task",
+            {"title": "held"},
             ctx,
-            tools["workspace_create"],
+            tools["add_task"],
         )
-    assert not (root / "note.md").exists()
+    assert titles(world) == before
     assert records[-1]["outcome"] == "asked"
     assert requests == []
 
@@ -263,21 +308,22 @@ async def test_calendar_changes_notifying_others_always_ask(actions, name):
 
 
 async def test_unknown_notification_status_asks_owner(actions):
-    gateway, ctx, tools, root, _, _, requests, _ = actions
+    gateway, ctx, tools, root, world, _, requests, _ = actions
     apply_mode(gateway.policy, "auto", reviewer=True)
+    before = titles(world)
 
     def unavailable(args):
         raise RuntimeError("cannot determine recipients")
 
-    gateway.notifies_others = {"workspace_create": unavailable}
+    gateway.notifies_others = {"add_task": unavailable}
     with pytest.raises(ApprovalRequired):
         await gateway.call_tool(
-            "workspace_create",
-            {"path": "note.md", "content": "held"},
+            "add_task",
+            {"title": "held"},
             ctx,
-            tools["workspace_create"],
+            tools["add_task"],
         )
-    assert not (root / "note.md").exists()
+    assert titles(world) == before
     assert requests == []
 
 
@@ -300,24 +346,24 @@ async def test_denied_call_cannot_use_owner_approval_to_bypass_policy(actions):
 
 
 async def test_mode_switch_applies_to_next_tool_call(actions):
-    gateway, ctx, tools, root, _, _, requests, _ = actions
+    gateway, ctx, tools, root, world, _, requests, _ = actions
     apply_mode(gateway.policy, "auto", reviewer=True)
+    before = titles(world)
     await gateway.call_tool(
-        "workspace_create",
-        {"path": "first.md", "content": "allowed"},
+        "add_task",
+        {"title": "allowed"},
         ctx,
-        tools["workspace_create"],
+        tools["add_task"],
     )
     apply_mode(gateway.policy, "strict", reviewer=True)
     with pytest.raises(ApprovalRequired):
         await gateway.call_tool(
-            "workspace_create",
-            {"path": "second.md", "content": "held"},
+            "add_task",
+            {"title": "held"},
             replace(ctx, tool_call_id="call-2"),
-            tools["workspace_create"],
+            tools["add_task"],
         )
-    assert (root / "first.md").read_text() == "allowed"
-    assert not (root / "second.md").exists()
+    assert titles(world) == sorted([*before, "allowed"])
     assert len(requests) == 1
 
 
@@ -333,7 +379,7 @@ async def test_reads_run_without_approval_or_reviewer(actions, mode):
 
 
 async def test_review_uses_owner_context_not_untrusted_tool_results(actions):
-    gateway, ctx, tools, root, _, _, requests, _ = actions
+    gateway, ctx, tools, root, world, _, requests, _ = actions
     apply_mode(gateway.policy, "auto", reviewer=True)
     ctx = replace(
         ctx,
@@ -350,10 +396,10 @@ async def test_review_uses_owner_context_not_untrusted_tool_results(actions):
         ],
     )
     await gateway.call_tool(
-        "workspace_create",
-        {"path": "note.md", "content": "owner's note"},
+        "add_task",
+        {"title": "owner's note"},
         ctx,
-        tools["workspace_create"],
+        tools["add_task"],
     )
     sent = json.dumps(requests)
     assert "Save my note" in sent
@@ -362,16 +408,17 @@ async def test_review_uses_owner_context_not_untrusted_tool_results(actions):
     assert "old owner request" not in sent
     assert "old clarification" not in sent
     assert "outsider injection" not in sent
-    assert (root / "note.md").read_text() == "owner's note"
+    assert "owner's note" in titles(world)
 
 
 async def test_owner_approved_held_call_grants_only_exact_call_in_same_session(actions):
-    gateway, ctx, tools, root, _, records, requests, response = actions
+    gateway, ctx, tools, root, world, records, requests, response = actions
     apply_mode(gateway.policy, "auto", reviewer=True)
+    before = titles(world)
     response["body"] = {}
-    args = {"path": "note.md", "content": "owner approved"}
+    args = {"title": "owner approved"}
     with pytest.raises(ApprovalRequired):
-        await gateway.call_tool("workspace_create", args, ctx, tools["workspace_create"])
+        await gateway.call_tool("add_task", args, ctx, tools["add_task"])
     held_review = records[-1]["review"]
 
     owner_ctx = replace(
@@ -379,36 +426,36 @@ async def test_owner_approved_held_call_grants_only_exact_call_in_same_session(a
         tool_call_approved=True,
         tool_call_metadata={"approval_id": "owner-approval", "review": held_review},
     )
-    await gateway.call_tool("workspace_create", args, owner_ctx, tools["workspace_create"])
-    assert (root / "note.md").read_text() == "owner approved"
+    await gateway.call_tool("add_task", args, owner_ctx, tools["add_task"])
+    assert titles(world) == sorted([*before, "owner approved"])
 
-    # Make the same requested write necessary again, with a new dispatch identity.
-    (root / "note.md").unlink()
+    # The same requested write again, with a new dispatch identity, runs on the session grant.
     retry_ctx = replace(ctx, tool_call_id="call-2")
-    await gateway.call_tool("workspace_create", args, retry_ctx, tools["workspace_create"])
-    assert (root / "note.md").read_text() == "owner approved"
+    await gateway.call_tool("add_task", args, retry_ctx, tools["add_task"])
+    assert titles(world) == sorted([*before, "owner approved", "owner approved"])
     assert records[-1]["review"]["tier"] == "session"
     assert len(requests) == 1
 
+    # A different write is not covered by that grant.
     with pytest.raises(ApprovalRequired):
         await gateway.call_tool(
-            "workspace_create",
-            {"path": "different.md", "content": "owner approved"},
+            "add_task",
+            {"title": "something else"},
             replace(ctx, tool_call_id="call-3"),
-            tools["workspace_create"],
+            tools["add_task"],
         )
-    assert not (root / "different.md").exists()
+    assert "something else" not in titles(world)
     assert len(requests) == 2
 
     with pytest.raises(ApprovalRequired):
         await gateway.call_tool(
-            "workspace_create",
+            "add_task",
             args,
             replace(
                 ctx,
                 tool_call_id="call-4",
                 metadata={"bud_request": "Save my note", "bud_session_id": "session-2"},
             ),
-            tools["workspace_create"],
+            tools["add_task"],
         )
     assert len(requests) == 3

@@ -180,9 +180,10 @@ def file_guidance() -> str:
 
 
 def allow_file_tools(policy: Policy) -> None:
-    """Reads and sandboxed commands run unasked; writes and new network sites ask."""
-    policy.tools.update(dict.fromkeys(FILE_READS | SHELL_TOOLS, "allow"))
-    policy.tools.update(dict.fromkeys(WORKSPACE_WRITE_TOOLS | {NETWORK_TOOL}, "ask"))
+    """Reads, writes in Bud's own workspace, and sandboxed commands run unasked; each new
+    network site asks. Strict mode makes workspace writes ask (bud.core.profiles)."""
+    policy.tools.update(dict.fromkeys(FILE_READS | SHELL_TOOLS | WORKSPACE_WRITE_TOOLS, "allow"))
+    policy.tools[NETWORK_TOOL] = "ask"
     # Each new site needs its own yes: "always allow" would let Bud add any site unasked.
     policy.no_grants = policy.no_grants | {NETWORK_TOOL}
 
