@@ -383,6 +383,27 @@ async def judge_site(
     return result.verdict is Verdict.ALLOW
 
 
+def runner(
+    workspace: Path,
+    grants: NetworkGrants,
+    reviewer: Callable[[], ToolReviewer | None],
+    private: Sequence[Path] = (),
+) -> Callable[[str, float, str], Awaitable[dict[str, Any]]]:
+    """Runs one command as run_command does, with the same network checks, for work that
+    outlives a model turn: (command, timeout seconds, owner request) -> its result."""
+    workspace = workspace.resolve()
+
+    async def run_one(command: str, timeout: float, owner_request: str) -> dict[str, Any]:
+        async def judge(host: str) -> bool:
+            if host in grants.sites():
+                return True
+            return await judge_site(reviewer(), host, command, owner_request)
+
+        return await run(workspace, command, timeout, judge, private)
+
+    return run_one
+
+
 def build_tools(
     workspace: Path,
     grants: NetworkGrants,

@@ -27,6 +27,9 @@ from bud.composio.binding import valid_toolkit
 from bud.composio.connection import ConnectionError, Connections
 from bud.config import Settings, get_settings
 from bud.core.auth import OwnerAuthentication, owner_token
+from bud.core.background import GUIDANCE as BACKGROUND_GUIDANCE
+from bud.core.background import TOOLS as BACKGROUND_TOOLS
+from bud.core.background import Background
 from bud.core.events import Event, MessageOrigin
 from bud.core.history import conversation_search
 from bud.core.hub import Hub
@@ -59,6 +62,7 @@ from bud.shell import GUIDANCE as SHELL_GUIDANCE
 from bud.shell import NETWORK_TOOL, SHELL_TOOLS, NetworkGrants
 from bud.shell import available as shell_available
 from bud.shell import build_tools as build_shell_tools
+from bud.shell import runner as shell_runner
 from bud.web import GUIDANCE as WEB_GUIDANCE
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
 from bud.web import build_tools as build_web_tools
@@ -156,6 +160,7 @@ def workspace_tools(
     state_dir: Path,
     reviewer: Callable[[], ToolReviewer | None],
     private: Sequence[Path] = (),
+    background: Background | None = None,
 ) -> FunctionToolset[None]:
     """File tools, and on macOS the sandboxed shell, whose network checks use `reviewer`.
     Shell commands cannot read `private` folders, such as Bud's data and its .env."""
@@ -166,8 +171,22 @@ def workspace_tools(
             *build_workspace_tools(root, state_dir / "workspace-dispatches.jsonl"),
             document_tool(root),
             *shell,
+            *(background.tools() if background is not None else []),
         ]
     )
+
+
+def build_background(
+    root: Path,
+    state_dir: Path,
+    reviewer: Callable[[], ToolReviewer | None],
+    private: Sequence[Path] = (),
+) -> Background:
+    """Reminders and long commands, run by the server; long commands use run_command's
+    sandbox and network checks."""
+    grants = NetworkGrants(state_dir / "network-grants.json")
+    run = shell_runner(root, grants, reviewer, private) if shell_available() else None
+    return Background(state_dir / "background.db", root, run)
 
 
 def private_folders(settings: Settings) -> list[Path]:
@@ -176,13 +195,16 @@ def private_folders(settings: Settings) -> list[Path]:
 
 
 def file_guidance() -> str:
-    return WORKSPACE_GUIDANCE + (SHELL_GUIDANCE if shell_available() else "")
+    return WORKSPACE_GUIDANCE + (SHELL_GUIDANCE if shell_available() else "") + BACKGROUND_GUIDANCE
 
 
 def allow_file_tools(policy: Policy) -> None:
     """Reads, writes in Bud's own workspace, and sandboxed commands run unasked; each new
     network site asks. Strict mode makes workspace writes ask (bud.core.profiles)."""
     policy.tools.update(dict.fromkeys(FILE_READS | SHELL_TOOLS | WORKSPACE_WRITE_TOOLS, "allow"))
+    # Reminders only post in the owner's own chat; a background command is run_command
+    # without its time limit, in the same sandbox with the same network checks.
+    policy.tools.update(dict.fromkeys(BACKGROUND_TOOLS, "allow"))
     policy.tools[NETWORK_TOOL] = "ask"
     # Each new site needs its own yes: "always allow" would let Bud add any site unasked.
     policy.no_grants = policy.no_grants | {NETWORK_TOOL}
@@ -266,6 +288,9 @@ def _create_app(
         session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         db_path = session_dir / "bud.db"
         workspace = workspace_home(settings)
+        background = build_background(
+            workspace, session_dir, lambda: harness.reviewer, private_folders(settings)
+        )
         gateway = build_gateway(
             settings,
             providers={"openai-chatgpt", "openai", "meta", "mistral", "deepseek"},
@@ -302,7 +327,11 @@ def _create_app(
                     build_toolset(connections, connections.accounts(), session_dir),
                     build_web_tools(settings),
                     workspace_tools(
-                        workspace, session_dir, lambda: harness.reviewer, private_folders(settings)
+                        workspace,
+                        session_dir,
+                        lambda: harness.reviewer,
+                        private_folders(settings),
+                        background,
                     ),
                     build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
                     *browser_toolsets(),
@@ -365,6 +394,9 @@ def _create_app(
     else:
         db_path = settings.data_dir / "bud.db"
         workspace = workspace_root(settings.data_dir)
+        background = build_background(
+            workspace, settings.data_dir, lambda: harness.reviewer, private_folders(settings)
+        )
         gateway = build_gateway(settings, model_id=model_id)
         world = World(settings.data_dir / "world.db")
         tools_policy = load_policy()
@@ -382,6 +414,7 @@ def _create_app(
                         settings.data_dir,
                         lambda: harness.reviewer,
                         private_folders(settings),
+                        background,
                     ),
                 ]
             ),
@@ -429,6 +462,7 @@ def _create_app(
         # The setup toolset was built before the log and hub existed; one seam
         # hands its journal over so every setup event is a journaled event.
         setup_journal.bind(hub)
+    background.bind(hub)
     learner = (
         Learner(
             harness.memory,
@@ -490,6 +524,7 @@ def _create_app(
             if connections is not None and connections.restart_required():
                 raise ConnectionError("Account binding changed during startup. Restart bud.")
             await runner.recover()
+            await background.resume()
             if photon is not None:
                 from bud.photon_chat import messaging
 
@@ -525,6 +560,7 @@ def _create_app(
                     if cleanup is not None:
                         cleanup.cancel()
                         await asyncio.gather(cleanup, return_exceptions=True)
+                    await background.close()
                     await runner.stop()
                     await asyncio.to_thread(DBOS.destroy, workflow_completion_timeout_sec=5)
             finally:

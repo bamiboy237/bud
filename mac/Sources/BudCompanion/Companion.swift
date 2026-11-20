@@ -1282,6 +1282,10 @@ final class Companion {
             }
             notice(event)
             refreshApprovals()
+        case "background.finished":
+            // A reminder or a background command, posted by the server; no run follows.
+            notice(event)
+            react(.hop)
         default:
             break
         }
@@ -1383,7 +1387,7 @@ final class Companion {
         let report = event.string("report_path")
         notices.append(Notice(
             text: String(text.prefix(160)),
-            report: event.type == "task.completed" && !report.isEmpty
+            report: ["task.completed", "background.finished"].contains(event.type) && !report.isEmpty
                 ? URL(fileURLWithPath: report) : nil))
         notices = Array(notices.suffix(3))
         bubbleOpen = true

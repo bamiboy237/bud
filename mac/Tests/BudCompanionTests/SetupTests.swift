@@ -47,6 +47,23 @@ struct SetupTests {
     }
 
     @Test
+    func aReminderShowsAsANoticeWithoutARun() throws {
+        let companion = Companion()
+        companion.apply(snapshot: ["last_seq": 1])
+        let reminder = try #require(BudEvent(json:
+            #"{"seq":2,"type":"background.finished","data":{"id":1,"kind":"reminder","title":"stretch","status":"done","text":"Reminder: stretch"}}"#))
+        companion.handle(reminder)
+        #expect(companion.notices.map(\.text) == ["Reminder: stretch"])
+        #expect(companion.notices.first?.report == nil)
+        #expect(companion.bubbleOpen)
+
+        let command = try #require(BudEvent(json:
+            #"{"seq":3,"type":"background.finished","data":{"id":2,"kind":"command","title":"Build","status":"done","text":"Finished “Build”.","report_path":"/tmp/background/2.log"}}"#))
+        companion.handle(command)
+        #expect(companion.notices.last?.report == URL(fileURLWithPath: "/tmp/background/2.log"))
+    }
+
+    @Test
     func reopenedTaskKeepsItsPupAfterTheOldCompletionDelay() async throws {
         let companion = Companion()
         companion.apply(snapshot: [
