@@ -469,12 +469,38 @@ def local_target(path: str, blocked: list[Path]) -> Path:
             raise _Refused("Bud does not read hidden or credential files.")
     real = Path(os.path.realpath(given))
     if real != given:
-        raise _Refused(f"That path goes through a link. Use the real path: {real}")
+        # Never say where a link points: that would tell the model about a file nobody
+        # approved. macOS's own /tmp, /var, and /etc links are named, since they are public.
+        system = next((top for top in _SYSTEM_LINKS if given.parts[1:2] == (top,)), None)
+        hint = f" Use /private/{system}/... instead of /{system}/...." if system else ""
+        raise _Refused("Bud reads only paths without links." + hint)
     for folder in blocked:
         root = Path(os.path.realpath(folder))
         if real == root or real.is_relative_to(root):
             raise _Refused("Bud does not read that folder, even with approval.")
+    if _inside_blocked(real, blocked):
+        raise _Refused("Bud does not read that folder, even with approval.")
     return real
+
+
+_SYSTEM_LINKS = ("tmp", "var", "etc")
+
+
+def _inside_blocked(path: Path, blocked: list[Path]) -> bool:
+    """Whether any folder on `path` is a blocked folder by identity, whatever it is called:
+    another letter case, or the /System/Volumes/Data view of it. Read before asking; the
+    walk checks again when the read runs."""
+    closed = _identities(blocked)
+    current = Path("/")
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            info = os.stat(current, follow_symlinks=False)
+        except OSError:
+            return False  # a missing step: the read itself will fail
+        if (info.st_dev, info.st_ino) in closed:
+            return True
+    return False
 
 
 def local_refusal(tool_args: dict[str, Any], blocked: list[Path]) -> str | None:

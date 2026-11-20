@@ -82,13 +82,14 @@ def test_blocked_folders_stay_closed_even_through_a_link(home, tools, tmp_path):
     assert not read(str(tmp_path / "workspace" / "a.txt"))["ok"]  # type: ignore[call-arg]
 
 
-def test_a_path_through_a_link_is_refused_with_its_real_path(home, tools):
+def test_a_path_through_a_link_is_refused_without_naming_its_target(home, tools):
     read, _, blocked = tools
     (home / "Documents" / "real.txt").write_text("x")
     (home / "Documents" / "alias.txt").symlink_to(home / "Documents" / "real.txt")
     result = read(str(home / "Documents" / "alias.txt"))  # type: ignore[call-arg]
     assert not result["ok"]
-    assert str(home / "Documents" / "real.txt") in result["error"]
+    # It never says where the link points: that file was not approved.
+    assert "real.txt" not in result["error"]
     # What the card shows is exactly what is opened.
     assert describe_local({"path": str(home / "Documents" / "real.txt")}, blocked) == (
         f"Opens {home / 'Documents' / 'real.txt'}"
@@ -96,23 +97,30 @@ def test_a_path_through_a_link_is_refused_with_its_real_path(home, tools):
 
 
 def test_a_blocked_folder_in_another_letter_case_is_refused(tools, tmp_path):
-    read, listing, _ = tools
+    from bud.workspace import local_refusal
+
+    read, listing, blocked = tools
     (tmp_path / "data").mkdir()
     (tmp_path / "data" / "notes.txt").write_text("bud's own data")
     if not (tmp_path / "DATA").exists():
         pytest.skip("case-sensitive file system")
     assert not read(str(tmp_path / "DATA" / "notes.txt"))["ok"]  # type: ignore[call-arg]
     assert not listing(str(tmp_path / "DATA"))["ok"]  # type: ignore[call-arg]
+    # Refused before any card, not only after an approval.
+    assert local_refusal({"path": str(tmp_path / "DATA" / "notes.txt")}, blocked)
 
 
 def test_a_blocked_folder_through_the_data_volume_is_refused(tools, tmp_path):
-    read, _, _ = tools
+    from bud.workspace import local_refusal
+
+    read, _, blocked = tools
     (tmp_path / "data").mkdir()
     (tmp_path / "data" / "notes.txt").write_text("bud's own data")
     other = Path("/System/Volumes/Data" + str(tmp_path / "data" / "notes.txt"))
     if not other.exists():
         pytest.skip("no /System/Volumes/Data view here")
     assert not read(str(other))["ok"]  # type: ignore[call-arg]
+    assert local_refusal({"path": str(other)}, blocked)
 
 
 def test_a_hard_link_is_refused(home, tools):
@@ -120,6 +128,12 @@ def test_a_hard_link_is_refused(home, tools):
     (home / "Documents" / "a.txt").write_text("x")
     os.link(home / "Documents" / "a.txt", home / "Documents" / "b.txt")
     assert not read(str(home / "Documents" / "b.txt"))["ok"]  # type: ignore[call-arg]
+
+
+def test_a_system_link_gets_its_real_path_named(tools):
+    read, _, _ = tools
+    error = read("/tmp/plan.txt")["error"]  # type: ignore[call-arg]
+    assert "/private/tmp/" in error
 
 
 def test_relative_paths_are_refused(tools):

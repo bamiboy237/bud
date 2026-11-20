@@ -43,13 +43,14 @@ Bud can read one of your files, or list one of your folders, when you name it:
 - **Every read asks you.** There is no "always allow", and the reviewer never answers for
   you. A path Bud refuses anyway (below) is refused at once, without a card and without
   running anything.
-- **The card names the file that is opened.** A path that goes through a link is refused,
-  with its real path in the message, so Bud asks again with that one. Bud opens the path one
+- **The card names the file that is opened.** A path that goes through a link is refused.
+  Bud never says where the link points, since that file was not approved; give the real
+  path instead. Bud opens the path one
   folder at a time without following links, so a link swapped in later fails: what you
   approve is what it reads.
 - **Blocked folders are recognized by identity, not name.** Each folder on the way is
   compared with the blocked ones on disk, so another letter case or the
-  `/System/Volumes/Data` view of the same folder is refused too.
+  `/System/Volumes/Data` view of the same folder is refused too, before any card.
 - **Some places stay closed even with approval:** Bud's data folder and the folder holding
   its `.env`, `~/.bud`, `~/.ssh`, `~/.gnupg`, `~/Library/Keychains`, the workspace (Bud reads
   it with `read_file`), hidden files, and names that look like credentials (`.env`, keys,
