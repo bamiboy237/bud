@@ -29,7 +29,7 @@ def test_rejected_question_calls_are_not_revalidated_as_owner_answers():
     assert [(answer.question, answer.answer) for answer in answers] == [("Which day?", "Friday")]
 
 
-def decisions(risk=None, authorization=None, concern=None):
+def decisions(risk=None, authorization=None, concern=None, sensitive=None):
     return {
         "answers": [
             {
@@ -44,6 +44,7 @@ def decisions(risk=None, authorization=None, concern=None):
                 ("risk", risk or {"low": 1.0}),
                 ("authorization", authorization or {"high": 1.0}),
                 ("concern", concern or {"none": 1.0}),
+                ("sensitive", sensitive or {"none": 1.0}),
             ]
         ]
     }
@@ -99,8 +100,9 @@ async def test_explicit_safe_authorized_response_allows(review_service, request_
     [
         ("low", "high", "none", True),
         ("medium", "medium", "none", True),
-        ("high", "high", "none", True),
-        ("high", "medium", "none", True),
+        ("medium", "low", "none", False),
+        ("high", "high", "none", False),
+        ("high", "medium", "none", False),
         ("high", "low", "none", False),
         ("critical", "high", "none", False),
         ("low", "unknown", "none", False),
@@ -123,6 +125,28 @@ async def test_code_applies_risk_authorization_and_concern_rules(
     assert result.verdict is (Verdict.ALLOW if allowed else Verdict.PROMPT)
     if not allowed:
         assert result.reason
+
+
+@pytest.mark.parametrize("kind", ["payment", "sends", "deletes", "credentials", "opaque"])
+async def test_paying_sending_deleting_secrets_and_opaque_code_always_ask(
+    review_service, request_to_review, kind
+):
+    reviewer, state, _ = review_service
+    # Clearly requested and low risk, but a fifth of the mass says it may do this.
+    state["body"] = decisions(sensitive={"none": 0.8, kind: 0.2})
+    result = await reviewer.review(request_to_review)
+    assert result.verdict is Verdict.PROMPT
+    assert result.sensitive == kind
+    assert "always needs the owner" in result.reason
+
+
+async def test_a_response_without_the_sensitive_answer_asks_the_owner(
+    review_service, request_to_review
+):
+    reviewer, state, _ = review_service
+    state["body"] = {"answers": decisions()["answers"][:3]}
+    result = await reviewer.review(request_to_review)
+    assert result.verdict is Verdict.ERROR
 
 
 @pytest.mark.parametrize(

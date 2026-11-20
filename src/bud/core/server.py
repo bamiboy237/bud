@@ -12,7 +12,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Lock
-from typing import Annotated, TextIO
+from typing import Annotated, Any, TextIO
 from uuid import uuid4
 
 from dbos import DBOS
@@ -20,8 +20,9 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
 from pydantic_ai import ModelRetry
-from pydantic_ai.toolsets import CombinedToolset, FunctionToolset
+from pydantic_ai.toolsets import AbstractToolset, CombinedToolset, FunctionToolset
 
+from bud import browser
 from bud.composio.binding import valid_toolkit
 from bud.composio.connection import ConnectionError, Connections
 from bud.config import Settings, get_settings
@@ -218,6 +219,10 @@ def _create_app(
     setup: SetupRegistry | None = None
     world: World | None = None
     account_scope: str | None = None
+    # Bud's own Browse relay, and a `browse pair` waiting for the extension; the pairing
+    # stops when the server stops.
+    relay = browser.Relay(browser.RELAY_HOME)
+    pairing = browser.Pairing(relay)
 
     # Set by the account branch: reloads the tool list after a new app connects.
     refresh_tools: Callable[[], None] = _noop
@@ -269,10 +274,26 @@ def _create_app(
         tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS, "allow"))
         allow_file_tools(tools_policy)
         tools_policy.tools["setup_capability"] = "allow"
+        browsing = settings.browser_tools
+        consent = browser.Consent(settings.data_dir / "browser-consent.json")
         setup = setup_registry(connections)
+        if browsing:
+            browser.allow_tools(tools_policy)
+            setup.register("browser", browser.setup_entry(pairing))
         setup_journal = SetupJournal()
-        loaded = {"accounts": frozenset(accounts)}
+        loaded: dict[str, Any] = {
+            "accounts": frozenset(accounts),
+            "browse": browser.executable() if browsing else None,
+        }
         refresh_lock = Lock()
+
+        def browser_toolsets() -> list[AbstractToolset[None]]:
+            if loaded["browse"] is None:
+                return []
+            return [
+                browser.toolset(loaded["browse"], consent, relay),
+                FunctionToolset(browser.control_tools(consent, relay)),
+            ]
 
         def account_toolset() -> CombinedToolset[None]:
             return CombinedToolset(
@@ -283,6 +304,7 @@ def _create_app(
                         workspace, session_dir, lambda: harness.reviewer, private_folders(settings)
                     ),
                     build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
+                    *browser_toolsets(),
                 ]
             )
 
@@ -292,10 +314,15 @@ def _create_app(
                 if connections.restart_required():
                     raise ConnectionError("Account changed. Restart Bud and start a new chat.")
                 current = frozenset(connections.accounts())
-                if current == loaded["accounts"]:
+                # Browse installed after Bud started, such as from the setup card, loads too.
+                browse = browser.executable() if browsing else None
+                if current == loaded["accounts"] and browse == loaded["browse"]:
                     return
+                previous = dict(loaded)
+                loaded["browse"] = browse
                 replacement = account_toolset()
                 if connections.restart_required() or frozenset(connections.accounts()) != current:
+                    loaded.update(previous)
                     raise ConnectionError("Accounts changed while loading tools. Try again.")
                 harness.swap_tools(replacement)
                 loaded["accounts"] = current
@@ -315,6 +342,7 @@ def _create_app(
             "message; no restart is needed."
             + WEB_GUIDANCE
             + file_guidance()
+            + (browser.GUIDANCE if browsing else "")
             + f"Your workspace is the folder {display_path(workspace)} on the person's Mac.\n",
             memory=build_memory(session_dir / "memory.db", namespace="owner"),
             state_dir=session_dir,
@@ -327,6 +355,8 @@ def _create_app(
             capabilities=workspace_read_capabilities(workspace, deferred=True),
         )
         tools_policy = harness.policy
+        if browsing:
+            harness.describers.update(browser.describers(relay))
         harness.live_instructions.append(
             lambda: "\nConnected apps: " + (", ".join(sorted(loaded["accounts"])) or "none")
         )
@@ -497,6 +527,7 @@ def _create_app(
                     await asyncio.to_thread(DBOS.destroy, workflow_completion_timeout_sec=5)
             finally:
                 try:
+                    pairing.stop()
                     gateway.close()
                 finally:
                     lock.close()
@@ -648,6 +679,8 @@ def _create_app(
                 headers={"Cache-Control": "no-store"},
             )
         status = "cancelled"
+        if capability == "browser":
+            pairing.stop()  # the cancelled code stops working at once
         if connections is not None:
             name = {"calendar": "googlecalendar"}.get(capability, capability)
             removed = connections.store.cancel_connect(name)

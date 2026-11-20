@@ -21,6 +21,8 @@ def isolated_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("WORKSPACE_DIR", str(tmp_path.resolve() / "bud-home" / "workspace"))
     monkeypatch.setenv("APPROVAL_REVIEW", "false")
     monkeypatch.setenv("LOOP_DETECTION", "false")
+    # Never the developer's real browser.
+    monkeypatch.setenv("BROWSER_TOOLS", "false")
     monkeypatch.delenv("BUD_DAILY_USD", raising=False)
     get_settings.cache_clear()
     with offline_requests():

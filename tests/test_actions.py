@@ -35,6 +35,7 @@ def safe_decision():
                 ("risk", "low"),
                 ("authorization", "high"),
                 ("concern", "none"),
+                ("sensitive", "none"),
             ]
         ]
     }
@@ -193,7 +194,7 @@ async def test_reviewer_failures_hold_write_without_effects(actions, failure):
     elif failure == "malformed":
         response["body"] = {}
     else:
-        response["body"]["answers"][-1]["probabilities"] = [
+        response["body"]["answers"][2]["probabilities"] = [
             {"value": "injected", "probability": 1.0}
         ]
 

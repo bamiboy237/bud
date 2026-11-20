@@ -92,6 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         panel.orderFrontRegardless()
         self.panel = panel
+        BundledBrowse.install()
         companion.start()
         Voice.shared.start()
     }

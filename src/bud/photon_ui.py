@@ -34,6 +34,8 @@ def action_preview(approval: dict, *, decision: bool = True) -> str:
         "GOOGLECALENDAR_PATCH_EVENT": "Move this meeting?",
         "workspace_create": f"Create {target}?",
         "workspace_update": f"Replace the contents of {target}?",
+        "enable_browser": "Let Bud use your browser?",
+        "open_chrome": "Open Chrome so Bud can use it?",
     }
     title = titles.get(tool, tool.replace("_", " ").capitalize() + "?")
     if approval.get("reference"):
@@ -62,6 +64,11 @@ def action_preview(approval: dict, *, decision: bool = True) -> str:
                 "send_updates": "Notify attendees",
             }.get(key, key.replace("_", " ").capitalize())
             details.append(f"{label}: {_value(value)}")
+    # Facts Bud looked up (the caution, the site a tab shows) and the reviewer's reason.
+    review = approval.get("review") or {}
+    for key, label in (("details", ""), ("reason", "Why: ")):
+        if isinstance(review.get(key), str) and review[key]:
+            details.append(label + review[key])
     parts = [title if decision else title.removesuffix("?")]
     if details:
         parts.append("\n".join(details))

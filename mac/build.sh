@@ -60,15 +60,52 @@ for name in ${(ok)pet_dirs}; do
     echo "pet: $name"
   fi
 done
+# OpenCode Browse (MIT) drives the owner's Chrome. The app copies it to ~/.bud/bin on launch,
+# where it keeps updating itself. Pinned by version and npm's SHA-512; a build without network
+# still succeeds, without the browser.
+browse_version=0.1.5
+typeset -A browse_sums=(
+  arm64 sha512-c3jdW5KyvTkfLPThVxowNaHydLd8asiUvb85sSvfSrLRaBpECFrpNO+OICUZnebsHc/hDX9rXZ2DahkYN5+dKA==
+  x86_64 sha512-ZjWAlCYzHdaMntuZeOZbKW9XEZ8sWxvpmeNzc5s5aTIEG6t2VNDmlHrER7oCg2Z+8kzLTOS29qkNhWNnsU+pbQ==
+)
+arch=$(uname -m)
+npm_arch=${arch/x86_64/x64}
+tarball=$here/build/browse-$browse_version-$arch.tgz
+if [[ ! -f $tarball ]]; then
+  curl -fsSL -o "$tarball.part" \
+    "https://registry.npmjs.org/@opencode/browse-darwin-$npm_arch/-/browse-darwin-$npm_arch-$browse_version.tgz" \
+    && mv "$tarball.part" "$tarball" || rm -f "$tarball.part"
+fi
+if [[ -f $tarball ]]; then
+  sum="sha512-$(openssl dgst -sha512 -binary "$tarball" | base64)"
+  if [[ $sum != ${browse_sums[$arch]} ]]; then
+    rm -f "$tarball"
+    echo "browse $browse_version: checksum mismatch, refusing it" >&2
+    exit 1
+  fi
+  unpacked=$(mktemp -d)
+  tar -xzf "$tarball" -C "$unpacked" package/bin/browse package/LICENSE
+  # Helpers holds nested code, which is signed before the app below.
+  mkdir -p "$app/Contents/Helpers"
+  cp "$unpacked/package/bin/browse" "$app/Contents/Helpers/browse"
+  cp "$unpacked/package/LICENSE" "$app/Contents/Resources/browse-LICENSE"
+  rm -rf "$unpacked"
+  echo "browse: $browse_version ($arch)"
+else
+  echo "browse: not bundled (download failed)" >&2
+fi
 # macOS remembers permissions such as the microphone per signing identity. An ad-hoc
 # signature changes with every build, so each rebuild would ask again. With a local
 # code-signing identity in the keychain (any name; set BUD_SIGN_ID), the app keeps one.
 # Make one in Keychain Access: Certificate Assistant > Create a Certificate, type Code Signing.
 identity=${BUD_SIGN_ID:-bud companion (local)}
+helper=$app/Contents/Helpers/browse
 if security find-identity -p codesigning | grep -qF "\"$identity\""; then
+  [[ -f $helper ]] && codesign --force --sign "$identity" "$helper"
   codesign --force --sign "$identity" "$app"
   echo "signed: $identity"
 else
+  [[ -f $helper ]] && codesign --force --sign - "$helper"
   codesign --force --sign - "$app"
   echo "signed ad hoc: no \"$identity\" identity, so permissions reset each build"
 fi

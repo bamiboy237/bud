@@ -29,7 +29,7 @@ from dbos import DBOS
 from pydantic import Field
 from pydantic_ai import RunContext, Tool
 
-from bud.harness.review import ReviewRequest, ToolReviewer, Verdict
+from bud.harness.review import ReviewRequest, ToolReviewer, Verdict, too_long_to_review
 
 logger = logging.getLogger(__name__)
 
@@ -368,12 +368,13 @@ async def judge_site(
 ) -> bool:
     """Whether the decision model allows a command to reach `host`. No reviewer, no owner
     request, or any doubt means no: the site is blocked and Bud can ask the owner."""
-    if reviewer is None or not owner_request:
+    args = {"host": host, "command": command}
+    if reviewer is None or not owner_request or too_long_to_review(args):
         return False
     result = await reviewer.review(
         ReviewRequest(
             tool="network_access",
-            args={"host": host, "command": command[:2_000]},
+            args=args,
             description="A sandboxed shell command in Bud's workspace wants to connect to "
             "this website. Allow it when the owner's request needs that site.",
             owner_request=owner_request,
