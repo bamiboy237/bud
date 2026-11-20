@@ -67,6 +67,9 @@ UPLOAD = f"{PREFIX}_upload"
 TOOLS = READS | STEPS | {UPLOAD}
 ENABLE = "enable_browser"
 DISABLE = "disable_browser"
+OPEN_CHROME = "open_chrome"
+# How long to wait for the extension after Chrome opens.
+CONNECT_SECONDS = 30
 # Bud's relay port. Browse's own default is 19988; another port keeps the two apart.
 PORT = 19989
 # Beside Bud's own copy of browse, outside the workspace, so shell commands cannot touch the
@@ -87,9 +90,10 @@ GUIDANCE = """browser_* tools use the person's own Chrome, with their tabs and s
 appear after the person turns the browser on: call enable_browser, which shows them what that
 allows, then search for browser tools. Work in small steps: snapshot a page, act on one
 element by its ref, then snapshot again to check. Pass the tab id from navigate to every later
-call. Use browser_handoff when only the person can act, such as signing in or paying. If no
-browser is connected, call setup_capability with "browser". Call disable_browser when the
-person asks to stop.
+call. Use browser_handoff when only the person can act, such as signing in or paying. If
+browser_status says no browser is connected, call open_chrome; if Chrome is open and still
+not connected, call setup_capability with "browser". Call disable_browser when the person
+asks to stop.
 """
 
 
@@ -141,13 +145,25 @@ class Consent:
 def allow_tools(policy: Policy) -> None:
     """Reads run unasked. Steps and uploads ask the owner; auto mode hands steps to the
     reviewer (bud.core.profiles). No standing grant covers a step, an upload, or turning the
-    browser on. Turning it off never asks."""
+    browser on. Opening Chrome asks, and may be always allowed. Turning it off never asks."""
     policy.tools.update(dict.fromkeys(READS | {DISABLE}, "allow"))
-    policy.tools.update(dict.fromkeys(STEPS | {UPLOAD, ENABLE}, "ask"))
+    policy.tools.update(dict.fromkeys(STEPS | {UPLOAD, ENABLE, OPEN_CHROME}, "ask"))
     policy.no_grants = policy.no_grants | STEPS | {UPLOAD, ENABLE}
 
 
-def control_tools(consent: Consent) -> list[Tool[None]]:
+def launch_chrome() -> None:
+    """Opens Chrome, or brings it forward, the way the Dock does."""
+    subprocess.run(["open", "-a", "Google Chrome"], check=True, capture_output=True, timeout=15)
+
+
+def control_tools(
+    consent: Consent,
+    relay: Relay,
+    find: Callable[[], Path | None] | None = None,
+    launch: Callable[[], None] = launch_chrome,
+) -> list[Tool[None]]:
+    locate = find or executable
+
     def enable_browser() -> str:
         """Ask the person to let you use their own Chrome. The approval shows them what that
         allows. Call it once, before you need a browser tool."""
@@ -159,7 +175,30 @@ def control_tools(consent: Consent) -> list[Tool[None]]:
         consent.set(False)
         return "The browser is off."
 
-    return [Tool(enable_browser), Tool(disable_browser)]
+    async def open_chrome() -> str:
+        """Open the person's Chrome when browser_status says no browser is connected, then
+        wait for the browse extension to connect."""
+        if not consent.on():
+            return "The browser is off. Call enable_browser first."
+        path = locate()
+        if path is None:
+            return 'Browse is not installed. Call setup_capability with "browser".'
+        if await asyncio.to_thread(connected, path, relay):
+            return "Chrome is already connected."
+        try:
+            await asyncio.to_thread(launch)
+        except (OSError, subprocess.SubprocessError):
+            return "Chrome could not be opened. Ask the person to open it."
+        for _ in range(CONNECT_SECONDS):
+            await asyncio.sleep(1)
+            if await asyncio.to_thread(connected, path, relay):
+                return "Chrome is open and connected. Continue with the browser tools."
+        return (
+            "Chrome is open, but the browse extension did not connect. Call "
+            'setup_capability with "browser" to pair it.'
+        )
+
+    return [Tool(enable_browser), Tool(disable_browser), Tool(open_chrome)]
 
 
 def executable() -> Path | None:

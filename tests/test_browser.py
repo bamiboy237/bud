@@ -137,6 +137,9 @@ def test_reads_run_steps_are_reviewed_or_asked_and_uploads_always_ask(mode: Mode
     assert policy.decide("browser_upload") == "ask"
     assert policy.decide("enable_browser") == "ask"
     assert policy.decide("disable_browser") == "allow"
+    # Opening Chrome asks, and the owner may choose to always allow it.
+    assert policy.decide("open_chrome") == "ask"
+    assert policy.grantable("open_chrome")
     # No standing grant can skip a step's check, an upload, or the caution.
     for tool in ("browser_click", "browser_upload", "enable_browser"):
         assert not policy.grantable(tool)
@@ -150,7 +153,7 @@ async def test_tools_start_only_once_the_browser_is_on_and_exclude_raw_javascrip
 ):
     consent = browser.Consent(tmp_path / "consent.json")
     toolset = browser.toolset(browse, consent, relay)
-    controls: dict[str, Any] = {t.name: t.function for t in browser.control_tools(consent)}
+    controls: dict[str, Any] = {t.name: t.function for t in browser.control_tools(consent, relay)}
     async with toolset:
         assert await toolset.get_tools(ctx()) == {}
         # Off means Browse never started.
@@ -264,6 +267,42 @@ async def test_an_approved_click_is_not_remembered_for_the_next_page():
             "browser_click", {"ref": "e1", "tab": "3"}, ctx(), tools["browser_click"]
         )
     assert len(fake.seen) == 1
+
+
+async def test_open_chrome_launches_it_and_waits_for_the_extension(
+    browse, relay, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(browser, "CONNECT_SECONDS", 2)
+    consent = browser.Consent(tmp_path / "consent.json")
+    launches: list[str] = []
+
+    def launch() -> None:
+        launches.append("Chrome")
+        (browse.parent / "paired").touch()  # the extension connects once Chrome is up
+
+    tools: dict[str, Any] = {
+        t.name: t.function
+        for t in browser.control_tools(consent, relay, find=lambda: browse, launch=launch)
+    }
+    open_chrome = tools["open_chrome"]
+    assert await open_chrome() == "The browser is off. Call enable_browser first."
+    consent.set(True)
+    assert await open_chrome() == "Chrome is open and connected. Continue with the browser tools."
+    assert await open_chrome() == "Chrome is already connected."
+    assert launches == ["Chrome"]
+
+
+async def test_open_chrome_sends_an_unpaired_extension_to_setup(
+    browse, relay, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(browser, "CONNECT_SECONDS", 1)
+    consent = browser.Consent(tmp_path / "consent.json")
+    consent.set(True)
+    tools: dict[str, Any] = {
+        t.name: t.function
+        for t in browser.control_tools(consent, relay, find=lambda: browse, launch=lambda: None)
+    }
+    assert "setup_capability" in await tools["open_chrome"]()
 
 
 def test_the_setup_card_cautions_and_pairs_with_buds_relay(browse, relay):

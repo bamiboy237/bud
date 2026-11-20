@@ -123,6 +123,7 @@ struct Approval: Identifiable, Equatable {
         if tool == "ask_user" { return ("", "Answer", "questionmark.bubble") }
         if tool == "enable_browser" { return ("Let Bud use your browser", "Turn on", "globe") }
         if tool.hasPrefix("browser_") { return browserStep(String(tool.dropFirst(8)), args) }
+        if tool == "open_chrome" { return ("Open Chrome so Bud can use it", "Open", "globe") }
         if tool == "archive_email" { return ("Archive email", "Archive", "archivebox") }
         if tool == "mark_read" { return ("Mark email read", "Mark read", "envelope.open") }
         if ["draft_reply", "gmail_create_email_draft"].contains(tool) {

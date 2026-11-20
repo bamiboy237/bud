@@ -299,7 +299,7 @@ def _create_app(
                     *(
                         [
                             browser.toolset(loaded["browse"], consent, relay),
-                            FunctionToolset(browser.control_tools(consent)),
+                            FunctionToolset(browser.control_tools(consent, relay)),
                         ]
                         if loaded["browse"] is not None
                         else []
