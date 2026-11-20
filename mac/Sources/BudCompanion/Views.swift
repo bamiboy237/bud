@@ -757,15 +757,8 @@ private struct StepRow: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .shimmer(active: live)
-                .overlay(alignment: .leading) {
-                    Rectangle()
-                        .fill(Paper.ink.opacity(0.35))
-                        .frame(height: 1)
-                        .scaleEffect(x: step.done || reduceMotion ? 1 : 0, anchor: .leading)
-                        .opacity(step.done ? 1 : 0)
-                        // The line follows the tick, so the eye goes circle, then words.
-                        .animation(reduceMotion ? check : check.delay(0.1), value: step.done)
-                }
+            // Done steps stay legible: the tick says done, and a line through the words
+            // would read as cancelled.
         }
         .accessibilityElement(children: .combine)
         .accessibilityValue(step.done ? "done" : live ? "in progress" : "")

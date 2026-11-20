@@ -65,7 +65,8 @@ final class ConversationWindow: NSObject, NSWindowDelegate {
 
 /// Replies in the window read like a page: the same SF Pro scale as the bubble, a step up in
 /// size, with more air between lines.
-private let pageType = ReplyType(size: 14.5, lineSpacing: 4)
+private let pageType = ReplyType(
+    size: 14.5, lineSpacing: 4.5, blockSpacing: 13, itemSpacing: 5.5, compact: false)
 
 /// The rhythm that separates speakers without labels: a wide gap before each of your
 /// messages starts a new exchange, a shorter one joins bud's answer to your question, about
