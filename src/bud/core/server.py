@@ -25,6 +25,12 @@ from pydantic_ai import ModelRetry
 from pydantic_ai.toolsets import AbstractToolset, CombinedToolset, FunctionToolset
 
 from bud import browser
+from bud.apps import CHANGES as APP_CHANGES
+from bud.apps import GUIDANCE as APP_GUIDANCE
+from bud.apps import OPEN_IN_APP, quiet_open
+from bud.apps import READS as APP_READS
+from bud.apps import available as apps_available
+from bud.apps import build_tools as build_app_tools
 from bud.composio.binding import AccountBinding, valid_toolkit
 from bud.composio.connection import ConnectionError, Connections
 from bud.config import Settings, get_settings
@@ -185,6 +191,7 @@ def workspace_tools(
             *local_tools(local_blocked(Path.home(), list(private), root)),
             *shell,
             *(background.tools() if background is not None else []),
+            *(build_app_tools(root, state_dir / "open-copies") if apps_available() else []),
         ]
     )
 
@@ -237,6 +244,7 @@ def file_guidance() -> str:
         WORKSPACE_GUIDANCE
         + LOCAL_GUIDANCE
         + (SHELL_GUIDANCE if shell_available() else "")
+        + (APP_GUIDANCE if apps_available() else "")
         + BACKGROUND_GUIDANCE
     )
 
@@ -251,6 +259,13 @@ def allow_file_tools(policy: Policy) -> None:
     policy.tools.update(dict.fromkeys(BACKGROUND_STARTS, "ask"))
     # No "always allow": one click must not let every later start skip approval.
     policy.no_grants = policy.no_grants | BACKGROUND_STARTS
+    # Mac apps: reads run unasked; changes ask, or go to the reviewer in auto mode.
+    policy.tools.update(dict.fromkeys(APP_READS, "allow"))
+    policy.tools.update(dict.fromkeys(APP_CHANGES, "ask"))
+    # A quiet document opens unasked (harness.harmless); one whose app can reach the network
+    # asks every time.
+    policy.tools[OPEN_IN_APP] = "ask"
+    policy.no_grants = policy.no_grants | {OPEN_IN_APP}
     policy.tools[NETWORK_TOOL] = "ask"
     # Each read outside the workspace asks, in every mode, and offers no "always allow".
     policy.tools.update(dict.fromkeys(LOCAL_TOOLS, "ask"))
@@ -498,6 +513,7 @@ def _create_app(
         harness.describers = build_describers(world)
         harness.notifies_others = build_notifies_others(world)
     # The card names the real file a local read opens, which a link cannot disguise.
+    harness.harmless[OPEN_IN_APP] = quiet_open
     outside = local_blocked(Path.home(), private_folders(settings), workspace)
     harness.describers.update(
         dict.fromkeys(LOCAL_TOOLS, lambda tool_args: describe_local(tool_args, outside))

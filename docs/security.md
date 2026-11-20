@@ -61,6 +61,28 @@ Bud can read one of your files, or list one of your folders, when you name it:
 - **macOS may ask too.** Reading Documents, Desktop, or Downloads can need permission in
   System Settings, Privacy & Security, Files and Folders.
 
+## Mac apps
+
+Bud can open and control a short list of your Mac apps: Notes, Reminders, Music, Calendar,
+Finder, and Safari. Other apps, Messages and Mail included, stay out until you
+add them.
+
+- **Typed actions, not free scripts.** Each action runs a fixed AppleScript. Your words reach
+  it only as arguments, never as script text, so nothing a model writes becomes code.
+- **Reads run unasked:** opening an app, what Music
+  is playing, your note titles, a note's text, and your open reminders.
+- **Only documents open, from a private copy.** `open_in_app` copies the file into Bud's own
+  data folder, where no sandboxed command can reach it, and opens the copy. Old copies are
+  removed after an hour. PDFs and images open in Preview, and text, Markdown, and CSV in
+  TextEdit, without asking: those apps only show the file. Word, Excel, PowerPoint, Pages,
+  and Numbers files, and RTF files, ask you first, every time, since their apps can follow
+  links or load remote content. Anything that can run or redirect (`.command`, `.app`,
+  `.webloc`, HTML) never opens. Chrome is not on the list: `open_chrome` asks first.
+- **Changes ask you:** playing or skipping music, creating a note, and adding a reminder. In
+  auto mode the reviewer judges them against your request, as it does browser steps.
+- **macOS asks too.** The first time Bud controls an app, macOS asks you to allow it in
+  System Settings, Privacy & Security, Automation.
+
 ## Shell commands
 
 On macOS, Bud runs shell commands in its workspace with `run_command`, and long ones with

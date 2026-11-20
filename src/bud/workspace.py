@@ -366,6 +366,18 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool[None]]:
 _DOCUMENT_BYTES = 25 * 1024 * 1024
 
 
+def read_workspace_bytes(root: Path, path: str, limit: int = _DOCUMENT_BYTES) -> bytes | None:
+    """A visible workspace file's bytes, read without following links, or None when the path
+    is hidden, credential-like, a link, a special file, or too large."""
+    try:
+        parts = _parts(path)
+        with _parent(root.absolute(), parts[:-1]) as fd:
+            data, _ = _read_bytes(fd, parts[-1], limit)
+        return data
+    except (_Refused, OSError, ValueError):
+        return None
+
+
 def document_tool(root: Path) -> Tool[None]:
     """read_document: a workspace document as Markdown, converted on this machine."""
     root = root.absolute()
