@@ -40,6 +40,15 @@ class AccountBinding:
         return sha256(value.encode()).hexdigest()[:32]
 
 
+@dataclass(frozen=True)
+class Attempt:
+    """One sign-in: the binding it started under, and a token only it holds, so a second
+    sign-in for the same app cannot be mistaken for this one."""
+
+    binding: AccountBinding
+    token: str
+
+
 class BindingStore:
     """Serialize intent, verified acceptance and retirement in real SQLite transactions."""
 
@@ -88,6 +97,9 @@ class BindingStore:
                 db.execute("INSERT INTO owner VALUES (?)", (uuid4().hex,))
             if "binding_state" not in existing:
                 db.execute("INSERT INTO binding_state VALUES (1, 1)")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(pending_accounts)")}
+            if "attempt" not in columns:
+                db.execute("ALTER TABLE pending_accounts ADD COLUMN attempt TEXT")
             self._read(db)
             db.execute("PRAGMA user_version = 1")
         path.chmod(0o600)
@@ -143,7 +155,7 @@ class BindingStore:
                 "SELECT scope FROM session_scopes WHERE generation = ?", (binding.generation,)
             ).fetchone()[0]
 
-    def begin_connect(self, toolkit: str) -> AccountBinding:
+    def begin_connect(self, toolkit: str) -> Attempt:
         if not valid_toolkit(toolkit):
             raise ConnectionError("Unsupported toolkit name.")
         with self._db() as db:
@@ -155,14 +167,28 @@ class BindingStore:
             if toolkit in current.accounts:
                 db.execute("UPDATE binding_state SET generation = generation + 1 WHERE id = 1")
             db.execute("DELETE FROM accounts WHERE toolkit = ?", (toolkit,))
-            db.execute("INSERT OR REPLACE INTO pending_accounts VALUES (?, NULL)", (toolkit,))
-            return self._read(db)[0]
+            token = uuid4().hex
+            db.execute(
+                "INSERT OR REPLACE INTO pending_accounts (toolkit, account_id, attempt) "
+                "VALUES (?, NULL, ?)",
+                (toolkit, token),
+            )
+            return Attempt(self._read(db)[0], token)
 
-    def save_pending(self, expected: AccountBinding, toolkit: str, account_id: str) -> None:
+    def save_pending(self, attempt: Attempt, toolkit: str, account_id: str) -> None:
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             current, pending = self._read(db)
-            if current != expected or toolkit not in pending or pending[toolkit] is not None:
+            row = db.execute(
+                "SELECT attempt FROM pending_accounts WHERE toolkit = ?", (toolkit,)
+            ).fetchone()
+            if (
+                current != attempt.binding
+                or toolkit not in pending
+                or pending[toolkit] is not None
+                or row is None
+                or row[0] != attempt.token
+            ):
                 raise ConnectionError(
                     "Connection changed during sign-in. Check /connections before trying again."
                 )
@@ -203,8 +229,11 @@ class BindingStore:
                     db.execute("UPDATE binding_state SET generation = generation + 1 WHERE id = 1")
                 db.execute("DELETE FROM accounts")
                 db.executemany("INSERT INTO accounts VALUES (?, ?)", sorted(active.items()))
-                db.execute("DELETE FROM pending_accounts")
-                db.executemany("INSERT INTO pending_accounts VALUES (?, ?)", remaining.items())
+                # Only remove rows: an unfinished sign-in keeps its attempt token.
+                db.executemany(
+                    "DELETE FROM pending_accounts WHERE toolkit = ?",
+                    [(toolkit,) for toolkit in pending if toolkit not in remaining],
+                )
             return self._read(db)[0]
 
     def retire(self, expected: AccountBinding, *, disconnected: str | None = None) -> None:

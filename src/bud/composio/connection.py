@@ -85,7 +85,7 @@ class Connections:
             attempt = self.store.begin_connect(toolkit)
             client = self.client()
             session = client.create(
-                user_id=attempt.owner,
+                user_id=attempt.binding.owner,
                 toolkits=[toolkit],
                 session_preset=SESSION_PRESET_DIRECT_TOOLS,
                 manage_connections=False,
@@ -134,18 +134,22 @@ class Connections:
             previous, pending = self.store.snapshot()
             references = previous.accounts | {k: v for k, v in pending.items() if v is not None}
             statuses = dict.fromkeys(set(TOOLKITS) | set(references), "NOT_CONNECTED")
+            unverifiable: set[str] = set()
             try:
                 if references:
                     client = self.client()
                     for toolkit, account_id in references.items():
                         try:
                             statuses[toolkit] = self._status(client, previous, toolkit, account_id)
-                        except Exception:
-                            if toolkit in previous.accounts:
-                                raise
+                        except Exception as exc:
+                            if toolkit in previous.accounts or getattr(
+                                exc, "status_code", None
+                            ) in (401, 403):
+                                raise  # an active account in doubt, or a rejected key
                             # Only an unfinished sign-in is in doubt; it never became an
                             # account, so it is dropped below without fencing the chat.
                             statuses[toolkit] = "UNAVAILABLE"
+                            unverifiable.add(toolkit)
             except Exception:
                 self.store.retire(previous)
                 raise
@@ -153,7 +157,11 @@ class Connections:
                 if account_id is None:
                     statuses[toolkit] = "CONNECT_REQUESTED"
             active = {k: v for k, v in references.items() if statuses[k] == "ACTIVE"}
-            remaining = {k: v for k, v in pending.items() if statuses[k] != "ACTIVE"}
+            remaining = {
+                k: v
+                for k, v in pending.items()
+                if statuses[k] != "ACTIVE" and k not in unverifiable
+            }
             accepted = self.store.accept_verified(previous, pending, active, remaining)
             # Adding an app cannot redirect an approval that already exists: every earlier
             # account is unchanged. Adopt it so the new app's tools work in this session.
