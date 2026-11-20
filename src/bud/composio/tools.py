@@ -105,12 +105,16 @@ selected id. Ask when multiple candidates match. Sending remains a separate appr
 A failed or interrupted write may already have happened. Do not retry it or ask for a replacement
 approval automatically. Tell the person to inspect their account first.
 Use explicit time zones in calendar calls. current_time gives the server's clock and offset,
-not the person's preferred timezone. Resolve the intended zone with the person and selected
-calendar metadata. Calendar tools can list available calendars.
-Before a real scheduling job, resolve the calendar, IANA timezone, exact dates, attendees,
-duration, notification policy, working hours and protected time with the person; do not infer
-personal preferences from the simulated seed. Calendar safety covers one chosen calendar only,
-not attendees' availability. Ordinary nonrecurring timed events up to 24 hours are supported.
+not the person's preferred timezone; take the zone from the selected calendar's metadata.
+Calendar tools can list available calendars.
+For a new event, use plain defaults instead of asking: the primary calendar, its time zone, no
+attendees unless the person names them, send_updates "none" without attendees and "all" with
+them, and the calendar's default reminders. Ask only what the request leaves open, such as a
+missing date, time, or length, or a named person whose address is unclear. Never ask about
+working hours or protected time unless the conflict check finds one. The approval card already
+shows the event, so do not ask "are you sure" first.
+Calendar safety covers one chosen calendar only, not attendees' availability.
+Ordinary nonrecurring timed events up to 24 hours are supported.
 CREATE requires explicit attendees, send_updates, create_meeting_room=false and
 exclude_organizer=true; include any desired self-attendee explicitly. Moves use time-only
 PATCH rather than replacement UPDATE, and require expected_etag copied from the event read before
@@ -507,7 +511,8 @@ class ComposioTools(WrapperToolset[None]):
                     description=(tool.tool_def.description or "")
                     + "\nBud supports only the explicit bounded scheduling fields in this schema. "
                     "For PATCH, expected_etag is a local stale-approval check, not a native "
-                    "Composio parameter. Resolve timezone, attendees and notifications first.",
+                    "Composio parameter. Use the calendar defaults from your instructions; "
+                    "ask only for what the request leaves open.",
                 )
                 # DBOS can replace the wrapped MCP client with a durable adapter.
                 # Preserve its returned tool, routing and validator; only prepare

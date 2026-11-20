@@ -358,7 +358,7 @@ def _create_app(
         tools_policy = harness.policy
         if browsing:
             harness.describers.update(browser.describers(relay))
-            harness.reads_only.update(browser.reads_only())
+            harness.harmless.update(browser.harmless(consent))
         harness.live_instructions.append(
             lambda: "\nConnected apps: " + (", ".join(sorted(loaded["accounts"])) or "none")
         )

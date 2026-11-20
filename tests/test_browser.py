@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import sys
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -294,7 +295,7 @@ async def test_auto_mode_sends_a_click_to_the_reviewer_with_the_real_site():
     assert request.details == "The tab shows a shop."
 
 
-async def test_listing_tabs_runs_unasked_while_opening_one_is_checked():
+async def test_listing_tabs_runs_unasked_while_opening_one_is_checked(tmp_path):
     def browser_tabs(action: str, url: str = "") -> str:
         """List, open or close tabs."""
         return f"tabs {action}"
@@ -308,7 +309,7 @@ async def test_listing_tabs_runs_unasked_while_opening_one_is_checked():
         policy=policy,
         reviewer=cast(ToolReviewer, fake),
         record=lambda record: None,
-        reads_only=browser.reads_only(),
+        harmless=browser.harmless(browser.Consent(tmp_path / "consent.json")),
     )
     tools = await actions.get_tools(ctx())
     listed = await actions.call_tool(
@@ -325,18 +326,46 @@ async def test_listing_tabs_runs_unasked_while_opening_one_is_checked():
     assert fake.seen == []
 
 
-def test_only_a_plain_tab_list_is_a_read():
-    is_read = browser.reads_only()["browser_tabs"]
-    assert is_read({"action": "list"})
-    # Anything more than a plain list keeps its check.
+def test_only_a_plain_tab_list_or_a_named_close_needs_no_approval(tmp_path):
+    harmless = browser.harmless(browser.Consent(tmp_path / "consent.json"))["browser_tabs"]
+    for args in (
+        {"action": "list"},
+        {"action": "close", "tab": 4},
+        {"action": "close", "tab": "work-mail"},
+        {"action": "close", "tabs": [4, "work-mail"]},
+        {"action": "close", "group": "hn-top-stories"},
+        {"action": "close", "group": "research", "idleMinutes": 10},
+    ):
+        assert harmless(args), args
+    # Anything more keeps its check.
     for args in (
         {"action": "list", "url": "https://evil.example/"},
         {"action": "list", "tab": 4},
         {"action": "LIST"},
         {"action": "new"},
+        {"action": "close"},
+        {"action": "close", "idleMinutes": 10},
+        {"action": "close", "tab": 4, "url": "https://evil.example/"},
+        {"action": "close", "tab": True},
+        {"action": "close", "tab": " "},
+        {"action": "close", "tabs": []},
+        {"action": "close", "tabs": "4"},
+        {"action": "close", "tab": 4, "idleMinutes": "10"},
         {},
     ):
-        assert not is_read(args), args
+        assert not harmless(args), args
+
+
+def test_turning_the_browser_on_asks_only_while_it_is_off(tmp_path):
+    consent = browser.Consent(tmp_path / "consent.json")
+    harmless = browser.harmless(consent)["enable_browser"]
+    assert not harmless({})
+    consent.set(True)
+    assert harmless({})
+    assert not harmless({"extra": 1})
+    [enable, *_] = browser.control_tools(consent, browser.Relay(tmp_path / "relay"))
+    turn_on = cast(Callable[[], str], enable.function)
+    assert "already on" in turn_on()
 
 
 async def test_tab_actions_are_described_by_what_they_do(browse, relay):

@@ -228,10 +228,9 @@ private struct ConversationView: View {
                     .frame(maxWidth: 420, alignment: .leading)
             }
             if !companion.approvals.isEmpty {
+                // The card is the surface; a second panel around it read as a card in a card.
                 ApprovalDeck(companion: companion)
                     .frame(maxWidth: 420, alignment: .leading)
-                    .padding(14)
-                    .surface(RoundedRectangle(cornerRadius: 14, style: .continuous))
             } else if let receipt = companion.receipt {
                 ReceiptLine(receipt: receipt)
             }

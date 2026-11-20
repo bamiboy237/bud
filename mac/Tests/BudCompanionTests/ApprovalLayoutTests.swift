@@ -201,7 +201,14 @@ struct ApprovalLayoutTests {
         deck.layoutSubtreeIfNeeded()
         try await Task.sleep(for: .milliseconds(150))
         deck.layoutSubtreeIfNeeded()
-        #expect(deck.fittingSize.height >= 240)
+        // One card: the deck is the header plus that card, with no empty space around it.
+        let card = NSHostingView(rootView: ApprovalCard(
+            companion: companion, approval: companion.approvals[0],
+            onDecide: { _ in }, onDrag: { _ in }
+        ).frame(width: 288).transaction { $0.disablesAnimations = true })
+        window.contentView = card
+        card.layoutSubtreeIfNeeded()
+        #expect(deck.fittingSize.height <= card.fittingSize.height + 40)
         #expect(deck.fittingSize.height <= 430)
     }
 

@@ -91,12 +91,17 @@ CAUTION = (
 )
 GUIDANCE = """browser_* tools use the person's own Chrome, with their tabs and sign-ins. They
 appear after the person turns the browser on: call enable_browser, which shows them what that
-allows, then search for browser tools.
+allows, then call search_tools with "browser" in the same turn and continue the task. Do not
+stop to announce that the browser is on.
+- Use the browser only when the task needs the person's own Chrome: their sign-ins, a page you
+  must click or type in, or when they ask for their browser. To read a public page, use
+  read_webpage instead, and do not turn the browser on for it.
 - Reuse tabs. Before opening a page, call browser_tabs with action "list"; if a tab you opened
   already shows the page, pass its id as tab. Pass the tab id from navigate to every later call.
 - Do not set readOnly or allowedOrigins unless the person asks: a read-only tab cannot click.
 - Work in small steps: one browser_snapshot to read a page, act on one element by its ref,
   then snapshot again to check. Take a screenshot only when the layout itself matters.
+  The snapshot leaves out a heading that repeats the page title; navigate returns the title.
 - When the task is done, close the tabs you opened with browser_tabs action "close".
 - Use browser_handoff when only the person can act, such as signing in or paying.
 - If browser_status says no browser is connected, call open_chrome; if Chrome is open and
@@ -174,9 +179,11 @@ def control_tools(
 
     def enable_browser() -> str:
         """Ask the person to let you use their own Chrome. The approval shows them what that
-        allows. Call it once, before you need a browser tool."""
+        allows. While the browser is already on, it asks nothing and says so."""
+        if consent.on():
+            return 'The browser is already on. Call search_tools with "browser" and continue.'
         consent.set(True)
-        return "The browser is on. Search for browser tools, such as browser_navigate."
+        return 'The browser is on. Call search_tools with "browser" and continue the task.'
 
     def disable_browser() -> str:
         """Turn the browser off, when the person asks you to stop using it."""
@@ -361,9 +368,37 @@ def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> di
     return {**dict.fromkeys(STEPS | {UPLOAD}, where), TABS: tabs, ENABLE: caution}
 
 
-def reads_only() -> dict[str, Callable[[dict[str, Any]], bool]]:
-    """Calls that only read, judged in code: listing tabs changes nothing."""
-    return {TABS: lambda tool_args: tool_args == {"action": "list"}}
+def _tab_ref(value: object) -> bool:
+    return (isinstance(value, int) and not isinstance(value, bool)) or (
+        isinstance(value, str) and bool(value.strip())
+    )
+
+
+def _closes_only_tabs(tool_args: dict[str, Any]) -> bool:
+    """A close that names its tabs and nothing else. Bud's relay holds only Bud's tabs, and
+    Browse gives a tab the person lent back to them instead of closing it."""
+    if tool_args.get("action") != "close":
+        return False
+    if not set(tool_args) <= {"action", "tab", "tabs", "group", "idleMinutes"}:
+        return False
+    tab, tabs, group = tool_args.get("tab"), tool_args.get("tabs"), tool_args.get("group")
+    idle = tool_args.get("idleMinutes")
+    return (
+        (tab is not None or tabs is not None or group is not None)
+        and (tab is None or _tab_ref(tab))
+        and (tabs is None or (isinstance(tabs, list) and bool(tabs) and all(map(_tab_ref, tabs))))
+        and (group is None or _tab_ref(group))
+        and (idle is None or (isinstance(idle, int | float) and not isinstance(idle, bool)))
+    )
+
+
+def harmless(consent: Consent) -> dict[str, Callable[[dict[str, Any]], bool]]:
+    """Calls that need no approval, judged in code: listing tabs, closing Bud's own tabs, and
+    turning the browser on while it is already on."""
+    return {
+        TABS: lambda tool_args: tool_args == {"action": "list"} or _closes_only_tabs(tool_args),
+        ENABLE: lambda tool_args: tool_args == {} and consent.on(),
+    }
 
 
 async def connected_now(path: Path, relay: Relay) -> bool:

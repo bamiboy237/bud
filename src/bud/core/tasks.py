@@ -708,9 +708,11 @@ class TaskFlow(AbstractCapability[None]):
                     + PROGRESS_NOTES
                 )
             return (
-                "Answer quick questions here. For work that takes time, produces a deliverable "
-                "or changes data, pass the person's goal and relevant inputs to start_task "
-                "and reply with its task number. Use update_task for a correction to that job. "
+                "Answer quick questions and make single quick changes here, such as saving a "
+                "short note or adding one event. For work that takes many steps or a long "
+                "time, or produces a sizable deliverable, pass the person's goal and relevant "
+                "inputs to start_task and reply with its task number. A job is an agent that "
+                "thinks; it is not a timer. Use update_task for a correction to that job. "
                 "Ask which job the person means when a follow-up could refer to several."
             )
 
@@ -772,7 +774,12 @@ class TaskFlow(AbstractCapability[None]):
         title: Annotated[str, Field(min_length=1, max_length=120)],
         brief: TaskBrief,
     ) -> TaskView:
-        """Start an independent job from a short brief. Returns its number; work continues."""
+        """Start an independent job from a short brief, for multi-step work or a sizable
+        deliverable. Returns its number; work continues.
+
+        Not for a single quick action, such as a short note, a memory, or one calendar event:
+        call that tool directly here, even when it asks for approval. Not a timer either.
+        """
         item = self.store.create(
             self._feed(ctx),
             title,

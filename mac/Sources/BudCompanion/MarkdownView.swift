@@ -99,7 +99,7 @@ private struct Block: View {
                   : heading.level == 2 ? type.heading : type.section)
                 .padding(.top, heading.level <= 2 ? 4 : 2)
         case let paragraph as Paragraph:
-            Prose(text: inline(paragraph))
+            Prose(text: inline(paragraph, code: type.code))
         case let list as UnorderedList:
             ListBlock(items: Array(list.listItems), start: nil)
         case let list as OrderedList:
@@ -228,7 +228,7 @@ private struct TableView: View {
     @ViewBuilder
     private func cells(_ cells: [any Markup], header: Bool) -> some View {
         ForEach(Array(cells.enumerated()), id: \.offset) { _, cell in
-            Text(inline(cell))
+            Text(inline(cell, code: .system(size: type.size - 2, design: .monospaced)))
                 .fontWeight(header ? .semibold : .regular)
                 .foregroundStyle(header ? .secondary : .primary)
                 .textSelection(.enabled)
@@ -239,7 +239,10 @@ private struct TableView: View {
 
 /// A block's inline children as one attributed string. Emphasis is carried as presentation
 /// intent, which SwiftUI's Text draws, so bold inside a link inside a list item still works.
-private func inline(_ markup: any Markup, intent: InlinePresentationIntent = []) -> AttributedString {
+/// `code` sets inline code a step below the text around it, so it does not look heavier.
+private func inline(
+    _ markup: any Markup, intent: InlinePresentationIntent = [], code codeFont: Font? = nil
+) -> AttributedString {
     var out = AttributedString()
     for child in markup.children {
         switch child {
@@ -248,17 +251,22 @@ private func inline(_ markup: any Markup, intent: InlinePresentationIntent = [])
             if !intent.isEmpty { run.inlinePresentationIntent = intent }
             out += run
         case is Strong:
-            out += inline(child, intent: intent.union(.stronglyEmphasized))
+            out += inline(child, intent: intent.union(.stronglyEmphasized), code: codeFont)
         case is Emphasis:
-            out += inline(child, intent: intent.union(.emphasized))
+            out += inline(child, intent: intent.union(.emphasized), code: codeFont)
         case is Strikethrough:
-            out += inline(child, intent: intent.union(.strikethrough))
+            out += inline(child, intent: intent.union(.strikethrough), code: codeFont)
         case let code as InlineCode:
             var run = AttributedString(code.code)
-            run.inlinePresentationIntent = intent.union(.code)
+            if let codeFont {
+                run.inlinePresentationIntent = intent.isEmpty ? nil : intent
+                run.font = codeFont
+            } else {
+                run.inlinePresentationIntent = intent.union(.code)
+            }
             out += run
         case let link as Markdown.Link:
-            var run = inline(link, intent: intent)
+            var run = inline(link, intent: intent, code: codeFont)
             if let destination = link.destination, let url = URL(string: destination) {
                 run.link = url
             }
@@ -269,7 +277,7 @@ private func inline(_ markup: any Markup, intent: InlinePresentationIntent = [])
             out += AttributedString("\n")
         case let image as Markdown.Image:
             // No images in a bubble: their alt text stands in.
-            out += inline(image, intent: intent)
+            out += inline(image, intent: intent, code: codeFont)
         default:
             out += AttributedString(child.format())
         }

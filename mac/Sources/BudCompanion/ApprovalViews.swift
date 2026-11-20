@@ -181,23 +181,13 @@ struct ApprovalDeck: View {
         .help(failed.isEmpty ? "Approve all actions in this request" : "Retry only failed actions")
     }
 
+    /// Room below the front card for the cards behind it to show.
+    private var peekRoom: CGFloat { CGFloat(min(max(totalCount - safeIndex - 1, 0), 2)) * 8 }
+
+    /// The front card sets the deck's height, so a short card leaves no empty space. The cards
+    /// behind it take that same size and show only their bottom edges.
     private var cardStack: some View {
         ZStack(alignment: .top) {
-            if safeIndex + 2 < totalCount {
-                PeekCard(
-                    approval: companion.approvals[safeIndex + 2],
-                    offset: 2,
-                    isTopAdvancing: deck.activeDecision != nil
-                )
-            }
-            if safeIndex + 1 < totalCount {
-                PeekCard(
-                    approval: companion.approvals[safeIndex + 1],
-                    offset: 1,
-                    isTopAdvancing: deck.activeDecision != nil
-                )
-            }
-
             if let activeApproval = currentApproval {
                 ApprovalCard(
                     companion: companion, approval: activeApproval,
@@ -210,10 +200,29 @@ struct ApprovalDeck: View {
                 .offset(x: deck.flyOffset, y: 0)
                 .scaleEffect(deck.flyScale)
                 .opacity(deck.flyOpacity)
-                .zIndex(10)
             }
         }
-        .frame(minHeight: 245, maxHeight: 275)
+        // As tall as the card, up to the pet panel's room with the peeking cards included.
+        .frame(maxWidth: .infinity, maxHeight: 262 - peekRoom, alignment: .top)
+        .background(alignment: .top) {
+            ZStack(alignment: .top) {
+                if safeIndex + 2 < totalCount {
+                    PeekCard(
+                        approval: companion.approvals[safeIndex + 2],
+                        offset: 2,
+                        isTopAdvancing: deck.activeDecision != nil
+                    )
+                }
+                if safeIndex + 1 < totalCount {
+                    PeekCard(
+                        approval: companion.approvals[safeIndex + 1],
+                        offset: 1,
+                        isTopAdvancing: deck.activeDecision != nil
+                    )
+                }
+            }
+        }
+        .padding(.bottom, peekRoom)
     }
 
     /// The card follows a horizontal drag 1:1; nil means the drag ended without deciding, so
@@ -304,15 +313,15 @@ struct PeekCard: View {
             Spacer(minLength: 0)
         }
         .padding(12)
-        .frame(maxWidth: .infinity)
-        .frame(height: 240)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Paper.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(Paper.hairline, lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.06), radius: 4, y: 2)
-        .scaleEffect(scale)
+        // Shrinks toward its bottom edge, so that edge peeks out below the card in front.
+        .scaleEffect(scale, anchor: .bottom)
         .offset(y: yOffset)
         .opacity(opacity)
         .zIndex(Double(5 - offset))
