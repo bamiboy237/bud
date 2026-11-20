@@ -22,6 +22,7 @@ from bud.composio.binding import ConnectionError
 from bud.core.profiles import Mode, apply_mode
 from bud.harness.actions import ActionGateway, Policy
 from bud.harness.review import ReviewResult, ToolReviewer, Verdict
+from bud.photon_ui import action_preview
 
 STAND_IN = """\
 #!{python}
@@ -153,8 +154,7 @@ async def test_tools_start_only_once_the_browser_is_on_and_exclude_raw_javascrip
     browse, relay, tmp_path
 ):
     consent = browser.Consent(tmp_path / "consent.json")
-    session = browser.Session()
-    toolset = browser.toolset(browse, consent, relay, session)
+    toolset = browser.toolset(browse, consent, relay)
     controls: dict[str, Any] = {t.name: t.function for t in browser.control_tools(consent, relay)}
     async with toolset:
         assert await toolset.get_tools(ctx()) == {}
@@ -180,7 +180,6 @@ async def test_tools_start_only_once_the_browser_is_on_and_exclude_raw_javascrip
     assert opened == "tab: 3 at https://shop.example/"
     assert untargeted.startswith("Nothing was done")
     assert late == "The browser is off, so nothing was done."
-    assert session._task is None  # turning the browser off stopped Browse
     assert started_with(browse, "mcp") == {
         "OPENCODE_BROWSER_HOME": str(relay.home),
         "OPENCODE_BROWSER_PORT": "29999",
@@ -188,22 +187,19 @@ async def test_tools_start_only_once_the_browser_is_on_and_exclude_raw_javascrip
     }
 
 
-async def test_concurrent_runs_share_one_browse_that_outlives_them(browse, relay, tmp_path):
+async def test_overlapping_runs_each_use_their_own_short_connection(browse, relay, tmp_path):
     consent = browser.Consent(tmp_path / "consent.json")
     consent.set(True)
-    session = browser.Session()
-    toolset = browser.toolset(browse, consent, relay, session)
+    toolset = browser.toolset(browse, consent, relay)
 
-    async def run() -> set[str]:
+    async def run() -> object:
         async with toolset:
-            return set(await toolset.get_tools(ctx()))
+            tools = await toolset.get_tools(ctx())
+            return await toolset.call_tool(
+                "browser_click", {"ref": "e1", "tab": "3"}, ctx(), tools["browser_click"]
+            )
 
-    first, second = await asyncio.gather(run(), run())
-    assert first == second == {"browser_status", "browser_navigate", "browser_click"}
-    held = session._task
-    assert held is not None and not held.done()  # still open after both runs ended
-    await session.stop()
-    assert held.done()
+    assert await asyncio.gather(run(), run()) == ["clicked e1", "clicked e1"]
 
 
 async def test_the_reviewer_sees_the_real_site_of_a_tab_and_nothing_the_model_wrote(browse, relay):
@@ -222,6 +218,14 @@ async def test_the_reviewer_sees_the_real_site_of_a_tab_and_nothing_the_model_wr
     assert found["enable_browser"]({}) == browser.CAUTION
 
 
+looked_up: list[dict] = []
+
+
+async def shop(tool_args: dict) -> str:
+    looked_up.append(tool_args)
+    return "The tab shows a shop."
+
+
 class FakeReviewer:
     def __init__(self, verdict: Verdict) -> None:
         self.verdict = verdict
@@ -233,6 +237,8 @@ class FakeReviewer:
 
 
 def gateway(mode: Mode, verdict: Verdict, describe=None) -> tuple[ActionGateway, FakeReviewer]:
+    """A gateway over one stand-in browser_click, described asynchronously like Browse's."""
+
     def browser_click(ref: str, tab: str) -> str:
         """Click an element."""
         return f"clicked {ref}"
@@ -247,7 +253,7 @@ def gateway(mode: Mode, verdict: Verdict, describe=None) -> tuple[ActionGateway,
             policy=policy,
             reviewer=cast(ToolReviewer, fake),
             record=lambda record: None,
-            describers={"browser_click": describe or (lambda args: "The tab shows a shop.")},
+            describers={"browser_click": describe or shop},
         ),
         fake,
     )
@@ -265,6 +271,7 @@ async def test_auto_mode_sends_a_click_to_the_reviewer_with_the_real_site():
 
 
 async def test_a_held_click_shows_the_owner_the_site_and_the_reason():
+    looked_up.clear()
     actions, _ = gateway("auto", Verdict.PROMPT)
     tools = await actions.get_tools(ctx())
     with pytest.raises(ApprovalRequired) as held:
@@ -274,6 +281,8 @@ async def test_a_held_click_shows_the_owner_the_site_and_the_reason():
     metadata = held.value.metadata or {}
     assert metadata["reason"] == "It may submit a form."
     assert metadata["details"] == "The tab shows a shop."
+    # One lookup serves the reviewer and the card, so both see the same page.
+    assert len(looked_up) == 1
 
 
 async def test_strict_mode_asks_before_every_click_without_the_reviewer():
@@ -326,6 +335,37 @@ async def test_open_chrome_launches_it_and_waits_for_the_extension(
     assert await open_chrome() == "Chrome is open and connected. Continue with the browser tools."
     assert await open_chrome() == "Chrome is already connected."
     assert launches == ["Chrome"]
+
+
+async def test_open_chrome_is_offered_only_while_the_browser_is_on(relay, tmp_path):
+    consent = browser.Consent(tmp_path / "consent.json")
+    toolset = FunctionToolset(browser.control_tools(consent, relay))
+    assert "open_chrome" not in await toolset.get_tools(ctx())
+    consent.set(True)
+    assert "open_chrome" in await toolset.get_tools(ctx())
+
+
+def test_imessage_shows_the_caution_site_and_reason():
+    caution = action_preview(
+        {
+            "approval_id": "a1",
+            "tool": "enable_browser",
+            "args": {},
+            "review": {"details": browser.CAUTION},
+        }
+    )
+    assert caution.startswith("Let Bud use your browser?")
+    assert browser.CAUTION in caution
+    held = action_preview(
+        {
+            "approval_id": "a2",
+            "tool": "browser_click",
+            "args": {"ref": "e1", "tab": 3},
+            "review": {"details": "The tab shows https://shop.example/.", "reason": "It may pay."},
+        }
+    )
+    assert "The tab shows https://shop.example/." in held
+    assert "Why: It may pay." in held
 
 
 async def test_open_chrome_sends_an_unpaired_extension_to_setup(

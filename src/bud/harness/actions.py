@@ -220,7 +220,12 @@ class ActionGateway(WrapperToolset[None]):
             action = "ask"  # the reviewer would see only part of the call
         rule: str = action
         outcome = "refused" if action == "deny" else "allowed"
-        details = await self._describe(name, tool_args) if action in ("ask", "review") else None
+        # An owner-approved call already showed its facts; it runs without looking them up again.
+        details = (
+            await self._describe(name, tool_args)
+            if action in ("ask", "review") and not ctx.tool_call_approved
+            else None
+        )
         review: dict[str, Any] | None = None
         if action in ("ask", "review") and ctx.tool_call_approved:
             rule, outcome = "ask", "approved"  # the owner already approved this exact call

@@ -28,14 +28,15 @@ import shutil
 import subprocess
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from pydantic_ai import RunContext, Tool
 from pydantic_ai.mcp import MCPToolset, StdioTransport
-from pydantic_ai.toolsets import AbstractToolset, DeferredLoadingToolset, WrapperToolset
+from pydantic_ai.tools import ToolDefinition
+from pydantic_ai.toolsets import AbstractToolset, DeferredLoadingToolset
 from pydantic_ai.toolsets.abstract import ToolsetTool
 
 from bud.composio.binding import ConnectionError
@@ -186,22 +187,27 @@ def control_tools(
         path = locate()
         if path is None:
             return 'Browse is not installed. Call setup_capability with "browser".'
-        if await asyncio.to_thread(connected, path, relay):
+        if await connected_now(path, relay):
             return "Chrome is already connected."
         try:
             await asyncio.to_thread(launch)
         except (OSError, subprocess.SubprocessError):
             return "Chrome could not be opened. Ask the person to open it."
-        for _ in range(CONNECT_SECONDS):
+        deadline = asyncio.get_running_loop().time() + CONNECT_SECONDS
+        while asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(1)
-            if await asyncio.to_thread(connected, path, relay):
+            if await connected_now(path, relay):
                 return "Chrome is open and connected. Continue with the browser tools."
         return (
             "Chrome is open, but the browse extension did not connect. Call "
             'setup_capability with "browser" to pair it.'
         )
 
-    return [Tool(enable_browser), Tool(disable_browser), Tool(open_chrome)]
+    async def while_on(ctx: RunContext[None], tool_def: ToolDefinition) -> ToolDefinition | None:
+        # Offered only while the browser is on, so an approval never ends in "it's off".
+        return tool_def if consent.on() else None
+
+    return [Tool(enable_browser), Tool(disable_browser), Tool(open_chrome, prepare=while_on)]
 
 
 def executable() -> Path | None:
@@ -221,102 +227,63 @@ def executable() -> Path | None:
 NEEDS_TAB = (STEPS - {f"{PREFIX}_navigate", f"{PREFIX}_tabs"}) | {UPLOAD}
 
 
-class Session:
-    """The one connection to `browse mcp`. A task Bud owns opens and closes it, so it never
-    depends on which agent run started first or finished last."""
-
-    def __init__(self) -> None:
-        self._task: asyncio.Task[None] | None = None
-        self._stop: asyncio.Event | None = None
-        self._lock = asyncio.Lock()
-
-    async def start(self, toolset: AbstractToolset[None]) -> None:
-        async with self._lock:
-            if self._task is not None and not self._task.done():
-                return
-            ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-            self._stop = asyncio.Event()
-            self._task = asyncio.create_task(self._hold(toolset, ready, self._stop))
-            await ready
-
-    @staticmethod
-    async def _hold(
-        toolset: AbstractToolset[None], ready: asyncio.Future[None], stop: asyncio.Event
-    ) -> None:
-        try:
-            async with toolset:
-                ready.set_result(None)
-                await stop.wait()
-        except Exception as exc:
-            if not ready.done():
-                ready.set_exception(exc)
-            else:
-                logger.warning("browse mcp stopped: %s", type(exc).__name__)
-
-    async def stop(self) -> None:
-        async with self._lock:
-            if self._task is None or self._stop is None:
-                return
-            self._stop.set()
-            with contextlib.suppress(Exception):
-                await self._task
-            self._task = None
-
-
 @dataclass
-class WhileOn(WrapperToolset[None]):
-    """Browse's tools, offered and callable only while the owner has the browser on. The
-    shared Session starts Browse at the first use and stops it once the browser is off."""
+class BrowseTools(AbstractToolset[None]):
+    """Browse's chosen tools as browser_*, offered and callable only while the owner has the
+    browser on. Each listing and each call opens its own short connection to `browse mcp`
+    and closes it in the same task, so no connection outlives a step, races another run, or
+    goes stale when Browse restarts. Bud's relay keeps the tabs between calls."""
 
-    session: Session | None = None
-    consent: Consent | None = None
+    path: Path
+    consent: Consent
+    relay: Relay
 
-    def _on(self) -> bool:
-        return self.consent is not None and self.consent.on()
+    @property
+    def id(self) -> str | None:
+        return "browse"
 
-    async def __aenter__(self) -> "WhileOn":
-        return self
-
-    async def __aexit__(self, *args: Any) -> bool | None:
-        return None
+    def _connect(self) -> AbstractToolset[None]:
+        self.relay.home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        remote = MCPToolset(
+            StdioTransport(str(self.path), ["mcp"], env=self.relay.env()),
+            init_timeout=30,
+            read_timeout=180,
+            max_retries=0,
+            tool_error_behavior="error",
+            include_instructions=False,
+            prefer_tasks=False,
+        )
+        return remote.prefixed(PREFIX).filtered(lambda ctx, tool: tool.name in TOOLS)
 
     async def get_tools(self, ctx: RunContext[None]) -> dict[str, ToolsetTool[None]]:
-        assert self.session is not None
-        if not self._on():
-            await self.session.stop()
+        if not self.consent.on():
             return {}
-        await self.session.start(self.wrapped)
-        return await self.wrapped.get_tools(ctx)
+        try:
+            async with self._connect() as connection:
+                tools = await connection.get_tools(ctx)
+        except Exception as exc:
+            # browser_status cannot explain a Browse that will not start; the tools stay away.
+            logger.warning("browse mcp did not list its tools: %s", type(exc).__name__)
+            return {}
+        return {name: replace(tool, toolset=self) for name, tool in tools.items()}
 
     async def call_tool(
         self, name: str, tool_args: dict[str, Any], ctx: RunContext[None], tool: ToolsetTool[None]
     ) -> Any:
-        assert self.session is not None
-        if not self._on():
+        if not self.consent.on():
             return "The browser is off, so nothing was done."
         if name in NEEDS_TAB and tool_args.get("tab") is None:
             return "Nothing was done: pass the tab id from browser_navigate as tab."
-        await self.session.start(self.wrapped)
-        return await self.wrapped.call_tool(name, tool_args, ctx, tool)
+        async with self._connect() as connection:
+            tools = await connection.get_tools(ctx)
+            if name not in tools:
+                return f"{name} is not available right now, so nothing was done."
+            return await connection.call_tool(name, tool_args, ctx, tools[name])
 
 
-def toolset(path: Path, consent: Consent, relay: Relay, session: Session) -> AbstractToolset[None]:
-    """Browse's chosen tools as browser_*: deferred until the model searches, and absent
-    while the browser is off. Build it once per server: durable execution names it "browse".
-    Bud's gateway already runs each call as one recorded DBOS step."""
-    relay.home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    remote = MCPToolset(
-        StdioTransport(str(path), ["mcp"], env=relay.env()),
-        id="browse",
-        init_timeout=30,
-        read_timeout=180,
-        max_retries=0,
-        tool_error_behavior="error",
-        include_instructions=False,
-        prefer_tasks=False,
-    )
-    offered = remote.prefixed(PREFIX).filtered(lambda ctx, tool: tool.name in TOOLS)
-    return DeferredLoadingToolset(WhileOn(offered, session=session, consent=consent))
+def toolset(path: Path, consent: Consent, relay: Relay) -> AbstractToolset[None]:
+    """Browse's chosen tools, deferred until the model searches for them."""
+    return DeferredLoadingToolset(BrowseTools(path, consent, relay))
 
 
 def _site(url: object) -> str:
@@ -371,6 +338,29 @@ def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> di
 
     # Every client shows the caution, because it rides the approval as a looked-up fact.
     return {**dict.fromkeys(STEPS | {UPLOAD}, where), ENABLE: caution}
+
+
+async def connected_now(path: Path, relay: Relay) -> bool:
+    """Whether the extension is connected, asked without blocking Bud and given up after a
+    few seconds."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            str(path),
+            "status",
+            "--json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=relay.env(),
+        )
+        try:
+            out, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            return False
+        return bool(json.loads(out).get("extension", {}).get("connected"))
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 def connected(path: Path, relay: Relay) -> bool:
