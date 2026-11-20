@@ -253,6 +253,20 @@ def test_owner_message_must_report_new_job_results(tmp_path):
     assert "mention a job only if it matters" not in note
 
 
+def test_a_job_report_turn_has_no_owner_message_to_answer(tmp_path):
+    log = EventLog(tmp_path / "events.db")
+    log.append(
+        "owner",
+        "task.completed",
+        {"task_id": 1, "title": "Lease renewal", "text": "Renews on 3 March."},
+    )
+    note = job_updates_note(log.read("owner"), {"run_id": "next", "trigger": "job"})
+
+    assert "Renews on 3 March." in note
+    assert "Report the job news below briefly." in note
+    assert "message above" not in note
+
+
 def test_stopping_a_report_pauses_its_queue_and_prevents_redispatch(tmp_path):
     log = EventLog(tmp_path / "events.db")
     log.append(

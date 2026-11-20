@@ -45,7 +45,7 @@ DOCUMENT_TOOL = "read_document"
 WRITE_TOOLS = {"workspace_create", "workspace_update"}
 GUIDANCE = """Manage text files in the dedicated workspace using relative paths.
 read_file shows each file's content hash. workspace_update needs the hash from the latest
-read. Creating and updating files require user approval.
+read. Whether a write asks first depends on the approval mode; call the tool either way.
 read_document reads PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB, and CSV files
 in the workspace as Markdown. It cannot read scanned pages.
 """
@@ -349,13 +349,13 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool[None]]:
     def workspace_create(
         ctx: RunContext[None], path: str, content: str
     ) -> dict[str, Any] | ToolReturn:
-        """Create a new text file after approval. Rejects paths that already exist."""
+        """Create a new text file in the workspace. Rejects paths that already exist."""
         return write(ctx, path, content, None)
 
     def workspace_update(
         ctx: RunContext[None], path: str, content: str, expected_revision: str
     ) -> dict[str, Any] | ToolReturn:
-        """Replace a text file after approval, only if its content hash still matches."""
+        """Replace a text file in the workspace, only if its content hash still matches."""
         return write(ctx, path, content, expected_revision)
 
     return [Tool[None](workspace_create), Tool[None](workspace_update)]

@@ -365,9 +365,8 @@ def _create_app(
             "to load only the actions you need from a connected app. When no app is needed, "
             "answer without searching the library. To connect a supported app, call "
             "setup_capability with its slug: the person gets a sign-in card in chat and "
-            "authorizes in their browser. Never send the person to a command line "
-            "(/connect remains a manual fallback). The connection is ready on the next "
-            "message; no restart is needed."
+            "authorizes in their browser. Never send the person to a command line. The "
+            "connection is ready on the next message; no restart is needed."
             + WEB_GUIDANCE
             + file_guidance()
             + (browser.GUIDANCE if browsing else "")
@@ -387,7 +386,13 @@ def _create_app(
             harness.describers.update(browser.describers(relay))
             harness.harmless.update(browser.harmless(consent))
         harness.live_instructions.append(
-            lambda: "\nConnected apps: " + (", ".join(sorted(loaded["accounts"])) or "none")
+            lambda: (
+                "\nConnected apps: "
+                + (
+                    ", ".join(sorted(loaded["accounts"]))
+                    or "none yet; setup_capability can connect a supported app"
+                )
+            )
         )
     else:
         db_path = settings.data_dir / "bud.db"
