@@ -122,7 +122,9 @@ struct Approval: Identifiable, Equatable {
     }
 
     /// Approvals that are a plain yes or no, with nothing to revise.
-    static let yesOrNo: Set<String> = ["enable_browser", "open_chrome"]
+    static let yesOrNo: Set<String> = [
+        "enable_browser", "open_chrome", "read_local_file", "list_local_folder",
+    ]
 
     /// One line for the card that turns the browser on.
     static let browserSummary = "Signed in as you, including Gmail and Calendar. Risky steps, "
@@ -145,6 +147,14 @@ struct Approval: Identifiable, Equatable {
         if tool == "enable_browser" { return ("Use your Chrome", "Turn on", "globe") }
         if tool.hasPrefix("browser_") { return browserStep(String(tool.dropFirst(8)), args) }
         if tool == "open_chrome" { return ("Open Chrome", "Open", "globe") }
+        if tool == "read_local_file" {
+            let name = (text(args, "path") as NSString).lastPathComponent
+            return (name.isEmpty ? "Read one of your files" : "Read \(name)", "Read", "doc.text.magnifyingglass")
+        }
+        if tool == "list_local_folder" {
+            let name = (text(args, "path") as NSString).lastPathComponent
+            return (name.isEmpty ? "Look in one of your folders" : "Look in \(name)", "Allow", "folder")
+        }
         if tool == "workspace_create" {
             let path = text(args, "path")
             return (path.isEmpty ? "Save a file" : "Save \(path)", "Save", "doc.badge.plus")

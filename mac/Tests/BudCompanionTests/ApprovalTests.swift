@@ -33,6 +33,15 @@ struct ApprovalTests {
     }
 
     @Test
+    func localReadsAskByFileName() throws {
+        let read = try approval("read_local_file", args: ["path": "~/Documents/plan.pdf"])
+        #expect(read.title == "Can I read plan.pdf?")
+        #expect(read.verb == "Read")
+        let look = try approval("list_local_folder", args: ["path": "/Users/me/Documents"])
+        #expect(look.title == "Can I look in Documents?")
+    }
+
+    @Test
     func grantableApprovalsOfferAlwaysAllow() throws {
         let grantable = try approval("archive_email", grantable: true)
         #expect(grantable.grantable)

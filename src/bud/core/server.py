@@ -67,7 +67,15 @@ from bud.shell import runner as shell_runner
 from bud.web import GUIDANCE as WEB_GUIDANCE
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
 from bud.web import build_tools as build_web_tools
-from bud.workspace import DOCUMENT_TOOL, document_tool
+from bud.workspace import (
+    DOCUMENT_TOOL,
+    LOCAL_GUIDANCE,
+    LOCAL_TOOLS,
+    describe_local,
+    document_tool,
+    local_blocked,
+    local_tools,
+)
 from bud.workspace import GUIDANCE as WORKSPACE_GUIDANCE
 from bud.workspace import READ_TOOLS as WORKSPACE_READ_TOOLS
 from bud.workspace import WRITE_TOOLS as WORKSPACE_WRITE_TOOLS
@@ -171,6 +179,7 @@ def workspace_tools(
         [
             *build_workspace_tools(root, state_dir / "workspace-dispatches.jsonl"),
             document_tool(root),
+            *local_tools(local_blocked(Path.home(), list(private), root)),
             *shell,
             *(background.tools() if background is not None else []),
         ]
@@ -192,7 +201,12 @@ def private_folders(settings: Settings) -> list[Path]:
 
 
 def file_guidance() -> str:
-    return WORKSPACE_GUIDANCE + (SHELL_GUIDANCE if shell_available() else "") + BACKGROUND_GUIDANCE
+    return (
+        WORKSPACE_GUIDANCE
+        + LOCAL_GUIDANCE
+        + (SHELL_GUIDANCE if shell_available() else "")
+        + BACKGROUND_GUIDANCE
+    )
 
 
 def allow_file_tools(policy: Policy) -> None:
@@ -206,8 +220,10 @@ def allow_file_tools(policy: Policy) -> None:
     # No "always allow": one click must not let every later start skip approval.
     policy.no_grants = policy.no_grants | BACKGROUND_STARTS
     policy.tools[NETWORK_TOOL] = "ask"
+    # Each read outside the workspace asks, in every mode, and offers no "always allow".
+    policy.tools.update(dict.fromkeys(LOCAL_TOOLS, "ask"))
     # Each new site needs its own yes: "always allow" would let Bud add any site unasked.
-    policy.no_grants = policy.no_grants | {NETWORK_TOOL}
+    policy.no_grants = policy.no_grants | {NETWORK_TOOL} | LOCAL_TOOLS
 
 
 def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAPI:
@@ -442,6 +458,11 @@ def _create_app(
     if world is not None:
         harness.describers = build_describers(world)
         harness.notifies_others = build_notifies_others(world)
+    # The card names the real file a local read opens, which a link cannot disguise.
+    outside = local_blocked(Path.home(), private_folders(settings), workspace)
+    harness.describers.update(
+        dict.fromkeys(LOCAL_TOOLS, lambda tool_args: describe_local(tool_args, outside))
+    )
     has_reviewer = harness.reviewer is not None
     apply_mode(harness.policy, approval_mode, reviewer=has_reviewer)
     live_mode: dict[str, Mode] = {"mode": approval_mode}
