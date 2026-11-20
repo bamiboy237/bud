@@ -16,8 +16,8 @@ MEMORY_RULES: dict[str, Action] = {
 
 GUIDANCE = """
 Personalize responses using verified facts and preferences in MEMORY.md or relevant topic notes.
-Record, update, or clear memories when explicitly requested by the user.
-Memory modifications require user approval through the system's write flow.
+Record, update, or clear memories when the person explicitly asks. Corrections to your style
+are learned after the turn on their own, so do not save them yourself.
 """
 
 

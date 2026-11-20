@@ -161,13 +161,13 @@ def ask_summary(args: dict[str, Any]) -> str:
 def ask_user(ctx: RunContext[None], questions: Questions) -> str:
     """Ask the person one or more questions and wait for their answers.
 
-    Use this only when a missing preference or decision genuinely blocks the task and no
-    available tool can supply the fact: read data with tools first. Group the questions
-    you need now into one call (1 to 10), each with a short unique header. Offer 2 to 6
-    concrete options when they are known, with multi_select when several may apply; leave
-    options empty for a free-text answer. The person can always answer in their own words.
-    It pauses and returns each question with its answer. For risky actions, still call the
-    action tool so it goes through approval.
+    Use this only when a missing preference or decision genuinely blocks the task, and
+    neither a tool nor a plain default (the primary calendar, no guests) supplies it: read
+    data with tools first. Never use it to confirm a write; the write's approval does that.
+    Group the questions you need now into one call (1 to 10), each with a short unique
+    header. Offer 2 to 6 concrete options when they are known, with multi_select when several
+    may apply; leave options empty for a free-text answer. The person can always answer in
+    their own words. It pauses and returns each question with its answer.
 
     Args:
         questions: The questions, in the order to ask them.

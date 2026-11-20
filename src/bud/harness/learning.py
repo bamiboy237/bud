@@ -43,7 +43,8 @@ Rules:
 - `evidence` is copied verbatim from OWNER text, never from the assistant or signals.
 - Skip one-offs ("this time", "just for this one", "today"), the task itself, and
   anything MEMORY already says.
-- Never record permissions or approval changes ("send without asking" is not a lesson).
+- Never record permissions, approval changes, or standing automation ("send without
+  asking", "always archive these automatically", "auto-accept Sam's invites" are not lessons).
 - `fact` is one short third-person sentence about the owner or a person.
 - If a lesson contradicts a MEMORY line, copy that whole line exactly into `replaces`.
 - Most turns teach nothing. Then return no lessons."""

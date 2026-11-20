@@ -379,8 +379,9 @@ async def judge_site(
         ReviewRequest(
             tool="network_access",
             args=args,
-            description="A sandboxed shell command in Bud's workspace wants to connect to "
-            "this website. Allow it when the owner's request needs that site.",
+            description="A sandboxed shell command in Bud's workspace asks to connect to this "
+            "host. Judge whether the owner's request needs this host, and whether the command "
+            "could send the owner's files or secrets to it.",
             owner_request=owner_request,
         )
     )

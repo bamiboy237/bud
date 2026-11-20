@@ -32,9 +32,10 @@ RULES = {
     "install_skill": "ask",
     "disable_skill": "ask",
 }
-GUIDANCE = """Discover available task capabilities using `list_skills`.
-Activate relevant methods for the task using `load_capability`.
-Follow instructions in loaded skills alongside available tools.
+GUIDANCE = """Skills are written methods for recurring work, such as briefings, meeting prep,
+message drafting, document writing, and research. When a request matches one, find it with
+`list_skills` and load it with `load_capability`, then follow it alongside your tools. Skip
+skills for a simple one-step question or action.
 """
 
 
