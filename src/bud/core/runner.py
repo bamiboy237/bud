@@ -634,7 +634,12 @@ class Runner(DBOSConfiguredInstance):
         call_id = f"{request['call_id']}-approved"
         results = DeferredToolResults(
             approvals={call_id: ToolApproved()},
-            metadata={call_id: {"approval_id": request["approval_id"]}},
+            metadata={
+                call_id: {
+                    "approval_id": request["approval_id"],
+                    **_review_of(request.get("review")),
+                }
+            },
         )
         run = self._inputs(session_id, None, results)
         queued = next(

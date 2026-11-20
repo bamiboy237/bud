@@ -195,17 +195,6 @@ class Connections:
         self.binding = current
         return before, current
 
-    @staticmethod
-    def changed_apps(before: AccountBinding | None, after: AccountBinding) -> set[str]:
-        """Apps whose account was replaced or removed between two bindings."""
-        if before is None:
-            return set()
-        return {
-            toolkit
-            for toolkit, account in before.accounts.items()
-            if after.accounts.get(toolkit) != account
-        }
-
     def restart_required(self) -> bool:
         return self.binding is None or self.store.snapshot()[0] != self.binding
 

@@ -28,6 +28,7 @@ def setup_api(tmp_path, monkeypatch):
     found.folder = tmp_path / "composio"
     found.user_id = "owner"
     found.capture_binding.return_value = AccountBinding("owner", 1, ())
+    found.binding = found.capture_binding.return_value
     found.accounts.return_value = {}
     found.restart_required.return_value = False
     found.store = Mock()
@@ -111,10 +112,10 @@ async def test_a_changed_account_binding_loads_in_place(setup_api):
 
     def adopt():
         changed["value"] = False
-        return binding, binding
+        before, found.binding = found.binding, binding
+        return before, binding
 
     found.adopt.side_effect = adopt
-    found.changed_apps.return_value = set()
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",
@@ -170,6 +171,8 @@ async def test_model_instructions_reflect_apps_connected_after_startup(setup_api
     runner.harness.policy.tools["SLACK_READ"] = "allow"
     remote[0] = FunctionToolset([Tool(read_slack, name="SLACK_READ")])
     found.accounts.return_value = {"slack": "account-slack"}
+    # Adding an app changes the binding too: refresh() adopts the additive change.
+    found.binding = AccountBinding("owner", 1, (("slack", "account-slack"),))
     found.statuses.return_value = {"slack": "ACTIVE"}
     log.append(
         "session",

@@ -297,7 +297,7 @@ def test_an_unverifiable_active_account_still_fences(connections):
     assert found.restart_required()
 
 
-def test_adopting_a_changed_binding_names_the_apps_that_changed(connections):
+def test_adopting_a_changed_binding_makes_it_current(connections):
     found, remote = connections
     connect(found, remote, "gmail", "acct-gmail")
     connect(found, remote, "googlecalendar", "acct-calendar")
@@ -306,26 +306,35 @@ def test_adopting_a_changed_binding_names_the_apps_that_changed(connections):
     connect(found, remote, "gmail", "acct-gmail-2")  # a different Gmail account
     assert found.restart_required()
     old, new = found.adopt()
-    assert old == before
+    assert old == before and new.generation > before.generation
     assert not found.restart_required()
-    assert found.changed_apps(old, new) == {"gmail"}
     # The new binding dispatches; the old one stays fenced.
     found.assert_current_binding(new, "googlecalendar")
     with pytest.raises(ConnectionError):
         found.assert_current_binding(old, "gmail")
 
 
-def test_a_changed_account_denies_only_its_own_waiting_approvals(tmp_path):
+def test_cards_asked_under_an_old_account_generation_are_denied(tmp_path):
     from bud.core.events import EventType
     from bud.core.log import EventLog
-    from bud.core.server import deny_for_apps
+    from bud.core.server import deny_stale
 
     log = EventLog(tmp_path / "events.db")
     events: list[tuple[EventType, dict]] = [
         ("run.queued", {"run_id": "r"}),
-        ("approval.requested", {"approval_id": "send", "tool": "GMAIL_SEND_EMAIL"}),
-        ("approval.requested", {"approval_id": "event", "tool": "GOOGLECALENDAR_CREATE_EVENT"}),
-        ("approval.requested", {"approval_id": "note", "tool": "workspace_create"}),
+        (
+            "approval.requested",
+            {
+                "approval_id": "old",
+                "tool": "GOOGLE_DRIVE_DELETE_FILE",
+                "review": {"account_generation": 1},
+            },
+        ),
+        (
+            "approval.requested",
+            {"approval_id": "new", "tool": "GMAIL_SEND_EMAIL", "review": {"account_generation": 2}},
+        ),
+        ("approval.requested", {"approval_id": "legacy", "tool": "workspace_create"}),
         ("run.waiting", {"run_id": "r"}),
     ]
     for type, data in events:
@@ -336,5 +345,26 @@ def test_a_changed_account_denies_only_its_own_waiting_approvals(tmp_path):
         asked.append((session_id, approval_id, approved))
         return True
 
-    assert deny_for_apps(log, decide, {"gmail"}) == ["send"]
-    assert asked == [("chat", "send", False)]
+    # An app with an underscore in its name is caught too: the stamp, not the tool name,
+    # decides.
+    assert deny_stale(log, decide, 2) == ["old"]
+    assert asked == [("chat", "old", False)]
+
+
+def test_an_approval_from_another_generation_never_dispatches():
+    from types import SimpleNamespace
+
+    from bud.composio.binding import AccountBinding
+    from bud.composio.tools import stale_approval
+
+    current = AccountBinding("owner", 3, (("gmail", "acct-2"),))
+
+    def ctx(metadata):
+        return SimpleNamespace(tool_call_metadata=metadata)
+
+    # Granted, parked, or recovered after a restart: the stamp travels with the approval.
+    assert stale_approval(ctx({"review": {"account_generation": 2}}), current)  # type: ignore[arg-type]
+    assert stale_approval(ctx({"account_generation": 1}), current)  # type: ignore[arg-type]
+    assert not stale_approval(ctx({"review": {"account_generation": 3}}), current)  # type: ignore[arg-type]
+    # A card from before the stamp keeps the binding fence alone.
+    assert not stale_approval(ctx({"approval_id": "a"}), current)  # type: ignore[arg-type]

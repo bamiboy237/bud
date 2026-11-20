@@ -388,6 +388,16 @@ class AppActions(AbstractToolset[None]):
         return await self.execute(name, tool_args, action.app, action.version)
 
 
+def stale_approval(ctx: RunContext[None], binding: AccountBinding) -> bool:
+    """Whether the owner approved this call under another account generation. A card from
+    before the stamp existed carries none and keeps the binding fence alone."""
+    metadata = ctx.tool_call_metadata or {}
+    review = metadata.get("review")
+    stamp = review.get("account_generation") if isinstance(review, dict) else None
+    stamp = metadata.get("account_generation", stamp)
+    return isinstance(stamp, int) and stamp != binding.generation
+
+
 @dataclass
 class ComposioTools(WrapperToolset[None]):
     dispatch_path: Path = field(kw_only=True)
@@ -606,6 +616,10 @@ class ComposioTools(WrapperToolset[None]):
     ) -> Any:
         if name not in self.allowed_tools and COMPOSIO_ACTION not in (tool.tool_def.metadata or {}):
             raise ConnectionError("This Composio tool is not allowed.")
+        if ctx.tool_call_approved and stale_approval(ctx, self.binding):
+            raise ConnectionError(
+                "This was approved for an account that has since changed. Ask the person again."
+            )
 
         if name == "GMAIL_CREATE_EMAIL_DRAFT" and (
             not tool_args.get("thread_id")

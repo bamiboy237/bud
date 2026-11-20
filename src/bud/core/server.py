@@ -197,19 +197,21 @@ def build_background(root: Path, state_dir: Path, private: Sequence[Path] = ()) 
     return Background(state_dir / "background.db", root, run)
 
 
-def deny_for_apps(
-    log: EventLog, decide: Callable[[str, str, bool, dict], bool], apps: set[str]
+def deny_stale(
+    log: EventLog, decide: Callable[[str, str, bool, dict], bool], generation: int
 ) -> list[str]:
-    """Deny every waiting approval for an app whose account changed or left, in every chat
-    and job, so nothing approved for one account runs against another. Returns the denied
-    approval ids."""
+    """Deny every waiting approval card asked under another account generation, in every chat
+    and job. The cards close; the account tools also refuse such an approval at dispatch
+    (bud.composio.tools.stale_approval), whether it was granted, parked, or recovered after a
+    restart. Returns the denied approval ids."""
     origin = {"channel": "api", "client_id": "account-change"}
     denied = []
     for session_id in log.sessions_with_requests():
         events = log.read(session_id)
         for request in undecided_approvals(events) + parked_approvals(events):
-            tool = str(request.get("tool", ""))
-            if tool.split("_", 1)[0].lower() not in apps:
+            review = request.get("review")
+            stamp = review.get("account_generation") if isinstance(review, dict) else None
+            if not isinstance(stamp, int) or stamp == generation:
                 continue
             with contextlib.suppress(UnknownApproval, DecisionRejected):
                 if decide(session_id, request["approval_id"], False, origin):
@@ -344,6 +346,7 @@ def _create_app(
             setup.register("browser", browser.setup_entry(pairing))
         setup_journal = SetupJournal()
         loaded: dict[str, Any] = {
+            "binding": binding,
             "accounts": frozenset(accounts),
             "browse": browser.executable() if browsing else None,
         }
@@ -377,29 +380,32 @@ def _create_app(
         def refresh_account_tools() -> None:
             """Swap in the account tools after any change, in the same chat: a new app, a
             reconnect, or a removal. The next message sees them; no restart is needed."""
-            stale: set[str] = set()
             with refresh_lock:
-                rebound = connections.restart_required()
-                if rebound:
-                    before, after = connections.adopt()
-                    stale = connections.changed_apps(before, after)
-                current = frozenset(connections.accounts())
+                if connections.restart_required():
+                    connections.adopt()
+                binding = connections.binding
                 # Browse installed after Bud started, such as from the setup card, loads too.
                 browse = browser.executable() if browsing else None
-                if not rebound and current == loaded["accounts"] and browse == loaded["browse"]:
+                if binding == loaded["binding"] and browse == loaded["browse"]:
                     return
-                previous = dict(loaded)
+                if binding is not None and (
+                    loaded["binding"] is None or binding.generation != loaded["binding"].generation
+                ):
+                    # Close cards asked under the old account before any tool can resume them.
+                    deny_stale_approvals(binding.generation)
                 loaded["browse"] = browse
                 replacement = account_toolset()
-                if connections.restart_required() or frozenset(connections.accounts()) != current:
-                    loaded.update(previous)
+                if connections.restart_required() or connections.binding != binding:
+                    # Changed again while loading: the next request rebuilds, since the loaded
+                    # binding still differs. Old tools keep refusing to dispatch meanwhile.
                     raise ConnectionError("Accounts changed while loading tools. Try again.")
                 harness.swap_tools(replacement)
-                loaded["accounts"] = current
-            if stale:
-                deny_stale_approvals(stale)
+                loaded["binding"] = binding
+                loaded["accounts"] = frozenset(binding.accounts if binding else ())
 
         refresh_tools = refresh_account_tools
+        # Every approval card names the account generation it was asked under.
+        stamp_binding = connections
         harness = Harness(
             account_toolset(),
             tools_policy,
@@ -424,6 +430,11 @@ def _create_app(
             | {DOCUMENT_TOOL, "current_time"},
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
             capabilities=workspace_read_capabilities(workspace, deferred=True),
+        )
+        harness.stamp = lambda: (
+            {"account_generation": stamp_binding.binding.generation}
+            if stamp_binding.binding is not None
+            else {}
         )
         tools_policy = harness.policy
         if browsing:
@@ -580,6 +591,9 @@ def _create_app(
             # never mistaken for one the restart cut off.
             await background.resume()
             await runner.recover()
+            if connections is not None and connections.binding is not None:
+                # Cards asked under an account replaced while Bud was stopped close now.
+                deny_stale_approvals(connections.binding.generation)
             if photon is not None:
                 from bud.photon_chat import messaging
 
@@ -741,8 +755,8 @@ def _create_app(
             except ConnectionError as exc:
                 raise HTTPException(409, str(exc)) from None
 
-    def deny_stale_approvals(apps: set[str]) -> None:
-        deny_for_apps(log, runner.decide, apps)
+    def deny_stale_approvals(generation: int) -> None:
+        deny_stale(log, runner.decide, generation)
 
     @app.post("/sessions/{session_id}/setup/{capability}/check")
     def check_capability(session_id: str, capability: str) -> JSONResponse:

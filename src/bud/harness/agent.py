@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from hashlib import sha256
 from importlib import resources
 from pathlib import Path
+from typing import Any
 
 from pydantic_ai import Agent, DeferredToolRequests, Tool
 from pydantic_ai.capabilities import (
@@ -120,6 +121,8 @@ class Harness:
         self.harmless: dict[str, Callable[[dict], bool]] = {}
         # Per tool: a reason to refuse the call outright, judged in code, or None.
         self.refuses: dict[str, Callable[[dict], str | None]] = {}
+        # Facts stamped on every approval card; see ActionGateway.stamp.
+        self.stamp: Callable[[], dict[str, Any]] = lambda: {}
         # Calls the owner approved after a hold, per session; see SessionGrants.
         self.grants = SessionGrants()
         # Instructions that must reflect live state (e.g. the approval mode) are
@@ -178,6 +181,7 @@ class Harness:
                     notifies_others=self.notifies_others,
                     harmless=self.harmless,
                     refuses=self.refuses,
+                    stamp=lambda: self.stamp(),
                     facts=self._today,
                     grants=self.grants,
                 ),
