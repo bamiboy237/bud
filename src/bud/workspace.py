@@ -429,7 +429,7 @@ for a path the person named or a folder they pointed you to.
 # macOS keeps /tmp, /var, and /etc under /private.
 _SECRET = re.compile(
     r"(^|[._\- ])(env|credentials?|secrets?|tokens?|passwords?|passwd|shadow|"
-    r"id_rsa|id_ed25519|key|keys|pem|p12|keychain)([._\- ]|$)",
+    r"id_rsa|id_ed25519|key|keys|pem|p12|keychains?)([._\- ]|$)",
     re.I,
 )
 _TEXT_CHARS = 16_000
@@ -450,20 +450,26 @@ def local_blocked(home: Path, private: list[Path], workspace: Path) -> list[Path
 
 
 def local_target(path: str, blocked: list[Path]) -> Path:
-    """The real path a local read would open, after `~` and links are resolved.
+    """The path a local read opens: absolute, with `~` expanded, and free of links.
 
-    Raises _Refused for a relative path, a hidden or credential-like name, or anything
-    inside a blocked folder. The caller opens exactly this path without following links.
+    A path through a link is refused, with its real path in the message, so the path on the
+    approval card is the path that is opened; the read walks it without following links, so
+    a link swapped in later fails. Raises _Refused for a relative path, a hidden or
+    credential-like name, or a blocked folder. Blocked folders are checked again by their
+    identity on disk while the read walks the path, which also catches another letter case
+    and the /System/Volumes/Data view of the same folder.
     """
     if not path or len(path) > 1024 or any(ord(c) < 32 for c in path):
         raise _Refused("Give a full path, such as ~/Documents/plan.pdf.")
     given = Path(path).expanduser()
-    if not given.is_absolute():
+    if not given.is_absolute() or ".." in given.parts:
         raise _Refused("Give a full path, such as ~/Documents/plan.pdf.")
-    real = Path(os.path.realpath(given))
-    for part in real.parts[1:]:
+    for part in given.parts[1:]:
         if part.startswith(".") or _SECRET.search(part):
             raise _Refused("Bud does not read hidden or credential files.")
+    real = Path(os.path.realpath(given))
+    if real != given:
+        raise _Refused(f"That path goes through a link. Use the real path: {real}")
     for folder in blocked:
         root = Path(os.path.realpath(folder))
         if real == root or real.is_relative_to(root):
@@ -471,14 +477,42 @@ def local_target(path: str, blocked: list[Path]) -> Path:
     return real
 
 
-def local_refused(tool_args: dict[str, Any], blocked: list[Path]) -> bool:
-    """A read the tool refuses anyway needs no card: it opens nothing. The tool checks again
-    when it runs, so a path that changes in between is still refused."""
+def local_refusal(tool_args: dict[str, Any], blocked: list[Path]) -> str | None:
+    """Why a local read is refused before it is asked, or None. Refusing never opens
+    anything; a path that passes is asked about and checked again when it runs."""
     try:
         local_target(str(tool_args.get("path", "")), blocked)
-    except _Refused:
-        return True
-    return False
+    except _Refused as exc:
+        return str(exc)
+    return None
+
+
+def _identities(blocked: list[Path]) -> set[tuple[int, int]]:
+    found = set()
+    for folder in blocked:
+        with suppress(OSError):
+            info = os.stat(folder)
+            found.add((info.st_dev, info.st_ino))
+    return found
+
+
+@contextmanager
+def _walk(path: Path, blocked: list[Path]):
+    """The folder at `path`, opened from / one step at a time without following links,
+    refusing any step that is a blocked folder by identity, whatever it is called."""
+    closed = _identities(blocked)
+    fd = os.open("/", _DIR_FLAGS)
+    try:
+        for part in path.parts[1:]:
+            new = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = new
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) in closed:
+                raise _Refused("Bud does not read that folder, even with approval.")
+        yield fd
+    finally:
+        os.close(fd)
 
 
 def describe_local(tool_args: dict[str, Any], blocked: list[Path]) -> str:
@@ -515,7 +549,7 @@ def local_tools(blocked: list[Path]) -> list[Tool[None]]:
 
         def read() -> dict[str, Any]:
             real = local_target(path, blocked)
-            with _directory(real.parent) as fd:
+            with _walk(real.parent, blocked) as fd:
                 if real.suffix.lower() in _DOCUMENTS:
                     data, _ = _read_bytes(fd, real.name, _DOCUMENT_BYTES)
                     kind = "csv" if real.suffix.lower() == ".csv" else None
@@ -553,7 +587,7 @@ def local_tools(blocked: list[Path]) -> list[Tool[None]]:
         def listing() -> dict[str, Any]:
             real = local_target(path, blocked)
             shown: list[str] = []
-            with _directory(real) as fd:
+            with _walk(real, blocked) as fd:
                 for name in sorted(os.listdir(fd)):
                     if name.startswith(".") or _SECRET.search(name):
                         continue

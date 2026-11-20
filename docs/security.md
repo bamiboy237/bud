@@ -41,11 +41,15 @@ Bud can read one of your files, or list one of your folders, when you name it:
 `read_local_file` and `list_local_folder`. These rules hold in every approval mode:
 
 - **Every read asks you.** There is no "always allow", and the reviewer never answers for
-  you. A path Bud refuses anyway (below) is refused at once, without a card.
-- **The card names the real file.** Bud resolves `~` and every link first, so a link named
-  `notes.txt` that points at something else shows where it really goes. Bud then opens that
-  exact path, one folder at a time, without following links, so what you approve is what
-  it reads.
+  you. A path Bud refuses anyway (below) is refused at once, without a card and without
+  running anything.
+- **The card names the file that is opened.** A path that goes through a link is refused,
+  with its real path in the message, so Bud asks again with that one. Bud opens the path one
+  folder at a time without following links, so a link swapped in later fails: what you
+  approve is what it reads.
+- **Blocked folders are recognized by identity, not name.** Each folder on the way is
+  compared with the blocked ones on disk, so another letter case or the
+  `/System/Volumes/Data` view of the same folder is refused too.
 - **Some places stay closed even with approval:** Bud's data folder and the folder holding
   its `.env`, `~/.bud`, `~/.ssh`, `~/.gnupg`, `~/Library/Keychains`, the workspace (Bud reads
   it with `read_file`), hidden files, and names that look like credentials (`.env`, keys,

@@ -82,12 +82,44 @@ def test_blocked_folders_stay_closed_even_through_a_link(home, tools, tmp_path):
     assert not read(str(tmp_path / "workspace" / "a.txt"))["ok"]  # type: ignore[call-arg]
 
 
-def test_the_card_names_the_real_file_behind_a_link(home, tools):
-    _, _, blocked = tools
+def test_a_path_through_a_link_is_refused_with_its_real_path(home, tools):
+    read, _, blocked = tools
     (home / "Documents" / "real.txt").write_text("x")
     (home / "Documents" / "alias.txt").symlink_to(home / "Documents" / "real.txt")
-    shown = describe_local({"path": str(home / "Documents" / "alias.txt")}, blocked)
-    assert shown == f"Opens {os.path.realpath(home / 'Documents' / 'real.txt')}"
+    result = read(str(home / "Documents" / "alias.txt"))  # type: ignore[call-arg]
+    assert not result["ok"]
+    assert str(home / "Documents" / "real.txt") in result["error"]
+    # What the card shows is exactly what is opened.
+    assert describe_local({"path": str(home / "Documents" / "real.txt")}, blocked) == (
+        f"Opens {home / 'Documents' / 'real.txt'}"
+    )
+
+
+def test_a_blocked_folder_in_another_letter_case_is_refused(tools, tmp_path):
+    read, listing, _ = tools
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "notes.txt").write_text("bud's own data")
+    if not (tmp_path / "DATA").exists():
+        pytest.skip("case-sensitive file system")
+    assert not read(str(tmp_path / "DATA" / "notes.txt"))["ok"]  # type: ignore[call-arg]
+    assert not listing(str(tmp_path / "DATA"))["ok"]  # type: ignore[call-arg]
+
+
+def test_a_blocked_folder_through_the_data_volume_is_refused(tools, tmp_path):
+    read, _, _ = tools
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "notes.txt").write_text("bud's own data")
+    other = Path("/System/Volumes/Data" + str(tmp_path / "data" / "notes.txt"))
+    if not other.exists():
+        pytest.skip("no /System/Volumes/Data view here")
+    assert not read(str(other))["ok"]  # type: ignore[call-arg]
+
+
+def test_a_hard_link_is_refused(home, tools):
+    read, _, _ = tools
+    (home / "Documents" / "a.txt").write_text("x")
+    os.link(home / "Documents" / "a.txt", home / "Documents" / "b.txt")
+    assert not read(str(home / "Documents" / "b.txt"))["ok"]  # type: ignore[call-arg]
 
 
 def test_relative_paths_are_refused(tools):
@@ -141,11 +173,36 @@ def test_imessage_asks_by_file_name():
     assert "Opens /Users/me/Documents/plan.pdf" in text
 
 
-def test_a_refused_path_needs_no_card(home, tools):
-    from bud.workspace import local_refused
+async def test_a_refused_path_is_denied_without_a_card_or_running(home, tools):
+    from typing import cast
+
+    from pydantic_ai import RunContext, Tool
+    from pydantic_ai.models.test import TestModel
+    from pydantic_ai.toolsets import FunctionToolset
+    from pydantic_ai.usage import RunUsage
+
+    from bud.harness.actions import ActionGateway
+    from bud.workspace import local_refusal
 
     _, _, blocked = tools
-    (home / "Documents" / "plan.txt").write_text("x")
-    assert local_refused({"path": "~/.ssh/config"}, blocked)
-    assert local_refused({"path": "relative.txt"}, blocked)
-    assert not local_refused({"path": str(home / "Documents" / "plan.txt")}, blocked)
+    ran: list[str] = []
+
+    def read_local_file(path: str) -> str:
+        ran.append(path)
+        return "read"
+
+    policy = Policy(tools={})
+    allow_file_tools(policy)
+    gateway = ActionGateway(
+        FunctionToolset([Tool(read_local_file)]),
+        policy=policy,
+        record=lambda record: None,
+        refuses={"read_local_file": lambda args: local_refusal(args, blocked)},
+    )
+    ctx = cast(RunContext[None], RunContext(deps=None, model=TestModel(), usage=RunUsage()))
+    tools_found = await gateway.get_tools(ctx)
+    result = await gateway.call_tool(
+        "read_local_file", {"path": "~/.ssh/config"}, ctx, tools_found["read_local_file"]
+    )
+    assert "hidden or credential" in result
+    assert ran == []
