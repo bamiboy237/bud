@@ -100,7 +100,7 @@ async def test_only_workspace_documents_open_and_only_as_a_copy(tmp_path):
 def test_office_documents_ask_and_quiet_ones_do_not():
     assert apps.quiet_open({"path": "notes/plan.md"})
     assert apps.quiet_open({"path": "scan.PDF"})
-    for path in ("brief.docx", "budget.xlsx", "letter.rtf", "deck.key"):
+    for path in ("brief.docx", "budget.xlsx", "letter.rtf", "deck.pptx"):
         assert not apps.quiet_open({"path": path}), path
 
 

@@ -75,7 +75,7 @@ add them.
   data folder, where no sandboxed command can reach it, and opens the copy. Old copies are
   removed after an hour. PDFs and images open in Preview, and text, Markdown, and CSV in
   TextEdit, without asking: those apps only show the file. Word, Excel, PowerPoint, Pages,
-  Numbers, Keynote, and RTF files ask you first, every time, since their apps can follow
+  and Numbers files, and RTF files, ask you first, every time, since their apps can follow
   links or load remote content. Anything that can run or redirect (`.command`, `.app`,
   `.webloc`, HTML) never opens. Chrome is not on the list: `open_chrome` asks first.
 - **Changes ask you:** playing or skipping music, creating a note, and adding a reminder. In

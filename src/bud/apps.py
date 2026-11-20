@@ -44,8 +44,9 @@ QUIET_TYPES = {
 }
 # Documents whose usual app can follow links or load remote content, such as Word fetching a
 # template: these open only after the owner approves. Anything else (.command, .app, .webloc,
-# .html, scripts) is refused.
-ASKED_TYPES = frozenset({".rtf", ".docx", ".xlsx", ".pptx", ".pages", ".numbers", ".key"})
+# .html, scripts) is refused. Keynote's .key is left out: the workspace never reads a file
+# named like a key.
+ASKED_TYPES = frozenset({".rtf", ".docx", ".xlsx", ".pptx", ".pages", ".numbers"})
 DOCUMENT_TYPES = frozenset(QUIET_TYPES) | ASKED_TYPES
 # A copy is kept this long, so the app has it open, then pruned.
 COPY_LIFETIME = 3600
