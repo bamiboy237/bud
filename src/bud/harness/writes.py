@@ -74,3 +74,23 @@ def reviewable_tools() -> frozenset[str]:
         | APP_CHANGES
         if not never_reviewed(name)
     )
+
+
+def consequential_tools() -> frozenset[str]:
+    """Calls that reach outward, whose targets matter: sends and account writes, shell and
+    background commands, browser steps, network access, reminders, and the simulated world's
+    writes. The taint check (bud.harness.taint) looks at these; protected tools also match by
+    prefix (is_protected). A private note or memory is not here: its text has no target."""
+    from bud.browser import STEPS as BROWSER_STEPS
+    from bud.core.background import STARTS as BACKGROUND_STARTS
+    from bud.shell import NETWORK_TOOL, SHELL_TOOLS
+    from bud.world.tools import WRITE_TOOLS as WORLD_WRITE_TOOLS
+
+    return (
+        PROTECTED
+        | SHELL_TOOLS
+        | {NETWORK_TOOL}
+        | BROWSER_STEPS
+        | BACKGROUND_STARTS
+        | WORLD_WRITE_TOOLS
+    )

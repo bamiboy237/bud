@@ -36,7 +36,15 @@ from bud.harness.review import (
     owner_answers,
     too_long_to_review,
 )
-from bud.harness.writes import never_reviewed, reviewable_tools, self_hosted_writes
+from bud.harness.taint import note as taint_note
+from bud.harness.taint import read_text, tainted
+from bud.harness.writes import (
+    consequential_tools,
+    is_protected,
+    never_reviewed,
+    reviewable_tools,
+    self_hosted_writes,
+)
 
 Action = Literal["allow", "ask", "deny", "review"]
 RecordDecision = Callable[[dict[str, Any]], None]
@@ -187,6 +195,17 @@ class ActionGateway(WrapperToolset[None]):
             today=self.facts(),
         )
 
+    def _tainted(self, name: str, tool_args: dict[str, Any], ctx: RunContext[None]) -> list[str]:
+        if name not in consequential_tools() and not is_protected(name):
+            return []
+        request = (ctx.metadata or {}).get("bud_request")
+        owner = request if isinstance(request, str) else ""
+        answers = " ".join(f"{a.question} {a.answer}" for a in owner_answers(ctx.messages))
+        try:
+            return tainted(name, tool_args, f"{owner} {answers}", read_text(ctx.messages))
+        except Exception:
+            return []  # unsure: the call keeps its policy
+
     def _refusal(self, name: str, tool_args: dict[str, Any]) -> str | None:
         check = self.refuses.get(name)
         if check is None:
@@ -260,6 +279,13 @@ class ActionGateway(WrapperToolset[None]):
             action = "deny"
         if action in ("ask", "review") and self._harmless(name, tool_args):
             action = "allow"
+        found = (
+            self._tainted(name, tool_args, ctx)
+            if action != "deny" and not ctx.tool_call_approved
+            else []
+        )
+        if found and action in ("allow", "review"):
+            action = "ask"  # a target came from what Bud read, not from the owner
         if action == "review" and self._notifies_others(name, tool_args):
             action = "ask"  # hard rule: other people would be notified
         if action == "review" and too_long_to_review(tool_args):
@@ -272,6 +298,8 @@ class ActionGateway(WrapperToolset[None]):
             if action in ("ask", "review") and not ctx.tool_call_approved
             else None
         )
+        if found:
+            details = "\n".join(part for part in (details, taint_note(found)) if part)
         review: dict[str, Any] | None = None
         if action in ("ask", "review") and ctx.tool_call_approved:
             rule, outcome = "ask", "approved"  # the owner already approved this exact call
