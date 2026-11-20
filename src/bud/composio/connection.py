@@ -183,6 +183,29 @@ class Connections:
         self.binding = binding
         return self.binding
 
+    def adopt(self) -> tuple[AccountBinding | None, AccountBinding]:
+        """Take the stored binding as current, even after a replacement or removal, and
+        return (before, after). The caller rebuilds account tools and denies approvals given
+        under an account that changed; tools built before keep their own binding, which the
+        dispatch fence refuses."""
+        before = self.binding
+        current = self.store.snapshot()[0]
+        if current.owner != self.user_id:
+            raise ConnectionError("Owner changed. Restart with the original owner state.")
+        self.binding = current
+        return before, current
+
+    @staticmethod
+    def changed_apps(before: AccountBinding | None, after: AccountBinding) -> set[str]:
+        """Apps whose account was replaced or removed between two bindings."""
+        if before is None:
+            return set()
+        return {
+            toolkit
+            for toolkit, account in before.accounts.items()
+            if after.accounts.get(toolkit) != account
+        }
+
     def restart_required(self) -> bool:
         return self.binding is None or self.store.snapshot()[0] != self.binding
 

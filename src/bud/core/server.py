@@ -4,6 +4,7 @@ It creates sessions, accepts messages, and streams session events as server-sent
 """
 
 import asyncio
+import contextlib
 import fcntl
 import hashlib
 import logging
@@ -37,7 +38,7 @@ from bud.core.hub import Hub
 from bud.core.log import EventLog, QueueFull
 from bud.core.profiles import Mode, ProfileStore, apply_mode, as_mode, mode_summary
 from bud.core.profiles import guidance as MODE_GUIDANCE
-from bud.core.projection import Snapshot
+from bud.core.projection import Snapshot, parked_approvals, undecided_approvals
 from bud.core.runner import DecisionRejected, Runner, UnknownApproval
 from bud.core.setup import (
     SetupJournal,
@@ -194,6 +195,26 @@ def build_background(root: Path, state_dir: Path, private: Sequence[Path] = ()) 
     grants = NetworkGrants(state_dir / "network-grants.json")
     run = shell_runner(root, grants, lambda: None, private) if shell_available() else None
     return Background(state_dir / "background.db", root, run)
+
+
+def deny_for_apps(
+    log: EventLog, decide: Callable[[str, str, bool, dict], bool], apps: set[str]
+) -> list[str]:
+    """Deny every waiting approval for an app whose account changed or left, in every chat
+    and job, so nothing approved for one account runs against another. Returns the denied
+    approval ids."""
+    origin = {"channel": "api", "client_id": "account-change"}
+    denied = []
+    for session_id in log.sessions_with_requests():
+        events = log.read(session_id)
+        for request in undecided_approvals(events) + parked_approvals(events):
+            tool = str(request.get("tool", ""))
+            if tool.split("_", 1)[0].lower() not in apps:
+                continue
+            with contextlib.suppress(UnknownApproval, DecisionRejected):
+                if decide(session_id, request["approval_id"], False, origin):
+                    denied.append(request["approval_id"])
+    return denied
 
 
 def private_folders(settings: Settings) -> list[Path]:
@@ -354,14 +375,18 @@ def _create_app(
             )
 
         def refresh_account_tools() -> None:
-            """Swap in the tools of a newly connected app; the next message sees them."""
+            """Swap in the account tools after any change, in the same chat: a new app, a
+            reconnect, or a removal. The next message sees them; no restart is needed."""
+            stale: set[str] = set()
             with refresh_lock:
-                if connections.restart_required():
-                    raise ConnectionError("Account changed. Restart Bud and start a new chat.")
+                rebound = connections.restart_required()
+                if rebound:
+                    before, after = connections.adopt()
+                    stale = connections.changed_apps(before, after)
                 current = frozenset(connections.accounts())
                 # Browse installed after Bud started, such as from the setup card, loads too.
                 browse = browser.executable() if browsing else None
-                if current == loaded["accounts"] and browse == loaded["browse"]:
+                if not rebound and current == loaded["accounts"] and browse == loaded["browse"]:
                     return
                 previous = dict(loaded)
                 loaded["browse"] = browse
@@ -371,6 +396,8 @@ def _create_app(
                     raise ConnectionError("Accounts changed while loading tools. Try again.")
                 harness.swap_tools(replacement)
                 loaded["accounts"] = current
+            if stale:
+                deny_stale_approvals(stale)
 
         refresh_tools = refresh_account_tools
         harness = Harness(
@@ -664,9 +691,8 @@ def _create_app(
         current = live_connections()
         try:
             statuses = current.statuses()
+            refresh_tools()  # any change, a reconnect included, loads in this chat
             restart_required = current.restart_required()
-            if not restart_required:
-                refresh_tools()
         except ConnectionError as exc:
             raise HTTPException(503, str(exc)) from None
         return JSONResponse(
@@ -688,6 +714,7 @@ def _create_app(
             url = current.pending_url(name) if request is not None and request.resume else None
             if url is None:
                 url = current.connect(name)
+            refresh_tools()  # a reconnect retires the old account at once, in place
             restart_required = current.restart_required()
         except ConnectionError as exc:
             raise HTTPException(503, str(exc)) from None
@@ -707,8 +734,15 @@ def _create_app(
             raise HTTPException(404, "unknown session")
 
     def require_current_binding() -> None:
+        """A changed account loads in place, in the same chat."""
         if connections is not None and connections.restart_required():
-            raise HTTPException(409, "Account binding changed. Restart bud and start a new chat.")
+            try:
+                refresh_tools()
+            except ConnectionError as exc:
+                raise HTTPException(409, str(exc)) from None
+
+    def deny_stale_approvals(apps: set[str]) -> None:
+        deny_for_apps(log, runner.decide, apps)
 
     @app.post("/sessions/{session_id}/setup/{capability}/check")
     def check_capability(session_id: str, capability: str) -> JSONResponse:

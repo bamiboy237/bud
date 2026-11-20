@@ -15,10 +15,11 @@ Bud uses Composio's Model Context Protocol (MCP) integrations to securely intera
    uv run bud connect gmail
    uv run bud connect calendar
    ```
-4. Finish the sign-in in your browser, then refresh connections in Bud. A new app's tools
-   load on your next message, without a restart.
+4. Finish the sign-in in your browser. The change loads on your next message, in the same
+   chat, without a restart.
 
-Starting a sign-in again, or cancelling it, before it finishes changes nothing else: that app
-was never active, so no chat or approval can point at it. Replacing, reconnecting, or
-removing an account that was active requires a server restart and a new chat, so an approval
-given for one account can never run against another.
+Every account change loads in place: a new app, a reconnect, a different account, or a
+removal. Your chat and memory carry over. One thing does not: when an account is replaced or
+removed, every approval still waiting for that app is denied, so an approval given for one
+account can never run against another. Ask again and Bud asks you again. Starting a sign-in
+again, or cancelling it, before it finishes changes nothing else.

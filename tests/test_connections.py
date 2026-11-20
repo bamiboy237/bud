@@ -175,7 +175,7 @@ def test_replacing_an_app_keeps_the_fence(connections):
         found.assert_current_binding(binding, "gmail")
 
 
-def test_reconnecting_same_account_keeps_the_fence(connections):
+def test_reconnecting_keeps_the_chat_and_the_dispatch_fence(connections):
     found, remote = connections
     connect(found, remote, "gmail", "acct-gmail")
     binding = found.capture_binding()
@@ -185,7 +185,9 @@ def test_reconnecting_same_account_keeps_the_fence(connections):
 
     assert found.restart_required()
     current = found.store.snapshot()[0]
-    assert found.store.session_scope(current) != old_scope
+    # The same chat and memory carry over the reconnect...
+    assert found.store.session_scope(current) == old_scope
+    # ...but tools built for the old binding still refuse to dispatch.
     with pytest.raises(ConnectionError):
         found.assert_current_binding(binding, "gmail")
 
@@ -293,3 +295,46 @@ def test_an_unverifiable_active_account_still_fences(connections):
     with pytest.raises(ConnectionError):
         found.refresh()
     assert found.restart_required()
+
+
+def test_adopting_a_changed_binding_names_the_apps_that_changed(connections):
+    found, remote = connections
+    connect(found, remote, "gmail", "acct-gmail")
+    connect(found, remote, "googlecalendar", "acct-calendar")
+    before = found.capture_binding()
+
+    connect(found, remote, "gmail", "acct-gmail-2")  # a different Gmail account
+    assert found.restart_required()
+    old, new = found.adopt()
+    assert old == before
+    assert not found.restart_required()
+    assert found.changed_apps(old, new) == {"gmail"}
+    # The new binding dispatches; the old one stays fenced.
+    found.assert_current_binding(new, "googlecalendar")
+    with pytest.raises(ConnectionError):
+        found.assert_current_binding(old, "gmail")
+
+
+def test_a_changed_account_denies_only_its_own_waiting_approvals(tmp_path):
+    from bud.core.events import EventType
+    from bud.core.log import EventLog
+    from bud.core.server import deny_for_apps
+
+    log = EventLog(tmp_path / "events.db")
+    events: list[tuple[EventType, dict]] = [
+        ("run.queued", {"run_id": "r"}),
+        ("approval.requested", {"approval_id": "send", "tool": "GMAIL_SEND_EMAIL"}),
+        ("approval.requested", {"approval_id": "event", "tool": "GOOGLECALENDAR_CREATE_EVENT"}),
+        ("approval.requested", {"approval_id": "note", "tool": "workspace_create"}),
+        ("run.waiting", {"run_id": "r"}),
+    ]
+    for type, data in events:
+        log.append("chat", type, data)
+    asked: list[tuple[str, str, bool]] = []
+
+    def decide(session_id, approval_id, approved, origin):
+        asked.append((session_id, approval_id, approved))
+        return True
+
+    assert deny_for_apps(log, decide, {"gmail"}) == ["send"]
+    assert asked == [("chat", "send", False)]
