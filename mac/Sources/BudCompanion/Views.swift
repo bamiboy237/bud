@@ -84,7 +84,7 @@ struct PetView: View {
                 }
                 if overflow > 0 {
                     Text("+\(overflow)")
-                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .font(.system(size: 10, weight: .semibold).monospacedDigit())
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 4)
                         .padding(.vertical, 2)
@@ -798,13 +798,16 @@ struct ApprovalCard: View {
     let companion: Companion
     let approval: Approval
     let onDecide: (Bool) -> Void
+    /// The card's horizontal drag, as it happens; nil when it ends without a decision.
+    var onDrag: (CGFloat?) -> Void = { _ in }
     @StateObject private var layout = ApprovalLayout()
 
     private var busy: Bool {
         companion.deciding.contains(approval.id) || companion.approvingBatch || companion.link != .connected
     }
     private var detailLimit: CGFloat {
-        let height: CGFloat = approval.isQuestion ? 190 : 100
+        // The browser caution is read in full before turning it on, never behind a scroll.
+        let height: CGFloat = approval.isQuestion ? 190 : approval.tool == "enable_browser" ? 300 : 100
         let hasProblem = companion.approvalFailures[approval.id] != nil || companion.decisionProblem != nil
         return hasProblem ? max(80, height - 40) : height
     }
@@ -827,11 +830,20 @@ struct ApprovalCard: View {
             heading
                 .contentShape(Rectangle())
                 .gesture(
-                    DragGesture(minimumDistance: 24)
+                    // Global space: the card moves with the drag, so local coordinates would
+                    // chase themselves and jitter.
+                    DragGesture(minimumDistance: 10, coordinateSpace: .global)
+                        .onChanged { value in
+                            guard !busy, !approval.isQuestion,
+                                  abs(value.translation.width) > abs(value.translation.height)
+                            else { return }
+                            onDrag(value.translation.width)
+                        }
                         .onEnded { value in
                             guard !busy, !approval.isQuestion,
-                                  let direction = DecisionDirection.swipe(value.translation)
-                            else { return }
+                                  let direction = DecisionDirection.release(
+                                      value.translation, projected: value.predictedEndTranslation)
+                            else { return onDrag(nil) }
                             onDecide(direction == .approve)
                         }
                 )
@@ -927,9 +939,12 @@ struct ApprovalCard: View {
     private var buttons: some View {
         VStack(spacing: 6) {
             HStack(spacing: 6) {
-                Button("Change…") { companion.write(.revise(approval.id)) }
-                    .buttonStyle(CardButton(kind: .quiet))
-                    .help("Tell bud what to do differently")
+                // Turning the browser on or opening Chrome has nothing to change: yes or no.
+                if !Approval.yesOrNo.contains(approval.tool) {
+                    Button("Change…") { companion.write(.revise(approval.id)) }
+                        .buttonStyle(CardButton(kind: .quiet))
+                        .help("Tell bud what to do differently")
+                }
                 Spacer(minLength: 0)
                 if approval.grantable { alwaysAllow }
             }

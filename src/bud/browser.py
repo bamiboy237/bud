@@ -69,6 +69,7 @@ STEPS = frozenset(
 )
 # Hands a local file to a website: the owner always decides.
 UPLOAD = f"{PREFIX}_upload"
+TABS = f"{PREFIX}_tabs"
 TOOLS = READS | STEPS | {UPLOAD}
 ENABLE = "enable_browser"
 DISABLE = "disable_browser"
@@ -93,12 +94,17 @@ CAUTION = (
 )
 GUIDANCE = """browser_* tools use the person's own Chrome, with their tabs and sign-ins. They
 appear after the person turns the browser on: call enable_browser, which shows them what that
-allows, then search for browser tools. Work in small steps: snapshot a page, act on one
-element by its ref, then snapshot again to check. Pass the tab id from navigate to every later
-call. Use browser_handoff when only the person can act, such as signing in or paying. If
-browser_status says no browser is connected, call open_chrome; if Chrome is open and still
-not connected, call setup_capability with "browser". Call disable_browser when the person
-asks to stop.
+allows, then search for browser tools.
+- Reuse tabs. Before opening a page, call browser_tabs with action "list"; if a tab you opened
+  already shows the page, pass its id as tab. Pass the tab id from navigate to every later call.
+- Do not set readOnly or allowedOrigins unless the person asks: a read-only tab cannot click.
+- Work in small steps: one browser_snapshot to read a page, act on one element by its ref,
+  then snapshot again to check. Take a screenshot only when the layout itself matters.
+- When the task is done, close the tabs you opened with browser_tabs action "close".
+- Use browser_handoff when only the person can act, such as signing in or paying.
+- If browser_status says no browser is connected, call open_chrome; if Chrome is open and
+  still not connected, call setup_capability with "browser".
+- Call disable_browser when the person asks to stop.
 """
 
 
@@ -332,7 +338,7 @@ def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> di
     async def where(tool_args: dict[str, Any]) -> str:
         tab = tool_args.get("tab")
         if tab is None:
-            return "No tab given: Browse opens a new tab."
+            return "Opens a new tab."
         path = find()
         if path is None:
             return "The tab could not be looked up."
@@ -341,11 +347,26 @@ def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> di
                 return f"The tab shows {_site(entry.get('url'))}."
         return "The tab is not one Browse knows."
 
+    async def tabs(tool_args: dict[str, Any]) -> str:
+        action = tool_args.get("action")
+        if action == "close" and tool_args.get("tab") is not None:
+            return f"Closes a tab. {await where(tool_args)}"
+        if action == "close":
+            return "Closes tabs Bud opened."
+        if action == "new":
+            return "Opens a new tab."
+        return "Changes Bud's browser tabs."
+
     def caution(tool_args: dict[str, Any]) -> str:
         return CAUTION
 
     # Every client shows the caution, because it rides the approval as a looked-up fact.
-    return {**dict.fromkeys(STEPS | {UPLOAD}, where), ENABLE: caution}
+    return {**dict.fromkeys(STEPS | {UPLOAD}, where), TABS: tabs, ENABLE: caution}
+
+
+def reads_only() -> dict[str, Callable[[dict[str, Any]], bool]]:
+    """Calls that only read, judged in code: listing tabs changes nothing."""
+    return {TABS: lambda tool_args: tool_args.get("action") == "list"}
 
 
 async def connected_now(path: Path, relay: Relay) -> bool:

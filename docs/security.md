@@ -75,7 +75,8 @@ Bud's relay disconnects any other agent that used Browse on this Mac.
   hidden and Browse does not start. Ask Bud to turn the browser off at any time
   (`disable_browser`).
 - **Reading runs unasked.** `browser_status`, `browser_snapshot`, `browser_screenshot`,
-  `browser_scroll`, `browser_wait_for`, and `browser_handoff` change nothing.
+  `browser_scroll`, `browser_wait_for`, `browser_handoff`, and listing tabs with
+  `browser_tabs` change nothing.
 - **Each step is checked.** Opening a page or a tab, clicking, typing, choosing, dragging,
   and answering a dialog go to the approval reviewer in auto mode, and to you in strict mode.
   The card shows the step, the site its tab really shows, and the reviewer's reason.

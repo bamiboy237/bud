@@ -27,6 +27,10 @@ struct Approval: Identifiable, Equatable {
         case "Mark read": "Marked read"
         case "Delete": "Deleted"
         case "Add": "Added"
+        case "Save": "Saved"
+        case "Replace": "Replaced"
+        case "Turn on": "Turned on"
+        case "Open": "Opened"
         default: "Approved"
         }
     }
@@ -106,6 +110,9 @@ struct Approval: Identifiable, Equatable {
         }
     }
 
+    /// Approvals that are a plain yes or no, with nothing to revise.
+    static let yesOrNo: Set<String> = ["enable_browser", "open_chrome"]
+
     /// What turning the browser on allows. Kept in step with bud.browser.CAUTION.
     static let browserCaution = "Bud will use your own Chrome, with your tabs and the sites you "
         + "are signed in to. It can read those sites, open pages, click, type, and submit forms "
@@ -125,6 +132,14 @@ struct Approval: Identifiable, Equatable {
         if tool == "enable_browser" { return ("Let Bud use your browser", "Turn on", "globe") }
         if tool.hasPrefix("browser_") { return browserStep(String(tool.dropFirst(8)), args) }
         if tool == "open_chrome" { return ("Open Chrome so Bud can use it", "Open", "globe") }
+        if tool == "workspace_create" {
+            let path = text(args, "path")
+            return (path.isEmpty ? "Save a file" : "Save \(path)", "Save", "doc.badge.plus")
+        }
+        if tool == "workspace_update" {
+            let path = text(args, "path")
+            return (path.isEmpty ? "Replace a file" : "Replace \(path)", "Replace", "doc.badge.arrow.up")
+        }
         if tool == "archive_email" { return ("Archive email", "Archive", "archivebox") }
         if tool == "mark_read" { return ("Mark email read", "Mark read", "envelope.open") }
         if ["draft_reply", "gmail_create_email_draft"].contains(tool) {

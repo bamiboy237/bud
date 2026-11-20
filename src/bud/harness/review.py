@@ -146,6 +146,10 @@ outsiders.
 - In the owner's browser, reading a page, scrolling, or taking a screenshot is low risk. \
 Opening a page, clicking, or typing is low or medium, judged by what the page and the \
 element do. The resolved details say which site a tab really shows.
+- Opening a site the owner named, or one their request plainly needs (for example the page \
+they refer to as "that page" or the site where the thing they asked about lives), is \
+authorized at medium or high. Reopening it, or opening a tab to work in, is part of that \
+request.
 - Code or arguments whose real effect you cannot read with confidence (encoded, minified, \
 built at run time, or very long) are at least high risk.
 - Judge only the call in front of you, and judge its real effect, not its name.

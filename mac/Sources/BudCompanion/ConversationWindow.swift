@@ -63,9 +63,9 @@ final class ConversationWindow: NSObject, NSWindowDelegate {
     }
 }
 
-/// Replies in the window read like a page: Georgia, a size up from the bubble, with air
-/// between lines. (Claude's own serif isn't on the Mac; Georgia is, and is built for screens.)
-private let pageType = ReplyType(body: .custom("Georgia", size: 15), lineSpacing: 4)
+/// Replies in the window read like a page: the same SF Pro scale as the bubble, a step up in
+/// size, with more air between lines.
+private let pageType = ReplyType(size: 14.5, lineSpacing: 4)
 
 /// The rhythm that separates speakers without labels: a wide gap before each of your
 /// messages starts a new exchange, a shorter one joins bud's answer to your question, about
