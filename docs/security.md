@@ -63,29 +63,48 @@ These limits are guardrails, not a virtual machine: a command runs as you, with 
 ## Browser
 
 Bud uses [OpenCode Browse](https://opencode.ai/product/browse) (MIT) to work in your own
-Chrome, with your tabs and sign-ins. Browse's tools are `browser_status`, `browser_tabs`, and
-`browser_execute`, which runs JavaScript in a tab.
+Chrome, with your tabs and sign-ins. Bud runs its own Browse relay, with its home folder in
+`~/.bud/browse` and port 19989, and asks it for Browse's small typed tools instead of one
+tool that runs any JavaScript. The extension connects to one relay at a time: pairing it with
+Bud's relay disconnects any other agent that used Browse on this Mac.
 
 - **You turn it on once.** Bud calls `enable_browser`, and the approval card explains what it
   allows. It always asks and offers no "always allow". Until then the browser tools are
-  hidden. Ask Bud to turn the browser off at any time (`disable_browser`).
-- **Each step is checked.** `browser_status` runs unasked. Every `browser_tabs` and
-  `browser_execute` call goes to the approval reviewer. A step it judges safe and clearly
-  requested runs. Anything else, such as paying, sending, deleting, or typing a password,
-  asks you with the reviewer's reason. If the reviewer cannot answer, Bud asks you.
-- **The reviewer sees the real page.** Bud looks up the address of the tab a script drives
-  and shows it to the reviewer, so a script cannot hide where it acts.
-- **No partial checks.** The reviewer sees at most 4,000 characters of a call. A longer call
-  asks you instead.
+  hidden and Browse does not start. Ask Bud to turn the browser off at any time
+  (`disable_browser`).
+- **Reading runs unasked.** `browser_status`, `browser_snapshot`, `browser_screenshot`,
+  `browser_scroll`, `browser_wait_for`, and `browser_handoff` change nothing.
+- **Each step is checked.** Opening a page or a tab, clicking, typing, choosing, dragging,
+  and answering a dialog go to the approval reviewer in auto mode, and to you in strict mode.
+  The card shows the step, the site its tab really shows, and the reviewer's reason.
+- **Uploading a file always asks you.**
+- **Never offered:** running JavaScript (`execute`, `eval`), Browse's settings, `webmcp`,
+  recording, and network or console capture. A tool a later Browse adds is refused until Bud
+  names it.
+- **The reviewer sees the real page.** Bud looks up which site a tab shows, without its query
+  or fragment, and never passes on an address the model wrote as a looked-up fact.
+- **No standing approvals.** An approved step is not remembered, even for the session: the
+  same click on a different page is checked again.
 - **Limits of the check.** A page Bud reads can try to trick it, and a step written to look
-  harmless can pass. The approval card says so before you turn the browser on.
-- A tool a later Browse version adds is refused until Bud names it.
+  harmless can pass. Browser steps are not covered by the rule that sends always ask: in
+  Gmail or Google Calendar, a click can send. The approval card says so before you turn the
+  browser on.
 
 The Mac app ships `browse` 0.1.5, pinned by SHA-512 and signed with the app, and copies it to
-`~/.bud/bin` on first launch. From there Browse updates itself with its own updater. A
-`browse` you installed (`~/.local/bin` or on `PATH`) is used when Bud's copy is missing. To
-connect Chrome, ask Bud: a setup card links the extension and shows a one-time pairing code.
-Set `BROWSER_TOOLS=false` to remove the browser entirely.
+`~/.bud/bin` on first launch. The pin covers only that copy: from there Browse updates itself
+with its own updater. A `browse` you installed (`~/.local/bin` or on `PATH`) is used when
+Bud's copy is missing. To connect Chrome, ask Bud: a setup card links the extension and shows
+a one-time pairing code and the relay address. Set `BROWSER_TOOLS=false` to remove the
+browser entirely.
+
+## Approval reviewer
+
+In auto mode, the reviewer (OpenAI's Decisions API) judges each reviewable call against your
+request. Only a low or medium risk call you clearly asked for runs unasked. Bud asks you when
+the call is high or critical risk, weakly supported by your request, raises any concern, or
+may pay, send, delete, handle a password or code, or hide its real effect. A one-in-five
+chance of any of those is enough. The reviewer sees a call's full arguments up to 32,000
+characters; a longer call asks you, and a shell command that long cannot reach a new site.
 
 ## Standing permissions
 

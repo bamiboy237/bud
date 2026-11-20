@@ -89,7 +89,8 @@ struct Approval: Identifiable, Equatable {
         title = tool == "ask_user" ? (questions.first?.text ?? "") : words.title
         verb = words.verb
         symbol = words.symbol
-        facts = Self.facts(args)
+        let review = raw["review"] as? [String: Any] ?? [:]
+        facts = Self.facts(args) + Self.reviewFacts(review)
         if tool == "enable_browser" {
             // Fixed words from the app, never from the model, so the caution cannot be edited.
             body = Self.browserCaution
@@ -107,10 +108,11 @@ struct Approval: Identifiable, Equatable {
     /// What turning the browser on allows. Kept in step with bud.browser.CAUTION.
     static let browserCaution = "Bud will use your own Chrome, with your tabs and the sites you "
         + "are signed in to. It can read those sites, open pages, click, type, and submit forms "
-        + "as you. Each step is checked first, and anything risky, such as paying, sending, "
-        + "deleting, or typing a password, asks you. A page Bud reads can still try to trick "
-        + "it, and a check can miss a step written to look harmless. Ask Bud to turn the "
-        + "browser off at any time."
+        + "as you, including in Gmail and Google Calendar. Each step is checked first, and "
+        + "anything risky, such as paying, sending, deleting, or typing a password, asks you. "
+        + "A page Bud reads can still try to trick it, and a check can miss a step written to "
+        + "look harmless. While Bud uses the browse extension, other apps that use it lose "
+        + "their connection. Ask Bud to turn the browser off at any time."
 
     /// The same plain words the terminal uses for each kind of action.
     private static func describe(_ tool: String, _ args: [String: Any])
@@ -120,6 +122,7 @@ struct Approval: Identifiable, Equatable {
         let named = text(args, "title", "summary")
         if tool == "ask_user" { return ("", "Answer", "questionmark.bubble") }
         if tool == "enable_browser" { return ("Let Bud use your browser", "Turn on", "globe") }
+        if tool.hasPrefix("browser_") { return browserStep(String(tool.dropFirst(8)), args) }
         if tool == "archive_email" { return ("Archive email", "Archive", "archivebox") }
         if tool == "mark_read" { return ("Mark email read", "Mark read", "envelope.open") }
         if ["draft_reply", "gmail_create_email_draft"].contains(tool) {
@@ -149,6 +152,36 @@ struct Approval: Identifiable, Equatable {
         return (cleaned.prefix(1).uppercased() + cleaned.dropFirst(), "Approve", "hand.raised")
     }
 
+    /// One step in the owner's browser, in plain words.
+    private static func browserStep(_ step: String, _ args: [String: Any])
+        -> (title: String, verb: String, symbol: String)
+    {
+        switch step {
+        case "navigate":
+            let url = text(args, "url")
+            return (url.isEmpty ? "Open a page" : "Open \(url)", "Open", "globe")
+        case "click": return ("Click on a page", "Click", "cursorarrow.click")
+        case "fill", "type": return ("Type into a page", "Type", "keyboard")
+        case "press": return ("Press a key on a page", "Press", "keyboard")
+        case "select": return ("Choose an option on a page", "Choose", "list.bullet")
+        case "hover": return ("Point at something on a page", "Approve", "cursorarrow")
+        case "drag": return ("Drag on a page", "Drag", "hand.draw")
+        case "dialog": return ("Answer a page's dialog", "Answer", "macwindow")
+        case "tabs": return ("Open or close browser tabs", "Approve", "square.on.square")
+        case "upload": return ("Upload a file to a page", "Upload", "arrow.up.doc")
+        default: return ("Use your browser", "Approve", "globe")
+        }
+    }
+
+    /// Why bud waits: facts it looked up itself, such as the site a tab shows, and the
+    /// reviewer's reason. Both are fixed or looked-up text, never the model's words.
+    private static func reviewFacts(_ review: [String: Any]) -> [(label: String, value: String)] {
+        var out: [(String, String)] = []
+        if let details = (review["details"] as? String)?.nilIfEmpty { out.append(("Checked", details)) }
+        if let reason = (review["reason"] as? String)?.nilIfEmpty { out.append(("Why", reason)) }
+        return out
+    }
+
     private static func facts(_ args: [String: Any]) -> [(label: String, value: String)] {
         var out: [(String, String)] = []
         let to = recipients(args)
@@ -158,7 +191,9 @@ struct Approval: Identifiable, Equatable {
             if !value.isEmpty { out.append((label, value)) }
         }
         for (key, label) in [("subject", "Subject"), ("start", "When"), ("when", "When"),
-                             ("location", "Where"), ("due", "Due"), ("path", "File")] {
+                             ("location", "Where"), ("due", "Due"), ("path", "File"),
+                             ("url", "Address"), ("key", "Key"), ("ref", "Element"),
+                             ("selector", "Element"), ("action", "Action")] {
             let value = text(args, key)
             if !value.isEmpty, !out.contains(where: { $0.0 == label }) {
                 out.append((label, key == "start" ? readableTime(value) : value))

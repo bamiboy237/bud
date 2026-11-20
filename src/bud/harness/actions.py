@@ -212,7 +212,14 @@ class ActionGateway(WrapperToolset[None]):
                 review = held_review
                 session = (ctx.metadata or {}).get("bud_session_id")
                 request = self._request(name, tool_args, ctx, tool)
-                if action == "review" and isinstance(session, str) and request is not None:
+                # A tool that offers no standing grant gets no session grant either: a
+                # browser step approved on one page must not replay on another.
+                if (
+                    action == "review"
+                    and name not in self.policy.no_grants
+                    and isinstance(session, str)
+                    and request is not None
+                ):
                     self.grants.remember(session, request)
         elif action == "ask":
             raise ApprovalRequired(metadata=await self._presentation(name, tool_args, ctx))
@@ -283,7 +290,15 @@ class ActionGateway(WrapperToolset[None]):
         except Exception:
             # Presentation failure must not suppress the exact approval or expose connector errors.
             preview = unavailable_email_preview(name, args)
-        return {"email_preview": preview.model_dump()} if preview else {}
+        shown: dict[str, Any] = {"email_preview": preview.model_dump()} if preview else {}
+        describe = self.describers.get(name)
+        if describe is not None:
+            # The card shows what the reviewer saw: facts Bud looked up, never model text.
+            try:
+                shown["details"] = describe(args)
+            except Exception:
+                shown["details"] = "The target could not be resolved from bud's records."
+        return shown
 
 
 @dataclass(kw_only=True)

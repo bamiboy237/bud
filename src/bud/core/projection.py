@@ -33,6 +33,9 @@ class PendingApproval(BaseModel):
     run_id: str | None = None
     request_id: str | None = None
     preview: EmailPreview | None = None
+    # Why the call waits: the reviewer's fixed-text reason, and facts Bud looked up itself,
+    # such as which site a browser tab really shows.
+    review: dict[str, Any] | None = None
     # True when the owner may grant this tool standing permission from the card.
     grantable: bool = False
     task_id: int | None = None

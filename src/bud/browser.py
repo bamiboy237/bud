@@ -1,60 +1,120 @@
 """bud's browser: OpenCode Browse, which drives the person's own Chrome through an extension.
 
-Bud starts `browse mcp` itself and offers its tools as `browser_*`, loaded only when the
-model searches for them, and only after the owner turned the browser on. Browse's MCP
-server has three tools: status, tabs, and execute, which runs JavaScript in a tab.
+Bud runs its own Browse relay, with its own home folder in Bud's data folder and its own
+port, so it can ask for Browse's small typed tools (navigate, snapshot, click, fill, ...)
+instead of one tool that runs any JavaScript. The extension connects to one relay at a time:
+pairing it with Bud's relay disconnects any other agent that used Browse.
+
+Bud offers a chosen set of Browse's tools as `browser_*`, loaded only when the model searches
+for them, and only after the owner turned the browser on. Reading a page runs unasked. Each
+step that acts on a page (opening, clicking, typing) goes to the approval reviewer in auto
+mode and to the owner in strict mode. Uploading a file always asks the owner. Running
+arbitrary JavaScript, Browse's settings, and the other tools are never offered.
 
 The owner turns the browser on once, after a caution that says what that allows
-(enable_browser, which always asks and offers no standing grant). From then on, status runs
-unasked, and every tabs or execute call goes to the approval reviewer first: a call it judges
-safe and clearly requested runs, and anything else, or any reviewer failure, asks the owner
-with the reason. The reviewer sees facts Bud looks up itself, such as the real address of the
-tab a script drives. A tool a later Browse adds is refused until Bud names it.
+(enable_browser, which always asks and offers no standing grant).
 
 The Mac app ships the `browse` program and copies it to ~/.bud/bin, where Browse keeps it up
 to date with its own updater. A `browse` the owner installed is used when Bud's copy is
 missing.
 """
 
+import asyncio
+import contextlib
 import json
 import os
 import shutil
 import subprocess
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from pydantic_ai import Tool
+from pydantic_ai import RunContext, Tool
 from pydantic_ai.mcp import MCPToolset, StdioTransport
-from pydantic_ai.toolsets import AbstractToolset, DeferredLoadingToolset
+from pydantic_ai.toolsets import AbstractToolset, DeferredLoadingToolset, WrapperToolset
+from pydantic_ai.toolsets.abstract import ToolsetTool
 
+from bud.composio.binding import ConnectionError
 from bud.core.setup import SetupEntry, SetupInitiation, SetupStatus
 from bud.harness.actions import Policy
 
 PREFIX = "browser"
-STATUS = f"{PREFIX}_status"
-TABS = f"{PREFIX}_tabs"
-EXECUTE = f"{PREFIX}_execute"
-TOOLS = {STATUS, TABS, EXECUTE}
+# Read the page or wait for the person: these change nothing, so they run unasked.
+READS = frozenset(
+    f"{PREFIX}_{name}" for name in ("status", "snapshot", "screenshot", "scroll", "wait_for")
+) | {f"{PREFIX}_handoff"}
+# Act on a page: reviewed in auto mode, asked in strict mode.
+STEPS = frozenset(
+    f"{PREFIX}_{name}"
+    for name in (
+        "tabs",
+        "navigate",
+        "click",
+        "fill",
+        "type",
+        "press",
+        "select",
+        "hover",
+        "drag",
+        "dialog",
+    )
+)
+# Hands a local file to a website: the owner always decides.
+UPLOAD = f"{PREFIX}_upload"
+TOOLS = READS | STEPS | {UPLOAD}
 ENABLE = "enable_browser"
 DISABLE = "disable_browser"
+# Bud's relay port. Browse's own default is 19988; another port keeps the two apart.
+PORT = 19989
 EXTENSION_URL = "https://chromewebstore.google.com/detail/mfnicocicmmlkpjnaffgihfjhdgjkdjg"
 INSTALL = "curl -fsSL https://opencode.ai/browse/install | bash"
 CAUTION = (
     "Bud will use your own Chrome, with your tabs and the sites you are signed in to. It can "
-    "read those sites, open pages, click, type, and submit forms as you. Each step is checked "
-    "first, and anything risky, such as paying, sending, deleting, or typing a password, asks "
-    "you. A page Bud reads can still try to trick it, and a check can miss a step written to "
-    "look harmless. Ask Bud to turn the browser off at any time."
+    "read those sites, open pages, click, type, and submit forms as you, including in Gmail "
+    "and Google Calendar. Each step is checked first, and anything risky, such as paying, "
+    "sending, deleting, or typing a password, asks you. A page Bud reads can still try to "
+    "trick it, and a check can miss a step written to look harmless. While Bud uses the "
+    "browse extension, other apps that use it lose their connection. Ask Bud to turn the "
+    "browser off at any time."
 )
 GUIDANCE = """browser_* tools use the person's own Chrome, with their tabs and sign-ins. They
 appear after the person turns the browser on: call enable_browser, which shows them what that
-allows. Keep each browser_execute script to one clear step, so it can be checked against what
-the person asked. Use handoff() when only the person can act, such as signing in. If no
+allows, then search for browser tools. Work in small steps: snapshot a page, act on one
+element by its ref, then snapshot again to check. Pass the tab id from navigate to every later
+call. Use browser_handoff when only the person can act, such as signing in or paying. If no
 browser is connected, call setup_capability with "browser". Call disable_browser when the
 person asks to stop.
 """
+
+
+@dataclass(frozen=True)
+class Relay:
+    """Bud's own Browse relay: its home folder and port, passed to every browse process."""
+
+    home: Path
+    port: int = PORT
+
+    def env(self) -> dict[str, str]:
+        return {
+            **os.environ,
+            "OPENCODE_BROWSER_HOME": str(self.home),
+            "OPENCODE_BROWSER_PORT": str(self.port),
+            "OPENCODE_BROWSER_TOOLS": "plain",
+        }
+
+    def run(self, path: Path, *args: str, timeout: float) -> str:
+        self.home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return subprocess.run(
+            [str(path), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=True,
+            env=self.env(),
+        ).stdout
 
 
 class Consent:
@@ -76,11 +136,12 @@ class Consent:
 
 
 def allow_tools(policy: Policy) -> None:
-    """status runs unasked; tabs and execute go to the reviewer, never to a standing grant;
-    turning the browser on always asks; turning it off never does."""
-    policy.tools.update({STATUS: "allow", TABS: "review", EXECUTE: "review", DISABLE: "allow"})
-    policy.tools[ENABLE] = "ask"
-    policy.no_grants = policy.no_grants | {TABS, EXECUTE, ENABLE}
+    """Reads run unasked. Steps and uploads ask the owner; auto mode hands steps to the
+    reviewer (bud.core.profiles). No standing grant covers a step, an upload, or turning the
+    browser on. Turning it off never asks."""
+    policy.tools.update(dict.fromkeys(READS | {DISABLE}, "allow"))
+    policy.tools.update(dict.fromkeys(STEPS | {UPLOAD, ENABLE}, "ask"))
+    policy.no_grants = policy.no_grants | STEPS | {UPLOAD, ENABLE}
 
 
 def control_tools(consent: Consent) -> list[Tool[None]]:
@@ -88,7 +149,7 @@ def control_tools(consent: Consent) -> list[Tool[None]]:
         """Ask the person to let you use their own Chrome. The approval shows them what that
         allows. Call it once, before you need a browser tool."""
         consent.set(True)
-        return "The browser is on. Search for browser tools to use it."
+        return "The browser is on. Search for browser tools, such as browser_navigate."
 
     def disable_browser() -> str:
         """Turn the browser off, when the person asks you to stop using it."""
@@ -110,11 +171,49 @@ def executable() -> Path | None:
     return Path(found) if found else None
 
 
-def toolset(path: Path, consent: Consent) -> AbstractToolset[None]:
-    """Browse's tools as browser_*: deferred until the model searches, and hidden while the
-    browser is off. Bud's gateway already runs each call as one recorded DBOS step."""
+@dataclass
+class WhileOn(WrapperToolset[None]):
+    """Starts `browse mcp` only once the owner has turned the browser on, and offers its
+    tools only while it stays on."""
+
+    consent: Consent | None = None
+
+    def __post_init__(self) -> None:
+        # Runs share this toolset: Browse starts at the first use and stops after the last
+        # open run ends.
+        self._runs = 0
+        self._started = False
+        self._lock = asyncio.Lock()
+
+    async def __aenter__(self) -> "WhileOn":
+        self._runs += 1
+        return self
+
+    async def __aexit__(self, *args: Any) -> bool | None:
+        async with self._lock:
+            self._runs -= 1
+            if self._runs > 0 or not self._started:
+                return None
+            self._started = False
+            return await self.wrapped.__aexit__(*args)
+
+    async def get_tools(self, ctx: RunContext[None]) -> dict[str, ToolsetTool[None]]:
+        if self.consent is None or not self.consent.on():
+            return {}
+        async with self._lock:
+            if not self._started:
+                await self.wrapped.__aenter__()
+                self._started = True
+        return await self.wrapped.get_tools(ctx)
+
+
+def toolset(path: Path, consent: Consent, relay: Relay) -> AbstractToolset[None]:
+    """Browse's chosen tools as browser_*: deferred until the model searches, and absent
+    while the browser is off. Bud's gateway already runs each call as one recorded DBOS
+    step."""
+    relay.home.mkdir(parents=True, exist_ok=True, mode=0o700)
     remote = MCPToolset(
-        StdioTransport(str(path), ["mcp"]),
+        StdioTransport(str(path), ["mcp"], env=relay.env()),
         id="browse",
         init_timeout=30,
         read_timeout=180,
@@ -123,45 +222,50 @@ def toolset(path: Path, consent: Consent) -> AbstractToolset[None]:
         include_instructions=False,
         prefer_tasks=False,
     )
-    visible = remote.prefixed(PREFIX).filtered(lambda ctx, tool: consent.on())
-    return DeferredLoadingToolset(visible)
+    offered = remote.prefixed(PREFIX).filtered(lambda ctx, tool: tool.name in TOOLS)
+    return DeferredLoadingToolset(WhileOn(offered, consent=consent))
 
 
-def _tabs(path: Path) -> list[dict[str, Any]]:
+def _site(url: object) -> str:
+    """A page's scheme, host, and path, without the query or fragment where pages put
+    tracking data or injected text, on one short line."""
+    parts = urlsplit(str(url))
+    shown = f"{parts.scheme}://{parts.netloc}{parts.path}" if parts.netloc else "an unknown page"
+    return " ".join(shown.split())[:160]
+
+
+def _tabs(path: Path, relay: Relay) -> list[dict[str, Any]]:
     try:
-        result = subprocess.run(
-            [str(path), "tabs"], capture_output=True, text=True, timeout=10, check=True
-        )
-        tabs = json.loads(result.stdout).get("tabs", [])
-        return tabs if isinstance(tabs, list) else []
+        tabs = json.loads(relay.run(path, "tabs", timeout=5)).get("tabs", [])
+        return [tab for tab in tabs if isinstance(tab, dict)] if isinstance(tabs, list) else []
     except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
         return []
 
 
-def describers(find: Callable[[], Path | None] = executable) -> dict[str, Callable]:
-    """Facts for the reviewer that a script cannot fake: where its tab really is."""
+def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> dict[str, Callable]:
+    """Facts for the reviewer that the model cannot fake: which site a tab really shows.
+    Nothing the model wrote is repeated here; the reviewer sees the arguments separately."""
 
     def where(tool_args: dict[str, Any]) -> str:
-        path = find()
         tab = tool_args.get("tab")
-        opening = f"Opens {tool_args['url']}." if tool_args.get("url") else ""
-        if path is None or tab is None:
-            return opening or "No tab named; Browse uses or opens one."
-        for entry in _tabs(path):
-            if str(tab) in (str(entry.get("tab")), str(entry.get("id"))):
-                return f"{opening} Tab {tab} shows {entry.get('url', 'an unknown page')}.".strip()
-        return f"{opening} Tab {tab} is not one Browse knows.".strip()
+        if tab is None:
+            return "No tab given: Browse opens a new tab."
+        path = find()
+        if path is None:
+            return "The tab could not be looked up."
+        for entry in _tabs(path, relay):
+            if str(tab) in {str(entry[key]) for key in ("tab", "id") if entry.get(key)}:
+                return f"The tab shows {_site(entry.get('url'))}."
+        return "The tab is not one Browse knows."
 
-    return {TABS: where, EXECUTE: where}
+    return dict.fromkeys(STEPS | {UPLOAD}, where)
 
 
-def connected(path: Path) -> bool:
+def connected(path: Path, relay: Relay) -> bool:
     try:
-        result = subprocess.run(
-            [str(path), "status", "--json"], capture_output=True, text=True, timeout=10
-        )
-        return bool(json.loads(result.stdout).get("extension", {}).get("connected"))
-    except (OSError, ValueError, AttributeError, subprocess.TimeoutExpired):
+        status = json.loads(relay.run(path, "status", "--json", timeout=10))
+        return bool(status.get("extension", {}).get("connected"))
+    except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
         return False
 
 
@@ -180,20 +284,24 @@ def _first_line(process: subprocess.Popen, timeout: float) -> str:
 class Pairing:
     """The one `browse pair` process that waits for the extension, if any."""
 
-    def __init__(self) -> None:
+    def __init__(self, relay: Relay) -> None:
+        self.relay = relay
         self._process: subprocess.Popen | None = None
         self._lock = threading.Lock()
 
     def code(self, path: Path) -> str:
-        """Starts pairing and returns its one-time code. Raises ConnectionError on failure."""
+        """Starts pairing and returns its one-time code. Raises Bud's ConnectionError, which
+        the setup card shows as a failed sign-in."""
         with self._lock:
             self._stop()
+            self.relay.home.mkdir(parents=True, exist_ok=True, mode=0o700)
             try:
                 self._process = subprocess.Popen(
                     [str(path), "pair", "--wait-seconds", "600"],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                     text=True,
+                    env=self.relay.env(),
                 )
             except OSError as exc:
                 raise ConnectionError("Browse could not start. Try again.") from exc
@@ -214,7 +322,8 @@ class Pairing:
         self._process.kill()
         self._process.wait()
         if self._process.stdout is not None:
-            self._process.stdout.close()
+            with contextlib.suppress(OSError):
+                self._process.stdout.close()
         self._process = None
 
 
@@ -239,14 +348,15 @@ def setup_entry(pairing: Pairing, find: Callable[[], Path | None] = executable) 
             steps=[
                 CAUTION,
                 f"Add the browse extension to Chrome: {EXTENSION_URL}",
-                f"In the extension, open Options, choose Pair with a code, and enter {code}. "
-                "The code works once, for ten minutes.",
+                "In the extension, open Options and choose Pair with a code. Enter "
+                f"{code} as the code and localhost:{pairing.relay.port} as the relay address, "
+                "then click Connect. The code works once, for ten minutes.",
             ],
         )
 
     def status() -> SetupStatus:
         path = find()
-        if path is not None and connected(path):
+        if path is not None and connected(path, pairing.relay):
             return SetupStatus(state="connected")
         return SetupStatus(state="waiting")
 

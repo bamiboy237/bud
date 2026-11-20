@@ -219,8 +219,10 @@ def _create_app(
     setup: SetupRegistry | None = None
     world: World | None = None
     account_scope: str | None = None
-    # A `browse pair` waiting for the extension; stopped when the server stops.
-    pairing = browser.Pairing()
+    # Bud's own Browse relay, and a `browse pair` waiting for the extension; the pairing
+    # stops when the server stops.
+    relay = browser.Relay(settings.data_dir / "browse")
+    pairing = browser.Pairing(relay)
 
     # Set by the account branch: reloads the tool list after a new app connects.
     refresh_tools: Callable[[], None] = _noop
@@ -296,7 +298,7 @@ def _create_app(
                     build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
                     *(
                         [
-                            browser.toolset(loaded["browse"], consent),
+                            browser.toolset(loaded["browse"], consent, relay),
                             FunctionToolset(browser.control_tools(consent)),
                         ]
                         if loaded["browse"] is not None
@@ -353,7 +355,7 @@ def _create_app(
         )
         tools_policy = harness.policy
         if browsing:
-            harness.describers.update(browser.describers())
+            harness.describers.update(browser.describers(relay))
         harness.live_instructions.append(
             lambda: "\nConnected apps: " + (", ".join(sorted(loaded["accounts"])) or "none")
         )
