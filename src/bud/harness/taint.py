@@ -34,6 +34,7 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    SystemPromptPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
@@ -256,23 +257,46 @@ def _prompt_text(part: UserPromptPart) -> str:
 
 
 def read_text(messages: list[ModelMessage]) -> str:
-    """What Bud read in this conversation: tool results (except the owner's own answers), the
-    context Bud added to messages, and its own notes."""
+    """What Bud read in this conversation: every part that is not the owner's own prompt or
+    the system's instructions. That covers tool results (except the owner's own answers),
+    compaction summaries, which quote what was read, native tool results such as a
+    provider's web search, the context Bud adds to messages, and its own notes. A part type
+    added later is read content too, so the check fails toward asking."""
     parts = []
     for message in messages:
+        if isinstance(message, ModelResponse):
+            parts.extend(
+                _content(part)
+                for part in message.parts
+                if type(part).__name__.endswith("ReturnPart")
+            )
+            continue
         if not isinstance(message, ModelRequest):
             continue
         for part in message.parts:
-            if isinstance(part, ToolReturnPart) and part.tool_name != "ask_user":
-                content = part.content
-                parts.append(content if isinstance(content, str) else _dump(content))
-            elif isinstance(part, UserPromptPart):
+            if isinstance(part, UserPromptPart):
                 text = _prompt_text(part)
                 if text.lstrip().startswith(SYSTEM_NOTE):
                     parts.append(text)
                 elif start := ADDED.search(text):
                     parts.append(text[start.start() :])
-    return "\n".join(parts)
+            elif (
+                isinstance(part, SystemPromptPart)
+                or type(part).__name__.startswith("Instruction")
+                or isinstance(part, ToolReturnPart)
+                and part.tool_name == "ask_user"
+            ):
+                continue
+            else:
+                parts.append(_content(part))
+    return "\n".join(text for text in parts if text)
+
+
+def _content(part: Any) -> str:
+    content = getattr(part, "content", None)
+    if content is None:
+        return ""
+    return content if isinstance(content, str) else _dump(content)
 
 
 def owner_text(messages: list[ModelMessage]) -> str:
