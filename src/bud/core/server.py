@@ -203,6 +203,8 @@ def allow_file_tools(policy: Policy) -> None:
     # (bud.core.profiles). Listing and cancelling only touch the owner's own items.
     policy.tools.update(dict.fromkeys(BACKGROUND_TOOLS - BACKGROUND_STARTS, "allow"))
     policy.tools.update(dict.fromkeys(BACKGROUND_STARTS, "ask"))
+    # No "always allow": one click must not let every later start skip approval.
+    policy.no_grants = policy.no_grants | BACKGROUND_STARTS
     policy.tools[NETWORK_TOOL] = "ask"
     # Each new site needs its own yes: "always allow" would let Bud add any site unasked.
     policy.no_grants = policy.no_grants | {NETWORK_TOOL}
@@ -517,8 +519,10 @@ def _create_app(
             DBOS.launch()
             if connections is not None and connections.restart_required():
                 raise ConnectionError("Account binding changed during startup. Restart bud.")
-            await runner.recover()
+            # Settle work from before the restart first, so a recovered run's new start is
+            # never mistaken for one the restart cut off.
             await background.resume()
+            await runner.recover()
             if photon is not None:
                 from bud.photon_chat import messaging
 
