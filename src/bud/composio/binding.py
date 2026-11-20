@@ -143,14 +143,16 @@ class BindingStore:
                 "SELECT scope FROM session_scopes WHERE generation = ?", (binding.generation,)
             ).fetchone()[0]
 
-    def begin_connect(self, toolkit: str, *, resume: bool = False) -> AccountBinding:
+    def begin_connect(self, toolkit: str) -> AccountBinding:
         if not valid_toolkit(toolkit):
             raise ConnectionError("Unsupported toolkit name.")
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            current, pending = self._read(db)
-            # Fence even an explicit reconnect to exactly the same remote ID.
-            if toolkit in current.accounts or (toolkit in pending and not resume):
+            current, _ = self._read(db)
+            # Fence even an explicit reconnect to exactly the same remote ID. An app that was
+            # only pending was never active, so no approval or tool can point at it: a fresh
+            # link replaces the unfinished one without a fence, as Cancel does.
+            if toolkit in current.accounts:
                 db.execute("UPDATE binding_state SET generation = generation + 1 WHERE id = 1")
             db.execute("DELETE FROM accounts WHERE toolkit = ?", (toolkit,))
             db.execute("INSERT OR REPLACE INTO pending_accounts VALUES (?, NULL)", (toolkit,))

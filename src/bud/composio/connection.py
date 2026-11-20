@@ -78,11 +78,11 @@ class Connections:
                 raise ConnectionError("Connection changed while recovering sign-in. Try again.")
             return value
 
-    def connect(self, toolkit: str, *, resume: bool = False) -> str:
+    def connect(self, toolkit: str) -> str:
         if not valid_toolkit(toolkit):
             raise ConnectionError("Unsupported toolkit name.")
         with safe_errors("Could not start Composio sign-in. Check your key and connection."):
-            attempt = self.store.begin_connect(toolkit, resume=resume)
+            attempt = self.store.begin_connect(toolkit)
             client = self.client()
             session = client.create(
                 user_id=attempt.owner,
@@ -138,7 +138,14 @@ class Connections:
                 if references:
                     client = self.client()
                     for toolkit, account_id in references.items():
-                        statuses[toolkit] = self._status(client, previous, toolkit, account_id)
+                        try:
+                            statuses[toolkit] = self._status(client, previous, toolkit, account_id)
+                        except Exception:
+                            if toolkit in previous.accounts:
+                                raise
+                            # Only an unfinished sign-in is in doubt; it never became an
+                            # account, so it is dropped below without fencing the chat.
+                            statuses[toolkit] = "UNAVAILABLE"
             except Exception:
                 self.store.retire(previous)
                 raise
