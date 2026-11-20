@@ -25,8 +25,10 @@ Bud reads and writes text files in one workspace folder, `~/.bud/workspace`. Set
 - Hidden paths and names that look like credentials are refused for reads and writes. For
   example, `.env`, `.git`, `api-key.txt`, `secrets.md`, `id_rsa`, `cert.pem`, and `AGENTS.md`.
 - Paths that leave the folder, through `..`, an absolute path, or a symlink, are refused.
-- `workspace_create` and `workspace_update` need approval. Each approved write runs once:
-  its claim is saved before the file changes, so a recovered run never writes it twice.
+- `workspace_create` and `workspace_update` run without asking in auto mode, the default,
+  like the sandboxed shell, which can already write the same files. Strict mode asks for
+  them. Each write runs once: its claim is saved before the file changes, so a recovered run
+  never writes it twice.
 - `workspace_update` needs the content hash from the latest `read_file`. A file that changed
   since that read is not overwritten.
 

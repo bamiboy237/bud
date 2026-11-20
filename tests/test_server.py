@@ -203,6 +203,8 @@ def running(root: Path, checkpoint: str | None = None, *, accounts: bool = False
 
 
 def start_report(server: ServerProcess) -> tuple[str, dict]:
+    # Auto mode saves workspace files unasked; strict mode keeps the approval to test.
+    server.request("POST", "/mode", json={"mode": "strict"})
     session = server.request("POST", "/sessions", status=201)["session_id"]
     server.request(
         "POST",
