@@ -20,7 +20,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
 from pydantic_ai import ModelRetry
-from pydantic_ai.toolsets import CombinedToolset, FunctionToolset
+from pydantic_ai.toolsets import AbstractToolset, CombinedToolset, FunctionToolset
 
 from bud import browser
 from bud.composio.binding import valid_toolkit
@@ -223,6 +223,7 @@ def _create_app(
     # stops when the server stops.
     relay = browser.Relay(browser.RELAY_HOME)
     pairing = browser.Pairing(relay)
+    browse_session = browser.Session()
 
     # Set by the account branch: reloads the tool list after a new app connects.
     refresh_tools: Callable[[], None] = _noop
@@ -286,6 +287,18 @@ def _create_app(
             "browse": browser.executable() if browsing else None,
         }
         refresh_lock = Lock()
+        # Built once: durable execution registers it as "browse", and a second instance under
+        # that id would break every later run. Its Session outlives tool swaps.
+        browser_tools: list[AbstractToolset[None]] = []
+
+        def browser_toolsets() -> list[AbstractToolset[None]]:
+            if loaded["browse"] is None:
+                return []
+            if not browser_tools:
+                browser_tools.append(
+                    browser.toolset(loaded["browse"], consent, relay, browse_session)
+                )
+            return [*browser_tools, FunctionToolset(browser.control_tools(consent, relay))]
 
         def account_toolset() -> CombinedToolset[None]:
             return CombinedToolset(
@@ -296,14 +309,7 @@ def _create_app(
                         workspace, session_dir, lambda: harness.reviewer, private_folders(settings)
                     ),
                     build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
-                    *(
-                        [
-                            browser.toolset(loaded["browse"], consent, relay),
-                            FunctionToolset(browser.control_tools(consent, relay)),
-                        ]
-                        if loaded["browse"] is not None
-                        else []
-                    ),
+                    *browser_toolsets(),
                 ]
             )
 
@@ -527,6 +533,7 @@ def _create_app(
             finally:
                 try:
                     pairing.stop()
+                    await browse_session.stop()
                     gateway.close()
                 finally:
                     lock.close()

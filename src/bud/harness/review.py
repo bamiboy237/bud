@@ -33,7 +33,7 @@ import logging
 import math
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -629,7 +629,8 @@ class SessionGrants:
 
 
 # A describer renders what a call's ids point to, from bud's own store.
-Describer = Callable[[dict[str, Any]], str | None]
+# A describer may be async, such as one that asks another program.
+Describer = Callable[[dict[str, Any]], str | None | Awaitable[str | None]]
 
 
 def build_reviewer() -> ToolReviewer | None:

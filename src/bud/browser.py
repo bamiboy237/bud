@@ -22,6 +22,7 @@ missing.
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -40,6 +41,8 @@ from pydantic_ai.toolsets.abstract import ToolsetTool
 from bud.composio.binding import ConnectionError
 from bud.core.setup import SetupEntry, SetupInitiation, SetupStatus
 from bud.harness.actions import Policy
+
+logger = logging.getLogger(__name__)
 
 PREFIX = "browser"
 # Read the page or wait for the person: these change nothing, so they run unasked.
@@ -213,46 +216,94 @@ def executable() -> Path | None:
     return Path(found) if found else None
 
 
-@dataclass
-class WhileOn(WrapperToolset[None]):
-    """Starts `browse mcp` only once the owner has turned the browser on, and offers its
-    tools only while it stays on."""
+# Page actions that need the tab they act on. Without one, Browse acts on a tab the reviewer
+# cannot see, so Bud refuses the call instead.
+NEEDS_TAB = (STEPS - {f"{PREFIX}_navigate", f"{PREFIX}_tabs"}) | {UPLOAD}
 
-    consent: Consent | None = None
 
-    def __post_init__(self) -> None:
-        # Runs share this toolset: Browse starts at the first use and stops after the last
-        # open run ends.
-        self._runs = 0
-        self._started = False
+class Session:
+    """The one connection to `browse mcp`. A task Bud owns opens and closes it, so it never
+    depends on which agent run started first or finished last."""
+
+    def __init__(self) -> None:
+        self._task: asyncio.Task[None] | None = None
+        self._stop: asyncio.Event | None = None
         self._lock = asyncio.Lock()
 
+    async def start(self, toolset: AbstractToolset[None]) -> None:
+        async with self._lock:
+            if self._task is not None and not self._task.done():
+                return
+            ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            self._stop = asyncio.Event()
+            self._task = asyncio.create_task(self._hold(toolset, ready, self._stop))
+            await ready
+
+    @staticmethod
+    async def _hold(
+        toolset: AbstractToolset[None], ready: asyncio.Future[None], stop: asyncio.Event
+    ) -> None:
+        try:
+            async with toolset:
+                ready.set_result(None)
+                await stop.wait()
+        except Exception as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+            else:
+                logger.warning("browse mcp stopped: %s", type(exc).__name__)
+
+    async def stop(self) -> None:
+        async with self._lock:
+            if self._task is None or self._stop is None:
+                return
+            self._stop.set()
+            with contextlib.suppress(Exception):
+                await self._task
+            self._task = None
+
+
+@dataclass
+class WhileOn(WrapperToolset[None]):
+    """Browse's tools, offered and callable only while the owner has the browser on. The
+    shared Session starts Browse at the first use and stops it once the browser is off."""
+
+    session: Session | None = None
+    consent: Consent | None = None
+
+    def _on(self) -> bool:
+        return self.consent is not None and self.consent.on()
+
     async def __aenter__(self) -> "WhileOn":
-        self._runs += 1
         return self
 
     async def __aexit__(self, *args: Any) -> bool | None:
-        async with self._lock:
-            self._runs -= 1
-            if self._runs > 0 or not self._started:
-                return None
-            self._started = False
-            return await self.wrapped.__aexit__(*args)
+        return None
 
     async def get_tools(self, ctx: RunContext[None]) -> dict[str, ToolsetTool[None]]:
-        if self.consent is None or not self.consent.on():
+        assert self.session is not None
+        if not self._on():
+            await self.session.stop()
             return {}
-        async with self._lock:
-            if not self._started:
-                await self.wrapped.__aenter__()
-                self._started = True
+        await self.session.start(self.wrapped)
         return await self.wrapped.get_tools(ctx)
 
+    async def call_tool(
+        self, name: str, tool_args: dict[str, Any], ctx: RunContext[None], tool: ToolsetTool[None]
+    ) -> Any:
+        assert self.session is not None
+        if not self._on():
+            return "The browser is off, so nothing was done."
+        if name in NEEDS_TAB and tool_args.get("tab") is None:
+            return "Nothing was done: pass the tab id from browser_navigate as tab."
+        await self.session.start(self.wrapped)
+        return await self.wrapped.call_tool(name, tool_args, ctx, tool)
 
-def toolset(path: Path, consent: Consent, relay: Relay) -> AbstractToolset[None]:
+
+def toolset(path: Path, consent: Consent, relay: Relay, session: Session) -> AbstractToolset[None]:
     """Browse's chosen tools as browser_*: deferred until the model searches, and absent
-    while the browser is off. Bud's gateway already runs each call as one recorded DBOS
-    step."""
+    while the browser is off. Build it once per server: durable execution names it "browse".
+    Bud's gateway already runs each call as one recorded DBOS step."""
     relay.home.mkdir(parents=True, exist_ok=True, mode=0o700)
     remote = MCPToolset(
         StdioTransport(str(path), ["mcp"], env=relay.env()),
@@ -265,7 +316,7 @@ def toolset(path: Path, consent: Consent, relay: Relay) -> AbstractToolset[None]
         prefer_tasks=False,
     )
     offered = remote.prefixed(PREFIX).filtered(lambda ctx, tool: tool.name in TOOLS)
-    return DeferredLoadingToolset(WhileOn(offered, consent=consent))
+    return DeferredLoadingToolset(WhileOn(offered, session=session, consent=consent))
 
 
 def _site(url: object) -> str:
@@ -276,11 +327,26 @@ def _site(url: object) -> str:
     return " ".join(shown.split())[:160]
 
 
-def _tabs(path: Path, relay: Relay) -> list[dict[str, Any]]:
+async def _tabs(path: Path, relay: Relay) -> list[dict[str, Any]]:
+    """Browse's tab list, without blocking Bud while Browse answers."""
+    relay.home.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
-        tabs = json.loads(relay.run(path, "tabs", timeout=5)).get("tabs", [])
+        process = await asyncio.create_subprocess_exec(
+            str(path),
+            "tabs",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=relay.env(),
+        )
+        try:
+            out, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            return []
+        tabs = json.loads(out).get("tabs", [])
         return [tab for tab in tabs if isinstance(tab, dict)] if isinstance(tabs, list) else []
-    except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+    except (OSError, ValueError, AttributeError):
         return []
 
 
@@ -288,19 +354,23 @@ def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> di
     """Facts for the reviewer that the model cannot fake: which site a tab really shows.
     Nothing the model wrote is repeated here; the reviewer sees the arguments separately."""
 
-    def where(tool_args: dict[str, Any]) -> str:
+    async def where(tool_args: dict[str, Any]) -> str:
         tab = tool_args.get("tab")
         if tab is None:
             return "No tab given: Browse opens a new tab."
         path = find()
         if path is None:
             return "The tab could not be looked up."
-        for entry in _tabs(path, relay):
+        for entry in await _tabs(path, relay):
             if str(tab) in {str(entry[key]) for key in ("tab", "id") if entry.get(key)}:
                 return f"The tab shows {_site(entry.get('url'))}."
         return "The tab is not one Browse knows."
 
-    return dict.fromkeys(STEPS | {UPLOAD}, where)
+    def caution(tool_args: dict[str, Any]) -> str:
+        return CAUTION
+
+    # Every client shows the caution, because it rides the approval as a looked-up fact.
+    return {**dict.fromkeys(STEPS | {UPLOAD}, where), ENABLE: caution}
 
 
 def connected(path: Path, relay: Relay) -> bool:

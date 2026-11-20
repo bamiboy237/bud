@@ -90,7 +90,8 @@ struct Approval: Identifiable, Equatable {
         verb = words.verb
         symbol = words.symbol
         let review = raw["review"] as? [String: Any] ?? [:]
-        facts = Self.facts(args) + Self.reviewFacts(review)
+        // enable_browser's looked-up fact is the caution, which the body already shows.
+        facts = Self.facts(args) + Self.reviewFacts(tool == "enable_browser" ? [:] : review)
         if tool == "enable_browser" {
             // Fixed words from the app, never from the model, so the caution cannot be edited.
             body = Self.browserCaution

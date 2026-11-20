@@ -4,6 +4,7 @@ Tools may also enforce their own safety checks.
 """
 
 import asyncio
+import inspect
 import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -130,20 +131,30 @@ class ActionGateway(WrapperToolset[None]):
             if self.policy.decide_tool(tool.tool_def) != "deny"
         }
 
+    async def _describe(self, name: str, tool_args: dict[str, Any]) -> str | None:
+        """What a call's ids refer to, looked up once per call so the reviewer and the owner's
+        card see the same facts. A describer may be async, such as one that asks Browse."""
+        describe = self.describers.get(name)
+        if describe is None:
+            return None
+        try:
+            details = describe(tool_args)
+            return await details if inspect.isawaitable(details) else details
+        except Exception:
+            return "The target could not be resolved from bud's records."
+
     def _request(
-        self, name: str, tool_args: dict[str, Any], ctx: RunContext[None], tool: ToolsetTool[None]
+        self,
+        name: str,
+        tool_args: dict[str, Any],
+        ctx: RunContext[None],
+        tool: ToolsetTool[None],
+        details: str | None,
     ) -> ReviewRequest | None:
         """The stripped reviewer input, or None when there is no owner request to judge by."""
         request = (ctx.metadata or {}).get("bud_request")
         if not isinstance(request, str) or not request.strip():
             return None
-        details: str | None = None
-        describe = self.describers.get(name)
-        if describe is not None:
-            try:
-                details = describe(tool_args)
-            except Exception:
-                details = "The target could not be resolved from bud's records."
         return ReviewRequest(
             tool=name,
             args=tool_args,
@@ -164,7 +175,12 @@ class ActionGateway(WrapperToolset[None]):
             return True  # unsure who would be notified: the owner decides
 
     async def _review(
-        self, name: str, tool_args: dict[str, Any], ctx: RunContext[None], tool: ToolsetTool[None]
+        self,
+        name: str,
+        tool_args: dict[str, Any],
+        ctx: RunContext[None],
+        tool: ToolsetTool[None],
+        details: str | None,
     ) -> ReviewResult:
         """Judge one call. Anything but an explicit ALLOW means the owner is asked."""
         # The policy overlay already keeps these off "review"; this is a second, explicit guard.
@@ -172,7 +188,7 @@ class ActionGateway(WrapperToolset[None]):
             return held("This kind of change always needs the owner.")
         if self.reviewer is None:
             return held("No reviewer is configured, so the owner decides.")
-        request = self._request(name, tool_args, ctx, tool)
+        request = self._request(name, tool_args, ctx, tool, details)
         if request is None:
             return held("There is no owner request to judge this call against.")
         session = (ctx.metadata or {}).get("bud_session_id")
@@ -204,6 +220,7 @@ class ActionGateway(WrapperToolset[None]):
             action = "ask"  # the reviewer would see only part of the call
         rule: str = action
         outcome = "refused" if action == "deny" else "allowed"
+        details = await self._describe(name, tool_args) if action in ("ask", "review") else None
         review: dict[str, Any] | None = None
         if action in ("ask", "review") and ctx.tool_call_approved:
             rule, outcome = "ask", "approved"  # the owner already approved this exact call
@@ -211,7 +228,7 @@ class ActionGateway(WrapperToolset[None]):
             if isinstance(held_review, dict):
                 review = held_review
                 session = (ctx.metadata or {}).get("bud_session_id")
-                request = self._request(name, tool_args, ctx, tool)
+                request = self._request(name, tool_args, ctx, tool, details)
                 # A tool that offers no standing grant gets no session grant either: a
                 # browser step approved on one page must not replay on another.
                 if (
@@ -222,9 +239,9 @@ class ActionGateway(WrapperToolset[None]):
                 ):
                     self.grants.remember(session, request)
         elif action == "ask":
-            raise ApprovalRequired(metadata=await self._presentation(name, tool_args, ctx))
+            raise ApprovalRequired(metadata=await self._presentation(name, tool_args, ctx, details))
         elif action == "review":
-            result = await self._review(name, tool_args, ctx, tool)
+            result = await self._review(name, tool_args, ctx, tool, details)
             review = result.public()
             if not result.allowed:
                 self.record(
@@ -239,7 +256,10 @@ class ActionGateway(WrapperToolset[None]):
                 # The runner stores this beside the approval request and hands it back when
                 # the owner decides, so a denial can carry the reviewer's concern.
                 raise ApprovalRequired(
-                    metadata={**review, **await self._presentation(name, tool_args, ctx)}
+                    metadata={
+                        **review,
+                        **await self._presentation(name, tool_args, ctx, details),
+                    }
                 )
             rule = "auto-allow"
         if action != "deny" and not ctx.tool_call_approved and name in self_hosted_writes():
@@ -275,7 +295,9 @@ class ActionGateway(WrapperToolset[None]):
             )
         return await super().call_tool(name, tool_args, ctx, tool)
 
-    async def _presentation(self, name: str, args: dict, ctx: RunContext[None]) -> dict:
+    async def _presentation(
+        self, name: str, args: dict, ctx: RunContext[None], details: str | None
+    ) -> dict:
         async def read(read_name: str, read_args: dict) -> Any:
             if self.policy.decide(read_name) != "allow":
                 raise ValueError("Preview read is not allowed")
@@ -291,13 +313,9 @@ class ActionGateway(WrapperToolset[None]):
             # Presentation failure must not suppress the exact approval or expose connector errors.
             preview = unavailable_email_preview(name, args)
         shown: dict[str, Any] = {"email_preview": preview.model_dump()} if preview else {}
-        describe = self.describers.get(name)
-        if describe is not None:
+        if details is not None:
             # The card shows what the reviewer saw: facts Bud looked up, never model text.
-            try:
-                shown["details"] = describe(args)
-            except Exception:
-                shown["details"] = "The target could not be resolved from bud's records."
+            shown["details"] = details
         return shown
 
 
