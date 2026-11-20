@@ -60,6 +60,25 @@ async def test_a_slow_command_is_stopped(workspace):
     assert result["exit_code"] != 0
 
 
+@macos
+async def test_a_child_a_finished_command_left_behind_is_stopped(workspace):
+    # The child closes its output, so the command returns while the child still runs.
+    result = await run(workspace, "sleep 30 >/dev/null 2>&1 & echo $!", 10, never)
+    child = int(result["stdout"].strip())
+    await asyncio.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        os.kill(child, 0)
+
+
+@macos
+async def test_a_cancelled_command_is_stopped_and_reaped(workspace):
+    task = asyncio.create_task(run(workspace, "sleep 30", 60, never))
+    await asyncio.sleep(1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
 async def serve_once(body: bytes) -> tuple[asyncio.Server, int]:
     async def answer(reader, writer):
         await reader.readuntil(b"\r\n\r\n")
@@ -343,3 +362,32 @@ async def test_malformed_plain_http_requests_are_refused(headers):
 def test_shell_commands_cannot_read_bud_data_or_the_folder_it_runs_from(tmp_path):
     settings = Settings(data_dir=tmp_path / "data")
     assert private_folders(settings) == [tmp_path / "data", Path.cwd()]
+
+
+@macos
+async def test_a_background_command_reaches_only_allowed_sites(workspace, tmp_path):
+    """build_background takes no reviewer: a site the owner allowed works, and any other site
+    is blocked, since nobody is there to judge it hours later."""
+    from bud.core.server import build_background
+
+    server, port = await serve_once(b"hello from the site")
+    background = build_background(workspace, tmp_path)
+    assert background.run_shell is not None
+    url = f"http://127.0.0.1:{port}/"
+    try:
+        blocked = await background.run_shell(f"curl -sS -m 5 {url}", 30, "fetch it")
+        NetworkGrants(tmp_path / "network-grants.json").add("127.0.0.1")
+        allowed = await background.run_shell(f"curl -sS -m 5 {url}", 30, "fetch it")
+    finally:
+        server.close()
+    assert blocked["blocked_sites"] == ["127.0.0.1"]
+    assert allowed["stdout"] == "hello from the site"
+
+
+def test_starting_background_work_offers_no_always_allow():
+    from bud.core.server import allow_file_tools
+    from bud.harness.actions import Policy
+
+    policy = Policy(tools={})
+    allow_file_tools(policy)
+    assert {"remind_me", "run_in_background"} <= policy.no_grants

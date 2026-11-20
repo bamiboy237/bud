@@ -348,6 +348,9 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
                         task_id=event.data["task_id"],
                     )
                 )
+            case "background.finished":
+                # A reminder or a background command, posted by the server: no model turn.
+                transcript.append(Turn(role="assistant", text=event.data["text"]))
             case "text.reset" | "text.delta":
                 # Logs written before text became live-only stored each streamed piece.
                 run_id = event.data["run_id"]

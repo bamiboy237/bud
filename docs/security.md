@@ -37,8 +37,9 @@ read.
 
 ## Shell commands
 
-On macOS, Bud runs shell commands in its workspace with `run_command`, without asking. Each
-command runs under the macOS sandbox (Seatbelt) with these limits:
+On macOS, Bud runs shell commands in its workspace with `run_command`, and long ones with
+`run_in_background`, without asking. Each command runs under the macOS sandbox (Seatbelt)
+with these limits:
 
 - It writes only inside the workspace and the system temp folder.
 - It cannot read your home folder, Bud's data folder, or the folder Bud runs from (which

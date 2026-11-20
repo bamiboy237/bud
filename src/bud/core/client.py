@@ -183,6 +183,8 @@ def render(
             print(f"\nTask {data['task_id']}: {data['text']}", flush=True)
         case "task.stalled":
             print(f"\nTask {data['task_id']} looks stuck: {data['text']}", flush=True)
+        case "background.finished":
+            print(f"\n{data['text']}", flush=True)
         case "task.paused":
             print(
                 f"\nTask {data['task_id']} paused (it was going in circles): {data['text']}",

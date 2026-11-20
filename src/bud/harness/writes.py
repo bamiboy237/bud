@@ -6,9 +6,9 @@ Three tiers, from the most to the least trusted:
   every mode, and never reach the reviewer.
 - Always-ask: installing or disabling a skill. A skill is third-party code or a change to
   what bud can do, so no model judges it.
-- Reviewable: every other write to memory and the simulated world, and each step in the
-  owner's browser. In auto mode the reviewer (bud.harness.review) judges each call; in
-  strict mode all of them ask.
+- Reviewable: every other write to memory and the simulated world, each step in the
+  owner's browser, and starting a reminder or a background command. In auto mode the
+  reviewer (bud.harness.review) judges each call; in strict mode all of them ask.
 
 Writes to bud's own workspace folder run without asking in auto mode, like the sandboxed
 shell, which can already write the same files; strict mode asks for them too.
@@ -63,9 +63,10 @@ def reviewable_tools() -> frozenset[str]:
     """Every tool the reviewer may judge: self-hosted writes outside the workspace and
     browser steps that no hard rule reserves."""
     from bud.browser import STEPS as BROWSER_STEPS
+    from bud.core.background import STARTS as BACKGROUND_STARTS
 
     return frozenset(
         name
-        for name in (self_hosted_writes() - workspace_writes()) | BROWSER_STEPS
+        for name in (self_hosted_writes() - workspace_writes()) | BROWSER_STEPS | BACKGROUND_STARTS
         if not never_reviewed(name)
     )

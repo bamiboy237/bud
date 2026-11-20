@@ -53,6 +53,29 @@ Name the job for a correction or follow-up. Bud asks which one when several
 jobs could fit the request. Ask it to inspect or stop a named job. `/stop`
 also stops the current conversation's open jobs.
 
+## Reminders and background commands
+
+A job is an agent that thinks. Some work needs no thinking while it waits, so the
+server runs it instead, and the model is not called until you write again.
+
+- **Reminders.** "Remind me in 20 minutes to stretch" stores a due time. When it
+  comes, "Reminder: stretch" appears in the chat and in the pet's bubble. A
+  reminder survives a restart. If Bud was not running when it came due, it
+  appears when Bud starts, marked late. Reminders can be up to 30 days away.
+- **Background commands.** A long shell command, such as a build or a download,
+  runs in the same sandbox as `run_command` for up to 6 hours. It can reach
+  package sites and sites you allowed; any other site is blocked and listed in
+  its result, because nobody is there to judge a new site hours later. The chat goes on meanwhile. When the command ends, its exit
+  status and last lines appear in the chat, and its full output is saved as
+  `background/<id>.log` in the workspace. At most three run at once. A command
+  that a restart cuts short is reported as interrupted and is not run again.
+
+Starting either one is an approval like any other write: in auto mode the
+reviewer checks it against your request, and in strict mode Bud asks you. Only a
+turn with your own words can start one, so a job report or a page Bud read
+cannot. Ask Bud what is waiting or running, or ask it to cancel one. `/stop`
+stops this chat's running commands; reminders keep waiting.
+
 ## API reference
 
 Session snapshots include `tasks` and aggregate pending job approvals.

@@ -324,8 +324,12 @@ async def run(
         _kill(process.pid)
         stdout, stderr = await process.communicate()
     finally:
+        # The whole group: a command cancelled mid-run, and any child a finished command
+        # left running behind it (`cmd &`), stop together.
+        _kill(process.pid)
         if process.returncode is None:
-            _kill(process.pid)  # cancelled while it ran: stop it with its children
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(process.wait(), 5)  # reap it; no zombie is left
         await proxy.close()
     result: dict[str, Any] = {
         "exit_code": process.returncode,
@@ -381,6 +385,27 @@ async def judge_site(
         )
     )
     return result.verdict is Verdict.ALLOW
+
+
+def runner(
+    workspace: Path,
+    grants: NetworkGrants,
+    reviewer: Callable[[], ToolReviewer | None],
+    private: Sequence[Path] = (),
+) -> Callable[[str, float, str], Awaitable[dict[str, Any]]]:
+    """Runs one command as run_command does, with the same network checks, for work that
+    outlives a model turn: (command, timeout seconds, owner request) -> its result."""
+    workspace = workspace.resolve()
+
+    async def run_one(command: str, timeout: float, owner_request: str) -> dict[str, Any]:
+        async def judge(host: str) -> bool:
+            if host in grants.sites():
+                return True
+            return await judge_site(reviewer(), host, command, owner_request)
+
+        return await run(workspace, command, timeout, judge, private)
+
+    return run_one
 
 
 def build_tools(
