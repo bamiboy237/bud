@@ -114,13 +114,11 @@ struct Approval: Identifiable, Equatable {
     static let yesOrNo: Set<String> = ["enable_browser", "open_chrome"]
 
     /// What turning the browser on allows. Kept in step with bud.browser.CAUTION.
-    static let browserCaution = "Bud will use your own Chrome, with your tabs and the sites you "
-        + "are signed in to. It can read those sites, open pages, click, type, and submit forms "
-        + "as you, including in Gmail and Google Calendar. Each step is checked first, and "
-        + "anything risky, such as paying, sending, deleting, or typing a password, asks you. "
-        + "A page Bud reads can still try to trick it, and a check can miss a step written to "
-        + "look harmless. While Bud uses the browse extension, other apps that use it lose "
-        + "their connection. Ask Bud to turn the browser off at any time."
+    static let browserCaution = "Bud will use your own Chrome, signed in as you, including "
+        + "Gmail and Calendar: it can open pages, click, type, and submit forms. Risky steps, "
+        + "such as paying, sending, deleting, or typing a password, ask you first. A page can "
+        + "still try to trick Bud. Other apps lose the browse extension while Bud uses it. "
+        + "Turn it off at any time."
 
     /// The same plain words the terminal uses for each kind of action.
     private static func describe(_ tool: String, _ args: [String: Any])

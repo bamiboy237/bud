@@ -325,6 +325,20 @@ async def test_listing_tabs_runs_unasked_while_opening_one_is_checked():
     assert fake.seen == []
 
 
+def test_only_a_plain_tab_list_is_a_read():
+    is_read = browser.reads_only()["browser_tabs"]
+    assert is_read({"action": "list"})
+    # Anything more than a plain list keeps its check.
+    for args in (
+        {"action": "list", "url": "https://evil.example/"},
+        {"action": "list", "tab": 4},
+        {"action": "LIST"},
+        {"action": "new"},
+        {},
+    ):
+        assert not is_read(args), args
+
+
 async def test_tab_actions_are_described_by_what_they_do(browse, relay):
     describe = browser.describers(relay, find=lambda: browse)["browser_tabs"]
     assert await describe({"action": "new", "url": "https://x.example/"}) == "Opens a new tab."

@@ -84,13 +84,10 @@ RELAY_HOME = Path.home() / ".bud" / "browse"
 EXTENSION_URL = "https://chromewebstore.google.com/detail/mfnicocicmmlkpjnaffgihfjhdgjkdjg"
 INSTALL = "curl -fsSL https://opencode.ai/browse/install | bash"
 CAUTION = (
-    "Bud will use your own Chrome, with your tabs and the sites you are signed in to. It can "
-    "read those sites, open pages, click, type, and submit forms as you, including in Gmail "
-    "and Google Calendar. Each step is checked first, and anything risky, such as paying, "
-    "sending, deleting, or typing a password, asks you. A page Bud reads can still try to "
-    "trick it, and a check can miss a step written to look harmless. While Bud uses the "
-    "browse extension, other apps that use it lose their connection. Ask Bud to turn the "
-    "browser off at any time."
+    "Bud will use your own Chrome, signed in as you, including Gmail and Calendar: it can "
+    "open pages, click, type, and submit forms. Risky steps, such as paying, sending, "
+    "deleting, or typing a password, ask you first. A page can still try to trick Bud. Other "
+    "apps lose the browse extension while Bud uses it. Turn it off at any time."
 )
 GUIDANCE = """browser_* tools use the person's own Chrome, with their tabs and sign-ins. They
 appear after the person turns the browser on: call enable_browser, which shows them what that
@@ -366,7 +363,7 @@ def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> di
 
 def reads_only() -> dict[str, Callable[[dict[str, Any]], bool]]:
     """Calls that only read, judged in code: listing tabs changes nothing."""
-    return {TABS: lambda tool_args: tool_args.get("action") == "list"}
+    return {TABS: lambda tool_args: tool_args == {"action": "list"}}
 
 
 async def connected_now(path: Path, relay: Relay) -> bool:

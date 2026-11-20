@@ -18,7 +18,10 @@ enum DecisionDirection: Equatable {
     /// A swipe that went far enough, or a flick whose projected landing point does: a quick
     /// throw is enough, it need not travel the whole way.
     static func release(_ translation: CGSize, projected: CGSize) -> Self? {
-        swipe(translation) ?? swipe(CGSize(width: projected.width, height: translation.height))
+        // Both the drag so far and its projection must be mostly sideways, so a fast vertical
+        // flick never decides.
+        guard abs(translation.width) > abs(translation.height) else { return nil }
+        return swipe(translation) ?? swipe(projected)
     }
 }
 
@@ -68,6 +71,10 @@ struct ApprovalDeck: View {
         }
         .onAppear { clampIndex() }
         .onChange(of: companion.approvals.map(\.id)) { _, _ in clampIndex() }
+        // A new front card always starts at home, whatever happened to the last one.
+        .onChange(of: currentApproval?.id) { _, _ in
+            if !deck.isAnimating { deck.finishDecision() }
+        }
     }
 
     private func clampIndex() {
@@ -223,18 +230,21 @@ struct ApprovalDeck: View {
     private func handleDecision(approval: Approval, approved: Bool) {
         guard !deck.isAnimating else { return }
         let flight = Duration.milliseconds(180)
-        guard companion.decide(approval.id, approved: approved, after: flight) else { return }
+        guard companion.decide(approval.id, approved: approved, after: reduceMotion ? nil : flight)
+        else {
+            follow(nil)  // refused: the card goes home
+            return
+        }
+        guard !reduceMotion else { return }
         deck.isAnimating = true
         deck.activeDecision = approved ? .approve : .deny
 
         // One short, quiet exit, faster than an entrance. It continues from wherever a drag
-        // left the card, a little further toward the choice. Reduce Motion only fades.
-        withAnimation(.easeOut(duration: reduceMotion ? 0.15 : 0.18)) {
-            if !reduceMotion {
-                let direction: CGFloat = approved ? 1 : -1
-                deck.flyOffset = direction * (abs(deck.flyOffset) + 24)
-                deck.flyScale = 0.98
-            }
+        // left the card, a little further toward the choice.
+        withAnimation(.easeOut(duration: 0.18)) {
+            let direction: CGFloat = approved ? 1 : -1
+            deck.flyOffset = direction * (abs(deck.flyOffset) + 24)
+            deck.flyScale = 0.98
             deck.flyOpacity = 0
         }
 

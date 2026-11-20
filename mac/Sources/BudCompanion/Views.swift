@@ -801,13 +801,17 @@ struct ApprovalCard: View {
     /// The card's horizontal drag, as it happens; nil when it ends without a decision.
     var onDrag: (CGFloat?) -> Void = { _ in }
     @StateObject private var layout = ApprovalLayout()
+    /// True while a drag is in progress. It resets on end and on cancel alike, so a drag the
+    /// system cancels still sends the card home.
+    @GestureState private var dragging = false
 
     private var busy: Bool {
         companion.deciding.contains(approval.id) || companion.approvingBatch || companion.link != .connected
     }
     private var detailLimit: CGFloat {
-        // The browser caution is read in full before turning it on, never behind a scroll.
-        let height: CGFloat = approval.isQuestion ? 190 : approval.tool == "enable_browser" ? 300 : 100
+        // The browser caution is read in full before turning it on, never behind a scroll;
+        // it is written short enough to fit the deck at this height.
+        let height: CGFloat = approval.isQuestion ? 190 : approval.tool == "enable_browser" ? 135 : 100
         let hasProblem = companion.approvalFailures[approval.id] != nil || companion.decisionProblem != nil
         return hasProblem ? max(80, height - 40) : height
     }
@@ -829,10 +833,14 @@ struct ApprovalCard: View {
         VStack(alignment: .leading, spacing: 10) {
             heading
                 .contentShape(Rectangle())
+                // A drag that ends without deciding, or that the system cancels, goes home.
+                // After a decision the deck is animating and ignores this.
+                .onChange(of: dragging) { _, now in if !now { onDrag(nil) } }
                 .gesture(
                     // Global space: the card moves with the drag, so local coordinates would
                     // chase themselves and jitter.
                     DragGesture(minimumDistance: 10, coordinateSpace: .global)
+                        .updating($dragging) { _, state, _ in state = true }
                         .onChanged { value in
                             guard !busy, !approval.isQuestion,
                                   abs(value.translation.width) > abs(value.translation.height)
@@ -843,7 +851,7 @@ struct ApprovalCard: View {
                             guard !busy, !approval.isQuestion,
                                   let direction = DecisionDirection.release(
                                       value.translation, projected: value.predictedEndTranslation)
-                            else { return onDrag(nil) }
+                            else { return }
                             onDecide(direction == .approve)
                         }
                 )
