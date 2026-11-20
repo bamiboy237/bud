@@ -110,7 +110,7 @@ private struct Block: View {
             HStack(alignment: .top, spacing: 8) {
                 RoundedRectangle(cornerRadius: 1).fill(.quaternary).frame(width: 2)
                 Blocks(blocks: Array(quote.children), spacing: Metrics.paragraph)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Paper.inkSecondary)
             }
             .fixedSize(horizontal: false, vertical: true)
         case let table as Markdown.Table:
@@ -182,13 +182,13 @@ private struct ListBlock: View {
         if let checkbox = item.checkbox {
             Image(systemName: checkbox == .checked ? "checkmark.square" : "square")
                 .font(type.body)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Paper.inkSecondary)
         } else if let start {
             Text("\(start + index).")
                 .font(type.marker)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Paper.inkSecondary)
         } else {
-            Text("•").font(type.body).foregroundStyle(.secondary)
+            Text("•").font(type.body).foregroundStyle(Paper.inkSecondary)
         }
     }
 }
@@ -230,7 +230,7 @@ private struct TableView: View {
         ForEach(Array(cells.enumerated()), id: \.offset) { _, cell in
             Text(inline(cell, code: .system(size: type.size - 2, design: .monospaced)))
                 .fontWeight(header ? .semibold : .regular)
-                .foregroundStyle(header ? .secondary : .primary)
+                .foregroundStyle(header ? Paper.inkSecondary : Paper.inkPrimary)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
         }

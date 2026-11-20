@@ -102,11 +102,11 @@ struct ApprovalDeck: View {
             Label {
                 Text("Approval \(min(safeIndex + 1, totalCount)) of \(totalCount)")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Paper.inkSecondary)
             } icon: {
                 Image(systemName: "doc.on.doc.fill")
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Paper.inkSecondary)
             }
             Spacer(minLength: 4)
 
@@ -383,16 +383,16 @@ struct EmailThreadPreview: View {
                     if let date = message.sentAt { Text(date) }
                 }
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Paper.inkSecondary)
                 .fixedSize(horizontal: false, vertical: true)
                 if let body = message.body {
                     EmailBody(text: body)
                 } else {
-                    Text("Email body unavailable").font(.callout).foregroundStyle(.secondary)
+                    Text("Email body unavailable").font(.callout).foregroundStyle(Paper.inkSecondary)
                 }
             }
             if let reason = email.unavailableReason {
-                Text(reason).font(.callout).foregroundStyle(.secondary)
+                Text(reason).font(.callout).foregroundStyle(Paper.inkSecondary)
             }
         }
     }

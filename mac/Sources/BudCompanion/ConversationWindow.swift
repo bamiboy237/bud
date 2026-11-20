@@ -208,7 +208,7 @@ private struct ConversationView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Label(notice.text, systemImage: "arrow.turn.down.right")
                         .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Paper.inkSecondary)
                     if let report = notice.report { OpenReport(file: report) }
                 }
             }
@@ -245,11 +245,11 @@ private struct ConversationView: View {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "arrowshape.turn.up.left")
                         .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Paper.inkSecondary)
                         .padding(.top, 2)
                     Text(quote)
                         .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Paper.inkSecondary)
                         .lineLimit(2)
                         .truncationMode(.tail)
                     Spacer(minLength: 4)
@@ -258,7 +258,7 @@ private struct ConversationView: View {
                     } label: {
                         Image(systemName: "xmark")
                             .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Paper.inkSecondary)
                             .frame(width: 16, height: 16)
                             .contentShape(Rectangle())
                     }
@@ -352,7 +352,7 @@ private struct TurnView: View {
                             RoundedRectangle(cornerRadius: 1).fill(Paper.ink.opacity(0.2)).frame(width: 2)
                             Text(quote)
                                 .font(.callout)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(Paper.inkSecondary)
                                 .lineLimit(3)
                         }
                         .fixedSize(horizontal: false, vertical: true)
@@ -460,7 +460,7 @@ private struct Working: View {
             TimelineView(.periodic(from: since, by: 1)) { context in
                 Text("Working for \(elapsed(Int(context.date.timeIntervalSince(since))))")
                     .font(.callout.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Paper.inkSecondary)
                     .shimmer(active: true)
             }
             if !steps.isEmpty {
@@ -485,7 +485,7 @@ private struct WorkLine: View {
                         summary
                         Image(systemName: "chevron.right")
                             .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(Paper.inkMuted)
                             .rotationEffect(.degrees(open.on ? 90 : 0))
                     }
                     .contentShape(Rectangle())
@@ -506,7 +506,7 @@ private struct WorkLine: View {
         let steps = count == 0 ? "" : " · \(count) \(count == 1 ? "step" : "steps")"
         return Text("Worked for \(elapsed(work.seconds))\(steps)")
             .font(.callout.monospacedDigit())
-            .foregroundStyle(.secondary)
+            .foregroundStyle(Paper.inkSecondary)
     }
 }
 
@@ -567,7 +567,7 @@ private struct SourcePanelView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(companion.chatFocus(for: panel) == nil ? "Earlier conversation" : "This conversation")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Paper.inkSecondary)
                     Text(panel.date.isEmpty ? " " : panel.date)
                         .font(.headline)
                 }
@@ -592,7 +592,7 @@ private struct SourcePanelView: View {
             if let problem = panel.problem {
                 Text(problem)
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Paper.inkSecondary)
                     .padding(16)
                 Spacer()
             } else if panel.loading {
@@ -642,7 +642,7 @@ private struct SourceTurn: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(turn.fromOwner ? "You" : "bud")
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Paper.inkSecondary)
                 MarkdownView(Citations.linked(turn.text, sources: turn.sources))
                     .textSelection(.enabled)
             }

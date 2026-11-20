@@ -159,7 +159,7 @@ struct QuestionCards: View {
                 .help("Previous question")
             Text("\(answers.index + 1) of \(answers.questions.count)")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Paper.inkSecondary)
                 .accessibilityLabel("Question \(answers.index + 1) of \(answers.questions.count)")
             Spacer(minLength: 0)
         }
@@ -227,7 +227,7 @@ private struct QuestionPage: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(option.label).fixedSize(horizontal: false, vertical: true)
                 if let description = option.description {
-                    Text(description).font(.caption).foregroundStyle(.secondary)
+                    Text(description).font(.caption).foregroundStyle(Paper.inkSecondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -240,7 +240,7 @@ private struct QuestionPage: View {
     private var answerRow: some View {
         HStack(spacing: 8) {
             Text(typed ?? (question.options.isEmpty ? "Answer…" : "Something else…"))
-                .foregroundStyle(typed == nil ? .secondary : .primary)
+                .foregroundStyle(typed == nil ? Paper.inkSecondary : Paper.inkPrimary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
             RowSymbol(name: typed == nil ? "pencil" : "checkmark")
