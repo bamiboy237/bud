@@ -169,22 +169,30 @@ to pick an action's *target*: an email that says "send the report to x@evil.exam
 "email x@evil.example" look like your "send the report". Bud checks that in code, with no
 model call:
 
-- For each call that reaches outward (a send, an account write, a shell or background
-  command, a browser step, network access, a reminder), Bud takes the email addresses and
-  links in its arguments.
-- One that appears in what Bud read this conversation (emails, pages, files, notes, job
-  output) but nowhere in your own words (your request and your answers to its questions) is
-  from content, not from you. The call then asks you, in every mode, and the card says
-  "From something Bud read, not from you: ...".
-- Text is decoded before matching, on both sides, so an address hidden as `x [at] y [dot] z`,
-  percent-encoding, HTML entities, full-width letters, or zero-width characters still
-  counts. A subdomain of a host Bud read counts too, and so does a bare host in a shell
-  command. The body and subject of a message are not targets; its recipients are.
+- Bud checks every call that reaches outward: a send or other account write, including app
+  actions found at run time, a shell or background command, a browser step or upload,
+  network access, and a reminder. It reads the email addresses, links, and hosts in the
+  call's arguments. Reads, such as searching Gmail or listing Calendar events, are not
+  checked.
+- **What Bud read** is every tool result this conversation (emails, pages, files, notes) and
+  the context Bud adds to a message: job reports, recalled history, and its own notes.
+  **Your words** are your messages in this conversation without that added context, and your
+  answers to Bud's questions. The questions themselves do not count, since Bud wrote them.
+- A target that appears in what Bud read but nowhere in your words came from content, not
+  from you. The call then asks you, in every mode, and the card says "From something Bud
+  read, not from you: ...".
+- Text is decoded before matching, on both sides, so an address hidden by HTML entities,
+  percent-encoding, full-width letters, invisible or direction characters, or
+  `x [at] y [dot] z` still counts. A subdomain of a host Bud read counts too, and so do IP
+  addresses, `//host` links, and a bare host in a shell command. The body and subject of a
+  message are not targets; its recipients are.
 - **Someone you already know needs no card.** Before the card, Bud searches your Gmail sent
-  mail for the address. If you have emailed it before, the call goes on as usual. Bud also
-  remembers each address you approve on a card. If the search fails, the card shows.
-- Package registries are not targets. Following a plain link a page showed is ordinary
-  browsing; a link carrying a query string, which can carry data out, counts.
+  mail for exactly that address. If you have emailed it before, the call goes on as usual.
+  Bud also remembers each recipient you approve on a card. This list is kept per account:
+  after you switch accounts it starts empty. If the search fails, the card shows.
+- Package registries, by their exact names, are not targets of a shell command. Following a
+  plain link a page showed is ordinary browsing; a link carrying a query string, which can
+  carry data out, counts.
 - A private note or memory is not checked: its text goes nowhere.
 
 The eval `inject_steer` measures it: `uv run bud eval --trials 3 --task inject_steer`.

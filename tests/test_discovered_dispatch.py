@@ -232,8 +232,11 @@ async def test_gmail_draft_loads_its_own_reads_and_skips_unsupported_actions(tmp
     assert {"GMAIL_FETCH_MESSAGE_BY_THREAD_ID", "GMAIL_GET_DRAFT"} <= offered[-1]
     assert "GMAIL_DELETE_DRAFT" not in offered[-1]
     api.list.assert_called_once_with(
-        tool_slugs="GMAIL_CREATE_EMAIL_DRAFT,GMAIL_FETCH_MESSAGE_BY_THREAD_ID,GMAIL_GET_DRAFT",
-        limit=3,
+        tool_slugs=(
+            "GMAIL_CREATE_EMAIL_DRAFT,GMAIL_FETCH_MESSAGE_BY_THREAD_ID,GMAIL_GET_DRAFT,"
+            "GMAIL_FETCH_EMAILS"
+        ),
+        limit=4,
     )
     # The approval card's preview read the thread with the read's own version.
     assert [(c.args[0], c.kwargs["version"]) for c in api.execute.call_args_list] == [

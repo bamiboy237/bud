@@ -36,11 +36,20 @@ from bud.harness.review import (
     owner_answers,
     too_long_to_review,
 )
-from bud.harness.taint import KnownAddresses, read_text, sent_to, tainted, targets
+from bud.harness.taint import (
+    ACCOUNT_TOOL,
+    KnownAddresses,
+    owner_replies,
+    owner_text,
+    read_text,
+    recipients,
+    sent_query,
+    sent_to,
+    tainted,
+)
 from bud.harness.taint import note as taint_note
 from bud.harness.writes import (
     consequential_tools,
-    is_protected,
     never_reviewed,
     reviewable_tools,
     self_hosted_writes,
@@ -197,14 +206,34 @@ class ActionGateway(WrapperToolset[None]):
             today=self.facts(),
         )
 
-    def _tainted(self, name: str, tool_args: dict[str, Any], ctx: RunContext[None]) -> list[str]:
-        if name not in consequential_tools() and not is_protected(name):
+    def _checks_targets(self, tool: ToolDefinition) -> bool:
+        """Whether a call's targets matter: every write that reaches outward, judged by the
+        tool's own rule before any standing grant. Reads, Gmail and Calendar ones included, are
+        not checked; an app action found at run time is checked unless it only reads."""
+        name = tool.name
+        if name in consequential_tools() or name == "browser_upload":
+            return True
+        found = (tool.metadata or {}).get(COMPOSIO_ACTION)
+        if name not in self.policy.tools and found is not None:
+            return not (isinstance(found, dict) and found.get("read_only") is True)
+        return bool(ACCOUNT_TOOL.fullmatch(name)) and self.policy.tools.get(name) != "allow"
+
+    def _tainted(
+        self, tool: ToolDefinition, tool_args: dict[str, Any], ctx: RunContext[None]
+    ) -> list[str]:
+        if not self._checks_targets(tool):
             return []
         request = (ctx.metadata or {}).get("bud_request")
-        owner = request if isinstance(request, str) else ""
-        answers = " ".join(f"{a.question} {a.answer}" for a in owner_answers(ctx.messages))
+        # The owner's own words: this request, their earlier messages, and their answers.
+        # Never Bud's questions: the model wrote those, and an injection could plant a target
+        # in one.
+        said = [
+            request if isinstance(request, str) else "",
+            owner_text(ctx.messages),
+            *owner_replies(ctx.messages),
+        ]
         try:
-            return tainted(name, tool_args, f"{owner} {answers}", read_text(ctx.messages))
+            return tainted(tool.name, tool_args, "\n".join(said), read_text(ctx.messages))
         except Exception:
             return []  # unsure: the call keeps its policy
 
@@ -217,15 +246,18 @@ class ActionGateway(WrapperToolset[None]):
         ]
 
     async def _known(self, address: str, ctx: RunContext[None]) -> bool:
-        """Whether the owner vouched for `address`: approved it before, or emailed it from
-        Gmail. Any failure counts as unknown, so the card still shows."""
-        if self.known is None:
+        """Whether the owner vouched for `address`, for the account generation this run
+        entered: approved it as a recipient before, or emailed it from Gmail. Any failure
+        counts as unknown, so the card still shows."""
+        known = self.known
+        if known is None:
             return False
-        if self.known.has(address):
-            return True
+        generation = ACCOUNT_GENERATION.get()
         search = "GMAIL_FETCH_EMAILS"
 
-        async def lookup() -> bool:
+        async def check() -> bool:
+            if known.has(address, generation):
+                return True
             if self.policy.decide(search) != "allow":
                 return False
             tools = await super(ActionGateway, self).get_tools(ctx)
@@ -234,25 +266,25 @@ class ActionGateway(WrapperToolset[None]):
             async with asyncio.timeout(8):
                 result = await super(ActionGateway, self).call_tool(
                     search,
-                    {"query": f"in:sent to:{address}", "max_results": 3, "user_id": "me"},
+                    {"query": sent_query(address), "max_results": 5, "user_id": "me"},
                     replace(ctx, tool_name=search),
                     tools[search],
                 )
-            return sent_to(result, address)
+            sent = sent_to(result, address)
+            if sent:
+                known.add([address], generation)
+            return sent
 
         try:
             if DBOS.workflow_id is not None and DBOS.step_id is None:
-                # Recovery replays the answer instead of searching again.
-                sent = await DBOS.run_step_async(
-                    {"name": "bud.known_address", "retries_allowed": False}, lookup
+                # One step for the whole answer, the remembered list included, so recovery
+                # replays it in the same place instead of skipping or repeating a search.
+                return await DBOS.run_step_async(
+                    {"name": "bud.known_address", "retries_allowed": False}, check
                 )
-            else:
-                sent = await lookup()
+            return await check()
         except Exception:
             return False
-        if sent:
-            self.known.add([address])
-        return sent
 
     def _refusal(self, name: str, tool_args: dict[str, Any]) -> str | None:
         check = self.refuses.get(name)
@@ -328,7 +360,7 @@ class ActionGateway(WrapperToolset[None]):
         if action in ("ask", "review") and self._harmless(name, tool_args):
             action = "allow"
         found = (
-            self._tainted(name, tool_args, ctx)
+            self._tainted(tool.tool_def, tool_args, ctx)
             if action != "deny" and not ctx.tool_call_approved
             else []
         )
@@ -350,12 +382,16 @@ class ActionGateway(WrapperToolset[None]):
         if found:
             details = "\n".join(part for part in (details, taint_note(found)) if part)
         review: dict[str, Any] | None = None
+        if ctx.tool_call_approved and self._checks_targets(tool.tool_def):
+            # The owner saw these recipients on the card and approved sending to them. A call
+            # whose rule is "allow" was held only by this check, so it is an approval too.
+            if action == "allow":
+                rule, outcome = "ask", "approved"
+            if self.known is not None and "DRAFT" not in name:
+                with contextlib.suppress(OSError):
+                    self.known.add(recipients(name, tool_args), ACCOUNT_GENERATION.get())
         if action in ("ask", "review") and ctx.tool_call_approved:
             rule, outcome = "ask", "approved"  # the owner already approved this exact call
-            if self.known is not None and (name in consequential_tools() or is_protected(name)):
-                # The owner saw these addresses on the card and approved them.
-                with contextlib.suppress(OSError):
-                    self.known.add(v for kind, v in targets(name, tool_args) if kind == "email")
             held_review = (ctx.tool_call_metadata or {}).get("review")
             if isinstance(held_review, dict):
                 review = held_review
