@@ -174,8 +174,6 @@ def test_imessage_asks_by_file_name():
 
 
 async def test_a_refused_path_is_denied_without_a_card_or_running(home, tools):
-    from typing import cast
-
     from pydantic_ai import RunContext, Tool
     from pydantic_ai.models.test import TestModel
     from pydantic_ai.toolsets import FunctionToolset
@@ -199,7 +197,7 @@ async def test_a_refused_path_is_denied_without_a_card_or_running(home, tools):
         record=lambda record: None,
         refuses={"read_local_file": lambda args: local_refusal(args, blocked)},
     )
-    ctx = cast(RunContext[None], RunContext(deps=None, model=TestModel(), usage=RunUsage()))
+    ctx = RunContext(deps=None, model=TestModel(), usage=RunUsage())
     tools_found = await gateway.get_tools(ctx)
     result = await gateway.call_tool(
         "read_local_file", {"path": "~/.ssh/config"}, ctx, tools_found["read_local_file"]
