@@ -36,8 +36,9 @@ struct ApprovalTests {
     func grantableApprovalsOfferAlwaysAllow() throws {
         let grantable = try approval("archive_email", grantable: true)
         #expect(grantable.grantable)
-        #expect(grantable.alwaysAllowHelp == "Archive email without asking again")
-        #expect(grantable.alwaysAllowDone == "Archive email will always run")
+        #expect(grantable.alwaysAllowHelp == "Archive this email without asking again")
+        #expect(grantable.alwaysAllowDone == "Archive this email will always run")
+        #expect(grantable.title == "Can I archive this email?")
         // Absent or false: the card keeps its two answers.
         let absent = try approval("archive_email")
         #expect(!absent.grantable)

@@ -876,7 +876,11 @@ struct ApprovalCard: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     if !approval.facts.isEmpty { facts }
-                    if let text = approval.body, !approval.isQuestion { EmailBody(text: text) }
+                    if approval.tool == "enable_browser" {
+                        BrowserCaution()
+                    } else if let text = approval.body, !approval.isQuestion {
+                        EmailBody(text: text)
+                    }
                     if let email = approval.emailPreview,
                        !email.messages.isEmpty || email.unavailableReason != nil {
                         if approval.body != nil {
@@ -1300,5 +1304,25 @@ struct OpenReport: View {
             .padding(.leading, 22)
             .help(file.path)
             .accessibilityLabel("Open report \(file.lastPathComponent)")
+    }
+}
+
+/// The one-time browser card: a short summary, with the full caution a click away.
+private struct BrowserCaution: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(Approval.browserSummary)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+            // The group keeps its own open state, so no @State macro is needed.
+            DisclosureGroup("What this allows") {
+                Text(Approval.browserCaution)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 4)
+            }
+            .font(.callout.weight(.medium))
+        }
     }
 }

@@ -431,7 +431,7 @@ def test_imessage_shows_the_caution_site_and_reason():
             "review": {"details": browser.CAUTION},
         }
     )
-    assert caution.startswith("Let Bud use your browser?")
+    assert caution.startswith("Can I use your Chrome?")
     assert browser.CAUTION in caution
     held = action_preview(
         {
