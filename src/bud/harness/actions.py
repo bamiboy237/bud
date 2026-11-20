@@ -239,8 +239,12 @@ class ActionGateway(WrapperToolset[None]):
             "" if in_job else owner_text(ctx.messages),
             *owner_replies(ctx.messages),
         ]
+        read = read_text(ctx.messages)
+        if in_job:
+            # The brief may carry a target from content the main chat read: it is read content.
+            read = f"{read}\n{owner_text(ctx.messages)}"
         try:
-            return tainted(tool.name, tool_args, "\n".join(said), read_text(ctx.messages))
+            return tainted(tool.name, tool_args, "\n".join(said), read)
         except Exception:
             return []  # unsure: the call keeps its policy
 
