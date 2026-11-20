@@ -130,6 +130,7 @@ def test_a_hard_link_is_refused(home, tools):
     assert not read(str(home / "Documents" / "b.txt"))["ok"]  # type: ignore[call-arg]
 
 
+@pytest.mark.skipif(not Path("/tmp").is_symlink(), reason="/tmp is a link only on macOS")
 def test_a_system_link_gets_its_real_path_named(tools):
     read, _, _ = tools
     error = read("/tmp/plan.txt")["error"]  # type: ignore[call-arg]
