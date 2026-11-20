@@ -12,7 +12,7 @@ from typing import Any, cast
 
 import pytest
 from pydantic_ai import RunContext, Tool
-from pydantic_ai.exceptions import ApprovalRequired
+from pydantic_ai.exceptions import ApprovalRequired, ToolFailed
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.toolsets import FunctionToolset
 from pydantic_ai.usage import RunUsage
@@ -50,6 +50,8 @@ if sys.argv[1:2] == ["mcp"]:
     @server.tool()
     def click(ref: str, tab: str) -> str:
         "Click an element"
+        if ref == "stale":
+            raise ValueError("ref e9 is stale: snapshot again")
         return f"clicked {{ref}}"
 
     @server.tool()
@@ -185,6 +187,28 @@ async def test_tools_start_only_once_the_browser_is_on_and_exclude_raw_javascrip
         "OPENCODE_BROWSER_PORT": "29999",
         "OPENCODE_BROWSER_TOOLS": "plain",
     }
+
+
+async def test_a_browse_error_goes_back_to_the_model_instead_of_ending_the_run(
+    browse, relay, tmp_path
+):
+    consent = browser.Consent(tmp_path / "consent.json")
+    consent.set(True)
+    toolset = browser.toolset(browse, consent, relay)
+    async with toolset:
+        tools = await toolset.get_tools(ctx())
+        with pytest.raises(ToolFailed, match="click"):
+            await toolset.call_tool(
+                "browser_click", {"ref": "stale", "tab": "3"}, ctx(), tools["browser_click"]
+            )
+    gone = browser.toolset(browse.parent / "missing-browse", consent, relay)
+    async with gone:
+        assert (
+            await gone.call_tool(
+                "browser_click", {"ref": "e1", "tab": "3"}, ctx(), tools["browser_click"]
+            )
+            == "Browse could not be reached, so nothing was done. Call browser_status."
+        )
 
 
 async def test_overlapping_runs_each_use_their_own_short_connection(browse, relay, tmp_path):
@@ -398,6 +422,9 @@ def test_the_setup_card_cautions_and_pairs_with_buds_relay(browse, relay):
     pairing.stop()
     assert process.poll() is not None
     assert pairing._process is None
+    # With no live code and no connection, the next request starts a fresh pairing.
+    (browse.parent / "paired").unlink()
+    assert entry.status().state == "failed"
     assert started_with(browse, "pair")["OPENCODE_BROWSER_PORT"] == "29999"
 
 
@@ -416,7 +443,8 @@ def test_without_browse_the_card_cautions_and_explains_how_to_install_it(relay):
     steps = entry.initiate().steps
     assert steps[0] == browser.CAUTION
     assert browser.INSTALL in steps[1]
-    assert entry.status().state == "waiting"
+    # A failed card, not a waiting one, so asking again after installing starts over.
+    assert entry.status().state == "failed"
 
 
 def test_consent_survives_a_restart_and_a_damaged_file_means_off(tmp_path):

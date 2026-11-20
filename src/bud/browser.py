@@ -34,6 +34,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from pydantic_ai import RunContext, Tool
+from pydantic_ai.exceptions import ToolFailed
 from pydantic_ai.mcp import MCPToolset, StdioTransport
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import AbstractToolset, DeferredLoadingToolset
@@ -249,7 +250,8 @@ class BrowseTools(AbstractToolset[None]):
             init_timeout=30,
             read_timeout=180,
             max_retries=0,
-            tool_error_behavior="error",
+            # A stale ref or a closed Chrome is the model's to handle, not a failed run.
+            tool_error_behavior="failed",
             include_instructions=False,
             prefer_tasks=False,
         )
@@ -274,11 +276,17 @@ class BrowseTools(AbstractToolset[None]):
             return "The browser is off, so nothing was done."
         if name in NEEDS_TAB and tool_args.get("tab") is None:
             return "Nothing was done: pass the tab id from browser_navigate as tab."
-        async with self._connect() as connection:
-            tools = await connection.get_tools(ctx)
-            if name not in tools:
-                return f"{name} is not available right now, so nothing was done."
-            return await connection.call_tool(name, tool_args, ctx, tools[name])
+        try:
+            async with self._connect() as connection:
+                tools = await connection.get_tools(ctx)
+                if name not in tools:
+                    return f"{name} is not available right now, so nothing was done."
+                return await connection.call_tool(name, tool_args, ctx, tools[name])
+        except ToolFailed:
+            raise  # Browse's own error message, which the model sees and can act on
+        except Exception as exc:
+            logger.warning("browse mcp failed during %s: %s", name, type(exc).__name__)
+            return "Browse could not be reached, so nothing was done. Call browser_status."
 
 
 def toolset(path: Path, consent: Consent, relay: Relay) -> AbstractToolset[None]:
@@ -418,6 +426,11 @@ class Pairing:
         with self._lock:
             self._stop()
 
+    def waiting(self) -> bool:
+        """True while a pairing code is live and `browse pair` waits for the extension."""
+        with self._lock:
+            return self._process is not None and self._process.poll() is None
+
     def _stop(self) -> None:
         if self._process is None:
             return
@@ -460,6 +473,16 @@ def setup_entry(pairing: Pairing, find: Callable[[], Path | None] = executable) 
         path = find()
         if path is not None and connected(path, pairing.relay):
             return SetupStatus(state="connected")
-        return SetupStatus(state="waiting")
+        if pairing.waiting():
+            return SetupStatus(state="waiting")
+        # No live code: a failed card lets the next "connect my browser" start over.
+        reason = (
+            "Browse is not installed yet."
+            if path is None
+            else "The pairing code expired or was cancelled."
+        )
+        return SetupStatus(
+            state="failed", reason=f"{reason} Ask Bud to connect your browser again."
+        )
 
     return SetupEntry(label="Browser", kind="steps", initiate=initiate, status=status)

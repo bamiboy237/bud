@@ -679,6 +679,8 @@ def _create_app(
                 headers={"Cache-Control": "no-store"},
             )
         status = "cancelled"
+        if capability == "browser":
+            pairing.stop()  # the cancelled code stops working at once
         if connections is not None:
             name = {"calendar": "googlecalendar"}.get(capability, capability)
             removed = connections.store.cancel_connect(name)
