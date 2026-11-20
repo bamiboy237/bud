@@ -36,8 +36,9 @@ struct ApprovalTests {
     func grantableApprovalsOfferAlwaysAllow() throws {
         let grantable = try approval("archive_email", grantable: true)
         #expect(grantable.grantable)
-        #expect(grantable.alwaysAllowHelp == "Archive email without asking again")
-        #expect(grantable.alwaysAllowDone == "Archive email will always run")
+        #expect(grantable.alwaysAllowHelp == "Archive this email without asking again")
+        #expect(grantable.alwaysAllowDone == "Archive this email will always run")
+        #expect(grantable.title == "Can I archive this email?")
         // Absent or false: the card keeps its two answers.
         let absent = try approval("archive_email")
         #expect(!absent.grantable)
@@ -215,6 +216,14 @@ struct ApprovalTests {
         #expect(DecisionDirection.swipe(CGSize(width: 100, height: 20)) == .approve)
         #expect(DecisionDirection.swipe(CGSize(width: -100, height: 20)) == .deny)
         #expect(DecisionDirection.swipe(CGSize(width: 79, height: 0)) == nil)
+        // A short flick whose projected landing point passes the line still decides.
+        #expect(DecisionDirection.release(CGSize(width: 30, height: 0),
+                                          projected: CGSize(width: 140, height: 0)) == .approve)
+        #expect(DecisionDirection.release(CGSize(width: 30, height: 0),
+                                          projected: CGSize(width: 50, height: 0)) == nil)
+        // A fast, mostly vertical flick never decides.
+        #expect(DecisionDirection.release(CGSize(width: 20, height: 50),
+                                          projected: CGSize(width: 90, height: 225)) == nil)
         #expect(DecisionDirection.swipe(CGSize(width: 100, height: 120)) == nil)
         #expect(DecisionDirection.swipe(CGSize(width: 100, height: 100)) == nil)
     }

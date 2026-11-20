@@ -43,6 +43,32 @@ struct ApprovalLayoutTests {
     }
 
     @Test
+    func browserCautionShowsInFullAndFitsTheDeck() async throws {
+        _ = NSApplication.shared
+        let companion = Companion()
+        companion.apply(snapshot: [
+            "last_seq": 1, "pending_approvals": [[
+                "approval_id": "browser", "tool": "enable_browser", "args": [String: Any](),
+            ]],
+        ])
+        companion.link = .connected
+        let host = NSHostingView(rootView: ApprovalCard(
+            companion: companion, approval: try #require(companion.approvals.first),
+            onDecide: { _ in }
+        ).frame(width: 288).transaction { $0.disablesAnimations = true })
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 288, height: 275),
+                              styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer { window.close() }
+        host.layoutSubtreeIfNeeded()
+        try await Task.sleep(for: .milliseconds(150))
+        host.layoutSubtreeIfNeeded()
+        // The deck's front card is at most 275 pt; Deny and Turn on stay inside it.
+        #expect(host.fittingSize.height <= 275)
+    }
+
+    @Test
     func setupCardFitsThePetPanel() async throws {
         _ = NSApplication.shared
         let companion = Companion()
@@ -175,7 +201,14 @@ struct ApprovalLayoutTests {
         deck.layoutSubtreeIfNeeded()
         try await Task.sleep(for: .milliseconds(150))
         deck.layoutSubtreeIfNeeded()
-        #expect(deck.fittingSize.height >= 240)
+        // One card: the deck is the header plus that card, with no empty space around it.
+        let card = NSHostingView(rootView: ApprovalCard(
+            companion: companion, approval: companion.approvals[0],
+            onDecide: { _ in }, onDrag: { _ in }
+        ).frame(width: 288).transaction { $0.disablesAnimations = true })
+        window.contentView = card
+        card.layoutSubtreeIfNeeded()
+        #expect(deck.fittingSize.height <= card.fittingSize.height + 40)
         #expect(deck.fittingSize.height <= 430)
     }
 

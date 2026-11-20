@@ -41,11 +41,20 @@ private enum ParsedMarkdown {
     }
 }
 
-/// The typeface replies are set in. The bubble keeps the system font for a quick glance; the
-/// conversation window sets a serif, so a long reply reads like a page.
+/// One type scale for replies, in SF Pro, built from a single body size: the bubble reads at
+/// 13 pt, the conversation window a step up. Headings, lists, tables, and code all derive
+/// from it, so nothing in a reply picks its own typeface or size.
 struct ReplyType {
-    var body: Font = .body
-    var lineSpacing: CGFloat = 2
+    var size: CGFloat = 13
+    var lineSpacing: CGFloat = 2.5
+
+    var body: Font { .system(size: size) }
+    var title: Font { .system(size: size + 3, weight: .semibold) }
+    var heading: Font { .system(size: size + 1, weight: .semibold) }
+    var section: Font { .system(size: size, weight: .semibold) }
+    var marker: Font { .system(size: size).monospacedDigit() }
+    var table: Font { .system(size: size - 1) }
+    var code: Font { .system(size: size - 1, design: .monospaced) }
 }
 
 private struct ReplyTypeKey: EnvironmentKey {
@@ -80,23 +89,17 @@ private struct Blocks: View {
 
 private struct Block: View {
     let markup: any Markup
+    @Environment(\.replyType) private var type
 
     var body: some View {
         switch markup {
-        case let heading as Heading where heading.level <= 2:
-            // Top headings share bud's name typeface, so its voice reads as one hand.
-            prose(inline(heading), font: .system(size: 15, weight: .semibold, design: .serif))
-                .padding(.top, 2)
         case let heading as Heading:
-            // Section labels: small spaced capitals, quieter than the text they introduce.
-            Text(String(inline(heading).characters).uppercased())
-                .font(.system(size: 11, weight: .semibold))
-                .tracking(0.6)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 4)
+            // Three steps of the same family, in the reply's own sentence case.
+            prose(inline(heading), font: heading.level == 1 ? type.title
+                  : heading.level == 2 ? type.heading : type.section)
+                .padding(.top, heading.level <= 2 ? 4 : 2)
         case let paragraph as Paragraph:
-            Prose(text: inline(paragraph))
+            Prose(text: inline(paragraph, code: type.code))
         case let list as UnorderedList:
             ListBlock(items: Array(list.listItems), start: nil)
         case let list as OrderedList:
@@ -121,7 +124,7 @@ private struct Block: View {
     }
 }
 
-/// Body text, wrapped to the bubble's width and selectable.
+/// Heading text, wrapped to the bubble's width and selectable.
 private func prose(_ text: AttributedString, font: Font) -> some View {
     Text(text)
         .font(font)
@@ -150,6 +153,7 @@ private struct ListBlock: View {
     let items: [ListItem]
     /// The first number of an ordered list; nil for bullets.
     let start: Int?
+    @Environment(\.replyType) private var type
 
     var body: some View {
         VStack(alignment: .leading, spacing: Metrics.item) {
@@ -170,32 +174,33 @@ private struct ListBlock: View {
     private var markerWidth: CGFloat {
         guard let start else { return Metrics.marker }
         let digits = String(start + max(items.count - 1, 0)).count
-        return max(Metrics.marker, CGFloat(digits) * 7.5 + 5)
+        return max(Metrics.marker, CGFloat(digits) * type.size * 0.58 + 5)
     }
 
     @ViewBuilder
     private func marker(_ index: Int, _ item: ListItem) -> some View {
         if let checkbox = item.checkbox {
             Image(systemName: checkbox == .checked ? "checkmark.square" : "square")
-                .font(.caption)
+                .font(type.body)
                 .foregroundStyle(.secondary)
         } else if let start {
             Text("\(start + index).")
-                .font(.body.monospacedDigit())
+                .font(type.marker)
                 .foregroundStyle(.secondary)
         } else {
-            Text("•").font(.body).foregroundStyle(.tertiary)
+            Text("•").font(type.body).foregroundStyle(.secondary)
         }
     }
 }
 
 private struct CodeBlockView: View {
     let code: String
+    @Environment(\.replyType) private var type
 
     var body: some View {
         // Long lines wrap: sideways scrolling inside a small floating bubble is fiddly.
         Text(code.hasSuffix("\n") ? String(code.dropLast()) : code)
-            .font(.system(size: 11.5, design: .monospaced))
+            .font(type.code)
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
             .padding(8)
@@ -206,6 +211,7 @@ private struct CodeBlockView: View {
 
 private struct TableView: View {
     let table: Markdown.Table
+    @Environment(\.replyType) private var type
 
     var body: some View {
         // Fits the bubble's width; cells wrap rather than scroll.
@@ -216,13 +222,13 @@ private struct TableView: View {
                 GridRow { cells(Array(row.children), header: false) }
             }
         }
-        .font(.callout)
+        .font(type.table)
     }
 
     @ViewBuilder
     private func cells(_ cells: [any Markup], header: Bool) -> some View {
         ForEach(Array(cells.enumerated()), id: \.offset) { _, cell in
-            Text(inline(cell))
+            Text(inline(cell, code: .system(size: type.size - 2, design: .monospaced)))
                 .fontWeight(header ? .semibold : .regular)
                 .foregroundStyle(header ? .secondary : .primary)
                 .textSelection(.enabled)
@@ -233,7 +239,10 @@ private struct TableView: View {
 
 /// A block's inline children as one attributed string. Emphasis is carried as presentation
 /// intent, which SwiftUI's Text draws, so bold inside a link inside a list item still works.
-private func inline(_ markup: any Markup, intent: InlinePresentationIntent = []) -> AttributedString {
+/// `code` sets inline code a step below the text around it, so it does not look heavier.
+private func inline(
+    _ markup: any Markup, intent: InlinePresentationIntent = [], code codeFont: Font? = nil
+) -> AttributedString {
     var out = AttributedString()
     for child in markup.children {
         switch child {
@@ -242,17 +251,22 @@ private func inline(_ markup: any Markup, intent: InlinePresentationIntent = [])
             if !intent.isEmpty { run.inlinePresentationIntent = intent }
             out += run
         case is Strong:
-            out += inline(child, intent: intent.union(.stronglyEmphasized))
+            out += inline(child, intent: intent.union(.stronglyEmphasized), code: codeFont)
         case is Emphasis:
-            out += inline(child, intent: intent.union(.emphasized))
+            out += inline(child, intent: intent.union(.emphasized), code: codeFont)
         case is Strikethrough:
-            out += inline(child, intent: intent.union(.strikethrough))
+            out += inline(child, intent: intent.union(.strikethrough), code: codeFont)
         case let code as InlineCode:
             var run = AttributedString(code.code)
-            run.inlinePresentationIntent = intent.union(.code)
+            if let codeFont {
+                run.inlinePresentationIntent = intent.isEmpty ? nil : intent
+                run.font = codeFont
+            } else {
+                run.inlinePresentationIntent = intent.union(.code)
+            }
             out += run
         case let link as Markdown.Link:
-            var run = inline(link, intent: intent)
+            var run = inline(link, intent: intent, code: codeFont)
             if let destination = link.destination, let url = URL(string: destination) {
                 run.link = url
             }
@@ -263,7 +277,7 @@ private func inline(_ markup: any Markup, intent: InlinePresentationIntent = [])
             out += AttributedString("\n")
         case let image as Markdown.Image:
             // No images in a bubble: their alt text stands in.
-            out += inline(image, intent: intent)
+            out += inline(image, intent: intent, code: codeFont)
         default:
             out += AttributedString(child.format())
         }

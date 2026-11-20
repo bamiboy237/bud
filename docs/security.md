@@ -71,11 +71,16 @@ tool that runs any JavaScript. The extension connects to one relay at a time: pa
 Bud's relay disconnects any other agent that used Browse on this Mac.
 
 - **You turn it on once.** Bud calls `enable_browser`, and the approval card explains what it
-  allows. It always asks and offers no "always allow". Until then the browser tools are
+  allows. While the browser is off it always asks, and offers no "always allow". While it is
+  already on, the call runs without a card. Until you turn it on, the browser tools are
   hidden and Browse does not start. Ask Bud to turn the browser off at any time
   (`disable_browser`).
 - **Reading runs unasked.** `browser_status`, `browser_snapshot`, `browser_screenshot`,
-  `browser_scroll`, `browser_wait_for`, and `browser_handoff` change nothing.
+  `browser_scroll`, `browser_wait_for`, `browser_handoff`, and listing tabs with
+  `browser_tabs` change nothing.
+- **Closing tabs runs unasked.** A `browser_tabs` close that names its tabs, and nothing
+  else, needs no approval. Bud's relay holds only Bud's tabs, and Browse hands a tab you lent
+  back to you instead of closing it.
 - **Each step is checked.** Opening a page or a tab, clicking, typing, choosing, dragging,
   and answering a dialog go to the approval reviewer in auto mode, and to you in strict mode.
   The card shows the step, the site its tab really shows, and the reviewer's reason.

@@ -100,6 +100,9 @@ class ActionGateway(WrapperToolset[None]):
     notifies_others: Mapping[str, Callable[[dict], bool]] = field(
         kw_only=True, default_factory=dict
     )
+    # Per tool: is this call harmless, judged by its arguments in code? Such a call of a tool
+    # that can also do more (browser_tabs lists, opens, and closes) runs unasked.
+    harmless: Mapping[str, Callable[[dict], bool]] = field(kw_only=True, default_factory=dict)
     # Trusted, non-owner context for the reviewer, such as today's date.
     facts: Callable[[], str] = field(kw_only=True, default=lambda: "")
     grants: SessionGrants = field(kw_only=True, default_factory=SessionGrants)
@@ -165,6 +168,15 @@ class ActionGateway(WrapperToolset[None]):
             today=self.facts(),
         )
 
+    def _harmless(self, name: str, tool_args: dict[str, Any]) -> bool:
+        check = self.harmless.get(name)
+        if check is None:
+            return False
+        try:
+            return check(tool_args) is True
+        except Exception:
+            return False  # unsure: the call keeps its policy
+
     def _notifies_others(self, name: str, tool_args: dict[str, Any]) -> bool:
         check = self.notifies_others.get(name)
         if check is None:
@@ -214,6 +226,8 @@ class ActionGateway(WrapperToolset[None]):
         tool: ToolsetTool[None],
     ) -> Any:
         action = self.policy.decide_tool(tool.tool_def)
+        if action in ("ask", "review") and self._harmless(name, tool_args):
+            action = "allow"
         if action == "review" and self._notifies_others(name, tool_args):
             action = "ask"  # hard rule: other people would be notified
         if action == "review" and too_long_to_review(tool_args):
@@ -331,6 +345,7 @@ class GuardTools(AbstractCapability[None]):
     reviewer: ToolReviewer | None = None
     describers: Mapping[str, Describer] = field(default_factory=dict)
     notifies_others: Mapping[str, Callable[[dict], bool]] = field(default_factory=dict)
+    harmless: Mapping[str, Callable[[dict], bool]] = field(default_factory=dict)
     facts: Callable[[], str] = lambda: ""
     # One set of grants for the life of the process, shared by every wrapper built from this.
     grants: SessionGrants = field(default_factory=SessionGrants)
@@ -366,6 +381,7 @@ class GuardTools(AbstractCapability[None]):
             reviewer=self.reviewer,
             describers=self.describers,
             notifies_others=self.notifies_others,
+            harmless=self.harmless,
             facts=self.facts,
             grants=self.grants,
         )

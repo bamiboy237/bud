@@ -116,6 +116,8 @@ class Harness:
         self.describers: dict[str, Describer] = {}
         # Per tool: does this call notify people other than the owner? Computed in code.
         self.notifies_others: dict[str, Callable[[dict], bool]] = {}
+        # Per tool: is this call harmless, judged by its arguments? It then runs unasked.
+        self.harmless: dict[str, Callable[[dict], bool]] = {}
         # Calls the owner approved after a hold, per session; see SessionGrants.
         self.grants = SessionGrants()
         # Instructions that must reflect live state (e.g. the approval mode) are
@@ -172,6 +174,7 @@ class Harness:
                     reviewer=self.reviewer,
                     describers=self.describers,
                     notifies_others=self.notifies_others,
+                    harmless=self.harmless,
                     facts=self._today,
                     grants=self.grants,
                 ),

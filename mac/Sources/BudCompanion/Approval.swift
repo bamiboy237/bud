@@ -11,7 +11,17 @@ struct Approval: Identifiable, Equatable {
     /// The job that asked, when it wasn't the main chat.
     let job: String?
     /// What will happen, in plain words: "Send email to dana@brightpath.example".
-    let title: String
+    let action: String
+    /// Bud asking, in its own voice: "Can I send email to dana@brightpath.example?" A question
+    /// card shows the question itself.
+    var title: String {
+        guard !isQuestion else { return action }
+        guard let first = action.first else { return "Can I go ahead?" }
+        // Lowercase a sentence-case first word ("Archive" to "archive"), not a name or path.
+        let second = action.dropFirst().first
+        let lead = second.map(\.isLowercase) ?? true ? first.lowercased() : String(first)
+        return "Can I \(lead)\(action.dropFirst())?"
+    }
     /// The verb on the confirming button: "Send", "Schedule", "Approve".
     let verb: String
     /// What the receipt says once it's approved: "Sent", "Scheduled".
@@ -27,6 +37,10 @@ struct Approval: Identifiable, Equatable {
         case "Mark read": "Marked read"
         case "Delete": "Deleted"
         case "Add": "Added"
+        case "Save": "Saved"
+        case "Replace": "Replaced"
+        case "Turn on": "Turned on"
+        case "Open": "Opened"
         default: "Approved"
         }
     }
@@ -45,10 +59,10 @@ struct Approval: Identifiable, Equatable {
     let grantable: Bool
 
     /// "Archive email without asking again": the action's own words, so the grant is clear.
-    var alwaysAllowHelp: String { "\(title) without asking again" }
+    var alwaysAllowHelp: String { "\(action) without asking again" }
 
     /// "Archive email will always run": what a standing grant leaves behind.
-    var alwaysAllowDone: String { "\(title) will always run" }
+    var alwaysAllowDone: String { "\(action) will always run" }
 
     var menuTitle: String {
         let subject = facts.first { $0.label == "Subject" }?.value ?? emailPreview?.subject
@@ -86,7 +100,7 @@ struct Approval: Identifiable, Equatable {
         questions = parsed.questions
         isQuestionList = parsed.isList
         let words = Self.describe(tool.lowercased(), args)
-        title = tool == "ask_user" ? (questions.first?.text ?? "") : words.title
+        action = tool == "ask_user" ? (questions.first?.text ?? "") : words.title
         verb = words.verb
         symbol = words.symbol
         let review = raw["review"] as? [String: Any] ?? [:]
@@ -94,7 +108,8 @@ struct Approval: Identifiable, Equatable {
         facts = Self.facts(args) + Self.reviewFacts(tool == "enable_browser" ? [:] : review)
         if tool == "enable_browser" {
             // Fixed words from the app, never from the model, so the caution cannot be edited.
-            body = Self.browserCaution
+            // The card shows this line; the full caution sits under "What this allows".
+            body = Self.browserSummary
         } else if args["is_html"] as? Bool == true {
             // Approvals saved before previews existed have no proposed text; show the body
             // they carry rather than hiding what will be sent.
@@ -106,14 +121,19 @@ struct Approval: Identifiable, Equatable {
         }
     }
 
+    /// Approvals that are a plain yes or no, with nothing to revise.
+    static let yesOrNo: Set<String> = ["enable_browser", "open_chrome"]
+
+    /// One line for the card that turns the browser on.
+    static let browserSummary = "Signed in as you, including Gmail and Calendar. Risky steps, "
+        + "such as paying, sending, or deleting, still ask you first."
+
     /// What turning the browser on allows. Kept in step with bud.browser.CAUTION.
-    static let browserCaution = "Bud will use your own Chrome, with your tabs and the sites you "
-        + "are signed in to. It can read those sites, open pages, click, type, and submit forms "
-        + "as you, including in Gmail and Google Calendar. Each step is checked first, and "
-        + "anything risky, such as paying, sending, deleting, or typing a password, asks you. "
-        + "A page Bud reads can still try to trick it, and a check can miss a step written to "
-        + "look harmless. While Bud uses the browse extension, other apps that use it lose "
-        + "their connection. Ask Bud to turn the browser off at any time."
+    static let browserCaution = "Bud will use your own Chrome, signed in as you, including "
+        + "Gmail and Calendar: it can open pages, click, type, and submit forms. Risky steps, "
+        + "such as paying, sending, deleting, or typing a password, ask you first. A page can "
+        + "still try to trick Bud. Other apps lose the browse extension while Bud uses it. "
+        + "Turn it off at any time."
 
     /// The same plain words the terminal uses for each kind of action.
     private static func describe(_ tool: String, _ args: [String: Any])
@@ -122,11 +142,19 @@ struct Approval: Identifiable, Equatable {
         let to = recipients(args)
         let named = text(args, "title", "summary")
         if tool == "ask_user" { return ("", "Answer", "questionmark.bubble") }
-        if tool == "enable_browser" { return ("Let Bud use your browser", "Turn on", "globe") }
+        if tool == "enable_browser" { return ("Use your Chrome", "Turn on", "globe") }
         if tool.hasPrefix("browser_") { return browserStep(String(tool.dropFirst(8)), args) }
-        if tool == "open_chrome" { return ("Open Chrome so Bud can use it", "Open", "globe") }
-        if tool == "archive_email" { return ("Archive email", "Archive", "archivebox") }
-        if tool == "mark_read" { return ("Mark email read", "Mark read", "envelope.open") }
+        if tool == "open_chrome" { return ("Open Chrome", "Open", "globe") }
+        if tool == "workspace_create" {
+            let path = text(args, "path")
+            return (path.isEmpty ? "Save a file" : "Save \(path)", "Save", "doc.badge.plus")
+        }
+        if tool == "workspace_update" {
+            let path = text(args, "path")
+            return (path.isEmpty ? "Replace a file" : "Replace \(path)", "Replace", "doc.badge.arrow.up")
+        }
+        if tool == "archive_email" { return ("Archive this email", "Archive", "archivebox") }
+        if tool == "mark_read" { return ("Mark this email read", "Mark read", "envelope.open") }
         if ["draft_reply", "gmail_create_email_draft"].contains(tool) {
             return (to.isEmpty ? "Save an email draft" : "Save a draft to \(to)", "Save draft", "square.and.pencil")
         }
@@ -161,7 +189,9 @@ struct Approval: Identifiable, Equatable {
         switch step {
         case "navigate":
             let url = text(args, "url")
-            return (url.isEmpty ? "Open a page" : "Open \(url)", "Open", "globe")
+            // The site, not the whole address: the Address row below shows that.
+            let site = URL(string: url)?.host() ?? url
+            return (site.isEmpty ? "Open a page" : "Open \(site)", "Open", "globe")
         case "click": return ("Click on a page", "Click", "cursorarrow.click")
         case "fill", "type": return ("Type into a page", "Type", "keyboard")
         case "press": return ("Press a key on a page", "Press", "keyboard")

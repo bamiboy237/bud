@@ -23,21 +23,22 @@ def action_preview(approval: dict, *, decision: bool = True) -> str:
         parts.append(f"Reply here, or /answer {identity} <reply>")
         return "\n\n".join(parts)
     target = args.get("path")
+    # Bud asks in its own voice, the same "Can I ...?" the Mac app uses.
     titles = {
-        "draft_reply": "Save this reply as a draft?",
-        "GMAIL_CREATE_EMAIL_DRAFT": "Save this as an email draft?",
-        "send_email": "Send this email?",
-        "GMAIL_SEND_EMAIL": "Send this email?",
-        "create_event": "Add this meeting to your calendar?",
-        "GOOGLECALENDAR_CREATE_EVENT": "Add this meeting to your calendar?",
-        "move_event": "Move this meeting?",
-        "GOOGLECALENDAR_PATCH_EVENT": "Move this meeting?",
-        "workspace_create": f"Create {target}?",
-        "workspace_update": f"Replace the contents of {target}?",
-        "enable_browser": "Let Bud use your browser?",
-        "open_chrome": "Open Chrome so Bud can use it?",
+        "draft_reply": "Can I save this reply as a draft?",
+        "GMAIL_CREATE_EMAIL_DRAFT": "Can I save this as an email draft?",
+        "send_email": "Can I send this email?",
+        "GMAIL_SEND_EMAIL": "Can I send this email?",
+        "create_event": "Can I add this meeting to your calendar?",
+        "GOOGLECALENDAR_CREATE_EVENT": "Can I add this meeting to your calendar?",
+        "move_event": "Can I move this meeting?",
+        "GOOGLECALENDAR_PATCH_EVENT": "Can I move this meeting?",
+        "workspace_create": f"Can I save {target}?",
+        "workspace_update": f"Can I replace {target}?",
+        "enable_browser": "Can I use your Chrome?",
+        "open_chrome": "Can I open Chrome?",
     }
-    title = titles.get(tool, tool.replace("_", " ").capitalize() + "?")
+    title = titles.get(tool, "Can I " + tool.replace("_", " ").lower() + "?")
     if approval.get("reference"):
         title = f"Task {approval['reference']}: {title}"
     details = []

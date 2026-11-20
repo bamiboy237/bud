@@ -358,6 +358,7 @@ def _create_app(
         tools_policy = harness.policy
         if browsing:
             harness.describers.update(browser.describers(relay))
+            harness.harmless.update(browser.harmless(consent))
         harness.live_instructions.append(
             lambda: "\nConnected apps: " + (", ".join(sorted(loaded["accounts"])) or "none")
         )
@@ -622,11 +623,7 @@ def _create_app(
         try:
             url = current.pending_url(name) if request is not None and request.resume else None
             if url is None:
-                url = (
-                    current.connect(name, resume=True)
-                    if request is not None and request.resume
-                    else current.connect(name)
-                )
+                url = current.connect(name)
             restart_required = current.restart_required()
         except ConnectionError as exc:
             raise HTTPException(503, str(exc)) from None

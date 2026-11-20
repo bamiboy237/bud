@@ -84,7 +84,7 @@ struct PetView: View {
                 }
                 if overflow > 0 {
                     Text("+\(overflow)")
-                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .font(.system(size: 10, weight: .semibold).monospacedDigit())
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 4)
                         .padding(.vertical, 2)
@@ -798,13 +798,20 @@ struct ApprovalCard: View {
     let companion: Companion
     let approval: Approval
     let onDecide: (Bool) -> Void
+    /// The card's horizontal drag, as it happens; nil when it ends without a decision.
+    var onDrag: (CGFloat?) -> Void = { _ in }
     @StateObject private var layout = ApprovalLayout()
+    /// True while a drag is in progress. It resets on end and on cancel alike, so a drag the
+    /// system cancels still sends the card home.
+    @GestureState private var dragging = false
 
     private var busy: Bool {
         companion.deciding.contains(approval.id) || companion.approvingBatch || companion.link != .connected
     }
     private var detailLimit: CGFloat {
-        let height: CGFloat = approval.isQuestion ? 190 : 100
+        // The browser caution is read in full before turning it on, never behind a scroll;
+        // it is written short enough to fit the deck at this height.
+        let height: CGFloat = approval.isQuestion ? 190 : approval.tool == "enable_browser" ? 135 : 100
         let hasProblem = companion.approvalFailures[approval.id] != nil || companion.decisionProblem != nil
         return hasProblem ? max(80, height - 40) : height
     }
@@ -826,11 +833,24 @@ struct ApprovalCard: View {
         VStack(alignment: .leading, spacing: 10) {
             heading
                 .contentShape(Rectangle())
+                // A drag that ends without deciding, or that the system cancels, goes home.
+                // After a decision the deck is animating and ignores this.
+                .onChange(of: dragging) { _, now in if !now { onDrag(nil) } }
                 .gesture(
-                    DragGesture(minimumDistance: 24)
+                    // Global space: the card moves with the drag, so local coordinates would
+                    // chase themselves and jitter.
+                    DragGesture(minimumDistance: 10, coordinateSpace: .global)
+                        .updating($dragging) { _, state, _ in state = true }
+                        .onChanged { value in
+                            guard !busy, !approval.isQuestion,
+                                  abs(value.translation.width) > abs(value.translation.height)
+                            else { return }
+                            onDrag(value.translation.width)
+                        }
                         .onEnded { value in
                             guard !busy, !approval.isQuestion,
-                                  let direction = DecisionDirection.swipe(value.translation)
+                                  let direction = DecisionDirection.release(
+                                      value.translation, projected: value.predictedEndTranslation)
                             else { return }
                             onDecide(direction == .approve)
                         }
@@ -856,7 +876,11 @@ struct ApprovalCard: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     if !approval.facts.isEmpty { facts }
-                    if let text = approval.body, !approval.isQuestion { EmailBody(text: text) }
+                    if approval.tool == "enable_browser" {
+                        BrowserCaution()
+                    } else if let text = approval.body, !approval.isQuestion {
+                        EmailBody(text: text)
+                    }
                     if let email = approval.emailPreview,
                        !email.messages.isEmpty || email.unavailableReason != nil {
                         if approval.body != nil {
@@ -927,9 +951,12 @@ struct ApprovalCard: View {
     private var buttons: some View {
         VStack(spacing: 6) {
             HStack(spacing: 6) {
-                Button("Change…") { companion.write(.revise(approval.id)) }
-                    .buttonStyle(CardButton(kind: .quiet))
-                    .help("Tell bud what to do differently")
+                // Turning the browser on or opening Chrome has nothing to change: yes or no.
+                if !Approval.yesOrNo.contains(approval.tool) {
+                    Button("Change…") { companion.write(.revise(approval.id)) }
+                        .buttonStyle(CardButton(kind: .quiet))
+                        .help("Tell bud what to do differently")
+                }
                 Spacer(minLength: 0)
                 if approval.grantable { alwaysAllow }
             }
@@ -1277,5 +1304,25 @@ struct OpenReport: View {
             .padding(.leading, 22)
             .help(file.path)
             .accessibilityLabel("Open report \(file.lastPathComponent)")
+    }
+}
+
+/// The one-time browser card: a short summary, with the full caution a click away.
+private struct BrowserCaution: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(Approval.browserSummary)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+            // The group keeps its own open state, so no @State macro is needed.
+            DisclosureGroup("What this allows") {
+                Text(Approval.browserCaution)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 4)
+            }
+            .font(.callout.weight(.medium))
+        }
     }
 }

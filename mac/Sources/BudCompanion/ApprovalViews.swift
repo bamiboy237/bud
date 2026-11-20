@@ -14,19 +14,28 @@ enum DecisionDirection: Equatable {
               abs(translation.width) > abs(translation.height) else { return nil }
         return translation.width > 0 ? .approve : .deny
     }
+
+    /// A swipe that went far enough, or a flick whose projected landing point does: a quick
+    /// throw is enough, it need not travel the whole way.
+    static func release(_ translation: CGSize, projected: CGSize) -> Self? {
+        // Both the drag so far and its projection must be mostly sideways, so a fast vertical
+        // flick never decides.
+        guard abs(translation.width) > abs(translation.height) else { return nil }
+        return swipe(translation) ?? swipe(projected)
+    }
 }
 
 final class DeckState: ObservableObject {
     @Published var currentIndex: Int = 0
     @Published var flyOffset: CGFloat = 0
-    @Published var flyRotation: Double = 0
+    @Published var flyScale: CGFloat = 1
     @Published var flyOpacity: Double = 1.0
     @Published var activeDecision: DecisionDirection? = nil
     @Published var isAnimating: Bool = false
 
     func finishDecision() {
         flyOffset = 0
-        flyRotation = 0
+        flyScale = 1
         flyOpacity = 1
         activeDecision = nil
         isAnimating = false
@@ -35,12 +44,16 @@ final class DeckState: ObservableObject {
 
 /// A stacked deck of pending approvals. Cards sit directly on top of each other with subtle
 /// depth offsets, keeping the vertical footprint constant regardless of how many actions wait.
-/// Deciding an action tints the card green as it slides right, or red as it slides left,
-/// while the card behind smoothly springs forward.
+/// Deciding an action lets the card drift a little toward the choice and fade, without tilt,
+/// color, or bounce, while the card behind settles forward. The receipt line says what
+/// happened.
 struct ApprovalDeck: View {
     @Bindable var companion: Companion
     @StateObject private var deck = DeckState()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// Lands without overshoot: the deck reports state, so it never shows one it isn't in.
+    static let settle = Animation.spring(duration: 0.4, bounce: 0)
 
     private var totalCount: Int { companion.approvals.count }
     private var safeIndex: Int {
@@ -58,6 +71,10 @@ struct ApprovalDeck: View {
         }
         .onAppear { clampIndex() }
         .onChange(of: companion.approvals.map(\.id)) { _, _ in clampIndex() }
+        // A new front card always starts at home, whatever happened to the last one.
+        .onChange(of: currentApproval?.id) { _, _ in
+            if !deck.isAnimating { deck.finishDecision() }
+        }
     }
 
     private func clampIndex() {
@@ -68,14 +85,14 @@ struct ApprovalDeck: View {
 
     private func cyclePrevious() {
         guard !deck.isAnimating, deck.currentIndex > 0 else { return }
-        withAnimation(.spring(response: 0.28, dampingFraction: 0.8)) {
+        withAnimation(Self.settle) {
             deck.currentIndex -= 1
         }
     }
 
     private func cycleNext() {
         guard !deck.isAnimating, deck.currentIndex < totalCount - 1 else { return }
-        withAnimation(.spring(response: 0.28, dampingFraction: 0.8)) {
+        withAnimation(Self.settle) {
             deck.currentIndex += 1
         }
     }
@@ -164,62 +181,79 @@ struct ApprovalDeck: View {
         .help(failed.isEmpty ? "Approve all actions in this request" : "Retry only failed actions")
     }
 
+    /// Room below the front card for the cards behind it to show.
+    private var peekRoom: CGFloat { CGFloat(min(max(totalCount - safeIndex - 1, 0), 2)) * 8 }
+
+    /// The front card sets the deck's height, so a short card leaves no empty space. The cards
+    /// behind it take that same size and show only their bottom edges.
     private var cardStack: some View {
         ZStack(alignment: .top) {
-            if safeIndex + 2 < totalCount {
-                PeekCard(
-                    approval: companion.approvals[safeIndex + 2],
-                    offset: 2,
-                    isTopAdvancing: deck.activeDecision != nil
-                )
-            }
-            if safeIndex + 1 < totalCount {
-                PeekCard(
-                    approval: companion.approvals[safeIndex + 1],
-                    offset: 1,
-                    isTopAdvancing: deck.activeDecision != nil
-                )
-            }
-
             if let activeApproval = currentApproval {
                 ApprovalCard(
                     companion: companion, approval: activeApproval,
                     onDecide: { approved in
                         handleDecision(approval: activeApproval, approved: approved)
-                    }
+                    },
+                    onDrag: { distance in follow(distance) }
                 )
                 .id(activeApproval.id)
-                .overlay(decisionTintOverlay)
                 .offset(x: deck.flyOffset, y: 0)
-                .rotationEffect(.degrees(deck.flyRotation))
+                .scaleEffect(deck.flyScale)
                 .opacity(deck.flyOpacity)
-                .zIndex(10)
             }
         }
-        .frame(minHeight: 245, maxHeight: 275)
+        // As tall as the card, up to the pet panel's room with the peeking cards included.
+        .frame(maxWidth: .infinity, maxHeight: 262 - peekRoom, alignment: .top)
+        .background(alignment: .top) {
+            ZStack(alignment: .top) {
+                if safeIndex + 2 < totalCount {
+                    PeekCard(
+                        approval: companion.approvals[safeIndex + 2],
+                        offset: 2,
+                        isTopAdvancing: deck.activeDecision != nil
+                    )
+                }
+                if safeIndex + 1 < totalCount {
+                    PeekCard(
+                        approval: companion.approvals[safeIndex + 1],
+                        offset: 1,
+                        isTopAdvancing: deck.activeDecision != nil
+                    )
+                }
+            }
+        }
+        .padding(.bottom, peekRoom)
     }
 
-    @ViewBuilder
-    private var decisionTintOverlay: some View {
-        if let decision = deck.activeDecision {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill((decision == .approve ? Color.green : Color.red).opacity(0.12))
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
+    /// The card follows a horizontal drag 1:1; nil means the drag ended without deciding, so
+    /// it settles home without overshoot.
+    private func follow(_ distance: CGFloat?) {
+        guard !deck.isAnimating, !reduceMotion else { return }
+        if let distance {
+            deck.flyOffset = distance
+        } else {
+            withAnimation(Self.settle) { deck.flyOffset = 0 }
         }
     }
 
     private func handleDecision(approval: Approval, approved: Bool) {
         guard !deck.isAnimating else { return }
-        let flight = Duration.milliseconds(220)
-        guard companion.decide(approval.id, approved: approved, after: reduceMotion ? nil : flight),
-              !reduceMotion else { return }
+        let flight = Duration.milliseconds(180)
+        guard companion.decide(approval.id, approved: approved, after: reduceMotion ? nil : flight)
+        else {
+            follow(nil)  // refused: the card goes home
+            return
+        }
+        guard !reduceMotion else { return }
         deck.isAnimating = true
         deck.activeDecision = approved ? .approve : .deny
 
-        withAnimation(.spring(response: 0.30, dampingFraction: 0.75)) {
-            deck.flyOffset = approved ? 360 : -360
-            deck.flyRotation = approved ? 12 : -12
+        // One short, quiet exit, faster than an entrance. It continues from wherever a drag
+        // left the card, a little further toward the choice.
+        withAnimation(.easeOut(duration: 0.18)) {
+            let direction: CGFloat = approved ? 1 : -1
+            deck.flyOffset = direction * (abs(deck.flyOffset) + 24)
+            deck.flyScale = 0.98
             deck.flyOpacity = 0
         }
 
@@ -279,19 +313,19 @@ struct PeekCard: View {
             Spacer(minLength: 0)
         }
         .padding(12)
-        .frame(maxWidth: .infinity)
-        .frame(height: 240)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Paper.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(Paper.hairline, lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.06), radius: 4, y: 2)
-        .scaleEffect(scale)
+        // Shrinks toward its bottom edge, so that edge peeks out below the card in front.
+        .scaleEffect(scale, anchor: .bottom)
         .offset(y: yOffset)
         .opacity(opacity)
         .zIndex(Double(5 - offset))
-        .animation(.spring(response: 0.35, dampingFraction: 0.75), value: isTopAdvancing)
+        .animation(ApprovalDeck.settle, value: isTopAdvancing)
         .allowsHitTesting(false)
     }
 }

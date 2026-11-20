@@ -103,7 +103,7 @@ def test_retrying_expired_first_sign_in_preserves_the_active_binding(connections
     )
     monkeypatch.setattr(found, "client", lambda: client)
 
-    assert found.connect("github", resume=True) == request.redirect_url
+    assert found.connect("github") == request.redirect_url
     assert found.store.snapshot()[0] == binding
     assert not found.restart_required()
     assert found.store.session_scope(found.capture_binding()) == scope
@@ -128,8 +128,8 @@ def test_resuming_an_unfinished_setup_does_not_replace_the_active_accounts(conne
     connect(found, remote, "googlecalendar", "acct-calendar")
     binding = found.capture_binding()
     found.store.begin_connect("github")
-    retry = found.store.begin_connect("github", resume=True)
-    assert retry == binding
+    retry = found.store.begin_connect("github")
+    assert retry.binding == binding
     assert not found.restart_required()
     found.store.save_pending(retry, "github", "acct-github")
     remote["acct-github"] = ("github", "ACTIVE")
@@ -142,7 +142,7 @@ def test_resuming_cannot_bypass_the_fence_for_an_active_account(connections):
     found, remote = connections
     connect(found, remote, "gmail", "acct-gmail")
     binding = found.capture_binding()
-    found.store.begin_connect("gmail", resume=True)
+    found.store.begin_connect("gmail")
     assert found.restart_required()
     with pytest.raises(ConnectionError):
         found.assert_current_binding(binding, "gmail")
@@ -201,3 +201,95 @@ def test_removing_an_app_keeps_the_fence(connections):
     assert found.restart_required()
     with pytest.raises(ConnectionError):
         found.assert_current_binding(binding, "gmail")
+
+
+def test_restarting_an_unfinished_first_sign_in_keeps_the_chat(connections):
+    """An app that was never active cannot redirect an approval, so a fresh sign-in link
+    for it, like Cancel, leaves the binding and every open chat alone."""
+    found, remote = connections
+    connect(found, remote, "googlecalendar", "acct-calendar")
+    binding = found.capture_binding()
+    first = found.store.begin_connect("gmail")
+    found.store.save_pending(first, "gmail", "acct-gmail-old")
+
+    second = found.store.begin_connect("gmail")
+    assert second.binding == binding
+    assert not found.restart_required()
+    found.store.save_pending(second, "gmail", "acct-gmail")
+    remote["acct-gmail"] = ("gmail", "ACTIVE")
+    remote["acct-gmail-old"] = ("gmail", "ACTIVE")  # the old link finishing late
+    found.refresh()
+
+    assert found.accounts() == {"googlecalendar": "acct-calendar", "gmail": "acct-gmail"}
+    assert not found.restart_required()
+    found.assert_current_binding(binding, "googlecalendar")
+    found.assert_current_binding(found.capture_binding(), "gmail")
+
+
+def test_an_unverifiable_pending_sign_in_does_not_fence_the_chat(connections):
+    found, remote = connections
+    connect(found, remote, "googlecalendar", "acct-calendar")
+    binding = found.capture_binding()
+    attempt = found.store.begin_connect("gmail")
+    found.store.save_pending(attempt, "gmail", "acct-gone")  # Composio no longer knows it
+
+    statuses = found.refresh()[1]
+
+    assert statuses["gmail"] == "UNAVAILABLE"
+    assert statuses["googlecalendar"] == "ACTIVE"
+    assert not found.restart_required()
+    found.assert_current_binding(binding, "googlecalendar")
+    # Dropped, so the next check does not ask Composio about it again.
+    assert "gmail" not in found.store.snapshot()[1]
+    assert found.refresh()[1]["gmail"] == "NOT_CONNECTED"
+
+
+def test_a_rejected_key_is_not_hidden_behind_a_pending_sign_in(connections, monkeypatch):
+    found, remote = connections
+    attempt = found.store.begin_connect("gmail")
+    found.store.save_pending(attempt, "gmail", "acct-gmail")
+
+    class Rejected(Exception):
+        status_code = 401
+
+    def get(*, nanoid):
+        raise Rejected()
+
+    monkeypatch.setattr(
+        found,
+        "client",
+        lambda: type("C", (), {"connected_accounts": type("A", (), {"get": staticmethod(get)})}),
+    )
+    with pytest.raises(ConnectionError, match="API key"):
+        found.refresh()
+
+
+def test_two_sign_ins_for_one_app_cannot_take_each_others_place(connections):
+    found, remote = connections
+    first = found.store.begin_connect("gmail")
+    second = found.store.begin_connect("gmail")
+    assert first.binding == second.binding and first.token != second.token
+
+    with pytest.raises(ConnectionError, match="changed during sign-in"):
+        found.store.save_pending(first, "gmail", "acct-1")
+    found.store.save_pending(second, "gmail", "acct-2")
+    assert found.store.snapshot()[1] == {"gmail": "acct-2"}
+
+
+def test_a_check_keeps_an_unfinished_sign_in_open(connections):
+    found, remote = connections
+    connect(found, remote, "googlecalendar", "acct-calendar")
+    attempt = found.store.begin_connect("gmail")
+    found.refresh()  # checks while the sign-in link is still being made
+    found.store.save_pending(attempt, "gmail", "acct-gmail")
+    assert found.store.snapshot()[1] == {"gmail": "acct-gmail"}
+
+
+def test_an_unverifiable_active_account_still_fences(connections):
+    found, remote = connections
+    connect(found, remote, "gmail", "acct-gmail")
+    found.capture_binding()
+    del remote["acct-gmail"]
+    with pytest.raises(ConnectionError):
+        found.refresh()
+    assert found.restart_required()

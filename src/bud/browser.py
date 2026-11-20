@@ -69,6 +69,7 @@ STEPS = frozenset(
 )
 # Hands a local file to a website: the owner always decides.
 UPLOAD = f"{PREFIX}_upload"
+TABS = f"{PREFIX}_tabs"
 TOOLS = READS | STEPS | {UPLOAD}
 ENABLE = "enable_browser"
 DISABLE = "disable_browser"
@@ -83,22 +84,29 @@ RELAY_HOME = Path.home() / ".bud" / "browse"
 EXTENSION_URL = "https://chromewebstore.google.com/detail/mfnicocicmmlkpjnaffgihfjhdgjkdjg"
 INSTALL = "curl -fsSL https://opencode.ai/browse/install | bash"
 CAUTION = (
-    "Bud will use your own Chrome, with your tabs and the sites you are signed in to. It can "
-    "read those sites, open pages, click, type, and submit forms as you, including in Gmail "
-    "and Google Calendar. Each step is checked first, and anything risky, such as paying, "
-    "sending, deleting, or typing a password, asks you. A page Bud reads can still try to "
-    "trick it, and a check can miss a step written to look harmless. While Bud uses the "
-    "browse extension, other apps that use it lose their connection. Ask Bud to turn the "
-    "browser off at any time."
+    "Bud will use your own Chrome, signed in as you, including Gmail and Calendar: it can "
+    "open pages, click, type, and submit forms. Risky steps, such as paying, sending, "
+    "deleting, or typing a password, ask you first. A page can still try to trick Bud. Other "
+    "apps lose the browse extension while Bud uses it. Turn it off at any time."
 )
 GUIDANCE = """browser_* tools use the person's own Chrome, with their tabs and sign-ins. They
 appear after the person turns the browser on: call enable_browser, which shows them what that
-allows, then search for browser tools. Work in small steps: snapshot a page, act on one
-element by its ref, then snapshot again to check. Pass the tab id from navigate to every later
-call. Use browser_handoff when only the person can act, such as signing in or paying. If
-browser_status says no browser is connected, call open_chrome; if Chrome is open and still
-not connected, call setup_capability with "browser". Call disable_browser when the person
-asks to stop.
+allows, then call search_tools with "browser" in the same turn and continue the task. Do not
+stop to announce that the browser is on.
+- Use the browser only when the task needs the person's own Chrome: their sign-ins, a page you
+  must click or type in, or when they ask for their browser. To read a public page, use
+  read_webpage instead, and do not turn the browser on for it.
+- Reuse tabs. Before opening a page, call browser_tabs with action "list"; if a tab you opened
+  already shows the page, pass its id as tab. Pass the tab id from navigate to every later call.
+- Do not set readOnly or allowedOrigins unless the person asks: a read-only tab cannot click.
+- Work in small steps: one browser_snapshot to read a page, act on one element by its ref,
+  then snapshot again to check. Take a screenshot only when the layout itself matters.
+  The snapshot leaves out a heading that repeats the page title; navigate returns the title.
+- When the task is done, close the tabs you opened with browser_tabs action "close".
+- Use browser_handoff when only the person can act, such as signing in or paying.
+- If browser_status says no browser is connected, call open_chrome; if Chrome is open and
+  still not connected, call setup_capability with "browser".
+- Call disable_browser when the person asks to stop.
 """
 
 
@@ -169,11 +177,16 @@ def control_tools(
 ) -> list[Tool[None]]:
     locate = find or executable
 
-    def enable_browser() -> str:
+    def enable_browser(ctx: RunContext[None]) -> str:
         """Ask the person to let you use their own Chrome. The approval shows them what that
-        allows. Call it once, before you need a browser tool."""
+        allows. While the browser is already on, it asks nothing and says so."""
+        if consent.on():
+            return 'The browser is already on. Call search_tools with "browser" and continue.'
+        if not ctx.tool_call_approved:
+            # Passed unasked because the browser was on, then turned off before this ran.
+            return "The browser was turned off. Call enable_browser again to ask the person."
         consent.set(True)
-        return "The browser is on. Search for browser tools, such as browser_navigate."
+        return 'The browser is on. Call search_tools with "browser" and continue the task.'
 
     def disable_browser() -> str:
         """Turn the browser off, when the person asks you to stop using it."""
@@ -332,7 +345,7 @@ def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> di
     async def where(tool_args: dict[str, Any]) -> str:
         tab = tool_args.get("tab")
         if tab is None:
-            return "No tab given: Browse opens a new tab."
+            return "Opens a new tab."
         path = find()
         if path is None:
             return "The tab could not be looked up."
@@ -341,11 +354,54 @@ def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> di
                 return f"The tab shows {_site(entry.get('url'))}."
         return "The tab is not one Browse knows."
 
+    async def tabs(tool_args: dict[str, Any]) -> str:
+        action = tool_args.get("action")
+        if action == "close" and tool_args.get("tab") is not None:
+            return f"Closes a tab. {await where(tool_args)}"
+        if action == "close":
+            return "Closes tabs Bud opened."
+        if action == "new":
+            return "Opens a new tab."
+        return "Changes Bud's browser tabs."
+
     def caution(tool_args: dict[str, Any]) -> str:
         return CAUTION
 
     # Every client shows the caution, because it rides the approval as a looked-up fact.
-    return {**dict.fromkeys(STEPS | {UPLOAD}, where), ENABLE: caution}
+    return {**dict.fromkeys(STEPS | {UPLOAD}, where), TABS: tabs, ENABLE: caution}
+
+
+def _tab_ref(value: object) -> bool:
+    return (isinstance(value, int) and not isinstance(value, bool)) or (
+        isinstance(value, str) and bool(value.strip())
+    )
+
+
+def _closes_only_tabs(tool_args: dict[str, Any]) -> bool:
+    """A close that names its tabs and nothing else. Bud's relay holds only Bud's tabs, and
+    Browse gives a tab the person lent back to them instead of closing it."""
+    if tool_args.get("action") != "close":
+        return False
+    if not set(tool_args) <= {"action", "tab", "tabs", "group", "idleMinutes"}:
+        return False
+    tab, tabs, group = tool_args.get("tab"), tool_args.get("tabs"), tool_args.get("group")
+    idle = tool_args.get("idleMinutes")
+    return (
+        (tab is not None or tabs is not None or group is not None)
+        and (tab is None or _tab_ref(tab))
+        and (tabs is None or (isinstance(tabs, list) and bool(tabs) and all(map(_tab_ref, tabs))))
+        and (group is None or _tab_ref(group))
+        and (idle is None or (isinstance(idle, int | float) and not isinstance(idle, bool)))
+    )
+
+
+def harmless(consent: Consent) -> dict[str, Callable[[dict[str, Any]], bool]]:
+    """Calls that need no approval, judged in code: listing tabs, closing Bud's own tabs, and
+    turning the browser on while it is already on."""
+    return {
+        TABS: lambda tool_args: tool_args == {"action": "list"} or _closes_only_tabs(tool_args),
+        ENABLE: lambda tool_args: tool_args == {} and consent.on(),
+    }
 
 
 async def connected_now(path: Path, relay: Relay) -> bool:
