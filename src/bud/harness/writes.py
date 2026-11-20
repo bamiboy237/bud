@@ -62,11 +62,15 @@ def workspace_writes() -> frozenset[str]:
 def reviewable_tools() -> frozenset[str]:
     """Every tool the reviewer may judge: self-hosted writes outside the workspace and
     browser steps that no hard rule reserves."""
+    from bud.apps import CHANGES as APP_CHANGES
     from bud.browser import STEPS as BROWSER_STEPS
     from bud.core.background import STARTS as BACKGROUND_STARTS
 
     return frozenset(
         name
-        for name in (self_hosted_writes() - workspace_writes()) | BROWSER_STEPS | BACKGROUND_STARTS
+        for name in (self_hosted_writes() - workspace_writes())
+        | BROWSER_STEPS
+        | BACKGROUND_STARTS
+        | APP_CHANGES
         if not never_reviewed(name)
     )

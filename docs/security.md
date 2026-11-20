@@ -61,6 +61,21 @@ Bud can read one of your files, or list one of your folders, when you name it:
 - **macOS may ask too.** Reading Documents, Desktop, or Downloads can need permission in
   System Settings, Privacy & Security, Files and Folders.
 
+## Mac apps
+
+Bud can open and control a short list of your Mac apps: Notes, Reminders, Music, Calendar,
+Finder, Safari, and Google Chrome. Other apps, Messages and Mail included, stay out until you
+add them.
+
+- **Typed actions, not free scripts.** Each action runs a fixed AppleScript. Your words reach
+  it only as arguments, never as script text, so nothing a model writes becomes code.
+- **Reads run unasked:** opening an app, opening a workspace file in its app, what Music is
+  playing, your note titles, a note's text, and your open reminders.
+- **Changes ask you:** playing or skipping music, creating a note, and adding a reminder. In
+  auto mode the reviewer judges them against your request, as it does browser steps.
+- **macOS asks too.** The first time Bud controls an app, macOS asks you to allow it in
+  System Settings, Privacy & Security, Automation.
+
 ## Shell commands
 
 On macOS, Bud runs shell commands in its workspace with `run_command`, and long ones with

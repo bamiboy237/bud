@@ -147,6 +147,20 @@ struct Approval: Identifiable, Equatable {
         if tool == "enable_browser" { return ("Use your Chrome", "Turn on", "globe") }
         if tool.hasPrefix("browser_") { return browserStep(String(tool.dropFirst(8)), args) }
         if tool == "open_chrome" { return ("Open Chrome", "Open", "globe") }
+        if tool == "music_control" {
+            let action = text(args, "action")
+            let words = ["play": "Play music", "pause": "Pause the music",
+                         "next": "Skip to the next song", "previous": "Go back a song"]
+            return (words[action] ?? "Control Music", action == "pause" ? "Pause" : "Go", "music.note")
+        }
+        if tool == "notes_create" {
+            let title = text(args, "title")
+            return (title.isEmpty ? "Create a note" : "Create the note \"\(title)\"", "Create", "note.text.badge.plus")
+        }
+        if tool == "reminders_add" {
+            let title = text(args, "title")
+            return (title.isEmpty ? "Add a reminder" : "Add the reminder \"\(title)\"", "Add", "checklist")
+        }
         if tool == "read_local_file" {
             let name = (text(args, "path") as NSString).lastPathComponent
             return (name.isEmpty ? "Read one of your files" : "Read \(name)", "Read", "doc.text.magnifyingglass")

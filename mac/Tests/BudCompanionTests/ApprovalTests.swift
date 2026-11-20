@@ -33,6 +33,16 @@ struct ApprovalTests {
     }
 
     @Test
+    func appChangesAskInPlainWords() throws {
+        #expect(try approval("music_control", args: ["action": "next"]).title
+            == "Can I skip to the next song?")
+        #expect(try approval("notes_create", args: ["title": "Groceries"]).title
+            == "Can I create the note \"Groceries\"?")
+        #expect(try approval("reminders_add", args: ["title": "Call Sam"]).title
+            == "Can I add the reminder \"Call Sam\"?")
+    }
+
+    @Test
     func localReadsAskByFileName() throws {
         let read = try approval("read_local_file", args: ["path": "~/Documents/plan.pdf"])
         #expect(read.title == "Can I read plan.pdf?")

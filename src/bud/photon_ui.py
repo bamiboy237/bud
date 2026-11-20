@@ -38,6 +38,14 @@ def action_preview(approval: dict, *, decision: bool = True) -> str:
         "workspace_update": f"Can I replace {target}?",
         "enable_browser": "Can I use your Chrome?",
         "open_chrome": "Can I open Chrome?",
+        "music_control": {
+            "play": "Can I play music?",
+            "pause": "Can I pause the music?",
+            "next": "Can I skip to the next song?",
+            "previous": "Can I go back a song?",
+        }.get(str(args.get("action")), "Can I control Music?"),
+        "notes_create": f"Can I create the note “{args.get('title', '')}”?",
+        "reminders_add": f"Can I add the reminder “{args.get('title', '')}”?",
         "read_local_file": f"Can I read {Path(str(target or '')).name or 'one of your files'}?",
         "list_local_folder": f"Can I look in {Path(str(target or '')).name or 'a folder'}?",
     }
