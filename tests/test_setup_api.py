@@ -29,6 +29,13 @@ def setup_api(tmp_path, monkeypatch):
     found.user_id = "owner"
     found.capture_binding.return_value = AccountBinding("owner", 1, ())
     found.binding = found.capture_binding.return_value
+    # The store holds what was adopted unless a test changes it.
+    found.stored.side_effect = lambda: found.binding
+
+    def adopt(expected):
+        found.binding = expected
+
+    found.adopt.side_effect = adopt
     found.accounts.return_value = {}
     found.restart_required.return_value = False
     found.store = Mock()
@@ -105,17 +112,9 @@ async def test_mac_can_recover_a_discovered_apps_link_and_check_it(setup_api):
 async def test_a_changed_account_binding_loads_in_place(setup_api):
     """A reconnect or removal is adopted in the same chat instead of asking for a restart."""
     app, token, found, _, _, _ = setup_api
-    changed = {"value": True}
-    found.restart_required.side_effect = lambda: changed["value"]
-
     binding = AccountBinding("owner", 2, ())
-
-    def adopt():
-        changed["value"] = False
-        before, found.binding = found.binding, binding
-        return before, binding
-
-    found.adopt.side_effect = adopt
+    found.restart_required.side_effect = lambda: found.binding != binding
+    found.stored.side_effect = lambda: binding  # Gmail was replaced in the store
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",
@@ -123,7 +122,8 @@ async def test_a_changed_account_binding_loads_in_place(setup_api):
     ) as client:
         checked = await client.post("/sessions/session/setup/github/check")
     assert checked.status_code != 409
-    found.adopt.assert_called_once()
+    found.adopt.assert_called_once_with(binding)
+    assert found.binding == binding
 
 
 async def test_cancelling_dismisses_the_setup_and_not_the_active_accounts(setup_api):

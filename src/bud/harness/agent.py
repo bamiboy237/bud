@@ -24,6 +24,7 @@ from bud.config import get_settings
 from bud.gateway.registry import Registry
 from bud.gateway.spend import build_spend_limits
 from bud.harness.actions import Action, GuardTools, Policy, RecordDecision
+from bud.harness.actions import _pinned as pinned_account
 from bud.harness.code import CODE_GUIDANCE, build_code_mode
 from bud.harness.context import BackgroundCompaction
 from bud.harness.live import LiveState, LiveTools
@@ -122,7 +123,7 @@ class Harness:
         # Per tool: a reason to refuse the call outright, judged in code, or None.
         self.refuses: dict[str, Callable[[dict], str | None]] = {}
         # Facts stamped on every approval card; see ActionGateway.stamp.
-        self.stamp: Callable[[], dict[str, Any]] = lambda: {}
+        self.stamp: Callable[[], dict[str, Any]] = pinned_account
         # Calls the owner approved after a hold, per session; see SessionGrants.
         self.grants = SessionGrants()
         # Instructions that must reflect live state (e.g. the approval mode) are

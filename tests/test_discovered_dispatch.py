@@ -54,7 +54,7 @@ def app_catalog(tmp_path, action=SEND, *, app="slack", items=None, related=("GMA
     api.execute.return_value.model_dump.return_value = {"successful": True, "data": {"id": "m1"}}
     subject = harness(tmp_path)
     subject.policy.tools.update(policy().tools)
-    subject.swap_tools(build_toolset(connections, connections.binding.accounts, tmp_path))
+    subject.swap_tools(build_toolset(connections, connections.binding, tmp_path))
     return subject, connections, api
 
 
@@ -120,6 +120,8 @@ async def test_first_turn_search_loads_one_app_then_holds_exact_write(tmp_path):
     result = await agent.run("Send hello on Slack", metadata=metadata)
     assert isinstance(result.output, DeferredToolRequests)
     assert [call.tool_name for call in result.output.approvals] == ["SLACK_SEND_MESSAGE"]
+    # The card names the generation of the account tools this run entered.
+    assert result.output.metadata["send"]["account_generation"] == 1
     connections.client.return_value.client.tool_router.session.search.assert_called_once_with(
         "search-session", queries=[{"use_case": "send message"}]
     )
@@ -129,7 +131,8 @@ async def test_first_turn_search_loads_one_app_then_holds_exact_write(tmp_path):
     saved = result.all_messages()
     choice = DeferredToolResults(
         approvals={"send": ToolApproved()},
-        metadata={"send": {"approval_id": "approval-1"}},
+        # As the runner does: the card's own metadata, its account stamp included, comes back.
+        metadata={"send": {**result.output.metadata["send"], "approval_id": "approval-1"}},
     )
     resumed = await agent.run(
         conversation=result.conversation, deferred_tool_results=choice, metadata=metadata
@@ -238,7 +241,8 @@ async def test_gmail_draft_loads_its_own_reads_and_skips_unsupported_actions(tmp
     ]
 
     choice = DeferredToolResults(
-        approvals={"draft": ToolApproved()}, metadata={"draft": {"approval_id": "approval-1"}}
+        approvals={"draft": ToolApproved()},
+        metadata={"draft": {**result.output.metadata["draft"], "approval_id": "approval-1"}},
     )
     await agent.run(conversation=result.conversation, deferred_tool_results=choice)
     # Draft verification reads the thread first; the failed read stops the write.

@@ -8,6 +8,7 @@ import contextlib
 import fcntl
 import hashlib
 import logging
+import re
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta
@@ -24,7 +25,7 @@ from pydantic_ai import ModelRetry
 from pydantic_ai.toolsets import AbstractToolset, CombinedToolset, FunctionToolset
 
 from bud import browser
-from bud.composio.binding import valid_toolkit
+from bud.composio.binding import AccountBinding, valid_toolkit
 from bud.composio.connection import ConnectionError, Connections
 from bud.config import Settings, get_settings
 from bud.core.auth import OwnerAuthentication, owner_token
@@ -203,7 +204,8 @@ def deny_stale(
     """Deny every waiting approval card asked under another account generation, in every chat
     and job. The cards close; the account tools also refuse such an approval at dispatch
     (bud.composio.tools.stale_approval), whether it was granted, parked, or recovered after a
-    restart. Returns the denied approval ids."""
+    restart. An account card with no stamp, from before stamps existed, is denied too: its
+    account is unknown. Returns the denied approval ids."""
     origin = {"channel": "api", "client_id": "account-change"}
     denied = []
     for session_id in log.sessions_with_requests():
@@ -211,12 +213,18 @@ def deny_stale(
         for request in undecided_approvals(events) + parked_approvals(events):
             review = request.get("review")
             stamp = review.get("account_generation") if isinstance(review, dict) else None
-            if not isinstance(stamp, int) or stamp == generation:
+            if stamp == generation:
                 continue
+            if not isinstance(stamp, int) and not ACCOUNT_TOOL.match(str(request.get("tool"))):
+                continue  # not an account tool: no account to go stale
             with contextlib.suppress(UnknownApproval, DecisionRejected):
                 if decide(session_id, request["approval_id"], False, origin):
                     denied.append(request["approval_id"])
     return denied
+
+
+# Account tools are named TOOLKIT_ACTION in capitals, such as GMAIL_SEND_EMAIL.
+ACCOUNT_TOOL = re.compile(r"[A-Z][A-Z0-9]*_[A-Z0-9_]+")
 
 
 def private_folders(settings: Settings) -> list[Path]:
@@ -322,7 +330,7 @@ def _create_app(
         connections = Connections(settings)
         binding = connections.capture_binding()
         accounts = binding.accounts
-        # Neither old approvals nor memory cross an owner/generation boundary.
+        # One session folder across account generations; approvals carry their generation.
         account_scope = connections.store.session_scope(binding)
         session_dir = connections.folder / "sessions" / account_scope
         session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -360,10 +368,10 @@ def _create_app(
                 FunctionToolset(browser.control_tools(consent, relay)),
             ]
 
-        def account_toolset() -> CombinedToolset[None]:
+        def account_toolset(binding: AccountBinding | None) -> CombinedToolset[None]:
             return CombinedToolset(
                 [
-                    build_toolset(connections, connections.accounts(), session_dir),
+                    build_toolset(connections, binding, session_dir),
                     build_web_tools(settings),
                     workspace_tools(
                         workspace,
@@ -381,33 +389,28 @@ def _create_app(
             """Swap in the account tools after any change, in the same chat: a new app, a
             reconnect, or a removal. The next message sees them; no restart is needed."""
             with refresh_lock:
-                if connections.restart_required():
-                    connections.adopt()
-                binding = connections.binding
+                binding = connections.stored()
                 # Browse installed after Bud started, such as from the setup card, loads too.
                 browse = browser.executable() if browsing else None
-                if binding == loaded["binding"] and browse == loaded["browse"]:
-                    return
-                if binding is not None and (
-                    loaded["binding"] is None or binding.generation != loaded["binding"].generation
+                if (
+                    binding == loaded["binding"] == connections.binding
+                    and browse == loaded["browse"]
                 ):
-                    # Close cards asked under the old account before any tool can resume them.
-                    deny_stale_approvals(binding.generation)
-                loaded["browse"] = browse
-                replacement = account_toolset()
-                if connections.restart_required() or connections.binding != binding:
-                    # Changed again while loading: the next request rebuilds, since the loaded
-                    # binding still differs. Old tools keep refusing to dispatch meanwhile.
-                    raise ConnectionError("Accounts changed while loading tools. Try again.")
+                    return
+                # Build first and adopt last: if anything fails, nothing changed, and the next
+                # request tries again. Old tools keep refusing to dispatch meanwhile.
+                replacement = account_toolset(binding)
+                connections.adopt(binding)
                 harness.swap_tools(replacement)
-                loaded["binding"] = binding
-                loaded["accounts"] = frozenset(binding.accounts if binding else ())
+                previous = loaded["binding"]
+                loaded.update(binding=binding, browse=browse, accounts=frozenset(binding.accounts))
+                if previous is None or binding.generation != previous.generation:
+                    # After the swap, so a run resumed by a denial enters the new tools.
+                    deny_stale_approvals(binding.generation)
 
         refresh_tools = refresh_account_tools
-        # Every approval card names the account generation it was asked under.
-        stamp_binding = connections
         harness = Harness(
-            account_toolset(),
+            account_toolset(binding),
             tools_policy,
             gateway.registry,
             PROFILE + "\nComposio is your library of app integrations. Use discover_tools to check "
@@ -430,11 +433,6 @@ def _create_app(
             | {DOCUMENT_TOOL, "current_time"},
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
             capabilities=workspace_read_capabilities(workspace, deferred=True),
-        )
-        harness.stamp = lambda: (
-            {"account_generation": stamp_binding.binding.generation}
-            if stamp_binding.binding is not None
-            else {}
         )
         tools_policy = harness.policy
         if browsing:
@@ -590,10 +588,11 @@ def _create_app(
             # Settle work from before the restart first, so a recovered run's new start is
             # never mistaken for one the restart cut off.
             await background.resume()
-            await runner.recover()
             if connections is not None and connections.binding is not None:
-                # Cards asked under an account replaced while Bud was stopped close now.
+                # Cards asked under an account replaced while Bud was stopped close before
+                # recovery can resume any of them.
                 deny_stale_approvals(connections.binding.generation)
+            await runner.recover()
             if photon is not None:
                 from bud.photon_chat import messaging
 

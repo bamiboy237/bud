@@ -305,8 +305,10 @@ def test_adopting_a_changed_binding_makes_it_current(connections):
 
     connect(found, remote, "gmail", "acct-gmail-2")  # a different Gmail account
     assert found.restart_required()
-    old, new = found.adopt()
-    assert old == before and new.generation > before.generation
+    new = found.stored()
+    assert new.generation > before.generation
+    found.adopt(new)
+    old = before
     assert not found.restart_required()
     # The new binding dispatches; the old one stays fenced.
     found.assert_current_binding(new, "googlecalendar")
@@ -335,6 +337,8 @@ def test_cards_asked_under_an_old_account_generation_are_denied(tmp_path):
             {"approval_id": "new", "tool": "GMAIL_SEND_EMAIL", "review": {"account_generation": 2}},
         ),
         ("approval.requested", {"approval_id": "legacy", "tool": "workspace_create"}),
+        # An account card from before stamps existed: its account is unknown.
+        ("approval.requested", {"approval_id": "unstamped", "tool": "SLACK_SEND_MESSAGE"}),
         ("run.waiting", {"run_id": "r"}),
     ]
     for type, data in events:
@@ -347,8 +351,8 @@ def test_cards_asked_under_an_old_account_generation_are_denied(tmp_path):
 
     # An app with an underscore in its name is caught too: the stamp, not the tool name,
     # decides.
-    assert deny_stale(log, decide, 2) == ["old"]
-    assert asked == [("chat", "old", False)]
+    assert deny_stale(log, decide, 2) == ["old", "unstamped"]
+    assert [approval for _, approval, _ in asked] == ["old", "unstamped"]
 
 
 def test_an_approval_from_another_generation_never_dispatches():
@@ -367,4 +371,20 @@ def test_an_approval_from_another_generation_never_dispatches():
     assert stale_approval(ctx({"account_generation": 1}), current)  # type: ignore[arg-type]
     assert not stale_approval(ctx({"review": {"account_generation": 3}}), current)  # type: ignore[arg-type]
     # A card from before the stamp keeps the binding fence alone.
-    assert not stale_approval(ctx({"approval_id": "a"}), current)  # type: ignore[arg-type]
+    # A card with no stamp names no account, so it is asked again rather than trusted.
+    assert stale_approval(ctx({"approval_id": "a"}), current)  # type: ignore[arg-type]
+
+
+def test_adopting_fails_cleanly_when_the_store_moved_on(connections):
+    """A refresh builds tools for one binding, then adopts it. If the store changed in
+    between, nothing is adopted, so the next request rebuilds instead of being stranded."""
+    found, remote = connections
+    connect(found, remote, "gmail", "acct-gmail")
+    before = found.capture_binding()
+    connect(found, remote, "gmail", "acct-gmail-2")
+    target = found.stored()
+    connect(found, remote, "gmail", "acct-gmail-3")  # changed again while tools were built
+    with pytest.raises(ConnectionError):
+        found.adopt(target)
+    assert found.binding == before
+    assert found.restart_required()

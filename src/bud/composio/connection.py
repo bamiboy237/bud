@@ -183,17 +183,21 @@ class Connections:
         self.binding = binding
         return self.binding
 
-    def adopt(self) -> tuple[AccountBinding | None, AccountBinding]:
-        """Take the stored binding as current, even after a replacement or removal, and
-        return (before, after). The caller rebuilds account tools and denies approvals given
-        under an account that changed; tools built before keep their own binding, which the
-        dispatch fence refuses."""
-        before = self.binding
+    def stored(self) -> AccountBinding:
+        """The binding the store holds now, which may differ from the adopted one."""
         current = self.store.snapshot()[0]
         if current.owner != self.user_id:
             raise ConnectionError("Owner changed. Restart with the original owner state.")
-        self.binding = current
-        return before, current
+        return current
+
+    def adopt(self, expected: AccountBinding) -> None:
+        """Take `expected` as current, even after a replacement or removal, but only while the
+        store still holds exactly it. The caller builds the new tools for `expected` first, so
+        a failure before this leaves the old binding, and the next request tries again. Tools
+        built before keep their own binding, which the dispatch fence refuses."""
+        if self.stored() != expected:
+            raise ConnectionError("Accounts changed while loading tools. Try again.")
+        self.binding = expected
 
     def restart_required(self) -> bool:
         return self.binding is None or self.store.snapshot()[0] != self.binding
