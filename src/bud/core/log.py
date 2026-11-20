@@ -766,6 +766,14 @@ class EventLog:
             ):
                 self._insert(db, session_id, "queue.paused", {"reason": "failed"})
 
+    def sessions_with_requests(self) -> list[str]:
+        """Every session that ever asked for an approval, chats and jobs alike."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT DISTINCT session_id FROM events WHERE type = 'approval.requested'"
+            ).fetchall()
+        return [row[0] for row in rows]
+
     def sessions_with_decisions(self) -> list[str]:
         with self._connect() as db:
             rows = db.execute(

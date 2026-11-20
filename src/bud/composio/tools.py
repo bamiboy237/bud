@@ -4,10 +4,12 @@ A claimed write may still have an unknown remote outcome.
 """
 
 import asyncio
+import contextlib
 import json
 import re
 import sqlite3
 from collections.abc import Callable
+from contextvars import Token
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from email.utils import getaddresses
@@ -43,7 +45,7 @@ from bud.composio.calendar import PATCH as CALENDAR_PATCH
 from bud.composio.connection import ConnectionError, Connections, safe_errors
 from bud.composio.discovery import search
 from bud.composio.drafts import verify_reply_body
-from bud.harness.actions import COMPOSIO_ACTION, Policy
+from bud.harness.actions import ACCOUNT_GENERATION, COMPOSIO_ACTION, Policy
 from bud.harness.ask import ask_user
 
 APP_SEARCH = "find_app_actions"
@@ -388,12 +390,24 @@ class AppActions(AbstractToolset[None]):
         return await self.execute(name, tool_args, action.app, action.version)
 
 
+def stale_approval(ctx: RunContext[None], binding: AccountBinding) -> bool:
+    """Whether the owner approved this call under another account generation. A card with no
+    stamp, from before stamps existed or drawn when stamping failed, counts as stale: the owner
+    is asked again rather than risk an approval landing on another account."""
+    metadata = ctx.tool_call_metadata or {}
+    review = metadata.get("review")
+    stamp = review.get("account_generation") if isinstance(review, dict) else None
+    stamp = metadata.get("account_generation", stamp)
+    return not isinstance(stamp, int) or stamp != binding.generation
+
+
 @dataclass
 class ComposioTools(WrapperToolset[None]):
     dispatch_path: Path = field(kw_only=True)
     allowed_tools: frozenset[str] = field(kw_only=True)
     connections: Connections = field(kw_only=True)
     binding: AccountBinding = field(kw_only=True)
+    _generation: Token[int | None] | None = field(default=None, init=False, repr=False)
 
     async def _check_binding(self, name: str, tool: ToolsetTool[None] | None = None) -> None:
         selected = (tool.tool_def.metadata or {}).get(COMPOSIO_ACTION) if tool else None
@@ -488,13 +502,22 @@ class ComposioTools(WrapperToolset[None]):
             "Could not open the Composio tool connection. Check your key and network."
         ):
             await super().__aenter__()
+        # Entered in the run's own task, so every card this run draws names this generation.
+        self._generation = ACCOUNT_GENERATION.set(self.binding.generation)
         return self
 
     async def __aexit__(self, *args: Any) -> bool | None:
-        with safe_errors(
-            "The Composio connection closed with an error. Inspect any pending write."
-        ):
-            return await super().__aexit__(*args)
+        token, self._generation = self._generation, None
+        try:
+            with safe_errors(
+                "The Composio connection closed with an error. Inspect any pending write."
+            ):
+                return await super().__aexit__(*args)
+        finally:
+            if token is not None:
+                # A later run in this task, with no account tools, must not inherit the stamp.
+                with contextlib.suppress(ValueError):
+                    ACCOUNT_GENERATION.reset(token)
 
     async def get_tools(self, ctx: RunContext[None]) -> dict[str, ToolsetTool[None]]:
         with safe_errors(
@@ -606,6 +629,10 @@ class ComposioTools(WrapperToolset[None]):
     ) -> Any:
         if name not in self.allowed_tools and COMPOSIO_ACTION not in (tool.tool_def.metadata or {}):
             raise ConnectionError("This Composio tool is not allowed.")
+        if ctx.tool_call_approved and stale_approval(ctx, self.binding):
+            raise ConnectionError(
+                "This was approved for an account that has since changed. Ask the person again."
+            )
 
         if name == "GMAIL_CREATE_EMAIL_DRAFT" and (
             not tool_args.get("thread_id")
@@ -658,18 +685,16 @@ class ComposioTools(WrapperToolset[None]):
 
 
 def build_toolset(
-    connections: Connections, accounts: dict[str, str], session_dir: Path
+    connections: Connections, binding: AccountBinding | None, session_dir: Path
 ) -> CombinedToolset[None]:
+    """Account tools for exactly `binding`: they dispatch only while it is current."""
     discovery = (
         [discovery_tool(connections)] if connections.settings.composio_api_key is not None else []
     )
     base: list[Tool[None]] = [Tool(current_time), Tool(ask_user)]
     base.extend(Tool(find) for find in discovery)
-    if not accounts:
+    if binding is None or not binding.accounts:
         return CombinedToolset([FunctionToolset(base)])
-    binding = connections.binding
-    if binding is None or binding.accounts != accounts:
-        raise ConnectionError("Capture the verified account binding before constructing tools.")
     remote = AppActions(connections, binding)
     base.append(Tool(remote.find_app_actions))
     return CombinedToolset(

@@ -4,9 +4,11 @@ Tools may also enforce their own safety checks.
 """
 
 import asyncio
+import contextlib
 import inspect
 import tomllib
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from importlib import resources
 from pathlib import Path
@@ -88,6 +90,17 @@ def load_policy(path: Path | None = None) -> Policy:
     return Policy.model_validate(tomllib.loads(text))
 
 
+# The account generation of the account tools this run entered (set by bud.composio.tools).
+# Every approval card is stamped with it, so the card names the account it was asked under,
+# even if the binding changes while the card is drawn.
+ACCOUNT_GENERATION: ContextVar[int | None] = ContextVar("bud_account_generation", default=None)
+
+
+def _pinned() -> dict[str, Any]:
+    generation = ACCOUNT_GENERATION.get()
+    return {"account_generation": generation} if generation is not None else {}
+
+
 @dataclass
 class ActionGateway(WrapperToolset[None]):
     policy: Policy = field(kw_only=True)
@@ -106,6 +119,9 @@ class ActionGateway(WrapperToolset[None]):
     # Per tool: a reason to refuse this call outright, judged in code, or None. A refusal
     # never runs the tool, so it is safe even if the arguments' target changes later.
     refuses: Mapping[str, Callable[[dict], str | None]] = field(kw_only=True, default_factory=dict)
+    # Facts stamped on every approval card, such as the account generation it was asked
+    # under, so the tool can refuse an approval given for an account that has since changed.
+    stamp: Callable[[], dict[str, Any]] = field(kw_only=True, default=_pinned)
     # Trusted, non-owner context for the reviewer, such as today's date.
     facts: Callable[[], str] = field(kw_only=True, default=lambda: "")
     grants: SessionGrants = field(kw_only=True, default_factory=SessionGrants)
@@ -348,6 +364,9 @@ class ActionGateway(WrapperToolset[None]):
             # Presentation failure must not suppress the exact approval or expose connector errors.
             preview = unavailable_email_preview(name, args)
         shown: dict[str, Any] = {"email_preview": preview.model_dump()} if preview else {}
+        # No stamp on failure: the tool's own binding fence still applies.
+        with contextlib.suppress(Exception):
+            shown.update(self.stamp())
         if details is not None:
             # The card shows what the reviewer saw: facts Bud looked up, never model text.
             shown["details"] = details
@@ -363,6 +382,7 @@ class GuardTools(AbstractCapability[None]):
     notifies_others: Mapping[str, Callable[[dict], bool]] = field(default_factory=dict)
     harmless: Mapping[str, Callable[[dict], bool]] = field(default_factory=dict)
     refuses: Mapping[str, Callable[[dict], str | None]] = field(default_factory=dict)
+    stamp: Callable[[], dict[str, Any]] = _pinned
     facts: Callable[[], str] = lambda: ""
     # One set of grants for the life of the process, shared by every wrapper built from this.
     grants: SessionGrants = field(default_factory=SessionGrants)
@@ -400,6 +420,7 @@ class GuardTools(AbstractCapability[None]):
             notifies_others=self.notifies_others,
             harmless=self.harmless,
             refuses=self.refuses,
+            stamp=self.stamp,
             facts=self.facts,
             grants=self.grants,
         )

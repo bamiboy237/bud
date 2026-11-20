@@ -175,7 +175,7 @@ def test_replacing_an_app_keeps_the_fence(connections):
         found.assert_current_binding(binding, "gmail")
 
 
-def test_reconnecting_same_account_keeps_the_fence(connections):
+def test_reconnecting_keeps_the_chat_and_the_dispatch_fence(connections):
     found, remote = connections
     connect(found, remote, "gmail", "acct-gmail")
     binding = found.capture_binding()
@@ -185,7 +185,9 @@ def test_reconnecting_same_account_keeps_the_fence(connections):
 
     assert found.restart_required()
     current = found.store.snapshot()[0]
-    assert found.store.session_scope(current) != old_scope
+    # The same chat and memory carry over the reconnect...
+    assert found.store.session_scope(current) == old_scope
+    # ...but tools built for the old binding still refuse to dispatch.
     with pytest.raises(ConnectionError):
         found.assert_current_binding(binding, "gmail")
 
@@ -292,4 +294,97 @@ def test_an_unverifiable_active_account_still_fences(connections):
     del remote["acct-gmail"]
     with pytest.raises(ConnectionError):
         found.refresh()
+    assert found.restart_required()
+
+
+def test_adopting_a_changed_binding_makes_it_current(connections):
+    found, remote = connections
+    connect(found, remote, "gmail", "acct-gmail")
+    connect(found, remote, "googlecalendar", "acct-calendar")
+    before = found.capture_binding()
+
+    connect(found, remote, "gmail", "acct-gmail-2")  # a different Gmail account
+    assert found.restart_required()
+    new = found.stored()
+    assert new.generation > before.generation
+    found.adopt(new)
+    old = before
+    assert not found.restart_required()
+    # The new binding dispatches; the old one stays fenced.
+    found.assert_current_binding(new, "googlecalendar")
+    with pytest.raises(ConnectionError):
+        found.assert_current_binding(old, "gmail")
+
+
+def test_cards_asked_under_an_old_account_generation_are_denied(tmp_path):
+    from bud.core.events import EventType
+    from bud.core.log import EventLog
+    from bud.core.server import deny_stale
+
+    log = EventLog(tmp_path / "events.db")
+    events: list[tuple[EventType, dict]] = [
+        ("run.queued", {"run_id": "r"}),
+        (
+            "approval.requested",
+            {
+                "approval_id": "old",
+                "tool": "GOOGLE_DRIVE_DELETE_FILE",
+                "review": {"account_generation": 1},
+            },
+        ),
+        (
+            "approval.requested",
+            {"approval_id": "new", "tool": "GMAIL_SEND_EMAIL", "review": {"account_generation": 2}},
+        ),
+        ("approval.requested", {"approval_id": "legacy", "tool": "workspace_create"}),
+        # An account card from before stamps existed: its account is unknown.
+        ("approval.requested", {"approval_id": "unstamped", "tool": "SLACK_SEND_MESSAGE"}),
+        ("run.waiting", {"run_id": "r"}),
+    ]
+    for type, data in events:
+        log.append("chat", type, data)
+    asked: list[tuple[str, str, bool]] = []
+
+    def decide(session_id, approval_id, approved, origin):
+        asked.append((session_id, approval_id, approved))
+        return True
+
+    # An app with an underscore in its name is caught too: the stamp, not the tool name,
+    # decides.
+    assert deny_stale(log, decide, 2) == ["old", "unstamped"]
+    assert [approval for _, approval, _ in asked] == ["old", "unstamped"]
+
+
+def test_an_approval_from_another_generation_never_dispatches():
+    from types import SimpleNamespace
+
+    from bud.composio.binding import AccountBinding
+    from bud.composio.tools import stale_approval
+
+    current = AccountBinding("owner", 3, (("gmail", "acct-2"),))
+
+    def ctx(metadata):
+        return SimpleNamespace(tool_call_metadata=metadata)
+
+    # Granted, parked, or recovered after a restart: the stamp travels with the approval.
+    assert stale_approval(ctx({"review": {"account_generation": 2}}), current)  # type: ignore[arg-type]
+    assert stale_approval(ctx({"account_generation": 1}), current)  # type: ignore[arg-type]
+    assert not stale_approval(ctx({"review": {"account_generation": 3}}), current)  # type: ignore[arg-type]
+    # A card from before the stamp keeps the binding fence alone.
+    # A card with no stamp names no account, so it is asked again rather than trusted.
+    assert stale_approval(ctx({"approval_id": "a"}), current)  # type: ignore[arg-type]
+
+
+def test_adopting_fails_cleanly_when_the_store_moved_on(connections):
+    """A refresh builds tools for one binding, then adopts it. If the store changed in
+    between, nothing is adopted, so the next request rebuilds instead of being stranded."""
+    found, remote = connections
+    connect(found, remote, "gmail", "acct-gmail")
+    before = found.capture_binding()
+    connect(found, remote, "gmail", "acct-gmail-2")
+    target = found.stored()
+    connect(found, remote, "gmail", "acct-gmail-3")  # changed again while tools were built
+    with pytest.raises(ConnectionError):
+        found.adopt(target)
+    assert found.binding == before
     assert found.restart_required()

@@ -62,9 +62,9 @@ def approval_text(approval: dict) -> str:
 def connection_text(state: dict) -> str:
     lines = [f"[{toolkit}] {value}" for toolkit, value in state["statuses"].items()]
     lines.append(
-        "[restart required] Stop and restart bud serve, then start a new conversation."
+        "[changing] Bud loads the change on your next message, in this conversation."
         if state["restart_required"]
-        else "[connections current] Tool refresh requires a full server process restart."
+        else "[connections current] Changes load on your next message; no restart needed."
     )
     return "\n".join(lines)
 

@@ -28,6 +28,14 @@ def setup_api(tmp_path, monkeypatch):
     found.folder = tmp_path / "composio"
     found.user_id = "owner"
     found.capture_binding.return_value = AccountBinding("owner", 1, ())
+    found.binding = found.capture_binding.return_value
+    # The store holds what was adopted unless a test changes it.
+    found.stored.side_effect = lambda: found.binding
+
+    def adopt(expected):
+        found.binding = expected
+
+    found.adopt.side_effect = adopt
     found.accounts.return_value = {}
     found.restart_required.return_value = False
     found.store = Mock()
@@ -101,15 +109,21 @@ async def test_mac_can_recover_a_discovered_apps_link_and_check_it(setup_api):
         assert (await client.post("/connections/Bad%20Slug/connect")).status_code == 400
 
 
-async def test_setup_check_rejects_a_changed_account_binding(setup_api):
+async def test_a_changed_account_binding_loads_in_place(setup_api):
+    """A reconnect or removal is adopted in the same chat instead of asking for a restart."""
     app, token, found, _, _, _ = setup_api
-    found.restart_required.return_value = True
+    binding = AccountBinding("owner", 2, ())
+    found.restart_required.side_effect = lambda: found.binding != binding
+    found.stored.side_effect = lambda: binding  # Gmail was replaced in the store
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",
         headers={"Authorization": f"Bearer {token}"},
     ) as client:
-        assert (await client.post("/sessions/session/setup/github/check")).status_code == 409
+        checked = await client.post("/sessions/session/setup/github/check")
+    assert checked.status_code != 409
+    found.adopt.assert_called_once_with(binding)
+    assert found.binding == binding
 
 
 async def test_cancelling_dismisses_the_setup_and_not_the_active_accounts(setup_api):
@@ -157,6 +171,8 @@ async def test_model_instructions_reflect_apps_connected_after_startup(setup_api
     runner.harness.policy.tools["SLACK_READ"] = "allow"
     remote[0] = FunctionToolset([Tool(read_slack, name="SLACK_READ")])
     found.accounts.return_value = {"slack": "account-slack"}
+    # Adding an app changes the binding too: refresh() adopts the additive change.
+    found.binding = AccountBinding("owner", 1, (("slack", "account-slack"),))
     found.statuses.return_value = {"slack": "ACTIVE"}
     log.append(
         "session",

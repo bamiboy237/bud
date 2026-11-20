@@ -142,14 +142,19 @@ class BindingStore:
             return self._read(db)
 
     def session_scope(self, binding: AccountBinding) -> str:
-        """Keep a generation's session directory stable when an app is added."""
+        """The owner's one session directory, kept across account changes: a reconnect loads
+        into the same chat and memory. A new generation reuses the latest directory; approvals
+        given under an earlier account are denied when the account changes (bud.core.server)."""
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             if self._read(db)[0] != binding:
                 raise ConnectionError("Account binding changed before opening the session.")
+            latest = db.execute(
+                "SELECT scope FROM session_scopes ORDER BY generation DESC LIMIT 1"
+            ).fetchone()
             db.execute(
                 "INSERT OR IGNORE INTO session_scopes VALUES (?, ?)",
-                (binding.generation, binding.scope),
+                (binding.generation, latest[0] if latest else binding.scope),
             )
             return db.execute(
                 "SELECT scope FROM session_scopes WHERE generation = ?", (binding.generation,)
