@@ -38,6 +38,7 @@ from bud.harness.spiral import (
     build_judge,
     loop_detector,
 )
+from bud.harness.taint import KnownAddresses
 from bud.skills import GUIDANCE as SKILL_GUIDANCE
 from bud.skills import RULES as SKILL_RULES
 from bud.skills import SkillMethods, SkillStore
@@ -124,6 +125,8 @@ class Harness:
         self.refuses: dict[str, Callable[[dict], str | None]] = {}
         # Facts stamped on every approval card; see ActionGateway.stamp.
         self.stamp: Callable[[], dict[str, Any]] = pinned_account
+        # Addresses the owner vouched for; see ActionGateway.known.
+        self.known: KnownAddresses | None = None
         # Calls the owner approved after a hold, per session; see SessionGrants.
         self.grants = SessionGrants()
         # Instructions that must reflect live state (e.g. the approval mode) are
@@ -183,6 +186,7 @@ class Harness:
                     harmless=self.harmless,
                     refuses=self.refuses,
                     stamp=lambda: self.stamp(),
+                    known=self.known,
                     facts=self._today,
                     grants=self.grants,
                 ),

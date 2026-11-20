@@ -176,6 +176,13 @@ model call:
   output) but nowhere in your own words (your request and your answers to its questions) is
   from content, not from you. The call then asks you, in every mode, and the card says
   "From something Bud read, not from you: ...".
+- Text is decoded before matching, on both sides, so an address hidden as `x [at] y [dot] z`,
+  percent-encoding, HTML entities, full-width letters, or zero-width characters still
+  counts. A subdomain of a host Bud read counts too, and so does a bare host in a shell
+  command. The body and subject of a message are not targets; its recipients are.
+- **Someone you already know needs no card.** Before the card, Bud searches your Gmail sent
+  mail for the address. If you have emailed it before, the call goes on as usual. Bud also
+  remembers each address you approve on a card. If the search fails, the card shows.
 - Package registries are not targets. Following a plain link a page showed is ordinary
   browsing; a link carrying a query string, which can carry data out, counts.
 - A private note or memory is not checked: its text goes nowhere.

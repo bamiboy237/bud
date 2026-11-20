@@ -64,6 +64,7 @@ from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
 from bud.harness.recall import Recall, embedder
 from bud.harness.review import ToolReviewer, build_reviewer
+from bud.harness.taint import KnownAddresses
 from bud.limits import MAX_MESSAGE_CHARS
 from bud.logs import guard_logs
 from bud.photon_config import PhotonConfig
@@ -451,6 +452,7 @@ def _create_app(
             result_retention=timedelta(hours=settings.tool_result_retention_hours),
             capabilities=workspace_read_capabilities(workspace, deferred=True),
         )
+        harness.known = KnownAddresses(session_dir / "known-addresses.json")
         tools_policy = harness.policy
         if browsing:
             harness.describers.update(browser.describers(relay))
@@ -511,6 +513,7 @@ def _create_app(
     harness.policy.grants = grants.tools
     if world is not None:
         harness.describers = build_describers(world)
+        harness.known = KnownAddresses(settings.data_dir / "known-addresses.json")
         harness.notifies_others = build_notifies_others(world)
     # The card names the real file a local read opens, which a link cannot disguise.
     harness.harmless[OPEN_IN_APP] = quiet_open
