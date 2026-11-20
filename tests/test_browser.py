@@ -163,7 +163,7 @@ async def test_tools_start_only_once_the_browser_is_on_and_exclude_raw_javascrip
         assert await toolset.get_tools(ctx()) == {}
         # Off means Browse never started.
         assert not (browse.parent / "env-mcp.json").exists()
-        controls["enable_browser"]()
+        controls["enable_browser"](replace(ctx(), tool_call_approved=True))
         tools = await toolset.get_tools(ctx())
         opened = await toolset.call_tool(
             "browser_navigate", {"url": "https://shop.example/"}, ctx(), tools["browser_navigate"]
@@ -364,8 +364,16 @@ def test_turning_the_browser_on_asks_only_while_it_is_off(tmp_path):
     assert harmless({})
     assert not harmless({"extra": 1})
     [enable, *_] = browser.control_tools(consent, browser.Relay(tmp_path / "relay"))
-    turn_on = cast(Callable[[], str], enable.function)
-    assert "already on" in turn_on()
+    turn_on = cast(Callable[[RunContext[None]], str], enable.function)
+    assert "already on" in turn_on(ctx())
+
+    # Passed unasked while on, then turned off before it ran: it must not turn itself on.
+    consent.set(False)
+    assert "turned off" in turn_on(ctx())
+    assert not consent.on()
+    approved = replace(ctx(), tool_call_approved=True)
+    assert "The browser is on" in turn_on(approved)
+    assert consent.on()
 
 
 async def test_tab_actions_are_described_by_what_they_do(browse, relay):

@@ -177,11 +177,14 @@ def control_tools(
 ) -> list[Tool[None]]:
     locate = find or executable
 
-    def enable_browser() -> str:
+    def enable_browser(ctx: RunContext[None]) -> str:
         """Ask the person to let you use their own Chrome. The approval shows them what that
         allows. While the browser is already on, it asks nothing and says so."""
         if consent.on():
             return 'The browser is already on. Call search_tools with "browser" and continue.'
+        if not ctx.tool_call_approved:
+            # Passed unasked because the browser was on, then turned off before this ran.
+            return "The browser was turned off. Call enable_browser again to ask the person."
         consent.set(True)
         return 'The browser is on. Call search_tools with "browser" and continue the task.'
 
