@@ -3,6 +3,7 @@ that run unasked, and changes that ask."""
 
 import html
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +35,8 @@ class Opener:
 
 
 def tools(tmp_path, scripts: Scripts, opener: Opener | None = None) -> dict[str, Any]:
-    built = apps.build_tools(tmp_path, scripts, opener or Opener())
+    copies = tmp_path.parent / f"{tmp_path.name}-copies"
+    built = apps.build_tools(tmp_path, copies, scripts, opener or Opener())
     return {tool.name: tool.function for tool in built}
 
 
@@ -84,11 +86,50 @@ async def test_only_workspace_documents_open_and_only_as_a_copy(tmp_path):
     assert opener.calls == []
 
     assert (await found["open_in_app"](path="report.pdf"))["ok"]  # type: ignore[call-arg]
-    [[copy]] = opener.calls
-    # A private copy outside the workspace, which cannot run and cannot be swapped.
-    assert not copy.startswith(str(tmp_path))
+    [[flag, app, copy]] = opener.calls
+    # Opened in Preview by name, from a private copy in Bud's own data folder: never the
+    # workspace file, and never the shared temp folder sandboxed commands can write to.
+    assert (flag, app) == ("-a", "Preview")
+    copies = tmp_path.parent / f"{tmp_path.name}-copies"
+    assert Path(copy).is_relative_to(copies)
     assert Path(copy).read_bytes() == b"%PDF-1.4 report"
     assert oct(os.stat(copy).st_mode & 0o777) == "0o600"
+    assert oct(os.stat(copies).st_mode & 0o777) == "0o700"
+
+
+def test_office_documents_ask_and_quiet_ones_do_not():
+    assert apps.quiet_open({"path": "notes/plan.md"})
+    assert apps.quiet_open({"path": "scan.PDF"})
+    for path in ("brief.docx", "budget.xlsx", "letter.rtf", "deck.key"):
+        assert not apps.quiet_open({"path": path}), path
+
+
+async def test_an_office_document_opens_in_its_usual_app(tmp_path):
+    opener = Opener()
+    (tmp_path / "brief.docx").write_bytes(b"PK docx")
+    assert (await tools(tmp_path, Scripts(), opener)["open_in_app"](path="brief.docx"))["ok"]  # type: ignore[call-arg]
+    [[copy]] = opener.calls  # no -a: the owner approved opening it in their own app
+    assert copy.endswith("brief.docx")
+
+
+async def test_old_copies_are_pruned_and_a_failed_copy_leaves_nothing(tmp_path):
+    copies = tmp_path.parent / f"{tmp_path.name}-copies"
+    old = copies / "open-old"
+    old.mkdir(parents=True)
+    (old / "a.pdf").write_bytes(b"x")
+    stale = time.time() - apps.COPY_LIFETIME - 60
+    os.utime(old, (stale, stale))
+    (tmp_path / "report.pdf").write_bytes(b"%PDF")
+    found = tools(tmp_path, Scripts())
+    assert (await found["open_in_app"](path="report.pdf"))["ok"]  # type: ignore[call-arg]
+    assert not old.exists()
+
+    copies.chmod(0o500)  # the copy cannot be written
+    try:
+        result = await found["open_in_app"](path="report.pdf")  # type: ignore[call-arg]
+    finally:
+        copies.chmod(0o700)
+    assert not result["ok"] and "copy" in result["error"]
 
 
 @pytest.mark.parametrize(

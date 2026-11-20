@@ -7,12 +7,14 @@ macOS asks the owner once per app before Bud may control it.
 """
 
 import asyncio
+import contextlib
 import html
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -27,34 +29,32 @@ OPEN = "/usr/bin/open"
 # Apps Bud may open or control. Messages, Mail, and others stay out until the owner adds them.
 # Chrome is opened by open_chrome, which asks first.
 ALLOWED_APPS = ("Notes", "Reminders", "Music", "Calendar", "Finder", "Safari")
-# Inert document types open_in_app may open. Anything that can run or redirect (.command,
-# .app, .webloc, .terminal, .scpt, .html, macro documents) is refused.
-DOCUMENT_TYPES = frozenset(
-    {
-        ".pdf",
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".gif",
-        ".heic",
-        ".txt",
-        ".md",
-        ".csv",
-        ".rtf",
-        ".docx",
-        ".xlsx",
-        ".pptx",
-        ".pages",
-        ".numbers",
-        ".key",
-    }
-)
+# Documents open_in_app opens without asking, each in a named Apple app that only shows it:
+# nothing in them can run or reach the network.
+QUIET_TYPES = {
+    ".pdf": "Preview",
+    ".png": "Preview",
+    ".jpg": "Preview",
+    ".jpeg": "Preview",
+    ".gif": "Preview",
+    ".heic": "Preview",
+    ".txt": "TextEdit",
+    ".md": "TextEdit",
+    ".csv": "TextEdit",
+}
+# Documents whose usual app can follow links or load remote content, such as Word fetching a
+# template: these open only after the owner approves. Anything else (.command, .app, .webloc,
+# .html, scripts) is refused.
+ASKED_TYPES = frozenset({".rtf", ".docx", ".xlsx", ".pptx", ".pages", ".numbers", ".key"})
+DOCUMENT_TYPES = frozenset(QUIET_TYPES) | ASKED_TYPES
+# A copy is kept this long, so the app has it open, then pruned.
+COPY_LIFETIME = 3600
 
-READS = frozenset(
-    {"open_app", "open_in_app", "music_now_playing", "notes_list", "notes_read", "reminders_list"}
-)
+READS = frozenset({"open_app", "music_now_playing", "notes_list", "notes_read", "reminders_list"})
+# Asks, except for a quiet document type (quiet_open), and never offers "always allow".
+OPEN_IN_APP = "open_in_app"
 CHANGES = frozenset({"music_control", "notes_create", "reminders_add"})
-TOOLS = READS | CHANGES
+TOOLS = READS | CHANGES | {OPEN_IN_APP}
 
 GUIDANCE = """Mac apps: open_app opens an app; open_in_app opens a workspace file in its app.
 Music, Notes, and Reminders have typed actions; reading runs at once, and changing something
@@ -220,10 +220,30 @@ def note_html(title: str, body: str) -> str:
     return f"<div><h1>{html.escape(title)}</h1></div>{lines}"
 
 
+def quiet_open(tool_args: dict[str, Any]) -> bool:
+    """Whether an open_in_app call opens a quiet document type, so it needs no card."""
+    return Path(str(tool_args.get("path", ""))).suffix.lower() in QUIET_TYPES
+
+
+def _prune(copies: Path) -> None:
+    """Remove copies old enough that their app has long since read them."""
+    now = time.time()
+    for entry in copies.iterdir() if copies.is_dir() else ():
+        with contextlib.suppress(OSError):
+            if now - entry.lstat().st_mtime > COPY_LIFETIME:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink()
+
+
 def build_tools(
-    workspace: Path, run: Runner = run_osascript, opener: Opener = run_open
+    workspace: Path,
+    copies: Path,
+    run: Runner = run_osascript,
+    opener: Opener = run_open,
 ) -> list[Tool[None]]:
-    workspace = workspace.resolve()
+    """`copies` is a folder in Bud's private data, which sandboxed commands cannot reach."""
 
     async def open_app(app: str) -> dict[str, Any]:
         """Open one of the person's Mac apps, or bring it forward.
@@ -247,14 +267,23 @@ def build_tools(
         data = read_workspace_bytes(workspace, path)
         if data is None:
             return {"ok": False, "error": "Give a visible file in your workspace."}
-        # Open a private copy, never the workspace file: a sandboxed command cannot swap it
-        # for a link, and the copy cannot run.
-        folder = Path(tempfile.mkdtemp(prefix="bud-open-"))
-        copy = folder / f"{Path(path).stem[:60] or 'file'}{suffix}"
-        fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-        opened = await opener([os.fspath(copy)])
+        # Open a private copy in Bud's own data, never the workspace file: no sandboxed
+        # command can reach it to swap in a link, and the copy cannot run.
+        folder: Path | None = None
+        try:
+            copies.mkdir(mode=0o700, parents=True, exist_ok=True)
+            _prune(copies)
+            folder = Path(tempfile.mkdtemp(prefix="open-", dir=copies))
+            copy = folder / f"{Path(path).stem[:60] or 'file'}{suffix}"
+            fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+        except OSError:
+            if folder is not None:
+                shutil.rmtree(folder, ignore_errors=True)
+            return {"ok": False, "error": "Bud could not make a copy to open. Try again."}
+        app = QUIET_TYPES.get(suffix)
+        opened = await opener(["-a", app, os.fspath(copy)] if app else [os.fspath(copy)])
         if not opened:
             shutil.rmtree(folder, ignore_errors=True)
         return {"ok": opened}

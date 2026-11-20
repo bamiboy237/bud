@@ -147,6 +147,10 @@ struct Approval: Identifiable, Equatable {
         if tool == "enable_browser" { return ("Use your Chrome", "Turn on", "globe") }
         if tool.hasPrefix("browser_") { return browserStep(String(tool.dropFirst(8)), args) }
         if tool == "open_chrome" { return ("Open Chrome", "Open", "globe") }
+        if tool == "open_in_app" {
+            let name = (text(args, "path") as NSString).lastPathComponent
+            return (name.isEmpty ? "Open a document" : "Open \(name)", "Open", "doc.richtext")
+        }
         if tool == "music_control" {
             let action = text(args, "action")
             let words = ["play": "Play music", "pause": "Pause the music",

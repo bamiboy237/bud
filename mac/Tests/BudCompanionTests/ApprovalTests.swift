@@ -34,6 +34,8 @@ struct ApprovalTests {
 
     @Test
     func appChangesAskInPlainWords() throws {
+        #expect(try approval("open_in_app", args: ["path": "drafts/brief.docx"]).title
+            == "Can I open brief.docx?")
         #expect(try approval("music_control", args: ["action": "next"]).title
             == "Can I skip to the next song?")
         #expect(try approval("notes_create", args: ["title": "Groceries"]).title

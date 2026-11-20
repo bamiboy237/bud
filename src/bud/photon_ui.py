@@ -44,6 +44,7 @@ def action_preview(approval: dict, *, decision: bool = True) -> str:
             "next": "Can I skip to the next song?",
             "previous": "Can I go back a song?",
         }.get(str(args.get("action")), "Can I control Music?"),
+        "open_in_app": f"Can I open {Path(str(args.get('path', ''))).name or 'a document'}?",
         "notes_create": f"Can I create the note “{args.get('title', '')}”?",
         "reminders_add": f"Can I add the reminder “{args.get('title', '')}”?",
         "read_local_file": f"Can I read {Path(str(target or '')).name or 'one of your files'}?",
