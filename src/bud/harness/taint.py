@@ -122,11 +122,11 @@ FILE_ENDINGS = frozenset(
         "sql",
     }
 )
-# Context Bud adds to a message. It is read content, not the owner's words.
+# Context Bud appends to a message, after the owner's own words. Everything from the first
+# such tag on is read content: a closing tag inside it may be forged, so it is never trusted
+# to mark where the context ends.
 ADDED = re.compile(
     r"<(job_updates|setup_updates|parked_decisions|still_open|recalled|surface|time)>"
-    r".*?</\1>",
-    re.S,
 )
 SYSTEM_NOTE = "[bud system note]"
 # Combining marks that draw nothing: the grapheme joiner and variation selectors.
@@ -270,8 +270,8 @@ def read_text(messages: list[ModelMessage]) -> str:
                 text = _prompt_text(part)
                 if text.lstrip().startswith(SYSTEM_NOTE):
                     parts.append(text)
-                else:
-                    parts.extend(match.group(0) for match in ADDED.finditer(text))
+                elif start := ADDED.search(text):
+                    parts.append(text[start.start() :])
     return "\n".join(parts)
 
 
@@ -285,7 +285,8 @@ def owner_text(messages: list[ModelMessage]) -> str:
             if isinstance(part, UserPromptPart):
                 text = _prompt_text(part)
                 if not text.lstrip().startswith(SYSTEM_NOTE):
-                    parts.append(ADDED.sub(" ", text))
+                    start = ADDED.search(text)
+                    parts.append(text[: start.start()] if start else text)
     return "\n".join(parts)
 
 
@@ -434,8 +435,8 @@ def sent_to(result: Any, address: str) -> bool:
         if not isinstance(message, dict):
             continue
         labels = message.get("labelIds")
-        if isinstance(labels, list) and "SENT" not in labels:
-            continue
+        if not isinstance(labels, list) or "SENT" not in labels:
+            continue  # only a message Gmail marks as sent
         parsed = _gmail_message(message)
         headers = [str(value) for value in (*parsed.to, *parsed.cc, *parsed.bcc)]
         for _, found in getaddresses(headers):

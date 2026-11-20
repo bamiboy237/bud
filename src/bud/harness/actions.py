@@ -113,6 +113,10 @@ def load_policy(path: Path | None = None) -> Policy:
 ACCOUNT_GENERATION: ContextVar[int | None] = ContextVar("bud_account_generation", default=None)
 
 
+def _failed(result: Any) -> bool:
+    return isinstance(result, dict) and result.get("successful") is False
+
+
 def _pinned() -> dict[str, Any]:
     generation = ACCOUNT_GENERATION.get()
     return {"account_generation": generation} if generation is not None else {}
@@ -227,9 +231,12 @@ class ActionGateway(WrapperToolset[None]):
         # The owner's own words: this request, their earlier messages, and their answers.
         # Never Bud's questions: the model wrote those, and an injection could plant a target
         # in one.
+        # In a job, the messages hold the brief, which the main chat's model wrote: only the
+        # owner's own request (bud_request) and replies count.
+        in_job = (ctx.metadata or {}).get("bud_task_id") is not None
         said = [
             request if isinstance(request, str) else "",
-            owner_text(ctx.messages),
+            "" if in_job else owner_text(ctx.messages),
             *owner_replies(ctx.messages),
         ]
         try:
@@ -382,14 +389,15 @@ class ActionGateway(WrapperToolset[None]):
         if found:
             details = "\n".join(part for part in (details, taint_note(found)) if part)
         review: dict[str, Any] | None = None
-        if ctx.tool_call_approved and self._checks_targets(tool.tool_def):
-            # The owner saw these recipients on the card and approved sending to them. A call
-            # whose rule is "allow" was held only by this check, so it is an approval too.
+        # Recipients the owner approved, remembered once the call has gone through.
+        learned: set[str] = set()
+        if ctx.tool_call_approved and action != "deny" and self._checks_targets(tool.tool_def):
+            # A call whose rule is "allow" was held only by the target check, so running it
+            # now is an owner approval too.
             if action == "allow":
                 rule, outcome = "ask", "approved"
-            if self.known is not None and "DRAFT" not in name:
-                with contextlib.suppress(OSError):
-                    self.known.add(recipients(name, tool_args), ACCOUNT_GENERATION.get())
+            if "draft" not in name.lower():
+                learned = recipients(name, tool_args)
         if action in ("ask", "review") and ctx.tool_call_approved:
             rule, outcome = "ask", "approved"  # the owner already approved this exact call
             held_review = (ctx.tool_call_metadata or {}).get("review")
@@ -453,7 +461,7 @@ class ActionGateway(WrapperToolset[None]):
         if action == "deny":
             return refusal or f"Refused by policy: {name} is not allowed."
         if DBOS.workflow_id is not None and DBOS.step_id is None:
-            return await DBOS.run_step_async(
+            result = await DBOS.run_step_async(
                 {"name": "bud.tool_call", "retries_allowed": False},
                 super().call_tool,
                 name,
@@ -461,7 +469,14 @@ class ActionGateway(WrapperToolset[None]):
                 ctx,
                 tool,
             )
-        return await super().call_tool(name, tool_args, ctx, tool)
+        else:
+            result = await super().call_tool(name, tool_args, ctx, tool)
+        # Only after the tool ran: an approval the account tools refused (another account,
+        # a stale card) raises above and teaches nothing.
+        if learned and self.known is not None and not _failed(result):
+            with contextlib.suppress(OSError):
+                self.known.add(learned, ACCOUNT_GENERATION.get())
+        return result
 
     async def _presentation(
         self, name: str, args: dict, ctx: RunContext[None], details: str | None
