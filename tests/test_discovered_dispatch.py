@@ -9,7 +9,7 @@ from pydantic_ai import DeferredToolRequests, DeferredToolResults, RunContext, T
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import FunctionModel
 
-from bud.composio.binding import AccountBinding
+from bud.composio.binding import AccountBinding, ConnectionError
 from bud.composio.connection import Connections
 from bud.composio.tools import AppActions, CatalogAction, build_toolset, policy, reads_only
 from bud.harness.context import BackgroundCompaction
@@ -291,3 +291,48 @@ def test_selection_keeps_pending_calls_and_stays_within_the_schema_budget():
     assert "SLACK_BIG_NEW" in selected
     assert "SLACK_BIG_OLD" not in selected
     assert len(selected) <= 13
+
+
+async def test_a_resumed_approval_from_another_account_never_dispatches(tmp_path):
+    """The card names the generation it was asked under. If the account changed before the
+    owner's approval resumed it, the account tools refuse it instead of sending."""
+    subject, connections, api = app_catalog(tmp_path)
+    step = 0
+
+    def respond(messages, info):
+        nonlocal step
+        step += 1
+        if step == 1:
+            return ModelResponse(
+                parts=[ToolCallPart("find_app_actions", {"app": "slack", "query": "send"}, "f")]
+            )
+        if step == 2:
+            return ModelResponse(parts=[ToolCallPart("SLACK_SEND_MESSAGE", {"text": "hi"}, "send")])
+        return ModelResponse(parts=[TextPart("Done.")])
+
+    agent = subject.agent(
+        FunctionModel(respond), lambda _: None, context=BackgroundCompaction(record=lambda _: None)
+    )
+    metadata = {"bud_request": "Send hi on Slack"}
+    held = await agent.run("Send hi on Slack", metadata=metadata)
+    assert isinstance(held.output, DeferredToolRequests)
+    card = {**held.output.metadata["send"], "account_generation": 0, "approval_id": "a1"}
+    with pytest.raises(ConnectionError, match="account that has since changed"):
+        await agent.run(
+            conversation=held.conversation,
+            deferred_tool_results=DeferredToolResults(
+                approvals={"send": ToolApproved()}, metadata={"send": card}
+            ),
+            metadata=metadata,
+        )
+    api.execute.assert_not_called()
+
+
+async def test_the_account_stamp_ends_with_the_run(tmp_path):
+    from bud.harness.actions import ACCOUNT_GENERATION
+
+    _, connections, _ = app_catalog(tmp_path)
+    toolset = build_toolset(connections, connections.binding, tmp_path)
+    async with toolset:
+        assert ACCOUNT_GENERATION.get() == 1
+    assert ACCOUNT_GENERATION.get() is None

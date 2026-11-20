@@ -40,7 +40,7 @@ from bud.core.log import EventLog, QueueFull
 from bud.core.profiles import Mode, ProfileStore, apply_mode, as_mode, mode_summary
 from bud.core.profiles import guidance as MODE_GUIDANCE
 from bud.core.projection import Snapshot, parked_approvals, undecided_approvals
-from bud.core.runner import DecisionRejected, Runner, UnknownApproval
+from bud.core.runner import ACCOUNT_CHANGE, DecisionRejected, Runner, UnknownApproval
 from bud.core.setup import (
     SetupJournal,
     SetupRegistry,
@@ -206,7 +206,7 @@ def deny_stale(
     (bud.composio.tools.stale_approval), whether it was granted, parked, or recovered after a
     restart. An account card with no stamp, from before stamps existed, is denied too: its
     account is unknown. Returns the denied approval ids."""
-    origin = {"channel": "api", "client_id": "account-change"}
+    origin = {"channel": "api", "client_id": ACCOUNT_CHANGE}
     denied = []
     for session_id in log.sessions_with_requests():
         events = log.read(session_id)
@@ -360,15 +360,17 @@ def _create_app(
         }
         refresh_lock = Lock()
 
-        def browser_toolsets() -> list[AbstractToolset[None]]:
-            if loaded["browse"] is None:
+        def browser_toolsets(browse: Path | None) -> list[AbstractToolset[None]]:
+            if browse is None:
                 return []
             return [
-                browser.toolset(loaded["browse"], consent, relay),
+                browser.toolset(browse, consent, relay),
                 FunctionToolset(browser.control_tools(consent, relay)),
             ]
 
-        def account_toolset(binding: AccountBinding | None) -> CombinedToolset[None]:
+        def account_toolset(
+            binding: AccountBinding | None, browse: Path | None
+        ) -> CombinedToolset[None]:
             return CombinedToolset(
                 [
                     build_toolset(connections, binding, session_dir),
@@ -381,7 +383,7 @@ def _create_app(
                         background,
                     ),
                     build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
-                    *browser_toolsets(),
+                    *browser_toolsets(browse),
                 ]
             )
 
@@ -399,7 +401,7 @@ def _create_app(
                     return
                 # Build first and adopt last: if anything fails, nothing changed, and the next
                 # request tries again. Old tools keep refusing to dispatch meanwhile.
-                replacement = account_toolset(binding)
+                replacement = account_toolset(binding, browse)
                 connections.adopt(binding)
                 harness.swap_tools(replacement)
                 previous = loaded["binding"]
@@ -410,7 +412,7 @@ def _create_app(
 
         refresh_tools = refresh_account_tools
         harness = Harness(
-            account_toolset(binding),
+            account_toolset(binding, loaded["browse"]),
             tools_policy,
             gateway.registry,
             PROFILE + "\nComposio is your library of app integrations. Use discover_tools to check "
@@ -588,11 +590,12 @@ def _create_app(
             # Settle work from before the restart first, so a recovered run's new start is
             # never mistaken for one the restart cut off.
             await background.resume()
-            if connections is not None and connections.binding is not None:
-                # Cards asked under an account replaced while Bud was stopped close before
-                # recovery can resume any of them.
-                deny_stale_approvals(connections.binding.generation)
             await runner.recover()
+            if connections is not None and connections.binding is not None:
+                # Cards asked under an account replaced while Bud was stopped close now. After
+                # recovery, so a run a denial resumes is launched once. A recovered run that
+                # reaches such a card meanwhile is refused at dispatch (stale_approval).
+                deny_stale_approvals(connections.binding.generation)
             if photon is not None:
                 from bud.photon_chat import messaging
 

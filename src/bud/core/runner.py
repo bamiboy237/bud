@@ -684,6 +684,13 @@ class Runner(DBOSConfiguredInstance):
             for event in events
             if event.type == "approval.denied" and event.data.get("revision_message_id")
         } | parked
+        # Cards closed because their account changed, not because the owner said no.
+        rebound = {
+            event.data["approval_id"]
+            for event in events
+            if event.type == "approval.denied"
+            and (event.data.get("origin") or {}).get("client_id") == ACCOUNT_CHANGE
+        }
         answers = {
             event.data["approval_id"]: event.data["text"]
             for event in events
@@ -708,6 +715,8 @@ class Runner(DBOSConfiguredInstance):
                     "replaces this request, follow it. If it is about something else, handle it, "
                     "then return to this request: it is still open, so ask again."
                     if request["approval_id"] in revised
+                    else ACCOUNT_CHANGED
+                    if request["approval_id"] in rebound
                     else _denial(request)
                 )
                 for request in batch
@@ -1621,6 +1630,15 @@ def _review_of(review: object) -> dict[str, dict]:
         **({"review": details} if details else {}),
         **({"preview": presentation} if isinstance(presentation, dict) else {}),
     }
+
+
+# The origin of a denial made because the account behind a card changed.
+ACCOUNT_CHANGE = "account-change"
+ACCOUNT_CHANGED = (
+    "The account for this action was replaced or removed before it ran, so it was cancelled; "
+    "nothing was done. If it is still needed, call the tool again and the person will be asked "
+    "with the current account."
+)
 
 
 def _denial(request: dict) -> str:

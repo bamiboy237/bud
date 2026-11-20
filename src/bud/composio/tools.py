@@ -4,10 +4,12 @@ A claimed write may still have an unknown remote outcome.
 """
 
 import asyncio
+import contextlib
 import json
 import re
 import sqlite3
 from collections.abc import Callable
+from contextvars import Token
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from email.utils import getaddresses
@@ -405,6 +407,7 @@ class ComposioTools(WrapperToolset[None]):
     allowed_tools: frozenset[str] = field(kw_only=True)
     connections: Connections = field(kw_only=True)
     binding: AccountBinding = field(kw_only=True)
+    _generation: Token[int | None] | None = field(default=None, init=False, repr=False)
 
     async def _check_binding(self, name: str, tool: ToolsetTool[None] | None = None) -> None:
         selected = (tool.tool_def.metadata or {}).get(COMPOSIO_ACTION) if tool else None
@@ -500,14 +503,21 @@ class ComposioTools(WrapperToolset[None]):
         ):
             await super().__aenter__()
         # Entered in the run's own task, so every card this run draws names this generation.
-        ACCOUNT_GENERATION.set(self.binding.generation)
+        self._generation = ACCOUNT_GENERATION.set(self.binding.generation)
         return self
 
     async def __aexit__(self, *args: Any) -> bool | None:
-        with safe_errors(
-            "The Composio connection closed with an error. Inspect any pending write."
-        ):
-            return await super().__aexit__(*args)
+        token, self._generation = self._generation, None
+        try:
+            with safe_errors(
+                "The Composio connection closed with an error. Inspect any pending write."
+            ):
+                return await super().__aexit__(*args)
+        finally:
+            if token is not None:
+                # A later run in this task, with no account tools, must not inherit the stamp.
+                with contextlib.suppress(ValueError):
+                    ACCOUNT_GENERATION.reset(token)
 
     async def get_tools(self, ctx: RunContext[None]) -> dict[str, ToolsetTool[None]]:
         with safe_errors(
