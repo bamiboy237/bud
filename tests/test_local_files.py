@@ -139,3 +139,13 @@ def test_imessage_asks_by_file_name():
     )
     assert text.startswith("Can I read plan.pdf?")
     assert "Opens /Users/me/Documents/plan.pdf" in text
+
+
+def test_a_refused_path_needs_no_card(home, tools):
+    from bud.workspace import local_refused
+
+    _, _, blocked = tools
+    (home / "Documents" / "plan.txt").write_text("x")
+    assert local_refused({"path": "~/.ssh/config"}, blocked)
+    assert local_refused({"path": "relative.txt"}, blocked)
+    assert not local_refused({"path": str(home / "Documents" / "plan.txt")}, blocked)

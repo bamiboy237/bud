@@ -471,6 +471,16 @@ def local_target(path: str, blocked: list[Path]) -> Path:
     return real
 
 
+def local_refused(tool_args: dict[str, Any], blocked: list[Path]) -> bool:
+    """A read the tool refuses anyway needs no card: it opens nothing. The tool checks again
+    when it runs, so a path that changes in between is still refused."""
+    try:
+        local_target(str(tool_args.get("path", "")), blocked)
+    except _Refused:
+        return True
+    return False
+
+
 def describe_local(tool_args: dict[str, Any], blocked: list[Path]) -> str:
     """For the approval card: the real path, which a link cannot disguise."""
     try:

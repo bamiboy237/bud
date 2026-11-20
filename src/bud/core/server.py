@@ -74,6 +74,7 @@ from bud.workspace import (
     describe_local,
     document_tool,
     local_blocked,
+    local_refused,
     local_tools,
 )
 from bud.workspace import GUIDANCE as WORKSPACE_GUIDANCE
@@ -462,6 +463,9 @@ def _create_app(
     outside = local_blocked(Path.home(), private_folders(settings), workspace)
     harness.describers.update(
         dict.fromkeys(LOCAL_TOOLS, lambda tool_args: describe_local(tool_args, outside))
+    )
+    harness.harmless.update(
+        dict.fromkeys(LOCAL_TOOLS, lambda tool_args: local_refused(tool_args, outside))
     )
     has_reviewer = harness.reviewer is not None
     apply_mode(harness.policy, approval_mode, reviewer=has_reviewer)

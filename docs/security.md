@@ -40,8 +40,8 @@ read.
 Bud can read one of your files, or list one of your folders, when you name it:
 `read_local_file` and `list_local_folder`. These rules hold in every approval mode:
 
-- **Every call asks you.** There is no "always allow", and the reviewer never answers for
-  you.
+- **Every read asks you.** There is no "always allow", and the reviewer never answers for
+  you. A path Bud refuses anyway (below) is refused at once, without a card.
 - **The card names the real file.** Bud resolves `~` and every link first, so a link named
   `notes.txt` that points at something else shows where it really goes. Bud then opens that
   exact path, one folder at a time, without following links, so what you approve is what
