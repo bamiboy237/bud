@@ -64,13 +64,17 @@ Bud can read one of your files, or list one of your folders, when you name it:
 ## Mac apps
 
 Bud can open and control a short list of your Mac apps: Notes, Reminders, Music, Calendar,
-Finder, Safari, and Google Chrome. Other apps, Messages and Mail included, stay out until you
+Finder, and Safari. Other apps, Messages and Mail included, stay out until you
 add them.
 
 - **Typed actions, not free scripts.** Each action runs a fixed AppleScript. Your words reach
   it only as arguments, never as script text, so nothing a model writes becomes code.
-- **Reads run unasked:** opening an app, opening a workspace file in its app, what Music is
-  playing, your note titles, a note's text, and your open reminders.
+- **Reads run unasked:** opening an app, opening a workspace document in its app, what Music
+  is playing, your note titles, a note's text, and your open reminders.
+- **Only documents open.** `open_in_app` opens PDFs, images, text, and Office or iWork
+  documents, never anything that can run or redirect (`.command`, `.app`, `.webloc`, HTML).
+  It opens a private copy, read without following links, so a sandboxed command cannot swap
+  in a link and the copy cannot run. Chrome is not on the list: `open_chrome` asks first.
 - **Changes ask you:** playing or skipping music, creating a note, and adding a reminder. In
   auto mode the reviewer judges them against your request, as it does browser steps.
 - **macOS asks too.** The first time Bud controls an app, macOS asks you to allow it in

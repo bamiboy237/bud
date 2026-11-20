@@ -7,9 +7,12 @@ macOS asks the owner once per app before Bud may control it.
 """
 
 import asyncio
+import html
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -17,10 +20,35 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 from pydantic_ai import Tool
 
+from bud.workspace import read_workspace_bytes
+
 OSASCRIPT = "/usr/bin/osascript"
 OPEN = "/usr/bin/open"
 # Apps Bud may open or control. Messages, Mail, and others stay out until the owner adds them.
-ALLOWED_APPS = ("Notes", "Reminders", "Music", "Calendar", "Finder", "Safari", "Google Chrome")
+# Chrome is opened by open_chrome, which asks first.
+ALLOWED_APPS = ("Notes", "Reminders", "Music", "Calendar", "Finder", "Safari")
+# Inert document types open_in_app may open. Anything that can run or redirect (.command,
+# .app, .webloc, .terminal, .scpt, .html, macro documents) is refused.
+DOCUMENT_TYPES = frozenset(
+    {
+        ".pdf",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".heic",
+        ".txt",
+        ".md",
+        ".csv",
+        ".rtf",
+        ".docx",
+        ".xlsx",
+        ".pptx",
+        ".pages",
+        ".numbers",
+        ".key",
+    }
+)
 
 READS = frozenset(
     {"open_app", "open_in_app", "music_now_playing", "notes_list", "notes_read", "reminders_list"}
@@ -36,6 +64,9 @@ be controlled. The first time, macOS asks the person to let Bud control the app.
 
 # (script, argv) -> (exit code, stdout, stderr)
 Runner = Callable[[str, list[str]], Awaitable[tuple[int, str, str]]]
+# (arguments to /usr/bin/open) -> whether it opened
+Opener = Callable[[list[str]], Awaitable[bool]]
+TIMED_OUT = "The app did not answer in time."
 
 _NOT_ALLOWED = (
     "Bud can only control these apps: " + ", ".join(ALLOWED_APPS) + ". The person can ask to "
@@ -43,6 +74,7 @@ _NOT_ALLOWED = (
 )
 
 NOW_PLAYING = """
+if application "Music" is not running then return "Music is not open."
 tell application "Music"
     if player state is stopped then return "Nothing is playing."
     set t to current track
@@ -88,10 +120,9 @@ end run
 """
 NOTES_CREATE = """
 on run argv
-    set noteTitle to item 1 of argv
-    set noteBody to item 2 of argv
+    set noteBody to item 1 of argv
     tell application "Notes"
-        make new note with properties {name:noteTitle, body:noteBody}
+        make new note with properties {body:noteBody}
     end tell
     return "Created."
 end run
@@ -128,6 +159,8 @@ def available() -> bool:
 
 async def run_osascript(script: str, argv: list[str]) -> tuple[int, str, str]:
     """Run a fixed script with the owner's values as arguments, never as script text."""
+    if any("\x00" in value for value in argv):
+        return 1, "", "A value held a null character."
     process = await asyncio.create_subprocess_exec(
         OSASCRIPT,
         "-",
@@ -141,14 +174,37 @@ async def run_osascript(script: str, argv: list[str]) -> tuple[int, str, str]:
     except TimeoutError:
         process.kill()
         await process.wait()
-        return 1, "", "The app did not answer in time."
-    return process.returncode or 0, out.decode().strip(), err.decode().strip()
+        return 1, "", TIMED_OUT
+    return (
+        process.returncode or 0,
+        out.decode(errors="replace").strip(),
+        err.decode(errors="replace").strip(),
+    )
+
+
+async def run_open(args: list[str]) -> bool:
+    """/usr/bin/open, given up after 15 seconds."""
+    process = await asyncio.create_subprocess_exec(
+        OPEN, *args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    try:
+        return await asyncio.wait_for(process.wait(), 15) == 0
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+        return False
 
 
 def _result(code: int, out: str, err: str) -> dict[str, Any]:
     if code == 0:
         return {"ok": True, "result": out}
-    if "-1743" in err or "Not authorized" in err:
+    if err == TIMED_OUT:
+        return {
+            "ok": False,
+            "error": "The app did not answer in time. If macOS is asking whether Bud may "
+            "control it, the person can answer that and try again.",
+        }
+    if "-1743" in err or "-1744" in err or "Not authorized" in err:
         return {
             "ok": False,
             "error": "macOS has not let Bud control this app. The person can allow it in "
@@ -157,7 +213,16 @@ def _result(code: int, out: str, err: str) -> dict[str, Any]:
     return {"ok": False, "error": "The app could not do that."}
 
 
-def build_tools(workspace: Path, run: Runner = run_osascript) -> list[Tool[None]]:
+def note_html(title: str, body: str) -> str:
+    """A note's body as Notes expects it: HTML, title first, text escaped, so nothing from a
+    page or an email renders as markup."""
+    lines = "".join(f"<div>{html.escape(line) or '<br>'}</div>" for line in body.splitlines())
+    return f"<div><h1>{html.escape(title)}</h1></div>{lines}"
+
+
+def build_tools(
+    workspace: Path, run: Runner = run_osascript, opener: Opener = run_open
+) -> list[Tool[None]]:
     workspace = workspace.resolve()
 
     async def open_app(app: str) -> dict[str, Any]:
@@ -168,10 +233,7 @@ def build_tools(workspace: Path, run: Runner = run_osascript) -> list[Tool[None]
         """
         if app not in ALLOWED_APPS:
             return {"ok": False, "error": _NOT_ALLOWED}
-        process = await asyncio.create_subprocess_exec(
-            OPEN, "-a", app, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        return {"ok": await process.wait() == 0}
+        return {"ok": await opener(["-a", app])}
 
     async def open_in_app(path: str) -> dict[str, Any]:
         """Open a file from your workspace in its usual app, such as a PDF in Preview.
@@ -179,15 +241,23 @@ def build_tools(workspace: Path, run: Runner = run_osascript) -> list[Tool[None]
         Args:
             path: Relative path in the workspace, such as reports/q3.pdf.
         """
-        target = (workspace / path).resolve()
-        if not target.is_relative_to(workspace) or not target.is_file():
-            return {"ok": False, "error": "Give a file in your workspace."}
-        if any(part.startswith(".") for part in target.relative_to(workspace).parts):
-            return {"ok": False, "error": "Give a file in your workspace."}
-        process = await asyncio.create_subprocess_exec(
-            OPEN, os.fspath(target), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        return {"ok": await process.wait() == 0}
+        suffix = Path(path).suffix.lower()
+        if suffix not in DOCUMENT_TYPES:
+            return {"ok": False, "error": "Bud opens only documents, such as PDFs and images."}
+        data = read_workspace_bytes(workspace, path)
+        if data is None:
+            return {"ok": False, "error": "Give a visible file in your workspace."}
+        # Open a private copy, never the workspace file: a sandboxed command cannot swap it
+        # for a link, and the copy cannot run.
+        folder = Path(tempfile.mkdtemp(prefix="bud-open-"))
+        copy = folder / f"{Path(path).stem[:60] or 'file'}{suffix}"
+        fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        opened = await opener([os.fspath(copy)])
+        if not opened:
+            shutil.rmtree(folder, ignore_errors=True)
+        return {"ok": opened}
 
     async def music_now_playing() -> dict[str, Any]:
         """What Music is playing now."""
@@ -228,7 +298,7 @@ def build_tools(workspace: Path, run: Runner = run_osascript) -> list[Tool[None]
             title: The note's title.
             body: The note's text.
         """
-        return _result(*await run(NOTES_CREATE, [title, body]))
+        return _result(*await run(NOTES_CREATE, [note_html(title, body)]))
 
     async def reminders_list(limit: Annotated[int, Field(ge=1, le=100)] = 30) -> dict[str, Any]:
         """The person's open reminders, by title.

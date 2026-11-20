@@ -1,6 +1,9 @@
 """Mac app control: an allowlist, fixed scripts with the owner's values as arguments, reads
 that run unasked, and changes that ask."""
 
+import html
+import os
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -21,8 +24,18 @@ class Scripts:
         return self.answer
 
 
-def tools(tmp_path, scripts: Scripts) -> dict[str, Any]:
-    return {tool.name: tool.function for tool in apps.build_tools(tmp_path, scripts)}
+class Opener:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    async def __call__(self, args: list[str]) -> bool:
+        self.calls.append(args)
+        return True
+
+
+def tools(tmp_path, scripts: Scripts, opener: Opener | None = None) -> dict[str, Any]:
+    built = apps.build_tools(tmp_path, scripts, opener or Opener())
+    return {tool.name: tool.function for tool in built}
 
 
 async def test_the_owners_words_reach_a_script_only_as_arguments(tmp_path):
@@ -31,31 +44,78 @@ async def test_the_owners_words_reach_a_script_only_as_arguments(tmp_path):
     sneaky = 'x" & (do shell script "rm -rf ~") & "'
     await found["notes_create"](title=sneaky, body="body")  # type: ignore[call-arg]
     await found["reminders_add"](title=sneaky)  # type: ignore[call-arg]
-    for script, argv in scripts.calls:
+    for script, _ in scripts.calls:
         assert sneaky not in script
-        assert sneaky in argv
-    assert scripts.calls[0][0] == apps.NOTES_CREATE
+    note, reminder = scripts.calls
+    assert note[0] == apps.NOTES_CREATE and html.escape(sneaky) in note[1][0]
+    assert reminder[1] == [sneaky]
 
 
 async def test_only_allowlisted_apps_open(tmp_path):
-    found = tools(tmp_path, Scripts())
-    result = await found["open_app"](app="Terminal")  # type: ignore[call-arg]
-    assert not result["ok"] and "Notes" in result["error"]
+    opener = Opener()
+    found = tools(tmp_path, Scripts(), opener)
+    # Chrome opens through open_chrome, which asks first.
+    for app in ("Terminal", "Google Chrome"):
+        result = await found["open_app"](app=app)  # type: ignore[call-arg]
+        assert not result["ok"] and "Notes" in result["error"]
+    assert (await found["open_app"](app="Notes"))["ok"]  # type: ignore[call-arg]
+    assert opener.calls == [["-a", "Notes"]]
 
 
-async def test_only_workspace_files_open_in_their_app(tmp_path):
-    found = tools(tmp_path, Scripts())
-    outside = tmp_path.parent / "outside.txt"
-    outside.write_text("x")
-    for path in ("../outside.txt", "missing.pdf", ".hidden"):
+async def test_only_workspace_documents_open_and_only_as_a_copy(tmp_path):
+    opener = Opener()
+    found = tools(tmp_path, Scripts(), opener)
+    (tmp_path / "report.pdf").write_bytes(b"%PDF-1.4 report")
+    (tmp_path / "run.command").write_text("#!/bin/sh\ncurl evil.example\n")
+    (tmp_path / "go.webloc").write_text("<plist/>")
+    outside = tmp_path.parent / "outside.pdf"
+    outside.write_bytes(b"%PDF-1.4 private")
+    (tmp_path / "linked.pdf").symlink_to(outside)
+    for path in (
+        "run.command",
+        "go.webloc",
+        "../outside.pdf",
+        "linked.pdf",
+        "missing.pdf",
+        ".hidden.pdf",
+    ):
         result = await found["open_in_app"](path=path)  # type: ignore[call-arg]
         assert not result["ok"], path
+    assert opener.calls == []
+
+    assert (await found["open_in_app"](path="report.pdf"))["ok"]  # type: ignore[call-arg]
+    [[copy]] = opener.calls
+    # A private copy outside the workspace, which cannot run and cannot be swapped.
+    assert not copy.startswith(str(tmp_path))
+    assert Path(copy).read_bytes() == b"%PDF-1.4 report"
+    assert oct(os.stat(copy).st_mode & 0o777) == "0o600"
 
 
-async def test_a_macos_refusal_says_where_to_allow_it(tmp_path):
-    scripts = Scripts((1, "", "execution error: Not authorized to send Apple events (-1743)"))
-    result = await tools(tmp_path, scripts)["music_now_playing"]()
+@pytest.mark.parametrize(
+    "error",
+    [
+        "execution error: Not authorized to send Apple events (-1743)",
+        "execution error: would require user consent (-1744)",
+    ],
+)
+async def test_a_macos_refusal_says_where_to_allow_it(tmp_path, error):
+    result = await tools(tmp_path, Scripts((1, "", error)))["music_now_playing"]()
     assert not result["ok"] and "Automation" in result["error"]
+
+
+async def test_a_timeout_points_at_the_macos_question(tmp_path):
+    result = await tools(tmp_path, Scripts((1, "", apps.TIMED_OUT)))["music_now_playing"]()
+    assert "did not answer in time" in result["error"]
+
+
+async def test_a_null_character_never_reaches_osascript():
+    assert (await apps.run_osascript(apps.REMINDERS_ADD, ["a\x00b"]))[0] == 1
+
+
+def test_a_note_body_is_escaped_html_with_the_title_first():
+    body = apps.note_html("Q3 <Plan>", "Line 1\n<img src=x>")
+    assert body.startswith("<div><h1>Q3 &lt;Plan&gt;</h1></div>")
+    assert "<img" not in body and "&lt;img src=x&gt;" in body
 
 
 async def test_reads_return_the_apps_answer(tmp_path):
