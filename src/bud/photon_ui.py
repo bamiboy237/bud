@@ -1,6 +1,7 @@
 """Conversational iMessage presentation; permission mechanics stay server-side."""
 
 import json
+from pathlib import Path
 
 from bud.harness.ask import question_lines
 
@@ -37,6 +38,8 @@ def action_preview(approval: dict, *, decision: bool = True) -> str:
         "workspace_update": f"Can I replace {target}?",
         "enable_browser": "Can I use your Chrome?",
         "open_chrome": "Can I open Chrome?",
+        "read_local_file": f"Can I read {Path(str(target or '')).name or 'one of your files'}?",
+        "list_local_folder": f"Can I look in {Path(str(target or '')).name or 'a folder'}?",
     }
     title = titles.get(tool, "Can I " + tool.replace("_", " ").lower() + "?")
     if approval.get("reference"):

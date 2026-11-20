@@ -35,6 +35,32 @@ Bud reads and writes text files in one workspace folder, `~/.bud/workspace`. Set
 These checks are guardrails, not isolation. Only put material in the workspace that Bud may
 read.
 
+## Your files outside the workspace
+
+Bud can read one of your files, or list one of your folders, when you name it:
+`read_local_file` and `list_local_folder`. These rules hold in every approval mode:
+
+- **Every read asks you.** There is no "always allow", and the reviewer never answers for
+  you. A path Bud refuses anyway (below) is refused at once, without a card and without
+  running anything.
+- **The card names the file that is opened.** A path that goes through a link is refused.
+  Bud never says where the link points, since that file was not approved; give the real
+  path instead. Bud opens the path one
+  folder at a time without following links, so a link swapped in later fails: what you
+  approve is what it reads.
+- **Blocked folders are recognized by identity, not name.** Each folder on the way is
+  compared with the blocked ones on disk, so another letter case or the
+  `/System/Volumes/Data` view of the same folder is refused too, before any card.
+- **Some places stay closed even with approval:** Bud's data folder and the folder holding
+  its `.env`, `~/.bud`, `~/.ssh`, `~/.gnupg`, `~/Library/Keychains`, the workspace (Bud reads
+  it with `read_file`), hidden files, and names that look like credentials (`.env`, keys,
+  tokens, passwords).
+- **It only reads.** Text comes back in pieces of 16,000 characters. PDF, Word, Excel,
+  PowerPoint, OpenDocument, RTF, EPUB, and CSV come back as Markdown, converted on your Mac.
+  Files over 25 MB are refused.
+- **macOS may ask too.** Reading Documents, Desktop, or Downloads can need permission in
+  System Settings, Privacy & Security, Files and Folders.
+
 ## Shell commands
 
 On macOS, Bud runs shell commands in its workspace with `run_command`, and long ones with

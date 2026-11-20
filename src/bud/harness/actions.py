@@ -103,6 +103,9 @@ class ActionGateway(WrapperToolset[None]):
     # Per tool: is this call harmless, judged by its arguments in code? Such a call of a tool
     # that can also do more (browser_tabs lists, opens, and closes) runs unasked.
     harmless: Mapping[str, Callable[[dict], bool]] = field(kw_only=True, default_factory=dict)
+    # Per tool: a reason to refuse this call outright, judged in code, or None. A refusal
+    # never runs the tool, so it is safe even if the arguments' target changes later.
+    refuses: Mapping[str, Callable[[dict], str | None]] = field(kw_only=True, default_factory=dict)
     # Trusted, non-owner context for the reviewer, such as today's date.
     facts: Callable[[], str] = field(kw_only=True, default=lambda: "")
     grants: SessionGrants = field(kw_only=True, default_factory=SessionGrants)
@@ -168,6 +171,16 @@ class ActionGateway(WrapperToolset[None]):
             today=self.facts(),
         )
 
+    def _refusal(self, name: str, tool_args: dict[str, Any]) -> str | None:
+        check = self.refuses.get(name)
+        if check is None:
+            return None
+        try:
+            reason = check(tool_args)
+        except Exception:
+            return None  # unsure: the call keeps its policy, which still asks
+        return reason if isinstance(reason, str) and reason else None
+
     def _harmless(self, name: str, tool_args: dict[str, Any]) -> bool:
         check = self.harmless.get(name)
         if check is None:
@@ -226,6 +239,9 @@ class ActionGateway(WrapperToolset[None]):
         tool: ToolsetTool[None],
     ) -> Any:
         action = self.policy.decide_tool(tool.tool_def)
+        refusal = self._refusal(name, tool_args)
+        if refusal is not None:
+            action = "deny"
         if action in ("ask", "review") and self._harmless(name, tool_args):
             action = "allow"
         if action == "review" and self._notifies_others(name, tool_args):
@@ -302,7 +318,7 @@ class ActionGateway(WrapperToolset[None]):
             record["review"] = review
         self.record(record)
         if action == "deny":
-            return f"Refused by policy: {name} is not allowed."
+            return refusal or f"Refused by policy: {name} is not allowed."
         if DBOS.workflow_id is not None and DBOS.step_id is None:
             return await DBOS.run_step_async(
                 {"name": "bud.tool_call", "retries_allowed": False},
@@ -346,6 +362,7 @@ class GuardTools(AbstractCapability[None]):
     describers: Mapping[str, Describer] = field(default_factory=dict)
     notifies_others: Mapping[str, Callable[[dict], bool]] = field(default_factory=dict)
     harmless: Mapping[str, Callable[[dict], bool]] = field(default_factory=dict)
+    refuses: Mapping[str, Callable[[dict], str | None]] = field(default_factory=dict)
     facts: Callable[[], str] = lambda: ""
     # One set of grants for the life of the process, shared by every wrapper built from this.
     grants: SessionGrants = field(default_factory=SessionGrants)
@@ -382,6 +399,7 @@ class GuardTools(AbstractCapability[None]):
             describers=self.describers,
             notifies_others=self.notifies_others,
             harmless=self.harmless,
+            refuses=self.refuses,
             facts=self.facts,
             grants=self.grants,
         )
