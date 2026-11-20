@@ -5,19 +5,23 @@ no model turn. A command runs in the same sandbox as run_command but without its
 and its exit status and last lines go into the chat when it ends. Both are kept in SQLite, so
 a reminder survives a restart and fires late if Bud was down. A command a restart cut short
 is reported as interrupted, never run again.
+
+Starting either is an approval like any other write: the reviewer judges it in auto mode and
+the owner in strict mode, and only a turn that carries the owner's own words may start one.
 """
 
 import asyncio
 import contextlib
 import logging
+import os
 import sqlite3
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Protocol
+from uuid import NAMESPACE_URL, uuid5
 
-from dbos import DBOS
 from pydantic import Field
 from pydantic_ai import RunContext, Tool
 
@@ -25,17 +29,20 @@ from bud.core.events import EventType
 
 logger = logging.getLogger(__name__)
 
-TOOLS = {"remind_me", "run_in_background", "list_background", "cancel_background"}
+STARTS = frozenset({"remind_me", "run_in_background"})
+TOOLS = STARTS | {"list_background", "cancel_background"}
 GUIDANCE = """remind_me posts a reminder in this chat at a set time, with no job and no cost
 while it waits. Use it for "remind me", never start_task or a sleep. run_in_background runs a
 long shell command, such as a build or a download, while the chat goes on; its result appears
 in the chat when it ends. list_background and cancel_background manage both.
 """
 LONGEST_WAIT = timedelta(days=30)
-LONGEST_COMMAND = timedelta(hours=6)
 MAX_RUNNING = 3
 TAIL_CHARS = 600
 LATE = timedelta(minutes=1)
+# A sleeping Mac pauses the event loop's clock, so waits re-check the wall clock this often.
+CHECK_SECONDS = 30.0
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 # Runs one sandboxed command: (command, timeout seconds, owner request) -> run() result.
 RunShell = Callable[[str, float, str], Awaitable[dict[str, Any]]]
@@ -67,6 +74,9 @@ class Item:
         return shown
 
 
+_COLUMNS = "id, session_id, kind, title, status, due_at, command, timeout, request"
+
+
 class Background:
     def __init__(
         self,
@@ -88,7 +98,7 @@ class Background:
                 "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY AUTOINCREMENT, "
                 "session_id TEXT NOT NULL, kind TEXT NOT NULL, title TEXT NOT NULL, "
                 "status TEXT NOT NULL, due_at TEXT, command TEXT, timeout REAL, "
-                "request TEXT NOT NULL DEFAULT '')"
+                "request TEXT NOT NULL DEFAULT '', source TEXT UNIQUE)"
             )
         path.chmod(0o600)
 
@@ -109,14 +119,14 @@ class Background:
 
     def _get(self, id: int) -> Item | None:
         with self._db() as db:
-            row = db.execute("SELECT * FROM items WHERE id = ?", (id,)).fetchone()
+            row = db.execute(f"SELECT {_COLUMNS} FROM items WHERE id = ?", (id,)).fetchone()
         return self._row(row) if row else None
 
     def items(self, session_id: str) -> list[Item]:
         with self._db() as db:
             rows = db.execute(
-                "SELECT * FROM items WHERE session_id = ? AND status IN ('waiting', 'running') "
-                "ORDER BY id",
+                f"SELECT {_COLUMNS} FROM items WHERE session_id = ? "
+                "AND status IN ('waiting', 'running') ORDER BY id",
                 (session_id,),
             ).fetchall()
         return [self._row(row) for row in rows]
@@ -129,45 +139,84 @@ class Background:
             ).rowcount
         return changed == 1
 
+    def _insert(self, source: str | None, values: dict[str, Any], cap: bool) -> tuple[Item, bool]:
+        """Insert once per source. Returns the item and whether this call created it, so a
+        replayed tool call finds its first item instead of starting the work again."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if source is not None:
+                found = db.execute(
+                    f"SELECT {_COLUMNS} FROM items WHERE source = ?", (source,)
+                ).fetchone()
+                if found:
+                    return self._row(found), False
+            if cap:
+                running = db.execute(
+                    "SELECT count(*) FROM items WHERE kind = 'command' AND status = 'running'"
+                ).fetchone()[0]
+                if running >= MAX_RUNNING:
+                    raise ValueError(
+                        f"{MAX_RUNNING} commands are already running. Wait for one to end, "
+                        "or cancel one."
+                    )
+            names = ", ".join(values) + ", source"
+            marks = ", ".join("?" for _ in values) + ", ?"
+            cursor = db.execute(
+                f"INSERT INTO items ({names}) VALUES ({marks})", (*values.values(), source)
+            )
+            row = db.execute(
+                f"SELECT {_COLUMNS} FROM items WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone()
+        return self._row(row), True
+
     # Starting work
 
-    def remind(self, session_id: str, text: str, due: datetime) -> Item:
-        with self._db() as db:
-            cursor = db.execute(
-                "INSERT INTO items (session_id, kind, title, status, due_at) "
-                "VALUES (?, 'reminder', ?, 'waiting', ?)",
-                (session_id, text, due.isoformat()),
-            )
-        item = self._get(cursor.lastrowid or 0)
-        assert item is not None
-        self._watch(item)
+    def remind(self, session_id: str, text: str, due: datetime, source: str | None = None) -> Item:
+        item, created = self._insert(
+            source,
+            {
+                "session_id": session_id,
+                "kind": "reminder",
+                "title": text,
+                "status": "waiting",
+                "due_at": due.isoformat(),
+            },
+            cap=False,
+        )
+        if created:
+            self._watch(item)
         return item
 
     def start(
-        self, session_id: str, title: str, command: str, timeout: float, request: str
+        self,
+        session_id: str,
+        title: str,
+        command: str,
+        timeout: float,
+        request: str,
+        source: str | None = None,
     ) -> Item:
         if self.run_shell is None:
             raise ValueError("Shell commands are not available on this computer.")
-        with self._db() as db:
-            running = db.execute(
-                "SELECT count(*) FROM items WHERE kind = 'command' AND status = 'running'"
-            ).fetchone()[0]
-            if running >= MAX_RUNNING:
-                raise ValueError(
-                    f"{MAX_RUNNING} commands are already running. Wait for one to end, or "
-                    "cancel one."
-                )
-            cursor = db.execute(
-                "INSERT INTO items (session_id, kind, title, status, command, timeout, request) "
-                "VALUES (?, 'command', ?, 'running', ?, ?, ?)",
-                (session_id, title, command, timeout, request),
-            )
-        item = self._get(cursor.lastrowid or 0)
-        assert item is not None
-        self._watch(item)
+        item, created = self._insert(
+            source,
+            {
+                "session_id": session_id,
+                "kind": "command",
+                "title": title,
+                "status": "running",
+                "command": command,
+                "timeout": timeout,
+                "request": request,
+            },
+            cap=True,
+        )
+        if created:
+            self._watch(item)
         return item
 
     def cancel(self, session_id: str, id: int) -> bool:
+        """Call on the event loop: it cancels the task that follows the item."""
         item = self._get(id)
         if item is None or item.session_id != session_id:
             return False
@@ -175,8 +224,16 @@ class Background:
             return False
         task = self._tasks.pop(id, None)
         if task is not None:
-            task.cancel()  # a command's process group is killed by shell.run
+            task.cancel()  # a command's process group is killed and reaped by shell.run
         return True
+
+    def stop_commands(self, session_id: str) -> int:
+        """Stop this chat's running commands, as /stop does; reminders keep waiting."""
+        stopped = 0
+        for item in self.items(session_id):
+            if item.kind == "command" and self.cancel(session_id, item.id):
+                stopped += 1
+        return stopped
 
     def _watch(self, item: Item) -> None:
         task = asyncio.get_running_loop().create_task(self._follow(item))
@@ -193,12 +250,14 @@ class Background:
             raise
         except Exception:
             logger.exception("Background item %d failed", item.id)
+            if item.kind == "command" and self._claim(item.id, "running", "failed"):
+                self._publish(item, "failed", f"“{item.title}” could not run.")
 
     async def _fire(self, item: Item) -> None:
         assert item.due_at is not None
-        wait = (item.due_at - self.now()).total_seconds()
-        if wait > 0:
-            await asyncio.sleep(wait)
+        # Re-check the wall clock often: a sleeping Mac pauses the loop's own clock.
+        while (wait := (item.due_at - self.now()).total_seconds()) > 0:
+            await asyncio.sleep(min(wait, CHECK_SECONDS))
         if not self._claim(item.id, "waiting", "done"):
             return  # cancelled while it waited
         late = self.now() - item.due_at
@@ -227,18 +286,44 @@ class Background:
         self._publish(item, status, text, log)
 
     def _save_log(self, item: Item, result: dict[str, Any]) -> Path | None:
-        folder = self.workspace / "background"
+        """Write background/<id>.log in the workspace, never through a link.
+
+        Sandboxed commands can write the workspace, so they could plant a link where the log
+        goes. This server writes outside the sandbox, so every folder is opened without
+        following links and the file must not exist yet.
+        """
+        body = (
+            f"$ {item.command}\nexit code: {result.get('exit_code')}\n\n"
+            f"--- stdout ---\n{result.get('stdout') or ''}\n"
+            f"--- stderr ---\n{result.get('stderr') or ''}\n"
+        ).encode()
+        name = f"{item.id}.log"
         try:
-            folder.mkdir(exist_ok=True)
-            path = folder / f"{item.id}.log"
-            path.write_text(
-                f"$ {item.command}\nexit code: {result.get('exit_code')}\n\n"
-                f"--- stdout ---\n{result.get('stdout') or ''}\n"
-                f"--- stderr ---\n{result.get('stderr') or ''}\n"
-            )
-            return path
+            root = os.open("/", _DIR_FLAGS)
+            try:
+                for part in self.workspace.absolute().parts[1:]:
+                    child = os.open(part, _DIR_FLAGS, dir_fd=root)
+                    os.close(root)
+                    root = child
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir("background", 0o700, dir_fd=root)
+                folder = os.open("background", _DIR_FLAGS, dir_fd=root)
+            finally:
+                os.close(root)
+            try:
+                fd = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=folder,
+                )
+            finally:
+                os.close(folder)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(body)
+            return self.workspace / "background" / name
         except OSError as exc:
-            logger.warning("Could not save background log %d: %s", item.id, exc)
+            logger.warning("Did not save background log %d: %s", item.id, exc)
             return None
 
     def _publish(self, item: Item, status: str, text: str, log: Path | None = None) -> None:
@@ -258,7 +343,7 @@ class Background:
         """At startup: wait again for every reminder, and report commands a restart cut off."""
         with self._db() as db:
             rows = db.execute(
-                "SELECT * FROM items WHERE status IN ('waiting', 'running')"
+                f"SELECT {_COLUMNS} FROM items WHERE status IN ('waiting', 'running')"
             ).fetchall()
         for item in map(self._row, rows):
             if item.kind == "reminder":
@@ -289,15 +374,15 @@ class Background:
             found = metadata.get("bud_session_id")
             return found if isinstance(found, str) and found else None
 
-        async def once(name: str, step: Callable[[], Any]) -> Any:
-            if DBOS.workflow_id is not None and DBOS.step_id is None:
-                # One recorded step: crash recovery returns this result instead of
-                # scheduling the same work twice.
-                async def run() -> Any:
-                    return step()
+        def owner_words(ctx: RunContext[None]) -> str | None:
+            """The owner's own request for this turn. A job report or other turn the owner
+            did not write has none, and cannot start background work."""
+            found = (ctx.metadata or {}).get("bud_request")
+            return found if isinstance(found, str) and found.strip() else None
 
-                return await DBOS.run_step_async({"name": name, "retries_allowed": False}, run)
-            return step()
+        def source(ctx: RunContext[None]) -> str:
+            # The same tool call replayed after a crash maps to the same item.
+            return str(uuid5(NAMESPACE_URL, f"bud:background:{ctx.run_id}:{ctx.tool_call_id}"))
 
         async def remind_me(
             ctx: RunContext[None],
@@ -315,6 +400,8 @@ class Background:
             where = session(ctx)
             if where is None:
                 return {"error": "Set reminders from the main conversation, not from a job."}
+            if owner_words(ctx) is None:
+                return {"error": "Only the person can ask for a reminder."}
             if (minutes_from_now is None) == (at is None):
                 return {"error": "Give exactly one of minutes_from_now or at."}
             now = background.now()
@@ -331,8 +418,8 @@ class Background:
                 return {"error": "That time has already passed."}
             if due - now > LONGEST_WAIT:
                 return {"error": "Reminders can be at most 30 days away."}
-            scheduled = await once("bud.remind", lambda: background.remind(where, text, due).view())
-            return {"scheduled": scheduled}
+            item = background.remind(where, text, due, source(ctx))
+            return {"scheduled": item.view()}
 
         async def run_in_background(
             ctx: RunContext[None],
@@ -342,8 +429,9 @@ class Background:
         ) -> dict[str, Any]:
             """Run a long shell command (zsh) in your workspace, sandboxed like run_command,
             while the chat goes on. Its exit status and last lines appear in the chat when it
-            ends, and its full output is saved to background/<id>.log in the workspace. Use
-            run_command for anything that ends within a few minutes.
+            ends, and its full output is saved to background/<id>.log in the workspace. It may
+            reach package sites and sites the person allowed; any other site is blocked and
+            listed. Use run_command for anything that ends within a few minutes.
 
             Args:
                 title: A few words the person will recognize, such as "Build the report".
@@ -353,24 +441,23 @@ class Background:
             where = session(ctx)
             if where is None:
                 return {"error": "Start background commands from the main conversation."}
-            found = (ctx.metadata or {}).get("bud_request")
-            request = found if isinstance(found, str) else ""
+            request = owner_words(ctx)
+            if request is None:
+                return {"error": "Only the person can ask for a background command."}
+            try:
+                item = background.start(
+                    where, title, command, timeout_minutes * 60, request, source(ctx)
+                )
+            except ValueError as exc:
+                return {"error": str(exc)}
+            return {"started": item.view()}
 
-            def start() -> dict[str, Any]:
-                try:
-                    item = background.start(where, title, command, timeout_minutes * 60, request)
-                except ValueError as exc:
-                    return {"error": str(exc)}
-                return {"started": item.view()}
-
-            return await once("bud.background", start)
-
-        def list_background(ctx: RunContext[None]) -> dict[str, Any]:
+        async def list_background(ctx: RunContext[None]) -> dict[str, Any]:
             """List this chat's waiting reminders and running background commands."""
             where = session(ctx)
             return {"items": [item.view() for item in background.items(where)] if where else []}
 
-        def cancel_background(ctx: RunContext[None], id: int) -> dict[str, Any]:
+        async def cancel_background(ctx: RunContext[None], id: int) -> dict[str, Any]:
             """Cancel a waiting reminder or stop a running background command.
 
             Args:

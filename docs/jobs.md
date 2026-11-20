@@ -63,14 +63,18 @@ server runs it instead, and the model is not called until you write again.
   reminder survives a restart. If Bud was not running when it came due, it
   appears when Bud starts, marked late. Reminders can be up to 30 days away.
 - **Background commands.** A long shell command, such as a build or a download,
-  runs in the same sandbox as `run_command`, with the same network checks, for
-  up to 6 hours. The chat goes on meanwhile. When the command ends, its exit
+  runs in the same sandbox as `run_command` for up to 6 hours. It can reach
+  package sites and sites you allowed; any other site is blocked and listed in
+  its result, because nobody is there to judge a new site hours later. The chat goes on meanwhile. When the command ends, its exit
   status and last lines appear in the chat, and its full output is saved as
   `background/<id>.log` in the workspace. At most three run at once. A command
   that a restart cuts short is reported as interrupted and is not run again.
 
-Ask Bud what is waiting or running, or ask it to cancel one. Start both from the
-main conversation; a job cannot post into the chat this way.
+Starting either one is an approval like any other write: in auto mode the
+reviewer checks it against your request, and in strict mode Bud asks you. Only a
+turn with your own words can start one, so a job report or a page Bud read
+cannot. Ask Bud what is waiting or running, or ask it to cancel one. `/stop`
+stops this chat's running commands; reminders keep waiting.
 
 ## API reference
 

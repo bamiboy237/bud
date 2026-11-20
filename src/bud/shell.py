@@ -324,8 +324,12 @@ async def run(
         _kill(process.pid)
         stdout, stderr = await process.communicate()
     finally:
+        # The whole group: a command cancelled mid-run, and any child a finished command
+        # left running behind it (`cmd &`), stop together.
+        _kill(process.pid)
         if process.returncode is None:
-            _kill(process.pid)  # cancelled while it ran: stop it with its children
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(process.wait(), 5)  # reap it; no zombie is left
         await proxy.close()
     result: dict[str, Any] = {
         "exit_code": process.returncode,

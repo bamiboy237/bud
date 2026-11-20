@@ -28,6 +28,7 @@ from bud.composio.connection import ConnectionError, Connections
 from bud.config import Settings, get_settings
 from bud.core.auth import OwnerAuthentication, owner_token
 from bud.core.background import GUIDANCE as BACKGROUND_GUIDANCE
+from bud.core.background import STARTS as BACKGROUND_STARTS
 from bud.core.background import TOOLS as BACKGROUND_TOOLS
 from bud.core.background import Background
 from bud.core.events import Event, MessageOrigin
@@ -176,16 +177,12 @@ def workspace_tools(
     )
 
 
-def build_background(
-    root: Path,
-    state_dir: Path,
-    reviewer: Callable[[], ToolReviewer | None],
-    private: Sequence[Path] = (),
-) -> Background:
-    """Reminders and long commands, run by the server; long commands use run_command's
-    sandbox and network checks."""
+def build_background(root: Path, state_dir: Path, private: Sequence[Path] = ()) -> Background:
+    """Reminders and long commands, run by the server in run_command's sandbox. A command
+    that runs for hours gets no reviewer to allow new sites: only package sites and sites the
+    owner allowed. Any other site is blocked and listed in its result."""
     grants = NetworkGrants(state_dir / "network-grants.json")
-    run = shell_runner(root, grants, reviewer, private) if shell_available() else None
+    run = shell_runner(root, grants, lambda: None, private) if shell_available() else None
     return Background(state_dir / "background.db", root, run)
 
 
@@ -202,9 +199,10 @@ def allow_file_tools(policy: Policy) -> None:
     """Reads, writes in Bud's own workspace, and sandboxed commands run unasked; each new
     network site asks. Strict mode makes workspace writes ask (bud.core.profiles)."""
     policy.tools.update(dict.fromkeys(FILE_READS | SHELL_TOOLS | WORKSPACE_WRITE_TOOLS, "allow"))
-    # Reminders only post in the owner's own chat; a background command is run_command
-    # without its time limit, in the same sandbox with the same network checks.
-    policy.tools.update(dict.fromkeys(BACKGROUND_TOOLS, "allow"))
+    # Starting a reminder or a background command asks; auto mode hands it to the reviewer
+    # (bud.core.profiles). Listing and cancelling only touch the owner's own items.
+    policy.tools.update(dict.fromkeys(BACKGROUND_TOOLS - BACKGROUND_STARTS, "allow"))
+    policy.tools.update(dict.fromkeys(BACKGROUND_STARTS, "ask"))
     policy.tools[NETWORK_TOOL] = "ask"
     # Each new site needs its own yes: "always allow" would let Bud add any site unasked.
     policy.no_grants = policy.no_grants | {NETWORK_TOOL}
@@ -288,9 +286,7 @@ def _create_app(
         session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         db_path = session_dir / "bud.db"
         workspace = workspace_home(settings)
-        background = build_background(
-            workspace, session_dir, lambda: harness.reviewer, private_folders(settings)
-        )
+        background = build_background(workspace, session_dir, private_folders(settings))
         gateway = build_gateway(
             settings,
             providers={"openai-chatgpt", "openai", "meta", "mistral", "deepseek"},
@@ -394,9 +390,7 @@ def _create_app(
     else:
         db_path = settings.data_dir / "bud.db"
         workspace = workspace_root(settings.data_dir)
-        background = build_background(
-            workspace, settings.data_dir, lambda: harness.reviewer, private_folders(settings)
-        )
+        background = build_background(workspace, settings.data_dir, private_folders(settings))
         gateway = build_gateway(settings, model_id=model_id)
         world = World(settings.data_dir / "world.db")
         tools_policy = load_policy()
@@ -882,6 +876,7 @@ def _create_app(
     @app.post("/sessions/{session_id}/stop", status_code=202)
     async def stop_session(session_id: str) -> dict:
         require_session(session_id)
+        background.stop_commands(session_id)
         return await runner.stop_session(session_id)
 
     @app.post("/sessions/{session_id}/approvals/{approval_id}")

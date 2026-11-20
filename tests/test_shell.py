@@ -60,6 +60,25 @@ async def test_a_slow_command_is_stopped(workspace):
     assert result["exit_code"] != 0
 
 
+@macos
+async def test_a_child_a_finished_command_left_behind_is_stopped(workspace):
+    # The child closes its output, so the command returns while the child still runs.
+    result = await run(workspace, "sleep 30 >/dev/null 2>&1 & echo $!", 10, never)
+    child = int(result["stdout"].strip())
+    await asyncio.sleep(0.2)
+    with pytest.raises(ProcessLookupError):
+        os.kill(child, 0)
+
+
+@macos
+async def test_a_cancelled_command_is_stopped_and_reaped(workspace):
+    task = asyncio.create_task(run(workspace, "sleep 30", 60, never))
+    await asyncio.sleep(1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
 async def serve_once(body: bytes) -> tuple[asyncio.Server, int]:
     async def answer(reader, writer):
         await reader.readuntil(b"\r\n\r\n")
