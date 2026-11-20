@@ -221,7 +221,7 @@ def _create_app(
     account_scope: str | None = None
     # Bud's own Browse relay, and a `browse pair` waiting for the extension; the pairing
     # stops when the server stops.
-    relay = browser.Relay(settings.data_dir / "browse")
+    relay = browser.Relay(browser.RELAY_HOME)
     pairing = browser.Pairing(relay)
 
     # Set by the account branch: reloads the tool list after a new app connects.

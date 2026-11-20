@@ -1,8 +1,8 @@
 """bud's browser: OpenCode Browse, which drives the person's own Chrome through an extension.
 
-Bud runs its own Browse relay, with its own home folder in Bud's data folder and its own
-port, so it can ask for Browse's small typed tools (navigate, snapshot, click, fill, ...)
-instead of one tool that runs any JavaScript. The extension connects to one relay at a time:
+Bud runs its own Browse relay, with its own home folder in ~/.bud/browse and its own port,
+so it can ask for Browse's small typed tools (navigate, snapshot, click, fill, ...) instead
+of one tool that runs any JavaScript. The extension connects to one relay at a time:
 pairing it with Bud's relay disconnects any other agent that used Browse.
 
 Bud offers a chosen set of Browse's tools as `browser_*`, loaded only when the model searches
@@ -69,6 +69,9 @@ ENABLE = "enable_browser"
 DISABLE = "disable_browser"
 # Bud's relay port. Browse's own default is 19988; another port keeps the two apart.
 PORT = 19989
+# Beside Bud's own copy of browse, outside the workspace, so shell commands cannot touch the
+# relay's token or pairing.
+RELAY_HOME = Path.home() / ".bud" / "browse"
 EXTENSION_URL = "https://chromewebstore.google.com/detail/mfnicocicmmlkpjnaffgihfjhdgjkdjg"
 INSTALL = "curl -fsSL https://opencode.ai/browse/install | bash"
 CAUTION = (
