@@ -45,7 +45,6 @@ from bud.config import get_settings
 from bud.core.events import RUN_END_EVENTS, Event, EventType
 from bud.core.hub import Hub
 from bud.core.log import StopRequested
-from bud.core.profiles import mode_neutral
 from bud.core.projection import (
     JOB_REPORT,
     PROMPTED,
@@ -150,7 +149,7 @@ class Runner(DBOSConfiguredInstance):
             (
                 harness.prompt_version
                 + gateway.registry.model_dump_json()
-                + json.dumps(mode_neutral(harness.policy.tools), sort_keys=True)
+                + json.dumps(harness.policy.tools, sort_keys=True)
                 + str(gateway.selected_model)
                 + str(gateway.fallback)
                 + str(jobs)

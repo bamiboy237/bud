@@ -68,13 +68,6 @@ def _overlay(mode: Mode, reviewer: bool) -> dict[str, Action]:
     return overlay
 
 
-def mode_neutral(tools: dict[str, Action]) -> dict[str, str]:
-    """The policy without the rules a mode switch changes. A switch applies live to the next
-    tool call, so a run recovered after a switch is still the same configuration."""
-    switched = _SELF_HOSTED_WRITES | _REVIEWABLE
-    return {name: "mode" if name in switched else action for name, action in tools.items()}
-
-
 def apply_mode(policy: Policy, mode: Mode, *, reviewer: bool = False) -> dict[str, Action]:
     """Shift the inspectable classes onto ``mode``, in place.
 

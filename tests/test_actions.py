@@ -195,6 +195,37 @@ async def test_auto_allow_records_decision_before_real_write_and_replay_is_once_
     assert titles(world) == sorted([*before, "auto-approved"])
 
 
+async def test_auto_mode_saves_a_workspace_file_unasked_and_once(actions):
+    gateway, ctx, tools, root, _, records, requests, _ = actions
+    allow_file_tools(gateway.policy)
+    apply_mode(gateway.policy, "auto", reviewer=True)
+    args = {"path": "note.md", "content": "saved"}
+    await gateway.call_tool("workspace_create", args, ctx, tools["workspace_create"])
+    assert (root / "note.md").read_text() == "saved"
+    assert records[-1]["rule"] == "allow"
+    # Bud's own folder never reaches the reviewer.
+    assert requests == []
+    # A recovered run replays the same dispatch without writing again.
+    replay = await gateway.call_tool("workspace_create", args, ctx, tools["workspace_create"])
+    assert replay.return_value["replayed"] is True
+    assert (root / "note.md").read_text() == "saved"
+
+
+async def test_strict_mode_asks_before_a_workspace_file_even_with_a_reviewer(actions):
+    gateway, ctx, tools, root, _, _, requests, _ = actions
+    allow_file_tools(gateway.policy)
+    apply_mode(gateway.policy, "strict", reviewer=True)
+    with pytest.raises(ApprovalRequired):
+        await gateway.call_tool(
+            "workspace_create",
+            {"path": "note.md", "content": "held"},
+            ctx,
+            tools["workspace_create"],
+        )
+    assert not (root / "note.md").exists()
+    assert requests == []
+
+
 @pytest.mark.parametrize("failure", ["refusal", "malformed", "timeout", "concern"])
 async def test_reviewer_failures_hold_write_without_effects(actions, failure):
     gateway, ctx, tools, root, world, records, requests, response = actions

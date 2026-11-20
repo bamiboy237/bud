@@ -202,9 +202,15 @@ def running(root: Path, checkpoint: str | None = None, *, accounts: bool = False
         process.close()
 
 
+def strict_from_boot(root: Path) -> None:
+    """Auto mode saves workspace files unasked; strict mode keeps the approval these tests
+    exercise. Set before the first start, so a restart recovers under the same rules."""
+    data = root.resolve() / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "approval-mode.json").write_text(json.dumps({"mode": "strict"}))
+
+
 def start_report(server: ServerProcess) -> tuple[str, dict]:
-    # Auto mode saves workspace files unasked; strict mode keeps the approval to test.
-    server.request("POST", "/mode", json={"mode": "strict"})
     session = server.request("POST", "/sessions", status=201)["session_id"]
     server.request(
         "POST",
@@ -443,6 +449,7 @@ def test_api_authentication_and_validation(tmp_path):
 
 
 def test_denied_workspace_write_does_not_dispatch(tmp_path):
+    strict_from_boot(tmp_path)
     with running(tmp_path) as server:
         session, approval = start_report(server)
         assert decide(server, session, approval, False) == {"applied": True}
@@ -458,6 +465,7 @@ def test_denied_workspace_write_does_not_dispatch(tmp_path):
 
 
 def test_always_allow_records_a_grant_and_revoke_restores_asking(tmp_path):
+    strict_from_boot(tmp_path)
     with running(tmp_path) as server:
         session, approval = start_report(server)
         assert approval["grantable"] is True
@@ -473,6 +481,7 @@ def test_always_allow_records_a_grant_and_revoke_restores_asking(tmp_path):
 
 
 def test_a_grant_is_recorded_only_for_an_approved_decision(tmp_path):
+    strict_from_boot(tmp_path)
     """A deny with "remember" must not leave a standing permission behind."""
     with running(tmp_path) as server:
         session, approval = start_report(server)
@@ -486,6 +495,7 @@ def test_a_grant_is_recorded_only_for_an_approved_decision(tmp_path):
 
 
 def test_revised_workspace_approval_survives_process_restart(tmp_path):
+    strict_from_boot(tmp_path)
     with running(tmp_path) as server:
         session, original = start_report(server)
         server.request(
@@ -529,6 +539,7 @@ def test_revised_workspace_approval_survives_process_restart(tmp_path):
 
 @pytest.mark.parametrize("checkpoint", ["before_dispatch", "after_claim", "after_write"])
 def test_crash_at_workspace_dispatch_boundary(tmp_path, checkpoint):
+    strict_from_boot(tmp_path)
     with running(tmp_path, checkpoint) as server:
         session, approval = start_report(server)
         assert decide(server, session, approval, True) == {"applied": True}
