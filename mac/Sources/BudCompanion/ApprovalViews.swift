@@ -8,34 +8,15 @@ final class ApprovalLayout: ObservableObject {
 enum DecisionDirection: Equatable {
     case approve
     case deny
-
-    static func swipe(_ translation: CGSize) -> Self? {
-        guard abs(translation.width) >= 80,
-              abs(translation.width) > abs(translation.height) else { return nil }
-        return translation.width > 0 ? .approve : .deny
-    }
-
-    /// A swipe that went far enough, or a flick whose projected landing point does: a quick
-    /// throw is enough, it need not travel the whole way.
-    static func release(_ translation: CGSize, projected: CGSize) -> Self? {
-        // Both the drag so far and its projection must be mostly sideways, so a fast vertical
-        // flick never decides.
-        guard abs(translation.width) > abs(translation.height) else { return nil }
-        return swipe(translation) ?? swipe(projected)
-    }
 }
 
 final class DeckState: ObservableObject {
     @Published var currentIndex: Int = 0
-    @Published var flyOffset: CGFloat = 0
-    @Published var flyScale: CGFloat = 1
     @Published var flyOpacity: Double = 1.0
     @Published var activeDecision: DecisionDirection? = nil
     @Published var isAnimating: Bool = false
 
     func finishDecision() {
-        flyOffset = 0
-        flyScale = 1
         flyOpacity = 1
         activeDecision = nil
         isAnimating = false
@@ -66,7 +47,8 @@ struct ApprovalDeck: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            headerBar
+            // A count and arrows only mean something with more than one card.
+            if totalCount > 1 { headerBar }
             cardStack
         }
         .onAppear { clampIndex() }
@@ -193,12 +175,9 @@ struct ApprovalDeck: View {
                     companion: companion, approval: activeApproval,
                     onDecide: { approved in
                         handleDecision(approval: activeApproval, approved: approved)
-                    },
-                    onDrag: { distance in follow(distance) }
+                    }
                 )
                 .id(activeApproval.id)
-                .offset(x: deck.flyOffset, y: 0)
-                .scaleEffect(deck.flyScale)
                 .opacity(deck.flyOpacity)
             }
         }
@@ -225,35 +204,18 @@ struct ApprovalDeck: View {
         .padding(.bottom, peekRoom)
     }
 
-    /// The card follows a horizontal drag 1:1; nil means the drag ended without deciding, so
-    /// it settles home without overshoot.
-    private func follow(_ distance: CGFloat?) {
-        guard !deck.isAnimating, !reduceMotion else { return }
-        if let distance {
-            deck.flyOffset = distance
-        } else {
-            withAnimation(Self.settle) { deck.flyOffset = 0 }
-        }
-    }
-
     private func handleDecision(approval: Approval, approved: Bool) {
         guard !deck.isAnimating else { return }
-        let flight = Duration.milliseconds(180)
+        let flight = Duration.milliseconds(150)
         guard companion.decide(approval.id, approved: approved, after: reduceMotion ? nil : flight)
-        else {
-            follow(nil)  // refused: the card goes home
-            return
-        }
+        else { return }
         guard !reduceMotion else { return }
         deck.isAnimating = true
         deck.activeDecision = approved ? .approve : .deny
 
-        // One short, quiet exit, faster than an entrance. It continues from wherever a drag
-        // left the card, a little further toward the choice.
-        withAnimation(.easeOut(duration: 0.18)) {
-            let direction: CGFloat = approved ? 1 : -1
-            deck.flyOffset = direction * (abs(deck.flyOffset) + 24)
-            deck.flyScale = 0.98
+        // A quiet fade where the card stands: no slide, no tilt, no stamp. The receipt line
+        // that follows says what happened.
+        withAnimation(.easeOut(duration: 0.15)) {
             deck.flyOpacity = 0
         }
 

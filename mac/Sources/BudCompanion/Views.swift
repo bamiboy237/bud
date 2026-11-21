@@ -182,16 +182,13 @@ private struct PetButton: View {
             .opacity(connected ? 1 : 0.55)
             .overlay(alignment: .topTrailing) {
                 ZStack {
-                    // Always mounted, so it can play on the very arrival that brings the dot.
-                    Ripple(trigger: companion.arrivals)
                     if companion.status == .needsYou && connected {
                         WaitingBadge(count: companion.waitingCount)
                             .fixedSize()
-                            .transition(.scale(scale: 0.6).combined(with: .opacity))
+                            .transition(.opacity)
                     }
                 }
-                // A fixed spot: the ripple fills whatever room it gets, which would centre the
-                // badge on the pet. A wider "9+" badge overflows this frame to the left.
+                // A fixed spot in the pet's corner. A wider "9+" badge overflows to the left.
                 .frame(width: 16, height: 16, alignment: .trailing)
                 .padding(10)
                 .allowsHitTesting(false)
@@ -294,26 +291,6 @@ struct WaitingBadge: View {
             .background(Capsule().fill(Paper.inkPrimary))
             .overlay(Capsule().strokeBorder(Paper.canvas, lineWidth: 1.5))
             .accessibilityLabel("\(count) waiting for you")
-    }
-}
-
-/// One ring spreading from the dot when something new needs you. Once per arrival, never a
-/// loop: a repeating pulse would turn into noise you learn to ignore. Still when reduced.
-private struct Ripple: View {
-    let trigger: Int
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        if !reduceMotion {
-            Circle()
-                .stroke(Paper.inkPrimary, lineWidth: 1.5)
-                .keyframeAnimator(initialValue: 1.0, trigger: trigger) { ring, t in
-                    ring.scaleEffect(1 + t * 1.8).opacity(t >= 1 ? 0 : 0.7 * (1 - t))
-                } keyframes: { _ in
-                    LinearKeyframe(0, duration: 0.01)
-                    CubicKeyframe(1, duration: 0.8)
-                }
-        }
     }
 }
 
@@ -556,7 +533,9 @@ private struct Bubble: View {
         // Only the name line: a small tag over the pet, not a wide empty card.
         .frame(width: compact ? nil : 320, alignment: .leading)
         .frame(minWidth: 132, alignment: .leading)
-        .fixedSize(horizontal: compact, vertical: false)
+        // Hug the content vertically too: a short card leaves no empty paper below it. Long
+        // content is still bounded, by the reply's height and the deck's cap.
+        .fixedSize(horizontal: compact, vertical: true)
         .surface(BubbleShape(anchor: companion.anchor))
         .onHover { companion.bubbleHovered = $0 }
         // A cited date opens the conversation window at that message.
@@ -817,13 +796,7 @@ struct ApprovalCard: View {
     let companion: Companion
     let approval: Approval
     let onDecide: (Bool) -> Void
-    /// The card's horizontal drag, as it happens; nil when it ends without a decision.
-    var onDrag: (CGFloat?) -> Void = { _ in }
     @StateObject private var layout = ApprovalLayout()
-    /// True while a drag is in progress. It resets on end and on cancel alike, so a drag the
-    /// system cancels still sends the card home.
-    @GestureState private var dragging = false
-
     private var busy: Bool {
         companion.deciding.contains(approval.id) || companion.approvingBatch || companion.link != .connected
     }
@@ -851,29 +824,6 @@ struct ApprovalCard: View {
     private var content: some View {
         VStack(alignment: .leading, spacing: 10) {
             heading
-                .contentShape(Rectangle())
-                // A drag that ends without deciding, or that the system cancels, goes home.
-                // After a decision the deck is animating and ignores this.
-                .onChange(of: dragging) { _, now in if !now { onDrag(nil) } }
-                .gesture(
-                    // Global space: the card moves with the drag, so local coordinates would
-                    // chase themselves and jitter.
-                    DragGesture(minimumDistance: 10, coordinateSpace: .global)
-                        .updating($dragging) { _, state, _ in state = true }
-                        .onChanged { value in
-                            guard !busy, !approval.isQuestion,
-                                  abs(value.translation.width) > abs(value.translation.height)
-                            else { return }
-                            onDrag(value.translation.width)
-                        }
-                        .onEnded { value in
-                            guard !busy, !approval.isQuestion,
-                                  let direction = DecisionDirection.release(
-                                      value.translation, projected: value.predictedEndTranslation)
-                            else { return }
-                            onDecide(direction == .approve)
-                        }
-                )
             if approval.isQuestion {
                 QuestionCards(companion: companion, approval: approval,
                               flow: companion.questionFlow(for: approval), listLimit: detailLimit)

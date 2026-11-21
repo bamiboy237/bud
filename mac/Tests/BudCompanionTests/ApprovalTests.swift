@@ -220,23 +220,6 @@ struct ApprovalTests {
         }
     }
 
-    @Test
-    func onlyDeliberateHorizontalSwipesMakeDecisions() {
-        #expect(DecisionDirection.swipe(CGSize(width: 100, height: 20)) == .approve)
-        #expect(DecisionDirection.swipe(CGSize(width: -100, height: 20)) == .deny)
-        #expect(DecisionDirection.swipe(CGSize(width: 79, height: 0)) == nil)
-        // A short flick whose projected landing point passes the line still decides.
-        #expect(DecisionDirection.release(CGSize(width: 30, height: 0),
-                                          projected: CGSize(width: 140, height: 0)) == .approve)
-        #expect(DecisionDirection.release(CGSize(width: 30, height: 0),
-                                          projected: CGSize(width: 50, height: 0)) == nil)
-        // A fast, mostly vertical flick never decides.
-        #expect(DecisionDirection.release(CGSize(width: 20, height: 50),
-                                          projected: CGSize(width: 90, height: 225)) == nil)
-        #expect(DecisionDirection.swipe(CGSize(width: 100, height: 120)) == nil)
-        #expect(DecisionDirection.swipe(CGSize(width: 100, height: 100)) == nil)
-    }
-
     @Test @MainActor
     func savedLegacyLoopNotesStayOutOfReplies() {
         let data: [String: Any] = ["messages": [[
