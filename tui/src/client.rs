@@ -291,21 +291,6 @@ impl Core {
             .unwrap_or(false))
     }
 
-    /// Returns the mode summary sentence.
-    pub async fn set_mode(&self, mode: &str) -> Res<(String, String)> {
-        let value = self
-            .send(self.req(Method::POST, "/mode").json(&json!({"mode": mode})))
-            .await?;
-        let get = |k: &str| {
-            value
-                .get(k)
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string()
-        };
-        Ok((get("mode"), get("summary")))
-    }
-
     pub async fn set_model(&self, session: &str, model: &str) -> Res<()> {
         self.send(
             self.req(Method::POST, &format!("/sessions/{session}/model"))

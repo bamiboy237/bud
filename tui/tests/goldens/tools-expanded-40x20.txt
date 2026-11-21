@@ -14,7 +14,7 @@
   ⇢ Searching web for "bud"…
   ⎣ Query: bud
   ⠋ Working… 0s
-─────────────────── stub-fast · strict ─
+───────────────────── stub-fast · auto ─
 > Ask anything…
 ────────────────────────────────────────
   bud:main · working    / · Esc/Ctrl+C

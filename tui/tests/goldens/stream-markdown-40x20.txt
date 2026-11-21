@@ -14,7 +14,7 @@
 
  Trailing paragraph still arriv
   ⠋ Generating… 0s
-─────────────────── stub-fast · strict ─
+───────────────────── stub-fast · auto ─
 > Ask anything…
 ────────────────────────────────────────
   bud:main · streaming  / · Esc/Ctrl+C

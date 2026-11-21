@@ -23,11 +23,6 @@ pub const COMMANDS: &[Command] = &[
         desc: "Switch mascot",
     },
     Command {
-        name: "/mode",
-        usage: "[strict|auto]",
-        desc: "Set what asks for approval",
-    },
-    Command {
         name: "/cost",
         usage: "",
         desc: "Estimated tokens this session",
@@ -121,7 +116,7 @@ pub fn matching(typed: &str) -> Vec<&'static Command> {
         .iter()
         .filter(|c| c.name.starts_with(&typed))
         .collect();
-    // An exact name leads, so Enter on `/mode` runs /mode and not /model.
+    // An exact name leads, so Enter on a full command runs it, not a longer one it prefixes.
     found.sort_by_key(|c| c.name != typed);
     found
 }
