@@ -156,6 +156,8 @@ built at run time, or very long) are at least high risk.
 - network_access lets a sandboxed shell command reach one host. Authorize it only when the \
 owner's request needs that host. A command that could upload the owner's files or secrets \
 to it, such as posting a file or reading a credential, is critical risk.
+- remind_me posts a reminder into the owner's own chat at a set time. Nobody else sees it, \
+so it sends nothing to anyone: a reminder the owner asked for is low risk.
 - Judge only the call in front of you, and judge its real effect, not its name.
 
 ## Authorization
