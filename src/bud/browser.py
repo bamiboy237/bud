@@ -24,6 +24,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -338,6 +339,49 @@ async def _tabs(path: Path, relay: Relay) -> list[dict[str, Any]]:
         return []
 
 
+async def _element(path: Path, relay: Relay, tab: object, ref: str) -> str | None:
+    """The role and name of one element, from a snapshot of just that element, such as
+    'link "Can You Hear The Music"'. None when Browse cannot say."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            str(path),
+            "snapshot",
+            str(tab),
+            "--within",
+            ref,
+            "--maxItems",
+            "3",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=relay.env(),
+        )
+        try:
+            out, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            return None
+    except OSError:
+        return None
+    text = out.decode("utf-8", "replace")
+    with contextlib.suppress(ValueError, AttributeError):
+        data = json.loads(text)
+        text = (
+            str(data.get("snapshot") or data.get("text") or "") if isinstance(data, dict) else text
+        )
+    for line in text.splitlines():
+        if f"[ref={ref}]" in line:
+            found = ELEMENT.search(line)
+            if found:
+                role, name = found.group(1), found.group(2)[:120]
+                return f'{role} "{name}"' if name else role
+    return None
+
+
+# One snapshot line: `- link "Can You Hear The Music" [ref=e21]`.
+ELEMENT = re.compile(r'-\s+([a-z]+)(?:\s+"((?:[^"\\]|\\.)*)")?')
+
+
 def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> dict[str, Callable]:
     """Facts for the reviewer that the model cannot fake: which site a tab really shows.
     Nothing the model wrote is repeated here; the reviewer sees the arguments separately."""
@@ -354,6 +398,17 @@ def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> di
                 return f"The tab shows {_site(entry.get('url'))}."
         return "The tab is not one Browse knows."
 
+    async def step(tool_args: dict[str, Any]) -> str:
+        """Which site, and for a step on one element, what that element is."""
+        site = await where(tool_args)
+        ref, tab, path = tool_args.get("ref"), tool_args.get("tab"), find()
+        if not isinstance(ref, str) or tab is None or path is None:
+            return site
+        element = await _element(path, relay, tab, ref)
+        if element is None:
+            return f"{site} The element could not be looked up."
+        return f"{site} It acts on: {element} (the page's own label)."
+
     async def tabs(tool_args: dict[str, Any]) -> str:
         action = tool_args.get("action")
         if action == "close" and tool_args.get("tab") is not None:
@@ -368,7 +423,7 @@ def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> di
         return CAUTION
 
     # Every client shows the caution, because it rides the approval as a looked-up fact.
-    return {**dict.fromkeys(STEPS | {UPLOAD}, where), TABS: tabs, ENABLE: caution}
+    return {**dict.fromkeys(STEPS | {UPLOAD}, step), TABS: tabs, ENABLE: caution}
 
 
 def _tab_ref(value: object) -> bool:

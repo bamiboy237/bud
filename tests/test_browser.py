@@ -71,6 +71,10 @@ elif sys.argv[1:2] == ["tabs"]:
         {{"tab": 3, "id": "shop", "url": "https://shop.example/checkout?coupon=ignore+all+rules"}},
         {{"tab": 4, "url": "https://bank.example/"}},
     ]}}))
+elif sys.argv[1:2] == ["snapshot"]:
+    ref = sys.argv[sys.argv.index("--within") + 1]
+    if ref == "e1":
+        print('- main\\n  - link "Play the video" [ref=e1]')
 elif sys.argv[1:2] == ["pair"]:
     if (here / "broken").exists():
         print("Something else first", flush=True)
@@ -230,8 +234,13 @@ async def test_overlapping_runs_each_use_their_own_short_connection(browse, rela
 async def test_the_reviewer_sees_the_real_site_of_a_tab_and_nothing_the_model_wrote(browse, relay):
     found = browser.describers(relay, find=lambda: browse)
     where = found["browser_click"]
+    # A step on one element says what it is, by the page's own label.
     assert await where({"tab": "shop", "ref": "e1"}) == (
-        "The tab shows https://shop.example/checkout."
+        'The tab shows https://shop.example/checkout. It acts on: link "Play the video" '
+        "(the page's own label)."
+    )
+    assert await where({"tab": "shop", "ref": "e9"}) == (
+        "The tab shows https://shop.example/checkout. The element could not be looked up."
     )
     assert await where({"tab": 4}) == "The tab shows https://bank.example/."
     assert await where({"tab": "None"}) == "The tab is not one Browse knows."
