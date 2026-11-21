@@ -71,10 +71,15 @@ elif sys.argv[1:2] == ["tabs"]:
         {{"tab": 3, "id": "shop", "url": "https://shop.example/checkout?coupon=ignore+all+rules"}},
         {{"tab": 4, "url": "https://bank.example/"}},
     ]}}))
-elif sys.argv[1:2] == ["snapshot"]:
-    ref = sys.argv[sys.argv.index("--within") + 1]
-    if ref == "e1":
-        print('- main\\n  - link "Play the video" [ref=e1]')
+elif sys.argv[1:2] == ["execute"]:
+    print("tab: 3\\n")
+    if 'ref("e1")' in sys.argv[2]:
+        print(json.dumps({{"tag": "a", "role": None, "type": None, "label": "Play the video",
+                          "href": "https://shop.example/watch?v=1", "script": False,
+                          "form": False}}))
+    else:
+        print("Error: Unknown snapshot ref", file=sys.stderr)
+        sys.exit(1)
 elif sys.argv[1:2] == ["pair"]:
     if (here / "broken").exists():
         print("Something else first", flush=True)
@@ -236,8 +241,8 @@ async def test_the_reviewer_sees_the_real_site_of_a_tab_and_nothing_the_model_wr
     where = found["browser_click"]
     # A step on one element says what it is, by the page's own label.
     assert await where({"tab": "shop", "ref": "e1"}) == (
-        'The tab shows https://shop.example/checkout. It acts on: link "Play the video" '
-        "(the page's own label)."
+        'The tab shows https://shop.example/checkout. It acts on: link "Play the video" to '
+        "https://shop.example/watch?v=1 (label and link read from the page)."
     )
     assert await where({"tab": "shop", "ref": "e9"}) == (
         "The tab shows https://shop.example/checkout. The element could not be looked up."
@@ -561,3 +566,18 @@ def test_the_mac_approval_card_shows_the_same_caution():
     start = swift.index("static let browserCaution =")
     end = swift.index("\n\n", start)
     assert "".join(re.findall(r'"([^"]*)"', swift[start:end])) == browser.CAUTION
+
+
+def test_an_element_is_described_by_where_it_goes_and_what_it_runs():
+    describe = browser.describe_element
+    assert describe({"tag": "a", "label": "Docs", "href": "https://a.example/x"}) == (
+        'link "Docs" to https://a.example/x'
+    )
+    # No label, as in an unlabelled icon button: no crash, just its kind.
+    assert describe({"tag": "button", "label": "", "form": True}) == "button, in a form"
+    assert describe({"tag": "a", "label": "Play", "href": "javascript:pay()"}) == (
+        'link "Play" that runs a script'
+    )
+    assert describe({"tag": "div", "role": "link", "label": "Play", "script": True}) == (
+        'link "Play", which runs its own script'
+    )

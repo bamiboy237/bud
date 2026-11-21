@@ -339,18 +339,39 @@ async def _tabs(path: Path, relay: Relay) -> list[dict[str, Any]]:
         return []
 
 
+# A ref Browse hands out ("e21", or "a5" in aria mode). Anything else never reaches a script.
+REF = re.compile(r"[a-z]\d{1,6}")
+# Reads one element and changes nothing: its tag, role, label, the link it opens, whether it
+# runs its own script, and whether it sits in a form.
+ELEMENT_SCRIPT = """
+const el = ref(%s);
+return await el.evaluate(e => {
+  const a = e.closest("a[href]");
+  const label = (e.getAttribute("aria-label") || e.innerText || e.value || "").trim();
+  return {
+    tag: e.tagName.toLowerCase(),
+    role: e.getAttribute("role"),
+    type: e.getAttribute("type"),
+    label: label.slice(0, 120),
+    href: a ? a.href : null,
+    script: e.hasAttribute("onclick") || (a ? a.hasAttribute("onclick") : false),
+    form: !!e.closest("form"),
+  };
+});
+"""
+
+
 async def _element(path: Path, relay: Relay, tab: object, ref: str) -> str | None:
-    """The role and name of one element, from a snapshot of just that element, such as
-    'link "Can You Hear The Music"'. None when Browse cannot say."""
+    """What one element is, read from the page itself: 'link "Play" to https://...' or
+    'button "Delete" in a form'. None when Browse cannot say."""
+    if not REF.fullmatch(ref):
+        return None
     try:
         process = await asyncio.create_subprocess_exec(
             str(path),
-            "snapshot",
-            str(tab),
-            "--within",
-            ref,
-            "--maxItems",
-            "3",
+            "execute",
+            ELEMENT_SCRIPT % json.dumps(ref),
+            f"--tab={tab}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             env=relay.env(),
@@ -363,23 +384,35 @@ async def _element(path: Path, relay: Relay, tab: object, ref: str) -> str | Non
             return None
     except OSError:
         return None
-    text = out.decode("utf-8", "replace")
-    with contextlib.suppress(ValueError, AttributeError):
-        data = json.loads(text)
-        text = (
-            str(data.get("snapshot") or data.get("text") or "") if isinstance(data, dict) else text
-        )
-    for line in text.splitlines():
-        if f"[ref={ref}]" in line:
-            found = ELEMENT.search(line)
-            if found:
-                role, name = found.group(1), found.group(2)[:120]
-                return f'{role} "{name}"' if name else role
-    return None
+    found: dict[str, Any] | None = None
+    for line in reversed(out.decode("utf-8", "replace").splitlines()):
+        with contextlib.suppress(ValueError):
+            data = json.loads(line)
+            if isinstance(data, dict) and "tag" in data:
+                found = data
+                break
+    if found is None:
+        return None
+    return describe_element(found)
 
 
-# One snapshot line: `- link "Can You Hear The Music" [ref=e21]`.
-ELEMENT = re.compile(r'-\s+([a-z]+)(?:\s+"((?:[^"\\]|\\.)*)")?')
+def describe_element(found: dict[str, Any]) -> str:
+    """Plain words for an element. A link names where it really goes; a script or a form says
+    so, since then the destination does not tell the whole story."""
+    role = str(found.get("role") or "")
+    tag = str(found.get("tag") or "element")
+    href = found.get("href")
+    kind = role or ("link" if href else "button" if tag == "button" else tag)
+    label = str(found.get("label") or "").replace('"', "'").replace("\n", " ")[:120]
+    words = f'{kind} "{label}"' if label else kind
+    if isinstance(href, str) and href:
+        scheme = href.split(":", 1)[0].lower()
+        words += f" to {href[:300]}" if scheme in ("http", "https") else " that runs a script"
+    if found.get("script"):
+        words += ", which runs its own script"
+    if found.get("form") or found.get("type") == "submit":
+        words += ", in a form"
+    return words
 
 
 def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> dict[str, Callable]:
@@ -407,7 +440,7 @@ def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> di
         element = await _element(path, relay, tab, ref)
         if element is None:
             return f"{site} The element could not be looked up."
-        return f"{site} It acts on: {element} (the page's own label)."
+        return f"{site} It acts on: {element} (label and link read from the page)."
 
     async def tabs(tool_args: dict[str, Any]) -> str:
         action = tool_args.get("action")
