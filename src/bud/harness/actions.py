@@ -248,12 +248,16 @@ class ActionGateway(WrapperToolset[None]):
         except Exception:
             return []  # unsure: the call keeps its policy
 
-    async def _unknown(self, found: list[str], ctx: RunContext[None]) -> list[str]:
-        """Drop tainted email addresses the owner already knows."""
+    async def _unknown(
+        self, name: str, tool_args: dict[str, Any], found: list[str], ctx: RunContext[None]
+    ) -> list[str]:
+        """Drop tainted recipients the owner already knows. Only a sending call's recipients:
+        an address someone emailed does not vouch for a command or a link naming its domain."""
+        sends_to = recipients(name, tool_args)
         return [
             target
             for target in found
-            if "://" in target or "@" not in target or not await self._known(target, ctx)
+            if target not in sends_to or not await self._known(target, ctx)
         ]
 
     async def _known(self, address: str, ctx: RunContext[None]) -> bool:
@@ -375,7 +379,7 @@ class ActionGateway(WrapperToolset[None]):
             if action != "deny" and not ctx.tool_call_approved
             else []
         )
-        found = await self._unknown(found, ctx) if found else found
+        found = await self._unknown(name, tool_args, found, ctx) if found else found
         if found and action in ("allow", "review"):
             action = "ask"  # a target came from what Bud read, not from the owner
         if action == "review" and self._notifies_others(name, tool_args):

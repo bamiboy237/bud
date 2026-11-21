@@ -47,6 +47,10 @@ URL = re.compile(
 )
 # Labels may hold Unicode letters, so an internationalized host matches its punycode form.
 DOMAIN = re.compile(r"(?<![\w@.\-/])(?:[^\W_](?:[\w\-]{0,61}[^\W_])?\.)+[^\W\d_]{2,63}\b")
+# A host right after an @ with no user before it (curl's `@evil.example/x`, `:@evil.example`),
+# and an IPv6 address in brackets.
+AT_HOST = re.compile(r"(?<![a-z0-9._%+\-])@((?:[a-z0-9\-]+\.)+[a-z]{2,63})")
+IPV6 = re.compile(r"\[([0-9a-f]*:[0-9a-f:.]+)\]")
 IPV4 = re.compile(r"(?<![\w.])(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b")
 # Navigating to a link a page showed is ordinary browsing; a link carrying a query string
 # can smuggle data out, so only those count for these tools.
@@ -278,14 +282,27 @@ def targets(tool: str, tool_args: dict[str, Any]) -> list[tuple[str, str, str, s
         links = _links(raw)
         found.update(("url", link, key, host) for link, host in links)
         if tool in COMMANDS or key in HOST_KEYS:
-            seen = {email.split("@", 1)[1] for email in emails} | {host for _, host in links}
-            seen |= {_host(url) for url in _urls(text)}
-            found.update(("host", host, key, host) for host in _bare_hosts(text) - seen)
+            # Links that only appear once decoded (`https%3A%2F%2Fevil.example`) count too.
+            decoded = [(url, _host(url)) for url in _urls(text)]
+            found.update(("url", url, key, host) for url, host in decoded)
+            seen = {host for _, host in links} | {host for _, host in decoded}
+            # Every host, even one that is also an address's domain: in a command,
+            # `sam@acme.example/drop` reaches acme.example whoever sam is.
+            hosts = _bare_hosts(text) | set(AT_HOST.findall(text)) | set(IPV6.findall(text))
+            hosts |= {email.split("@", 1)[1] for email in emails}
+            found.update(("host", host, key, host) for host in hosts - seen)
     return sorted(found)
 
 
+# Tools that send to or invite their recipients. Only their approved recipients become known.
+SENDS = re.compile(r"send|reply|forward|invite|share|event", re.I)
+
+
 def recipients(tool: str, tool_args: dict[str, Any]) -> set[str]:
-    """The addresses a call sends to, by argument name."""
+    """The addresses a sending call delivers to, by argument name. Other tools' address
+    arguments, such as a contact note's, are not recipients."""
+    if not SENDS.search(tool) or "draft" in tool.lower():
+        return set()
     return {
         value
         for kind, value, key, _ in targets(tool, tool_args)
@@ -311,12 +328,14 @@ def read_text(messages: list[ModelMessage], current_call: str | None = None) -> 
     parts = []
     for message in messages:
         if isinstance(message, ModelResponse):
-            if current_call is not None and any(
+            current = current_call is not None and any(
                 isinstance(part, ToolCallPart) and part.tool_call_id == current_call
                 for part in message.parts
-            ):
-                continue
+            )
             for part in message.parts:
+                returned = type(part).__name__.endswith("ReturnPart")
+                if current and not returned:
+                    continue  # the call being checked, and the words around it
                 if isinstance(part, ToolCallPart):
                     parts.append(_dump(part.args_as_dict()))
                 else:
@@ -389,6 +408,12 @@ def owner_replies(messages: list[ModelMessage]) -> list[str]:
 def _replies(content: str, questions: list[str]) -> list[str]:
     """Split "question\nAnswer: reply" blocks (bud.harness.ask.render_answers) by the known
     question texts, in order."""
+    typed = "\nAnswer (one message for all): "
+    if typed in content:
+        # Several questions answered in one typed message (bud.harness.ask.answer_from_text).
+        asked = "\n".join(f"{n}. {q}" for n, q in enumerate(questions, 1))
+        head, _, reply = content.partition(typed)
+        return [reply] if head == asked else []
     out: list[str] = []
     rest = content
     for index, question in enumerate(questions):
