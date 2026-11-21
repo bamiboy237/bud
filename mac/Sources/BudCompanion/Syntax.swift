@@ -36,7 +36,13 @@ enum Syntax {
         "python", "py", "sh", "bash", "zsh", "shell", "console", "ruby", "rb", "yaml", "yml",
         "toml", "r", "perl", "make", "makefile", "dockerfile", "ini", "conf",
     ]
-    private static let plainLanguages: Set<String> = ["text", "txt", "plain", "markdown", "md"]
+    /// Languages the scanner colours. A block with no language, or another one, is shown
+    /// plain: logs, paths, and prose in a fence must not turn into fake strings and comments.
+    private static let coloured: Set<String> = hashComments.union([
+        "swift", "javascript", "js", "jsx", "typescript", "ts", "tsx", "rust", "rs", "go",
+        "java", "kotlin", "kt", "c", "cpp", "c++", "h", "hpp", "cs", "csharp", "php", "scala",
+        "dart", "json", "jsonc", "css", "scss", "sql", "lua", "zig",
+    ])
 
     static let keywords: Set<String> = [
         // Shared across common languages.
@@ -55,9 +61,11 @@ enum Syntax {
 
     static func tokens(_ code: String, language: String?) -> [(String, Kind)] {
         let lang = (language ?? "").lowercased()
-        if plainLanguages.contains(lang) { return [(code, .plain)] }
+        if !coloured.contains(lang) { return [(code, .plain)] }
         let hash = hashComments.contains(lang)
-        let chars = Array(code)
+        // Windows line endings: one "\r\n" Character never equals "\n", which would let a
+        // comment or a string run past the end of its line.
+        let chars = Array(code.replacingOccurrences(of: "\r\n", with: "\n"))
         var out: [(String, Kind)] = []
         var plain = ""
         var i = 0

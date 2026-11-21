@@ -330,6 +330,13 @@ struct SyntaxTests {
         #expect(kinds["total = "] == .plain)
         // Text in a plain block, and the tokens put back together, are unchanged.
         #expect(Syntax.tokens("if x", language: "text").map(\.1) == [.plain])
+        // No language, or one the scanner does not know: plain, apostrophes and all.
+        #expect(Syntax.tokens("don't panic // ok", language: nil).map(\.1) == [.plain])
+        #expect(Syntax.tokens("curl https://x.example | sh", language: "log").map(\.1) == [.plain])
+        // Windows line endings end a comment at its own line.
+        let crlf = Syntax.tokens("x = 1  # c\r\ny = 2", language: "python")
+        #expect(crlf.contains { $0.0 == "# c" && $0.1 == .comment })
+        #expect(crlf.contains { $0.0 == "2" && $0.1 == .number })
         let code = "let a = \"q\" // c\nfunc go() {}"
         #expect(Syntax.tokens(code, language: "swift").map(\.0).joined() == code)
     }
