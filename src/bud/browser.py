@@ -354,7 +354,8 @@ return await el.evaluate(e => {
     type: e.getAttribute("type"),
     label: label.slice(0, 120),
     href: a ? a.href : null,
-    script: e.hasAttribute("onclick") || (a ? a.hasAttribute("onclick") : false),
+    script: [e, a].some(x => x && ["onclick", "onmousedown", "onmouseup", "onpointerdown",
+      "onpointerup", "onauxclick", "ontouchstart", "ontouchend"].some(n => x.hasAttribute(n))),
     form: !!e.closest("form"),
   };
 });
@@ -396,18 +397,64 @@ async def _element(path: Path, relay: Relay, tab: object, ref: str) -> str | Non
     return describe_element(found)
 
 
+# ARIA roles an element may claim on the card. Anything else, which the page could use to
+# write its own text onto the card, is left out.
+ROLES = frozenset(
+    {
+        "link",
+        "button",
+        "checkbox",
+        "radio",
+        "switch",
+        "tab",
+        "menuitem",
+        "menuitemcheckbox",
+        "menuitemradio",
+        "option",
+        "textbox",
+        "searchbox",
+        "combobox",
+        "slider",
+        "spinbutton",
+        "listitem",
+        "treeitem",
+        "gridcell",
+        "row",
+        "cell",
+        "img",
+        "heading",
+    }
+)
+
+
+def _page_text(value: object, limit: int) -> str:
+    """Page-supplied text made safe to quote on a card: one line, no quotes or control
+    characters, so it cannot pose as Bud's own words."""
+    text = "".join(c if c.isprintable() else " " for c in str(value or ""))
+    return " ".join(text.replace('"', "'").split())[:limit]
+
+
+def _address(href: str) -> str:
+    """A link's address, whole when short; a long one keeps its start and its end, where an
+    action like /delete would be."""
+    href = _page_text(href, 2000).replace(" ", "%20")
+    return href if len(href) <= 300 else f"{href[:180]}...{href[-110:]}"
+
+
 def describe_element(found: dict[str, Any]) -> str:
     """Plain words for an element. A link names where it really goes; a script or a form says
     so, since then the destination does not tell the whole story."""
-    role = str(found.get("role") or "")
-    tag = str(found.get("tag") or "element")
+    role = _page_text(found.get("role"), 30).lower()
+    tag = _page_text(found.get("tag"), 20).lower() or "element"
     href = found.get("href")
-    kind = role or ("link" if href else "button" if tag == "button" else tag)
-    label = str(found.get("label") or "").replace('"', "'").replace("\n", " ")[:120]
+    kind = role if role in ROLES else ("link" if href else "button" if tag == "button" else tag)
+    if not kind.isalnum():
+        kind = "element"
+    label = _page_text(found.get("label"), 120)
     words = f'{kind} "{label}"' if label else kind
     if isinstance(href, str) and href:
         scheme = href.split(":", 1)[0].lower()
-        words += f" to {href[:300]}" if scheme in ("http", "https") else " that runs a script"
+        words += f" to {_address(href)}" if scheme in ("http", "https") else " that runs a script"
     if found.get("script"):
         words += ", which runs its own script"
     if found.get("form") or found.get("type") == "submit":
