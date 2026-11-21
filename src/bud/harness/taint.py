@@ -28,7 +28,7 @@ from collections.abc import Iterable
 from email.utils import getaddresses
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 from pydantic_ai.messages import (
     ModelMessage,
@@ -136,6 +136,36 @@ _AT = re.compile(r"\s*[\[({<]\s*at\s*[\])}>]\s*")
 _DOT = re.compile(r"\s*[\[({<]\s*dot\s*[\])}>]\s*")
 
 
+def _light(text: str) -> str:
+    """Folded like `normalize`, but not percent-decoded: a link keeps its structure, so a
+    `%2F` or `%20` before an `@` stays inside the userinfo, as curl and browsers read it."""
+    for _ in range(3):
+        decoded = html.unescape(text)
+        if decoded == text:
+            break
+        text = decoded
+    text = unicodedata.normalize("NFKC", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Cf")
+    return _SILENT_MARKS.sub("", text).lower()
+
+
+def _link_host(link: str) -> str:
+    """The host a client connects to, parsed from an undecoded link, then normalized."""
+    try:
+        host = urlsplit(link if "//" in link else f"//{link}").hostname or ""
+    except ValueError:
+        host = _host(link)
+    return normalize(host).strip(".")
+
+
+def _links(text: str) -> list[tuple[str, str]]:
+    """Each link in `text` as (normalized link, host it connects to)."""
+    return [
+        (normalize(link), _link_host(link))
+        for link in (match.rstrip(".,;:!") for match in URL.findall(_light(text)))
+    ]
+
+
 def normalize(text: str) -> str:
     """One canonical form for matching. Decoding comes first, so an encoded invisible or
     full-width character is decoded, then folded and removed like a literal one."""
@@ -202,6 +232,10 @@ class Words:
         self.emails = set(EMAIL.findall(self.text))
         self.urls = _urls(self.text)
         hosts = {_host(url) for url in self.urls}
+        # Also the hosts links really connect to, read before percent-decoding.
+        links = _links(text)
+        self.urls |= {link for link, _ in links}
+        hosts |= {host for _, host in links}
         hosts |= {email.split("@", 1)[1] for email in self.emails}
         hosts |= _bare_hosts(self.text)
         self.hosts = {form for host in hosts if host for form in _forms(host)}
@@ -221,29 +255,32 @@ def _strings(value: Any, key: str = "") -> Iterable[tuple[str, str]]:
             yield from _strings(item, key)
 
 
-def targets(tool: str, tool_args: dict[str, Any]) -> list[tuple[str, str, str]]:
-    """What a call acts on, as (kind, value, argument name): kind is email, url, or host."""
+def targets(tool: str, tool_args: dict[str, Any]) -> list[tuple[str, str, str, str]]:
+    """What a call acts on, as (kind, value, argument name, host): kind is email, url, or
+    host. A link's host is the one a client connects to, parsed before percent-decoding, so
+    `https://news.example%2F@evil.example/` is evil.example."""
     skip_text = bool(ACCOUNT_TOOL.fullmatch(tool))
-    found: set[tuple[str, str, str]] = set()
+    found: set[tuple[str, str, str, str]] = set()
     for key, raw in _strings(tool_args):
         if skip_text and key in FREE_TEXT:
             continue
         text = normalize(raw)
         emails = set(EMAIL.findall(text))
-        urls = _urls(text)
-        found.update(("email", email, key) for email in emails)
+        found.update(("email", email, key, email.split("@", 1)[1]) for email in emails)
         if tool in NAVIGATION:
             # The argument is one link. A path with a space or parentheses would cut a regex
             # match short of its query, so the whole argument is the target. A plain link is
             # browsing; one with a query can carry data out.
-            link = text.strip()
+            link = _light(raw).strip()
             if "//" in link and "?" in link:
-                found.add(("url", link, key))
+                found.add(("url", normalize(link), key, _link_host(link)))
             continue
-        found.update(("url", url, key) for url in urls)
+        links = _links(raw)
+        found.update(("url", link, key, host) for link, host in links)
         if tool in COMMANDS or key in HOST_KEYS:
-            seen = {email.split("@", 1)[1] for email in emails} | {_host(url) for url in urls}
-            found.update(("host", host, key) for host in _bare_hosts(text) - seen)
+            seen = {email.split("@", 1)[1] for email in emails} | {host for _, host in links}
+            seen |= {_host(url) for url in _urls(text)}
+            found.update(("host", host, key, host) for host in _bare_hosts(text) - seen)
     return sorted(found)
 
 
@@ -251,7 +288,7 @@ def recipients(tool: str, tool_args: dict[str, Any]) -> set[str]:
     """The addresses a call sends to, by argument name."""
     return {
         value
-        for kind, value, key in targets(tool, tool_args)
+        for kind, value, key, _ in targets(tool, tool_args)
         if kind == "email" and RECIPIENT.search(key)
     }
 
@@ -381,11 +418,7 @@ def tainted(tool: str, tool_args: dict[str, Any], owner: str, read: str) -> list
     """Targets that came from content Bud read and not from the owner's own words."""
     said, seen = Words(owner), Words(read)
     out = []
-    for kind, value, _ in targets(tool, tool_args):
-        if kind == "email":
-            host = value.split("@", 1)[1]
-        else:
-            host = _host(value) if kind == "url" else value
+    for kind, value, _, host in targets(tool, tool_args):
         if tool in COMMANDS and _registry(host):
             continue
         if kind == "email":
