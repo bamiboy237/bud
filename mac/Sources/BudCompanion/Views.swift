@@ -186,10 +186,13 @@ private struct PetButton: View {
                     Ripple(trigger: companion.arrivals)
                     if companion.status == .needsYou && connected {
                         WaitingBadge(count: companion.waitingCount)
+                            .fixedSize()
                             .transition(.scale(scale: 0.6).combined(with: .opacity))
                     }
                 }
-                .frame(minWidth: 16, minHeight: 16)
+                // A fixed spot: the ripple fills whatever room it gets, which would centre the
+                // badge on the pet. A wider "9+" badge overflows this frame to the left.
+                .frame(width: 16, height: 16, alignment: .trailing)
                 .padding(10)
                 .allowsHitTesting(false)
             }
