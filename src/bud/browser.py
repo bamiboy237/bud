@@ -24,6 +24,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -338,6 +339,135 @@ async def _tabs(path: Path, relay: Relay) -> list[dict[str, Any]]:
         return []
 
 
+# A ref Browse hands out ("e21", or "a5" in aria mode). Anything else never reaches a script.
+REF = re.compile(r"[a-z]\d{1,6}")
+# Reads one element and changes nothing: its tag, role, label, the link it opens, whether it
+# runs its own script, and whether it sits in a form.
+ELEMENT_SCRIPT = """
+const el = ref(%s);
+return await el.evaluate(e => {
+  const a = e.closest("a[href]");
+  const raw = a ? (a.getAttribute("href") || "").trim() : null;
+  const label = (e.getAttribute("aria-label") || e.innerText || e.value || "").trim();
+  return {
+    tag: e.tagName.toLowerCase(),
+    role: e.getAttribute("role"),
+    type: e.getAttribute("type"),
+    label: label.slice(0, 120),
+    href: a && typeof a.href === "string" ? a.href : null,
+    // "#", "#top", or empty: the link goes nowhere, so a listener does whatever it does.
+    in_page: raw !== null && (raw === "" || raw.startsWith("#")),
+    script: [e, a].some(x => x && ["onclick", "onmousedown", "onmouseup", "onpointerdown",
+      "onpointerup", "onauxclick", "ontouchstart", "ontouchend"].some(n => x.hasAttribute(n))),
+    form: !!e.closest("form"),
+  };
+});
+"""
+
+
+async def _element(path: Path, relay: Relay, tab: object, ref: str) -> str | None:
+    """What one element is, read from the page itself: 'link "Play" to https://...' or
+    'button "Delete" in a form'. None when Browse cannot say."""
+    if not REF.fullmatch(ref):
+        return None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            str(path),
+            "execute",
+            ELEMENT_SCRIPT % json.dumps(ref),
+            f"--tab={tab}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=relay.env(),
+        )
+        try:
+            out, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            return None
+    except OSError:
+        return None
+    found: dict[str, Any] | None = None
+    for line in reversed(out.decode("utf-8", "replace").splitlines()):
+        with contextlib.suppress(ValueError):
+            data = json.loads(line)
+            if isinstance(data, dict) and "tag" in data:
+                found = data
+                break
+    if found is None:
+        return None
+    return describe_element(found)
+
+
+# ARIA roles an element may claim on the card. Anything else, which the page could use to
+# write its own text onto the card, is left out.
+ROLES = frozenset(
+    {
+        "link",
+        "button",
+        "checkbox",
+        "radio",
+        "switch",
+        "tab",
+        "menuitem",
+        "menuitemcheckbox",
+        "menuitemradio",
+        "option",
+        "textbox",
+        "searchbox",
+        "combobox",
+        "slider",
+        "spinbutton",
+        "listitem",
+        "treeitem",
+        "gridcell",
+        "row",
+        "cell",
+        "img",
+        "heading",
+    }
+)
+
+
+def _page_text(value: object, limit: int) -> str:
+    """Page-supplied text made safe to quote on a card: one line, no quotes or control
+    characters, so it cannot pose as Bud's own words."""
+    text = "".join(c if c.isprintable() else " " for c in str(value or ""))
+    return " ".join(text.replace('"', "'").split())[:limit]
+
+
+def _address(href: str) -> str:
+    """A link's address, whole when short; a long one keeps its start and its end, where an
+    action like /delete would be."""
+    href = _page_text(href, 2000).replace(" ", "%20")
+    return href if len(href) <= 300 else f"{href[:180]}...{href[-110:]}"
+
+
+def describe_element(found: dict[str, Any]) -> str:
+    """Plain words for an element. A link names where it really goes; a script or a form says
+    so, since then the destination does not tell the whole story."""
+    role = _page_text(found.get("role"), 30).lower()
+    tag = _page_text(found.get("tag"), 20).lower() or "element"
+    href = found.get("href")
+    kind = role if role in ROLES else ("link" if href else "button" if tag == "button" else tag)
+    if not kind.isalnum():
+        kind = "element"
+    label = _page_text(found.get("label"), 120)
+    words = f'{kind} "{label}"' if label else kind
+    if found.get("in_page"):
+        # A link to "#" is a script's button: where it "goes" says nothing about what it does.
+        words += " that stays on this page, so a script decides what it does"
+    elif isinstance(href, str) and href:
+        scheme = href.split(":", 1)[0].lower()
+        words += f" to {_address(href)}" if scheme in ("http", "https") else " that runs a script"
+    if found.get("script"):
+        words += ", which runs its own script"
+    if found.get("form") or found.get("type") == "submit":
+        words += ", in a form"
+    return words
+
+
 def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> dict[str, Callable]:
     """Facts for the reviewer that the model cannot fake: which site a tab really shows.
     Nothing the model wrote is repeated here; the reviewer sees the arguments separately."""
@@ -354,6 +484,22 @@ def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> di
                 return f"The tab shows {_site(entry.get('url'))}."
         return "The tab is not one Browse knows."
 
+    async def step(tool_args: dict[str, Any]) -> str:
+        """Which site, and for a step on one element, what that element is."""
+        site = await where(tool_args)
+        ref, tab, path = tool_args.get("ref"), tool_args.get("tab"), find()
+        if (
+            not isinstance(ref, str)
+            or tab is None
+            or path is None
+            or not site.startswith("The tab shows")
+        ):
+            return site
+        element = await _element(path, relay, tab, ref)
+        if element is None:
+            return f"{site} The element could not be looked up."
+        return f"{site} It acts on: {element} (label and link read from the page)."
+
     async def tabs(tool_args: dict[str, Any]) -> str:
         action = tool_args.get("action")
         if action == "close" and tool_args.get("tab") is not None:
@@ -368,7 +514,7 @@ def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> di
         return CAUTION
 
     # Every client shows the caution, because it rides the approval as a looked-up fact.
-    return {**dict.fromkeys(STEPS | {UPLOAD}, where), TABS: tabs, ENABLE: caution}
+    return {**dict.fromkeys(STEPS | {UPLOAD}, step), TABS: tabs, ENABLE: caution}
 
 
 def _tab_ref(value: object) -> bool:
