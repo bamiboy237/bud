@@ -5,6 +5,7 @@ import json
 import logging
 from collections.abc import AsyncIterable
 from contextvars import Context, ContextVar
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -28,6 +29,7 @@ from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
     ModelMessage,
+    ModelRequest,
     ModelResponse,
     PartDeltaEvent,
     PartEndEvent,
@@ -37,6 +39,7 @@ from pydantic_ai.messages import (
     TextPartDelta,
     ToolCallPart,
     ToolReturnPart,
+    UserPromptPart,
 )
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
@@ -1066,6 +1069,13 @@ class Runner(DBOSConfiguredInstance):
 
             conversation, history = self._history(run)
             if late := run.get("late_call"):
+                # The history ends with the owner's newer messages, already answered. Without
+                # this note the model reads the newest one as unanswered and answers it again.
+                note = UserPromptPart(late_approval_note(late["tool"]))
+                if history and isinstance(history[-1], ModelRequest):
+                    history[-1] = replace(history[-1], parts=[*history[-1].parts, note])
+                else:
+                    history = [*history, ModelRequest(parts=[note])]
                 call = ToolCallPart(late["tool"], late["args"], tool_call_id=late["call_id"])
                 history = [*history, ModelResponse(parts=[call])]
             if conversation is not None and conversation.conversation_id != run["session_id"]:
@@ -1377,6 +1387,14 @@ def _failure(error: BaseException) -> dict[str, str]:
     if isinstance(error, RecoveryRefused):
         return {"reason": str(error), "kind": "recovery", "next": NEXT_STEP["recovery"]}
     return failure(error)
+
+
+def late_approval_note(tool: str) -> str:
+    return (
+        f"[bud system note] The owner has now approved {tool}, which you proposed before their "
+        "newer messages. It runs next. Those newer messages were already answered: do not "
+        "answer them again. Reply only about this action, in a sentence or two."
+    )
 
 
 def _parked_note(approval_id: str) -> str:

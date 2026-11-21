@@ -238,3 +238,40 @@ async def test_stop_cancels_inflight_model_without_executing_tools(tmp_path):
                     await asyncio.sleep(0)
         assert bud.runner.snapshot("owner").recent_runs[-1].status == "cancelled"
         assert not (bud.root / "note.txt").exists()
+
+
+async def test_a_late_approval_does_not_answer_the_newer_message_again(tmp_path):
+    """The owner sends another message before approving a card. When they approve it later,
+    Bud reports on that action and does not answer the newer message a second time."""
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    def respond(messages, info):
+        prompts = [
+            part.content
+            for message in messages
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, UserPromptPart) and isinstance(part.content, str)
+        ]
+        latest = prompts[-1]
+        if latest.startswith("Create note.txt") and len(messages) == 1:
+            return create_note()
+        if "has now approved workspace_create" in latest:
+            return reply("Created note.txt.")
+        if latest.startswith("What is 2+2?"):
+            return reply("4")
+        return reply("Okay.")
+
+    async with running_bud(tmp_path, respond) as bud:
+        bud.log.append("owner", "session.created")
+        bud.runner.start("owner", "Create note.txt", "message-1")
+        await bud.settle()
+        card = bud.runner.snapshot("owner").pending_approvals[0].approval_id
+        bud.runner.start("owner", "What is 2+2?", "message-2")
+        await bud.settle()
+        assert bud.runner.decide("owner", card, True)
+        await bud.settle()
+        said = [t.text for t in bud.runner.snapshot("owner").transcript if t.role == "assistant"]
+        assert said.count("4") == 1, said
+        assert said[-1] == "Created note.txt."
+        assert (bud.root / "note.txt").read_text() == "Cedar first draft"
