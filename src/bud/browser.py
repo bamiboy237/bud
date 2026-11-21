@@ -347,13 +347,16 @@ ELEMENT_SCRIPT = """
 const el = ref(%s);
 return await el.evaluate(e => {
   const a = e.closest("a[href]");
+  const raw = a ? (a.getAttribute("href") || "").trim() : null;
   const label = (e.getAttribute("aria-label") || e.innerText || e.value || "").trim();
   return {
     tag: e.tagName.toLowerCase(),
     role: e.getAttribute("role"),
     type: e.getAttribute("type"),
     label: label.slice(0, 120),
-    href: a ? a.href : null,
+    href: a && typeof a.href === "string" ? a.href : null,
+    // "#", "#top", or empty: the link goes nowhere, so a listener does whatever it does.
+    in_page: raw !== null && (raw === "" || raw.startsWith("#")),
     script: [e, a].some(x => x && ["onclick", "onmousedown", "onmouseup", "onpointerdown",
       "onpointerup", "onauxclick", "ontouchstart", "ontouchend"].some(n => x.hasAttribute(n))),
     form: !!e.closest("form"),
@@ -452,7 +455,10 @@ def describe_element(found: dict[str, Any]) -> str:
         kind = "element"
     label = _page_text(found.get("label"), 120)
     words = f'{kind} "{label}"' if label else kind
-    if isinstance(href, str) and href:
+    if found.get("in_page"):
+        # A link to "#" is a script's button: where it "goes" says nothing about what it does.
+        words += " that stays on this page, so a script decides what it does"
+    elif isinstance(href, str) and href:
         scheme = href.split(":", 1)[0].lower()
         words += f" to {_address(href)}" if scheme in ("http", "https") else " that runs a script"
     if found.get("script"):
@@ -482,7 +488,12 @@ def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> di
         """Which site, and for a step on one element, what that element is."""
         site = await where(tool_args)
         ref, tab, path = tool_args.get("ref"), tool_args.get("tab"), find()
-        if not isinstance(ref, str) or tab is None or path is None:
+        if (
+            not isinstance(ref, str)
+            or tab is None
+            or path is None
+            or not site.startswith("The tab shows")
+        ):
             return site
         element = await _element(path, relay, tab, ref)
         if element is None:

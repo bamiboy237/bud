@@ -578,6 +578,13 @@ def test_an_element_is_described_by_where_it_goes_and_what_it_runs():
     assert describe({"tag": "a", "label": "Play", "href": "javascript:pay()"}) == (
         'link "Play" that runs a script'
     )
+    # A link to "#" goes nowhere: a script decides what it does.
+    assert (
+        describe(
+            {"tag": "a", "label": "Pay", "href": "https://shop.example/cart#", "in_page": True}
+        )
+        == 'link "Pay" that stays on this page, so a script decides what it does'
+    )
     assert describe({"tag": "div", "role": "link", "label": "Play", "script": True}) == (
         'link "Play", which runs its own script'
     )
