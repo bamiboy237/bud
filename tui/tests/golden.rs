@@ -402,20 +402,6 @@ fn slash_menu_executes_instead_of_pasting() {
 }
 
 #[test]
-fn exact_command_name_wins_over_longer_prefix_in_the_menu() {
-    use crossterm::event::KeyCode;
-    let mut a = app(Kind::Dog, Theme::dark(ColorDepth::TrueColor));
-    typed(&mut a, "/mode");
-    press(&mut a, KeyCode::Enter);
-    let picker = a.picker.as_ref().expect("mode picker");
-    assert_eq!(picker.kind, bud_tui::app::PickKind::Mode);
-    assert_eq!(
-        picker.items[picker.selected].value, "strict",
-        "cursor starts on the current mode"
-    );
-}
-
-#[test]
 fn picker_filter_and_empty_states() {
     use crossterm::event::KeyCode;
     let mut a = app(Kind::Dog, Theme::dark(ColorDepth::TrueColor));
@@ -472,7 +458,6 @@ fn picker_frames(name: &str, open: impl Fn(&mut App)) {
 fn picker_cards() {
     picker_frames("picker-theme", |a| a.run_command("/theme"));
     picker_frames("picker-mascot", |a| a.run_command("/mascot"));
-    picker_frames("picker-mode", |a| a.run_command("/mode"));
     picker_frames("picker-connect", |a| {
         a.on_outcome(bud_tui::app::Outcome::ConnectStates(
             json!({"statuses": {"gmail": "ACTIVE", "calendar": "NOT_CONNECTED"}}),

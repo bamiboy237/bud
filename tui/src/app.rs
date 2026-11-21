@@ -129,7 +129,6 @@ pub enum PickKind {
     Model,
     Theme,
     Mascot,
-    Mode,
     Connect,
     Cancel,
     Edit,
@@ -184,7 +183,6 @@ pub enum Outcome {
     Models(Vec<ModelInfo>),
     ConnectStates(Value),
     ModelSet(String),
-    ModeSet(String, String),
     SetupLink { label: String, url: String },
     Decided { id: String, approved: bool },
     Answered(String),
@@ -287,7 +285,7 @@ impl App {
             post_tx: None,
             session: String::new(),
             model: model.to_string(),
-            approval_mode: "strict".into(),
+            approval_mode: "auto".into(),
             context_label: context_label(),
             entries: vec![Entry::Banner],
             hide_before: 0,
@@ -694,10 +692,6 @@ impl App {
             Outcome::ModelSet(model) => {
                 self.model = sanitize::clean_line(&model);
                 self.note(Level::Muted, format!("model pinned to {}", self.model));
-            }
-            Outcome::ModeSet(mode, summary) => {
-                self.approval_mode = sanitize::clean_line(&mode);
-                self.note(Level::Info, summary);
             }
             Outcome::SetupLink { label, url } => {
                 self.setups.retain(|c| c.capability != "link");

@@ -13,14 +13,6 @@ use crate::ui::text::elide;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 
-const MODES: [(&str, &str); 2] = [
-    ("strict", "every write asks: workspace, memory, skills"),
-    (
-        "auto",
-        "a reviewer runs safe, requested writes; sends still ask",
-    ),
-];
-
 fn item(label: &str, detail: &str, value: &str) -> PickItem {
     PickItem {
         label: label.to_string(),
@@ -95,18 +87,6 @@ impl App {
             "",
         );
         p.revert = Some(Revert::Mascot(self.mascot.kind()));
-        self.open_picker(p);
-    }
-
-    pub fn open_mode_picker(&mut self) {
-        let items = MODES.iter().map(|(m, d)| item(m, d, m)).collect();
-        let p = self.new_picker(
-            PickKind::Mode,
-            "Approval mode",
-            items,
-            Some(self.approval_mode.clone()),
-            "",
-        );
         self.open_picker(p);
     }
 
@@ -376,7 +356,6 @@ impl App {
             PickKind::Model => self.switch_model(value),
             PickKind::Theme => self.run_command(&format!("/theme {value}")),
             PickKind::Mascot => self.run_command(&format!("/mascot {value}")),
-            PickKind::Mode => self.run_command(&format!("/mode {value}")),
             PickKind::Connect => self.run_command(&format!("/connect {value}")),
             PickKind::Cancel => self.run_command(&format!("/cancel {value}")),
             PickKind::Edit => self.begin_edit(&value),

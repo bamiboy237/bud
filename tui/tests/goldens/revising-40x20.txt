@@ -14,7 +14,7 @@
  │ Paragraph line 1 of the full draft
  Enter send  Esc back
 ────────────────────────────────────────
-─────────────────── stub-fast · strict ─
+───────────────────── stub-fast · auto ─
 revise › Say what to change instead…
 ────────────────────────────────────────
   bud:main · approval needed

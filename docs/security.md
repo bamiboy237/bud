@@ -168,11 +168,11 @@ An approval card offers **Always allow** for a tool that may be granted. Choosin
 
 Hard rules stay in code. Sending email, real Gmail and Calendar writes, and installing or disabling skills can never be granted, and their cards do not offer the button. Revoke a permission with `bud grants revoke <tool>`; `bud grants` lists them. Grants live in `DATA_DIR/grants.json`, outside the event log.
 
-## Approval modes
-Switch with `/mode`. There are two, and `auto` is the default.
+## Approval mode
+Bud runs in `auto` mode, and no client offers another. Strict mode, where every write asks,
+remains in the code for evals and tests (`bud eval --mode strict`, or `POST /mode`).
 
-- `strict`: every write asks, as described above.
-- `auto`: each write to Bud's own workspace, memory, and the simulated world is reviewed per call. The reviewer (OpenAI's Decisions API, `gpt-6-luna` by default) rates the call's risk and how clearly you authorized it. A call that is judged safe and clearly requested runs and is journaled; anything else asks you. A timeout, refusal, or malformed answer asks you, never allows.
+In `auto`, each write to Bud's own workspace, memory, and the simulated world is reviewed per call. The reviewer (OpenAI's Decisions API, `gpt-6-luna` by default) rates the call's risk and how clearly you authorized it. A call that is judged safe and clearly requested runs and is journaled; anything else asks you. A timeout, refusal, or malformed answer asks you, never allows.
 
 Hard rules live in code and hold in both modes: sending email, real Gmail and Calendar writes, and installing or disabling skills always ask, and never reach the reviewer.
 

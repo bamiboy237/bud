@@ -14,7 +14,7 @@
 
 
 
-─────────────────── stub-fast · strict ─
+───────────────────── stub-fast · auto ─
 > Ask anything…
 ────────────────────────────────────────
   bud:main     / · Ctrl+D · Esc/Ctrl+C

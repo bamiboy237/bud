@@ -78,7 +78,6 @@ impl App {
             }
             "/theme" => self.cmd_theme(rest.first().copied()),
             "/mascot" => self.cmd_mascot(rest.first().copied()),
-            "/mode" => self.cmd_mode(rest.first().copied()),
             "/cost" => {
                 let tokens = self.session_chars / 4;
                 self.note(
@@ -271,24 +270,5 @@ impl App {
         self.mascot.set_kind(kind);
         self.sync_mascot();
         self.note(Level::Muted, format!("mascot {}", kind.name()));
-    }
-
-    fn cmd_mode(&mut self, mode: Option<&str>) {
-        let Some(mode) = mode else {
-            return self.open_mode_picker();
-        };
-        let target = mode.to_lowercase();
-        self.act(move |core, _| async move {
-            match core.set_mode(&target).await {
-                Ok((mode, summary)) => vec![Outcome::ModeSet(mode, summary)],
-                Err(e) if e.status == Some(400) => {
-                    vec![Outcome::Note(
-                        Level::Muted,
-                        format!("unknown mode '{target}'"),
-                    )]
-                }
-                Err(e) => vec![Outcome::Note(Level::Error, format!("mode failed: {e}"))],
-            }
-        });
     }
 }
