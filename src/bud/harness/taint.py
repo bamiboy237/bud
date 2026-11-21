@@ -232,10 +232,15 @@ def targets(tool: str, tool_args: dict[str, Any]) -> list[tuple[str, str, str]]:
         emails = set(EMAIL.findall(text))
         urls = _urls(text)
         found.update(("email", email, key) for email in emails)
-        for url in urls:
-            if tool in NAVIGATION and "?" not in url:
-                continue
-            found.add(("url", url, key))
+        if tool in NAVIGATION:
+            # The argument is one link. A path with a space or parentheses would cut a regex
+            # match short of its query, so the whole argument is the target. A plain link is
+            # browsing; one with a query can carry data out.
+            link = text.strip()
+            if "//" in link and "?" in link:
+                found.add(("url", link, key))
+            continue
+        found.update(("url", url, key) for url in urls)
         if tool in COMMANDS or key in HOST_KEYS:
             seen = {email.split("@", 1)[1] for email in emails} | {_host(url) for url in urls}
             found.update(("host", host, key) for host in _bare_hosts(text) - seen)
