@@ -17,6 +17,7 @@ HTML entities, percent-encoding, full-width letters, invisible characters, and
 """
 
 import contextlib
+import functools
 import html
 import json
 import os
@@ -35,12 +36,14 @@ from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
     SystemPromptPart,
+    TextContent,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
 )
 
-EMAIL = re.compile(r"[a-z0-9._%+\-]+@(?:[a-z0-9\-]+\.)+[a-z]{2,63}")
+# The domain may hold Unicode letters (x@bücher.example), matched in its punycode form too.
+EMAIL = re.compile(r"[a-z0-9._%+\-]+@(?:[^\W_][\w\-]*\.)+[^\W\d_]{2,63}")
 # A scheme link, or a protocol-relative one (//host/path), with an IPv6 host in brackets.
 URL = re.compile(
     r"(?:[a-z][a-z0-9+.\-]*:)?//(?:\[[0-9a-f:.]+\]|[^\s\"'<>()\[\]{}`\\/?#])[^\s\"'<>()\[\]{}`\\]*"
@@ -54,7 +57,7 @@ IPV6 = re.compile(r"\[([0-9a-f]*:[0-9a-f:.]+)\]")
 IPV4 = re.compile(r"(?<![\w.])(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b")
 # Navigating to a link a page showed is ordinary browsing; a link carrying a query string
 # can smuggle data out, so only those count for these tools.
-NAVIGATION = frozenset({"browser_navigate", "browser_tabs"})
+NAVIGATION = frozenset({"browser_navigate", "browser_tabs", "read_webpage"})
 # Calls whose whole text is the action, so a bare host in it is a target. Package registries
 # are not targets here: installing from them is what these commands are for.
 COMMANDS = frozenset({"run_command", "run_in_background"})
@@ -217,6 +220,15 @@ def _host(url: str) -> str:
     return authority.split(":", 1)[0].strip(".")
 
 
+def _canonical(link: str) -> str:
+    """A web link as Chrome reads it: `https:/x`, `https:x`, and `https:\\x` all mean
+    `https://x`, and a backslash is a slash."""
+    match = re.match(r"(https?):[\\/]*", link)
+    if not match:
+        return link
+    return f"{match.group(1)}://{link[match.end() :].replace(chr(92), '/')}"
+
+
 def _urls(text: str) -> set[str]:
     return {url.rstrip(".,;:!") for url in URL.findall(text)}
 
@@ -272,12 +284,11 @@ def targets(tool: str, tool_args: dict[str, Any]) -> list[tuple[str, str, str, s
         emails = set(EMAIL.findall(text))
         found.update(("email", email, key, email.split("@", 1)[1]) for email in emails)
         if tool in NAVIGATION:
-            # The argument is one link. A path with a space or parentheses would cut a regex
-            # match short of its query, so the whole argument is the target. A plain link is
-            # browsing; one with a query can carry data out.
-            link = _light(raw).strip()
-            if "//" in link and "?" in link:
-                found.add(("url", normalize(link), key, _link_host(link)))
+            # The argument is one link, read the way Chrome reads it. A path with a space or
+            # parentheses would cut a regex match short, so the whole argument is the target.
+            link = _canonical(_light(raw).strip())
+            if "//" in link:
+                found.add(("link", normalize(link), key, _link_host(link)))
             continue
         links = _links(raw)
         found.update(("url", link, key, host) for link, host in links)
@@ -315,6 +326,26 @@ def _prompt_text(part: UserPromptPart) -> str:
     return content if isinstance(content, str) else _dump(content)
 
 
+def _prompt_split(part: UserPromptPart) -> tuple[str, str]:
+    """A prompt's text as (the owner's, added by the harness). Plain text is the owner's;
+    content the harness attached with its own metadata, such as a memory snapshot the model
+    wrote, is read content."""
+    content = part.content
+    if isinstance(content, str):
+        return content, ""
+    own, added = [], []
+    for item in content:
+        if isinstance(item, str):
+            own.append(item)
+        elif isinstance(item, TextContent) and item.metadata is None:
+            own.append(item.content)
+        elif isinstance(item, TextContent):
+            added.append(item.content)
+        else:
+            added.append(_dump(item))
+    return "\n".join(own), "\n".join(added)
+
+
 def read_text(messages: list[ModelMessage], current_call: str | None = None) -> str:
     """What Bud read in this conversation: every part that is not the owner's own prompt or
     the system's instructions. That covers tool results (except the owner's own answers),
@@ -345,7 +376,8 @@ def read_text(messages: list[ModelMessage], current_call: str | None = None) -> 
             continue
         for part in message.parts:
             if isinstance(part, UserPromptPart):
-                text = _prompt_text(part)
+                text, added = _prompt_split(part)
+                parts.append(added)
                 if text.lstrip().startswith(SYSTEM_NOTE):
                     parts.append(text)
                 elif start := ADDED.search(text):
@@ -377,7 +409,7 @@ def owner_text(messages: list[ModelMessage]) -> str:
             continue
         for part in message.parts:
             if isinstance(part, UserPromptPart):
-                text = _prompt_text(part)
+                text = _prompt_split(part)[0]
                 if not text.lstrip().startswith(SYSTEM_NOTE):
                     start = ADDED.search(text)
                     parts.append(text[: start.start()] if start else text)
@@ -441,9 +473,12 @@ def _dump(content: Any) -> str:
 
 def tainted(tool: str, tool_args: dict[str, Any], owner: str, read: str) -> list[str]:
     """Targets that came from content Bud read and not from the owner's own words."""
-    said, seen = Words(owner), Words(read)
+    found = targets(tool, tool_args)
+    if not found:
+        return []  # nothing to check: skip scanning what was read
+    said, seen = _words(owner), _words(read)
     out = []
-    for kind, value, _, host in targets(tool, tool_args):
+    for kind, value, _, host in found:
         if tool in COMMANDS and _registry(host):
             continue
         if kind == "email":
@@ -456,9 +491,23 @@ def tainted(tool: str, tool_args: dict[str, Any], owner: str, read: str) -> list
                 continue
             if value in seen.urls or seen.has_host(host):
                 out.append(value)
+        elif kind == "link":
+            # Following a link exactly as a page or result gave it is browsing: it carries
+            # only what that content already said. One Bud built or changed on a host it read
+            # about can carry data out, in its query, path, or fragment alike.
+            if said.has_host(host) or not seen.has_host(host):
+                continue
+            if value.rstrip("/") not in {url.rstrip("/") for url in seen.urls}:
+                out.append(value)
         elif not said.has_host(host) and seen.has_host(host):
             out.append(value)
     return sorted(set(out))
+
+
+@functools.lru_cache(maxsize=8)
+def _words(text: str) -> Words:
+    """Scanning a long read is costly; the same text is scanned once per call burst."""
+    return Words(text)
 
 
 def _registry(host: str) -> bool:

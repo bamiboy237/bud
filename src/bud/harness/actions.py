@@ -215,7 +215,7 @@ class ActionGateway(WrapperToolset[None]):
         tool's own rule before any standing grant. Reads, Gmail and Calendar ones included, are
         not checked; an app action found at run time is checked unless it only reads."""
         name = tool.name
-        if name in consequential_tools() or name == "browser_upload":
+        if name in consequential_tools() or name in {"browser_upload", "read_webpage"}:
             return True
         found = (tool.metadata or {}).get(COMPOSIO_ACTION)
         if name not in self.policy.tools and found is not None:
