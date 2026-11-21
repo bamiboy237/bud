@@ -172,6 +172,10 @@ private struct Prose: View {
     }
 }
 
+private enum ChipMetrics {
+    static let gap: CGFloat = 3
+}
+
 /// Marks a run that is inline code, so `CodeChips` can draw its chip.
 private enum CodeRun: AttributedStringKey {
     typealias Value = Bool
@@ -197,15 +201,29 @@ private struct CodeChips: TextRenderer {
 
     func draw(layout: SwiftUI.Text.Layout, in context: inout GraphicsContext) {
         for line in layout {
+            // One chip per stretch of code: neighbouring code runs (kerning splits the last
+            // character into its own run) share a single rounded rectangle.
+            var chips: [CGRect] = []
+            var current: CGRect?
             for run in line {
                 if run[CodeChipAttribute.self] != nil {
-                    let rect = run.typographicBounds.rect.insetBy(dx: -3, dy: -1)
-                    context.fill(
-                        RoundedRectangle(cornerRadius: 4, style: .continuous).path(in: rect),
-                        with: .color(fill))
+                    let bounds = run.typographicBounds.rect
+                    current = current.map { $0.union(bounds) } ?? bounds
+                } else if let done = current {
+                    chips.append(done)
+                    current = nil
                 }
-                context.draw(run)
             }
+            if let done = current { chips.append(done) }
+            for var chip in chips {
+                // The stretch's bounds include the kerning after its last character.
+                chip.size.width -= ChipMetrics.gap
+                context.fill(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .path(in: chip.insetBy(dx: -3, dy: -1)),
+                    with: .color(fill))
+            }
+            for run in line { context.draw(run) }
         }
     }
 }
@@ -340,11 +358,12 @@ private struct TableView: View {
     @Environment(\.replyType) private var type
 
     var body: some View {
-        // As wide as its content, like an editor's table; a table too wide for the space
-        // takes the full width instead and its cells wrap.
+        // As wide as its content, like an editor's table. A table too wide for the space
+        // scrolls sideways at its natural column widths, rather than squeezing every column
+        // to the same narrow width.
         ViewThatFits(in: .horizontal) {
             grid.fixedSize(horizontal: true, vertical: true)
-            grid.fixedSize(horizontal: false, vertical: true)
+            ScrollView(.horizontal) { grid.fixedSize(horizontal: true, vertical: true) }
         }
     }
 
@@ -368,7 +387,8 @@ private struct TableView: View {
     private func cells(_ cells: [any Markup], header: Bool) -> some View {
         ForEach(Array(cells.enumerated()), id: \.offset) { index, cell in
             let alignment = alignment(index)
-            Text(inline(cell, code: .system(size: type.codeSize - 1, design: .monospaced)))
+            chipped(inline(cell, code: .system(size: type.codeSize - 1, design: .monospaced)))
+                .textRenderer(CodeChips(fill: Paper.inkPrimary.opacity(0.085)))
                 .fontWeight(header ? .semibold : .regular)
                 .foregroundStyle(header ? Paper.inkSecondary : Paper.inkPrimary)
                 .multilineTextAlignment(alignment.text)
@@ -424,8 +444,15 @@ private func inline(
                 run.inlinePresentationIntent = intent.union(.code)
             }
             run[CodeRun.self] = true
-            // Hair spaces outside the chip keep it off the words beside it.
-            out += AttributedString("\u{200A}") + run + AttributedString("\u{200A}")
+            // Extra kerning on either side keeps the chip off the words beside it. It is
+            // spacing, not characters, so copying the text copies only the code.
+            if let last = out.characters.indices.last {
+                out[last..<out.endIndex].kern = ChipMetrics.gap
+            }
+            if let last = run.characters.indices.last {
+                run[last..<run.endIndex].kern = ChipMetrics.gap
+            }
+            out += run
         case let link as Markdown.Link:
             var run = inline(link, intent: intent, code: codeFont)
             if let destination = link.destination, let url = URL(string: destination) {

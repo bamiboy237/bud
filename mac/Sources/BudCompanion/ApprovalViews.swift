@@ -181,8 +181,10 @@ struct ApprovalDeck: View {
                 .opacity(deck.flyOpacity)
             }
         }
-        // As tall as the card, up to the pet panel's room with the peeking cards included.
-        .frame(maxWidth: .infinity, maxHeight: 262 - peekRoom, alignment: .top)
+        // Exactly as tall as the card: a capped flexible frame grew to its cap and left empty
+        // paper under a short card. Cards bound their own long content.
+        .frame(maxWidth: .infinity, alignment: .top)
+        .fixedSize(horizontal: false, vertical: true)
         .background(alignment: .top) {
             ZStack(alignment: .top) {
                 if safeIndex + 2 < totalCount {

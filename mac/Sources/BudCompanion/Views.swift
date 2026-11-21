@@ -533,9 +533,7 @@ private struct Bubble: View {
         // Only the name line: a small tag over the pet, not a wide empty card.
         .frame(width: compact ? nil : 320, alignment: .leading)
         .frame(minWidth: 132, alignment: .leading)
-        // Hug the content vertically too: a short card leaves no empty paper below it. Long
-        // content is still bounded, by the reply's height and the deck's cap.
-        .fixedSize(horizontal: compact, vertical: true)
+        .fixedSize(horizontal: compact, vertical: false)
         .surface(BubbleShape(anchor: companion.anchor))
         .onHover { companion.bubbleHovered = $0 }
         // A cited date opens the conversation window at that message.
@@ -575,7 +573,9 @@ private struct Bubble: View {
     }
 
     /// The reply gives way when a card needs the room, so both fit above the pet.
-    private var maxReply: CGFloat { companion.needsAttention ? 60 : 260 }
+    private var maxReply: CGFloat {
+        companion.approvals.isEmpty && companion.setups.isEmpty ? 260 : 60
+    }
 
     /// Who is speaking and what they're doing, like a name above a message.
     private var header: some View {
@@ -658,6 +658,7 @@ private struct Bubble: View {
             return ("Working on it", Paper.inkSecondary, true)
         case .needsYou:
             if !companion.setups.isEmpty { return ("Needs you", Paper.inkPrimary, false) }
+            if companion.approvals.isEmpty { return ("A job needs you", Paper.inkPrimary, false) }
             let asking = companion.hasQuestion
             return (asking ? "Has a question" : "Needs your OK", Paper.inkPrimary, false)
         case .failed: return ("Couldn't finish", Paper.errorInk, false)
@@ -803,7 +804,7 @@ struct ApprovalCard: View {
     private var detailLimit: CGFloat {
         // The browser caution is read in full before turning it on, never behind a scroll;
         // it is written short enough to fit the deck at this height.
-        let height: CGFloat = approval.isQuestion ? 190 : approval.tool == "enable_browser" ? 135 : 100
+        let height: CGFloat = approval.isQuestion ? 190 : approval.tool == "enable_browser" ? 135 : 94
         let hasProblem = companion.approvalFailures[approval.id] != nil || companion.decisionProblem != nil
         return hasProblem ? max(80, height - 40) : height
     }
