@@ -94,7 +94,7 @@ struct SetupCard: View {
             if let problem = companion.setupProblems[setup.id] ?? setup.reason {
                 Text(problem)
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(Paper.errorInk)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }

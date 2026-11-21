@@ -85,7 +85,7 @@ struct PetView: View {
                 if overflow > 0 {
                     Text("+\(overflow)")
                         .font(.system(size: 10, weight: .semibold).monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Paper.inkSecondary)
                         .padding(.horizontal, 4)
                         .padding(.vertical, 2)
                         .background(.ultraThinMaterial, in: Capsule())
@@ -182,15 +182,14 @@ private struct PetButton: View {
             .opacity(connected ? 1 : 0.55)
             .overlay(alignment: .topTrailing) {
                 ZStack {
-                    // Always mounted, so it can play on the very arrival that brings the dot.
-                    Ripple(trigger: companion.arrivals)
                     if companion.status == .needsYou && connected {
-                        Circle().fill(.orange)
-                            .overlay(Circle().strokeBorder(.white.opacity(0.9), lineWidth: 1.5))
-                            .transition(.scale(scale: 0.6).combined(with: .opacity))
+                        WaitingBadge(count: companion.waitingCount)
+                            .fixedSize()
+                            .transition(.opacity)
                     }
                 }
-                .frame(width: 12, height: 12)
+                // A fixed spot in the pet's corner. A wider "9+" badge overflows to the left.
+                .frame(width: 16, height: 16, alignment: .trailing)
                 .padding(10)
                 .allowsHitTesting(false)
             }
@@ -273,28 +272,25 @@ struct ChildPupView: View {
     private var fallbackPaw: some View {
         Image(systemName: "pawprint.fill")
             .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(.secondary)
+            .foregroundStyle(Paper.inkSecondary)
             .frame(width: size.width, height: size.height)
     }
 }
 
-/// One ring spreading from the dot when something new needs you. Once per arrival, never a
-/// loop: a repeating pulse would turn into noise you learn to ignore. Still when reduced.
-private struct Ripple: View {
-    let trigger: Int
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+/// "Needs you", Option A: an inverted ink pill with how many things wait, cut out of the pet by
+/// a paper ring. Pure ink, so it never collides with links, the golden dog, or errors.
+struct WaitingBadge: View {
+    let count: Int
 
     var body: some View {
-        if !reduceMotion {
-            Circle()
-                .stroke(.orange, lineWidth: 1.5)
-                .keyframeAnimator(initialValue: 1.0, trigger: trigger) { ring, t in
-                    ring.scaleEffect(1 + t * 1.8).opacity(t >= 1 ? 0 : 0.7 * (1 - t))
-                } keyframes: { _ in
-                    LinearKeyframe(0, duration: 0.01)
-                    CubicKeyframe(1, duration: 0.8)
-                }
-        }
+        Text(count > 9 ? "9+" : "\(max(count, 1))")
+            .font(.system(size: 10, weight: .semibold).monospacedDigit())
+            .foregroundStyle(Paper.canvas)
+            .padding(.horizontal, count > 9 ? 4 : 0)
+            .frame(minWidth: 16, minHeight: 16)
+            .background(Capsule().fill(Paper.inkPrimary))
+            .overlay(Capsule().strokeBorder(Paper.canvas, lineWidth: 1.5))
+            .accessibilityLabel("\(count) waiting for you")
     }
 }
 
@@ -316,18 +312,18 @@ private struct StatusRing: View {
     var body: some View {
         ZStack {
             if case .problem = link {
-                Circle().strokeBorder(.secondary, style: StrokeStyle(lineWidth: 2, dash: [3, 4]))
+                Circle().strokeBorder(Paper.inkSecondary, style: StrokeStyle(lineWidth: 2, dash: [3, 4]))
             } else {
                 switch status {
                 case .working:
                     working
                 case .needsYou:
-                    Circle().strokeBorder(.orange, lineWidth: 2)
-                    Circle().fill(.orange).frame(width: 12, height: 12)
-                        .overlay(Circle().strokeBorder(.background, lineWidth: 2))
+                    Circle().strokeBorder(Paper.inkPrimary, lineWidth: 2)
+                    Circle().fill(Paper.inkPrimary).frame(width: 12, height: 12)
+                        .overlay(Circle().strokeBorder(Paper.canvas, lineWidth: 1.5))
                         .offset(x: 20, y: -20)
                 case .failed:
-                    Circle().strokeBorder(.red, lineWidth: 2)
+                    Circle().strokeBorder(Paper.errorInk, lineWidth: 2)
                 case .idle, .done:
                     EmptyView()
                 }
@@ -340,13 +336,13 @@ private struct StatusRing: View {
     /// Reduced motion: a still, faint ring.
     @ViewBuilder private var working: some View {
         if reduceMotion {
-            Circle().strokeBorder(.secondary.opacity(0.6), lineWidth: 2)
+            Circle().strokeBorder(Paper.inkSecondary.opacity(0.6), lineWidth: 2)
         } else {
             TimelineView(.animation) { context in
                 let turn = context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 0.9) / 0.9
                 Circle()
                     .trim(from: 0, to: 0.28)
-                    .stroke(.secondary, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                    .stroke(Paper.inkSecondary, style: StrokeStyle(lineWidth: 2, lineCap: .round))
                     .padding(1)
                     .rotationEffect(.degrees(turn * 360))
             }
@@ -392,7 +388,7 @@ private struct VoicePill: View {
             } else {
                 Text("Writing")
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Paper.inkSecondary)
                     .shimmer(active: true)
             }
         }
@@ -413,7 +409,7 @@ struct UnsentSpeech: View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text("“\(companion.unsentSpeech ?? "")”")
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Paper.inkSecondary)
                 .lineLimit(2)
                 .frame(maxWidth: .infinity, alignment: .leading)
             Button(companion.inputPurpose == .ask ? "Send" : "Add to answer") { companion.resendSpeech() }
@@ -435,7 +431,7 @@ struct UnsentMessage: View {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text("“\(message.text)”")
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Paper.inkSecondary)
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Button("Retry") { companion.retryHeldMessage() }
@@ -463,7 +459,7 @@ private struct Bubble: View {
                 // What you asked, so the answer keeps its context. One line: a reminder.
                 Text(companion.question)
                     .font(.callout)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(Paper.inkMuted)
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .padding(.top, -4)
@@ -479,7 +475,7 @@ private struct Bubble: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Label(notice.text, systemImage: "arrow.turn.down.right")
                         .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Paper.inkSecondary)
                         .lineLimit(2)
                     if let report = notice.report { OpenReport(file: report) }
                 }
@@ -577,7 +573,9 @@ private struct Bubble: View {
     }
 
     /// The reply gives way when a card needs the room, so both fit above the pet.
-    private var maxReply: CGFloat { companion.needsAttention ? 60 : 260 }
+    private var maxReply: CGFloat {
+        companion.approvals.isEmpty && companion.setups.isEmpty ? 260 : 60
+    }
 
     /// Who is speaking and what they're doing, like a name above a message.
     private var header: some View {
@@ -585,8 +583,15 @@ private struct Bubble: View {
             Text("bud")
                 .font(.system(size: 13, weight: .semibold, design: .serif))
             if let state {
+                if companion.status == .needsYou {
+                    // Option A: pure ink, never a colour that could pass for a link or an error.
+                    Rectangle().fill(Paper.inkPrimary).frame(width: 4.25, height: 4.25)
+                        .rotationEffect(.degrees(45))
+                        .alignmentGuide(.firstTextBaseline) { $0.height / 2 + 4 }
+                        .accessibilityHidden(true)
+                }
                 Text(state.text)
-                    .font(.system(size: 12))
+                    .font(.system(size: 12, weight: companion.status == .needsYou ? .medium : .regular))
                     .foregroundStyle(state.tint)
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -599,7 +604,7 @@ private struct Bubble: View {
             if let count = stepCount {
                 Text(count)
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(Paper.inkMuted)
                     .contentTransition(.numericText())
             }
             expand
@@ -642,21 +647,22 @@ private struct Bubble: View {
     /// Plain words for what bud is doing. Colour only when it's your move or something broke.
     private var state: (text: String, tint: Color, busy: Bool)? {
         if case .problem(let detail) = companion.link {
-            return (detail, .secondary, false)
+            return (detail, Paper.inkSecondary, false)
         }
         switch companion.status {
         case .working:
             // The live line: the step bud is on, unless the checklist below already shows it.
             if companion.stepsLayout != .checklist, let step = companion.steps.last {
-                return (step.text, .secondary, true)
+                return (step.text, Paper.inkSecondary, true)
             }
-            return ("Working on it", .secondary, true)
+            return ("Working on it", Paper.inkSecondary, true)
         case .needsYou:
-            if !companion.setups.isEmpty { return ("Needs you", .orange, false) }
+            if !companion.setups.isEmpty { return ("Needs you", Paper.inkPrimary, false) }
+            if companion.approvals.isEmpty { return ("A job needs you", Paper.inkPrimary, false) }
             let asking = companion.hasQuestion
-            return (asking ? "Has a question" : "Needs your OK", .orange, false)
-        case .failed: return ("Couldn't finish", .red, false)
-        case .done: return ("Done", .secondary, false)
+            return (asking ? "Has a question" : "Needs your OK", Paper.inkPrimary, false)
+        case .failed: return ("Couldn't finish", Paper.errorInk, false)
+        case .done: return ("Done", Paper.inkSecondary, false)
         case .idle: return nil
         }
     }
@@ -678,7 +684,7 @@ struct StepList: View {
             if let limit, steps.count > limit {
                 Text("\(steps.count - limit) earlier \(steps.count - limit == 1 ? "step" : "steps")")
                     .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(Paper.inkMuted)
                     .padding(.leading, 22)
             }
             ForEach(steps.suffix(limit ?? steps.count)) { step in
@@ -730,19 +736,12 @@ private struct StepRow: View {
 
             Text(step.text)
                 .font(.callout)
-                .foregroundStyle(live ? .primary : .secondary)
+                .foregroundStyle(live ? Paper.inkPrimary : Paper.inkSecondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .shimmer(active: live)
-                .overlay(alignment: .leading) {
-                    Rectangle()
-                        .fill(Paper.ink.opacity(0.35))
-                        .frame(height: 1)
-                        .scaleEffect(x: step.done || reduceMotion ? 1 : 0, anchor: .leading)
-                        .opacity(step.done ? 1 : 0)
-                        // The line follows the tick, so the eye goes circle, then words.
-                        .animation(reduceMotion ? check : check.delay(0.1), value: step.done)
-                }
+            // Done steps stay legible: the tick says done, and a line through the words
+            // would read as cancelled.
         }
         .accessibilityElement(children: .combine)
         .accessibilityValue(step.done ? "done" : live ? "in progress" : "")
@@ -776,7 +775,7 @@ private struct StepsSummary: View {
                         .rotationEffect(.degrees(companion.stepsExpanded ? 90 : 0))
                 }
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Paper.inkSecondary)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -798,20 +797,14 @@ struct ApprovalCard: View {
     let companion: Companion
     let approval: Approval
     let onDecide: (Bool) -> Void
-    /// The card's horizontal drag, as it happens; nil when it ends without a decision.
-    var onDrag: (CGFloat?) -> Void = { _ in }
     @StateObject private var layout = ApprovalLayout()
-    /// True while a drag is in progress. It resets on end and on cancel alike, so a drag the
-    /// system cancels still sends the card home.
-    @GestureState private var dragging = false
-
     private var busy: Bool {
         companion.deciding.contains(approval.id) || companion.approvingBatch || companion.link != .connected
     }
     private var detailLimit: CGFloat {
         // The browser caution is read in full before turning it on, never behind a scroll;
         // it is written short enough to fit the deck at this height.
-        let height: CGFloat = approval.isQuestion ? 190 : approval.tool == "enable_browser" ? 135 : 100
+        let height: CGFloat = approval.isQuestion ? 190 : approval.tool == "enable_browser" ? 135 : 94
         let hasProblem = companion.approvalFailures[approval.id] != nil || companion.decisionProblem != nil
         return hasProblem ? max(80, height - 40) : height
     }
@@ -832,29 +825,6 @@ struct ApprovalCard: View {
     private var content: some View {
         VStack(alignment: .leading, spacing: 10) {
             heading
-                .contentShape(Rectangle())
-                // A drag that ends without deciding, or that the system cancels, goes home.
-                // After a decision the deck is animating and ignores this.
-                .onChange(of: dragging) { _, now in if !now { onDrag(nil) } }
-                .gesture(
-                    // Global space: the card moves with the drag, so local coordinates would
-                    // chase themselves and jitter.
-                    DragGesture(minimumDistance: 10, coordinateSpace: .global)
-                        .updating($dragging) { _, state, _ in state = true }
-                        .onChanged { value in
-                            guard !busy, !approval.isQuestion,
-                                  abs(value.translation.width) > abs(value.translation.height)
-                            else { return }
-                            onDrag(value.translation.width)
-                        }
-                        .onEnded { value in
-                            guard !busy, !approval.isQuestion,
-                                  let direction = DecisionDirection.release(
-                                      value.translation, projected: value.predictedEndTranslation)
-                            else { return }
-                            onDecide(direction == .approve)
-                        }
-                )
             if approval.isQuestion {
                 QuestionCards(companion: companion, approval: approval,
                               flow: companion.questionFlow(for: approval), listLimit: detailLimit)
@@ -865,7 +835,7 @@ struct ApprovalCard: View {
             if let problem = companion.approvalFailures[approval.id] ?? companion.decisionProblem {
                 Text(problem)
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(Paper.errorInk)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -885,13 +855,13 @@ struct ApprovalCard: View {
                        !email.messages.isEmpty || email.unavailableReason != nil {
                         if approval.body != nil {
                             Divider()
-                            Text("Original email").font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                            Text("Original email").font(.caption.weight(.medium)).foregroundStyle(Paper.inkSecondary)
                         }
                         EmailThreadPreview(email: email)
                     } else if approval.expectsOriginalEmail && approval.emailPreview == nil {
                         Text("Original email preview unavailable")
                             .font(.callout)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Paper.inkSecondary)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -906,7 +876,7 @@ struct ApprovalCard: View {
             if layout.height > detailLimit {
                 Text("Scroll to read more")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Paper.inkSecondary)
             }
         }
     }
@@ -925,7 +895,7 @@ struct ApprovalCard: View {
                 if let job = approval.job {
                     Text("For the job “\(job)”")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Paper.inkSecondary)
                         .lineLimit(1)
                 }
             }
@@ -938,7 +908,7 @@ struct ApprovalCard: View {
         Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 3) {
             ForEach(approval.facts.indices, id: \.self) { index in
                 GridRow {
-                    Text(approval.facts[index].label).foregroundStyle(.secondary)
+                    Text(approval.facts[index].label).foregroundStyle(Paper.inkSecondary)
                     Text(approval.facts[index].value)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
@@ -1025,7 +995,7 @@ struct IconButton: ButtonStyle {
 
         private var ink: AnyShapeStyle {
             guard highlight else { return AnyShapeStyle(Paper.surface) }
-            return hover.on ? AnyShapeStyle(Paper.ink) : AnyShapeStyle(.secondary)
+            return hover.on ? AnyShapeStyle(Paper.ink) : AnyShapeStyle(Paper.inkSecondary)
         }
 
         private var scale: CGFloat {
@@ -1074,7 +1044,7 @@ struct CardButton: ButtonStyle {
             switch kind {
             case .primary: AnyShapeStyle(Paper.surface)
             case .secondary: AnyShapeStyle(Paper.ink)
-            case .quiet: hover.on ? AnyShapeStyle(Paper.ink) : AnyShapeStyle(.secondary)
+            case .quiet: hover.on ? AnyShapeStyle(Paper.ink) : AnyShapeStyle(Paper.inkSecondary)
             }
         }
     }
@@ -1127,7 +1097,7 @@ struct RowSymbol: View {
     var body: some View {
         Image(systemName: name)
             .font(.system(size: 10, weight: .semibold))
-            .foregroundStyle(hovered ? .secondary : .tertiary)
+            .foregroundStyle(hovered ? Paper.inkSecondary : Paper.inkMuted)
             .offset(x: hovered ? 2 : 0)
     }
 }
@@ -1281,7 +1251,7 @@ struct SettingsView: View {
             TextField("bud folder", text: $draft.settings.home, prompt: Text("/path/to/bud"))
             Text("The folder that holds bud's .env and data. The owner token is read from there.")
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Paper.inkSecondary)
             Button("Save and reconnect") {
                 draft.settings.save()
                 Companion.shared.start()
@@ -1318,7 +1288,7 @@ private struct BrowserCaution: View {
             DisclosureGroup("What this allows") {
                 Text(Approval.browserCaution)
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Paper.inkSecondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.top, 4)
             }
