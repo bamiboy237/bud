@@ -244,7 +244,10 @@ class ActionGateway(WrapperToolset[None]):
             # The brief may carry a target from content the main chat read: it is read content.
             read = f"{read}\n{owner_text(ctx.messages)}"
         try:
-            return tainted(tool.name, tool_args, "\n".join(said), read)
+            # Only content from outside can show a link as given: not the model's own words or
+            # calls, and not a job's brief, which the model wrote.
+            given = read_text(ctx.messages, ctx.tool_call_id, model=False)
+            return tainted(tool.name, tool_args, "\n".join(said), read, given)
         except Exception:
             return []  # unsure: the call keeps its policy
 

@@ -348,7 +348,9 @@ def _prompt_split(part: UserPromptPart) -> tuple[str, str]:
     return "\n".join(own), "\n".join(added)
 
 
-def read_text(messages: list[ModelMessage], current_call: str | None = None) -> str:
+def read_text(
+    messages: list[ModelMessage], current_call: str | None = None, *, model: bool = True
+) -> str:
     """What Bud read in this conversation: every part that is not the owner's own prompt or
     the system's instructions. That covers tool results (except the owner's own answers),
     compaction summaries, which quote what was read, native tool results such as a
@@ -357,7 +359,8 @@ def read_text(messages: list[ModelMessage], current_call: str | None = None) -> 
 
     The model's own earlier text, thinking, and tool calls count too: clearing old tool
     results leaves what the model repeated from them. The response holding `current_call` is
-    left out, so a call is not flagged for its own arguments."""
+    left out, so a call is not flagged for its own arguments. With `model=False`, the model's
+    own words are left out entirely: what remains is what Bud was given."""
     parts = []
     for message in messages:
         if isinstance(message, ModelResponse):
@@ -367,7 +370,7 @@ def read_text(messages: list[ModelMessage], current_call: str | None = None) -> 
             )
             for part in message.parts:
                 returned = type(part).__name__.endswith("ReturnPart")
-                if current and not returned:
+                if (current or not model) and not returned:
                     continue  # the call being checked, and the words around it
                 if isinstance(part, ToolCallPart):
                     parts.append(_dump(part.args_as_dict()))
@@ -473,8 +476,14 @@ def _dump(content: Any) -> str:
         return str(content)
 
 
-def tainted(tool: str, tool_args: dict[str, Any], owner: str, read: str) -> list[str]:
-    """Targets that came from content Bud read and not from the owner's own words."""
+def tainted(
+    tool: str, tool_args: dict[str, Any], owner: str, read: str, given: str | None = None
+) -> list[str]:
+    """Targets that came from content Bud read and not from the owner's own words.
+
+    `given` is the part of `read` that came from outside: tool results, added context, and
+    summaries, without the model's own words. Only it can show a link as given, so the model
+    cannot vouch for a link by writing it first. It defaults to `read`."""
     found = targets(tool, tool_args)
     if not found:
         return []  # nothing to check: skip scanning what was read
@@ -499,17 +508,33 @@ def tainted(tool: str, tool_args: dict[str, Any], owner: str, read: str) -> list
             # about can carry data out, in its query, path, or fragment alike.
             if said.has_host(host) or not seen.has_host(host):
                 continue
-            # Found whole in the read text also counts: a link with brackets or quotes, which
-            # the link pattern cuts short, carries nothing the content did not already say.
-            link = value.rstrip("/")
-            if link not in {url.rstrip("/") for url in seen.urls} and link not in seen.text:
+            if not _given(value, _words(read if given is None else given)):
                 out.append(value)
         elif not said.has_host(host) and seen.has_host(host):
             out.append(value)
     return sorted(set(out))
 
 
-@functools.lru_cache(maxsize=2)
+# What may follow a link in text: its end, a space, a closing quote or bracket, or sentence
+# punctuation before a space or the end.
+_LINK_END = r"/?(?=$|[\s\"'<>)\]}]|[.,;:!?]+(?:\s|$))"
+# Characters a link given whole never holds: past them, a match would run on into other text.
+_NOT_IN_LINK = re.compile(r"[\s\"'<>{}]")
+
+
+def _given(value: str, given: "Words") -> bool:
+    """Whether `value` is a link the content gave whole. A link with brackets, which the link
+    pattern cuts short, counts when it stands whole in the text: no quote, space, or brace in
+    it, and ending where a link ends, so it never runs on into the content after it."""
+    link = value.rstrip("/")
+    if link in {url.rstrip("/") for url in given.urls}:
+        return True
+    if _NOT_IN_LINK.search(link):
+        return False
+    return re.search(re.escape(link) + _LINK_END, given.text) is not None
+
+
+@functools.lru_cache(maxsize=4)
 def _words(text: str) -> Words:
     """Scanning a long read is costly; the same text is scanned once per call burst."""
     return Words(text)
