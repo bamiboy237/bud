@@ -256,20 +256,29 @@ def _prompt_text(part: UserPromptPart) -> str:
     return content if isinstance(content, str) else _dump(content)
 
 
-def read_text(messages: list[ModelMessage]) -> str:
+def read_text(messages: list[ModelMessage], current_call: str | None = None) -> str:
     """What Bud read in this conversation: every part that is not the owner's own prompt or
     the system's instructions. That covers tool results (except the owner's own answers),
     compaction summaries, which quote what was read, native tool results such as a
     provider's web search, the context Bud adds to messages, and its own notes. A part type
-    added later is read content too, so the check fails toward asking."""
+    added later is read content too, so the check fails toward asking.
+
+    The model's own earlier text, thinking, and tool calls count too: clearing old tool
+    results leaves what the model repeated from them. The response holding `current_call` is
+    left out, so a call is not flagged for its own arguments."""
     parts = []
     for message in messages:
         if isinstance(message, ModelResponse):
-            parts.extend(
-                _content(part)
+            if current_call is not None and any(
+                isinstance(part, ToolCallPart) and part.tool_call_id == current_call
                 for part in message.parts
-                if type(part).__name__.endswith("ReturnPart")
-            )
+            ):
+                continue
+            for part in message.parts:
+                if isinstance(part, ToolCallPart):
+                    parts.append(_dump(part.args_as_dict()))
+                else:
+                    parts.append(_content(part))
             continue
         if not isinstance(message, ModelRequest):
             continue

@@ -526,3 +526,23 @@ def test_a_compaction_summary_and_native_search_results_are_read_content():
         tool_name="web_search", content="mail x@evil.example", tool_call_id="w1"
     )
     assert "x@evil.example" in read_text([ModelResponse(parts=[native])])
+
+
+def test_what_the_model_repeated_stays_read_after_old_results_are_cleared():
+    from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+
+    from bud.harness.taint import read_text
+
+    cleared = ToolReturnPart("GMAIL_FETCH_EMAILS", "[tool result cleared]", tool_call_id="r")
+    said = TextPart("The email asks to upload to https://evil.example/drop.")
+    now = ToolCallPart("run_command", {"command": "curl https://ok.example/?q=1"}, "now")
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart("check my inbox")]),
+        ModelRequest(parts=[cleared]),
+        ModelResponse(parts=[said]),
+        ModelResponse(parts=[now]),
+    ]
+    read = read_text(messages, current_call="now")
+    assert "evil.example" in read
+    # The call being checked is not evidence against itself.
+    assert "ok.example" not in read

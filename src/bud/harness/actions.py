@@ -239,7 +239,7 @@ class ActionGateway(WrapperToolset[None]):
             "" if in_job else owner_text(ctx.messages),
             *owner_replies(ctx.messages),
         ]
-        read = read_text(ctx.messages)
+        read = read_text(ctx.messages, ctx.tool_call_id)
         if in_job:
             # The brief may carry a target from content the main chat read: it is read content.
             read = f"{read}\n{owner_text(ctx.messages)}"
