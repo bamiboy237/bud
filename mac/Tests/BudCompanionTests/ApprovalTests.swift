@@ -316,3 +316,21 @@ struct ApprovalTests {
         #expect(companion.draft == "unfinished message\n\nunfinished answer")
     }
 }
+
+@MainActor
+struct SyntaxTests {
+    @Test
+    func codeIsColouredByToken() {
+        let tokens = Syntax.tokens("total = sum([84, 2])  # done\nprint(f\"x {y}\")", language: "python")
+        let kinds = Dictionary(tokens.map { ($0.0, $0.1) }, uniquingKeysWith: { a, _ in a })
+        #expect(kinds["sum"] == .function)
+        #expect(kinds["84"] == .number)
+        #expect(kinds["# done"] == .comment)
+        #expect(kinds["f\"x {y}\""] == .string)
+        #expect(kinds["total = "] == .plain)
+        // Text in a plain block, and the tokens put back together, are unchanged.
+        #expect(Syntax.tokens("if x", language: "text").map(\.1) == [.plain])
+        let code = "let a = \"q\" // c\nfunc go() {}"
+        #expect(Syntax.tokens(code, language: "swift").map(\.0).joined() == code)
+    }
+}

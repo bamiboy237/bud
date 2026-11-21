@@ -109,9 +109,15 @@ private struct Block: View {
         switch markup {
         case let heading as Heading:
             // More room above than below, so a heading belongs to the text it introduces.
-            Prose(text: inline(heading, code: type.code), font: font(heading.level), spacing: 1.5)
-                .foregroundStyle(heading.level >= 4 ? Paper.inkSecondary : Paper.inkPrimary)
-                .padding(.top, first ? 0 : heading.level <= 2 ? type.blockSpacing * 0.6 : 2)
+            VStack(alignment: .leading, spacing: 5) {
+                Prose(text: inline(heading, code: type.code), font: font(heading.level), spacing: 1.5)
+                    .foregroundStyle(heading.level >= 4 ? Paper.inkSecondary : Paper.inkPrimary)
+                // Top-level headings carry a hairline, so a long reply reads in sections.
+                if heading.level <= 2 {
+                    Rectangle().fill(Paper.hairline).frame(height: 0.5)
+                }
+            }
+            .padding(.top, first ? 0 : heading.level <= 2 ? type.blockSpacing * 0.6 : 2)
         case let paragraph as Paragraph:
             Prose(text: inline(paragraph, code: type.code))
         case let list as UnorderedList:
@@ -159,7 +165,7 @@ private struct Prose: View {
         chipped(text)
             .font(font ?? type.body)
             .lineSpacing(spacing ?? type.lineSpacing)
-            .textRenderer(CodeChips(fill: Paper.inkPrimary.opacity(0.07)))
+            .textRenderer(CodeChips(fill: Paper.inkPrimary.opacity(0.085)))
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -193,7 +199,7 @@ private struct CodeChips: TextRenderer {
         for line in layout {
             for run in line {
                 if run[CodeChipAttribute.self] != nil {
-                    let rect = run.typographicBounds.rect.insetBy(dx: -2.5, dy: -0.5)
+                    let rect = run.typographicBounds.rect.insetBy(dx: -3, dy: -1)
                     context.fill(
                         RoundedRectangle(cornerRadius: 4, style: .continuous).path(in: rect),
                         with: .color(fill))
@@ -265,7 +271,8 @@ private struct CodeBlockView: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 9)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Paper.recessed, in: shape)
+            // Lighter than the page, like an editor pane set into the reply.
+            .background(Paper.elevated, in: shape)
             .overlay(shape.strokeBorder(Paper.hairline, lineWidth: 0.5))
             .overlay(alignment: .topTrailing) { toolbar }
             .onHover { hover.on = $0 }
@@ -277,7 +284,7 @@ private struct CodeBlockView: View {
 
     @ViewBuilder
     private var content: some View {
-        let text = Text(source)
+        let text = Text(Syntax.highlight(source, language: language))
             .font(type.code)
             .lineSpacing(type.codeLineSpacing)
             .foregroundStyle(Paper.inkPrimary)
@@ -333,6 +340,15 @@ private struct TableView: View {
     @Environment(\.replyType) private var type
 
     var body: some View {
+        // As wide as its content, like an editor's table; a table too wide for the space
+        // takes the full width instead and its cells wrap.
+        ViewThatFits(in: .horizontal) {
+            grid.fixedSize(horizontal: true, vertical: true)
+            grid.fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var grid: some View {
         Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
             GridRow { cells(Array(table.head.children), header: true) }
                 .background(Paper.recessed)
@@ -346,7 +362,6 @@ private struct TableView: View {
         .overlay(
             RoundedRectangle(cornerRadius: Metrics.radius, style: .continuous)
                 .strokeBorder(Paper.hairline, lineWidth: 0.5))
-        .fixedSize(horizontal: false, vertical: true)
     }
 
     @ViewBuilder
@@ -361,7 +376,12 @@ private struct TableView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
-                .frame(maxWidth: .infinity, alignment: alignment.frame)
+                // Fill the column, so dividers and the header tint line up on every row.
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: alignment.frame)
+                // A full grid, as in an editor: a hairline between columns too.
+                .overlay(alignment: .leading) {
+                    if index > 0 { Rectangle().fill(Paper.hairline).frame(width: 0.5) }
+                }
                 .gridColumnAlignment(alignment.horizontal)
         }
     }
