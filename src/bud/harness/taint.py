@@ -43,10 +43,12 @@ from pydantic_ai.messages import (
 )
 
 # The domain may hold Unicode letters (x@bücher.example), matched in its punycode form too.
-EMAIL = re.compile(r"[a-z0-9._%+\-]+@(?:[^\W_][\w\-]*\.)+[^\W\d_]{2,63}")
+# Every unbounded run is capped: a long blob of hex or dashes would otherwise be rescanned
+# from each position, a stall quadratic in its length. 64 is the longest local part allowed.
+EMAIL = re.compile(r"[a-z0-9._%+\-]{1,64}@(?:[^\W_][\w\-]*\.)+[^\W\d_]{2,63}")
 # A scheme link, or a protocol-relative one (//host/path), with an IPv6 host in brackets.
 URL = re.compile(
-    r"(?:[a-z][a-z0-9+.\-]*:)?//(?:\[[0-9a-f:.]+\]|[^\s\"'<>()\[\]{}`\\/?#])[^\s\"'<>()\[\]{}`\\]*"
+    r"(?:[a-z][a-z0-9+.\-]{0,31}:)?//(?:\[[0-9a-f:.]+\]|[^\s\"'<>()\[\]{}`\\/?#])[^\s\"'<>()\[\]{}`\\]*"
 )
 # Labels may hold Unicode letters, so an internationalized host matches its punycode form.
 DOMAIN = re.compile(r"(?<![\w@.\-/])(?:[^\W_](?:[\w\-]{0,61}[^\W_])?\.)+[^\W\d_]{2,63}\b")
@@ -497,14 +499,17 @@ def tainted(tool: str, tool_args: dict[str, Any], owner: str, read: str) -> list
             # about can carry data out, in its query, path, or fragment alike.
             if said.has_host(host) or not seen.has_host(host):
                 continue
-            if value.rstrip("/") not in {url.rstrip("/") for url in seen.urls}:
+            # Found whole in the read text also counts: a link with brackets or quotes, which
+            # the link pattern cuts short, carries nothing the content did not already say.
+            link = value.rstrip("/")
+            if link not in {url.rstrip("/") for url in seen.urls} and link not in seen.text:
                 out.append(value)
         elif not said.has_host(host) and seen.has_host(host):
             out.append(value)
     return sorted(set(out))
 
 
-@functools.lru_cache(maxsize=8)
+@functools.lru_cache(maxsize=2)
 def _words(text: str) -> Words:
     """Scanning a long read is costly; the same text is scanned once per call burst."""
     return Words(text)
