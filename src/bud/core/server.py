@@ -11,7 +11,7 @@ import logging
 import re
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any, TextIO
@@ -88,6 +88,7 @@ from bud.workspace import (
     local_blocked,
     local_refusal,
     local_tools,
+    read_workspace_text,
 )
 from bud.workspace import GUIDANCE as WORKSPACE_GUIDANCE
 from bud.workspace import READ_TOOLS as WORKSPACE_READ_TOOLS
@@ -921,6 +922,20 @@ def _create_app(
             "seq": seq,
             "date": cited.created_at.date().isoformat(),
             "turns": [turn.model_dump() for turn in chat],
+        }
+
+    @app.get("/workspace/source")
+    def get_workspace_source(path: str) -> dict:
+        """A cited workspace file's text, enforcing workspace privacy and link rules."""
+        found = read_workspace_text(workspace, path)
+        if found is None:
+            raise HTTPException(404, "unknown source")
+        content, info = found
+        return {
+            "kind": "workspace",
+            "path": path,
+            "date": datetime.fromtimestamp(info.st_mtime_ns / 1e9, tz=UTC).date().isoformat(),
+            "content": content,
         }
 
     @app.get("/sessions/{session_id}/tasks/{task_id}")

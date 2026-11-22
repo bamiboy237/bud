@@ -129,8 +129,13 @@ struct BudConnection: Sendable {
 
     // MARK: Requests
 
-    func request(_ method: String, _ path: String, json: [String: Any]? = nil) -> URLRequest {
-        var request = URLRequest(url: base.appending(path: path))
+    func request(
+        _ method: String, _ path: String, json: [String: Any]? = nil,
+        queryItems: [URLQueryItem] = []
+    ) -> URLRequest {
+        var url = base.appending(path: path)
+        if !queryItems.isEmpty { url = url.appending(queryItems: queryItems) }
+        var request = URLRequest(url: url)
         request.httpMethod = method
         request.timeoutInterval = 10
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -142,11 +147,15 @@ struct BudConnection: Sendable {
         return request
     }
 
-    func send(_ method: String, _ path: String, json: [String: Any]? = nil) async throws -> [String: Any] {
+    func send(
+        _ method: String, _ path: String, json: [String: Any]? = nil,
+        queryItems: [URLQueryItem] = []
+    ) async throws -> [String: Any] {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await transport(request(method, path, json: json))
+            (data, response) = try await transport(
+                request(method, path, json: json, queryItems: queryItems))
         } catch {
             throw ConnectionError.unreachable
         }

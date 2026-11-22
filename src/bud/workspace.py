@@ -30,6 +30,7 @@ import re
 import stat
 import uuid
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -364,6 +365,64 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool[None]]:
 
 
 _DOCUMENT_BYTES = 25 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class WorkspaceEntry:
+    path: str
+    mtime_ns: int
+    size: int
+
+
+def list_workspace_files(root: Path) -> list[WorkspaceEntry]:
+    """Visible, non-symlinked regular workspace files within the text size limit."""
+    entries: list[WorkspaceEntry] = []
+
+    def walk(dir_fd: int, prefix: tuple[str, ...]) -> None:
+        if len(prefix) >= 8:
+            return
+        try:
+            names = sorted(os.listdir(dir_fd))
+        except OSError:
+            return
+        for name in names:
+            rel = "/".join((*prefix, name))
+            try:
+                _parts(rel)
+                info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except (_Refused, OSError):
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                try:
+                    sub_fd = os.open(name, _DIR_FLAGS, dir_fd=dir_fd)
+                except OSError:
+                    continue
+                try:
+                    walk(sub_fd, (*prefix, name))
+                finally:
+                    os.close(sub_fd)
+            elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size <= _MAX_BYTES:
+                entries.append(WorkspaceEntry(rel, info.st_mtime_ns, info.st_size))
+
+    try:
+        with _directory(root.absolute()) as root_fd:
+            walk(root_fd, ())
+    except (_Refused, OSError):
+        return []
+    return entries
+
+
+def read_workspace_text(root: Path, path: str) -> tuple[str, os.stat_result] | None:
+    """Read an allowed UTF-8 text workspace file without following links, or None."""
+    try:
+        parts = _parts(path)
+        with _parent(root.absolute(), parts[:-1]) as fd:
+            data, info = _read(fd, parts[-1])
+        return data.decode("utf-8"), info
+    except (_Refused, OSError, UnicodeError, ValueError):
+        return None
 
 
 def read_workspace_bytes(root: Path, path: str, limit: int = _DOCUMENT_BYTES) -> bytes | None:
