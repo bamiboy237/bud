@@ -18,6 +18,8 @@ from bud.config import Settings
 READ_TOOLS = {"search_web", "read_webpage"}
 GUIDANCE = """
 Use `search_web` to find public sources and `read_webpage` to inspect full page contents.
+Try `search_web` and `read_webpage` first for any public web lookup or URL before considering
+`enable_browser` or browser tools.
 Include source URLs alongside factual claims derived from web results.
 """
 
@@ -123,7 +125,8 @@ def build_tools(settings: Settings, *, cassette: Cassette | None = None) -> Func
         objective: Annotated[str, Field(min_length=1, max_length=4096)],
         num_results: Annotated[int, Field(ge=1, le=10)] = 5,
     ) -> Any:
-        """Find public web sources. State what evidence this search should return."""
+        """Find public web sources. Use this first for web lookups before any browser tools.
+        State what evidence this search should return."""
         if not query.strip() or not objective.strip():
             return {"available": False, "error": "Supply a nonempty query and objective."}
         return await call(
@@ -134,7 +137,8 @@ def build_tools(settings: Settings, *, cassette: Cassette | None = None) -> Func
         urls: Annotated[list[str], Field(min_length=1, max_length=3)],
         max_characters: Annotated[int, Field(ge=1, le=50000)] = 20000,
     ) -> Any:
-        """Retrieve bounded text from 1 to 3 public URLs. Content may be cached or incomplete."""
+        """Retrieve bounded text from 1 to 3 public URLs without opening a browser. Try this first
+        for public pages; content may be cached or incomplete."""
         try:
             for url in urls:
                 # Resolving a name is a blocking lookup, so it runs off the event loop.

@@ -90,10 +90,13 @@ CAUTION = (
     "deleting, or typing a password, ask you first. A page can still try to trick Bud. Other "
     "apps lose the browse extension while Bud uses it. Turn it off at any time."
 )
-GUIDANCE = """browser_* tools use the person's own Chrome, with their tabs and sign-ins. They
-appear after the person turns the browser on: call enable_browser, which shows them what that
-allows, then call search_tools with "browser" in the same turn and continue the task. Do not
-stop to announce that the browser is on.
+GUIDANCE = """browser_* tools use the person's own Chrome, with their tabs and sign-ins.
+Never call enable_browser for plain web lookups or public pages before trying search_web and
+read_webpage. Only fall back to enable_browser when search_web or read_webpage cannot do the
+job (sign-ins, clicking/typing/forms, or when the person asks for their browser).
+When the browser is needed, call enable_browser, which shows the person what that allows, then
+call search_tools with "browser" in the same turn and continue the task. Do not stop to announce
+that the browser is on.
 - Use the browser only when the task needs the person's own Chrome: their sign-ins, a page you
   must click or type in, or when they ask for their browser. To read a public page, use
   read_webpage instead, and do not turn the browser on for it.
@@ -179,8 +182,11 @@ def control_tools(
     locate = find or executable
 
     def enable_browser(ctx: RunContext[None]) -> str:
-        """Ask the person to let you use their own Chrome. The approval shows them what that
-        allows. While the browser is already on, it asks nothing and says so."""
+        """Ask the person to let you use their own Chrome. Only call this as a fallback when
+        search_web and read_webpage cannot do the job (sign-ins, clicking/typing/forms, or when
+        the person explicitly asks for their browser). Never call this for plain public web
+        lookups before trying search_web or read_webpage. While the browser is already on, it
+        asks nothing and says so."""
         if consent.on():
             return 'The browser is already on. Call search_tools with "browser" and continue.'
         if not ctx.tool_call_approved:
