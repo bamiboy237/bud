@@ -225,7 +225,10 @@ final class Companion {
     @ObservationIgnored private var setupMonitor: Task<Void, Never>?
     private(set) var updatingSetups: Set<String> = []
     private(set) var setupProblems: [String: String] = [:]
-    var needsAttention: Bool { !approvals.isEmpty || !setups.isEmpty }
+    var needsAttention: Bool { !approvals.isEmpty || !setups.isEmpty || stalledCount > 0 }
+    /// How many things wait on you: decisions, setups, and stalled jobs. The pet's badge.
+    var waitingCount: Int { openApprovals.count + setups.count + stalledCount }
+    private var stalledCount: Int { activeTasks.filter { $0.status == "stalled" }.count }
     /// Decisions sent and not yet confirmed: their buttons stay disabled, so one click is one call.
     private(set) var deciding: Set<String> = []
     /// True while a batch approval is running, so single decisions wait for it.
@@ -1273,6 +1276,7 @@ final class Companion {
                let index = activeTasks.firstIndex(where: { $0.id == id }) {
                 activeTasks[index].status = "stalled"
             }
+            arrivals += 1  // a stalled job needs you, like a new decision
             notice(event)
             refreshApprovals()
         case "task.paused":

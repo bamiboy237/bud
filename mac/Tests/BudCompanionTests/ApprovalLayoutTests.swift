@@ -204,7 +204,7 @@ struct ApprovalLayoutTests {
         // One card: the deck is the header plus that card, with no empty space around it.
         let card = NSHostingView(rootView: ApprovalCard(
             companion: companion, approval: companion.approvals[0],
-            onDecide: { _ in }, onDrag: { _ in }
+            onDecide: { _ in }
         ).frame(width: 288).transaction { $0.disablesAnimations = true })
         window.contentView = card
         card.layoutSubtreeIfNeeded()

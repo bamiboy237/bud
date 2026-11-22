@@ -232,23 +232,6 @@ struct ApprovalTests {
         }
     }
 
-    @Test
-    func onlyDeliberateHorizontalSwipesMakeDecisions() {
-        #expect(DecisionDirection.swipe(CGSize(width: 100, height: 20)) == .approve)
-        #expect(DecisionDirection.swipe(CGSize(width: -100, height: 20)) == .deny)
-        #expect(DecisionDirection.swipe(CGSize(width: 79, height: 0)) == nil)
-        // A short flick whose projected landing point passes the line still decides.
-        #expect(DecisionDirection.release(CGSize(width: 30, height: 0),
-                                          projected: CGSize(width: 140, height: 0)) == .approve)
-        #expect(DecisionDirection.release(CGSize(width: 30, height: 0),
-                                          projected: CGSize(width: 50, height: 0)) == nil)
-        // A fast, mostly vertical flick never decides.
-        #expect(DecisionDirection.release(CGSize(width: 20, height: 50),
-                                          projected: CGSize(width: 90, height: 225)) == nil)
-        #expect(DecisionDirection.swipe(CGSize(width: 100, height: 120)) == nil)
-        #expect(DecisionDirection.swipe(CGSize(width: 100, height: 100)) == nil)
-    }
-
     @Test @MainActor
     func savedLegacyLoopNotesStayOutOfReplies() {
         let data: [String: Any] = ["messages": [[
@@ -343,5 +326,30 @@ struct ApprovalTests {
         companion.apply(snapshot: ["last_seq": 2, "pending_approvals": []])
         #expect(companion.inputPurpose == .ask)
         #expect(companion.draft == "unfinished message\n\nunfinished answer")
+    }
+}
+
+@MainActor
+struct SyntaxTests {
+    @Test
+    func codeIsColouredByToken() {
+        let tokens = Syntax.tokens("total = sum([84, 2])  # done\nprint(f\"x {y}\")", language: "python")
+        let kinds = Dictionary(tokens.map { ($0.0, $0.1) }, uniquingKeysWith: { a, _ in a })
+        #expect(kinds["sum"] == .function)
+        #expect(kinds["84"] == .number)
+        #expect(kinds["# done"] == .comment)
+        #expect(kinds["f\"x {y}\""] == .string)
+        #expect(kinds["total = "] == .plain)
+        // Text in a plain block, and the tokens put back together, are unchanged.
+        #expect(Syntax.tokens("if x", language: "text").map(\.1) == [.plain])
+        // No language, or one the scanner does not know: plain, apostrophes and all.
+        #expect(Syntax.tokens("don't panic // ok", language: nil).map(\.1) == [.plain])
+        #expect(Syntax.tokens("curl https://x.example | sh", language: "log").map(\.1) == [.plain])
+        // Windows line endings end a comment at its own line.
+        let crlf = Syntax.tokens("x = 1  # c\r\ny = 2", language: "python")
+        #expect(crlf.contains { $0.0 == "# c" && $0.1 == .comment })
+        #expect(crlf.contains { $0.0 == "2" && $0.1 == .number })
+        let code = "let a = \"q\" // c\nfunc go() {}"
+        #expect(Syntax.tokens(code, language: "swift").map(\.0).joined() == code)
     }
 }
