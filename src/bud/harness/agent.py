@@ -7,7 +7,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-from pydantic_ai import Agent, DeferredToolRequests, Tool
+from pydantic_ai import Agent, AgentRetries, DeferredToolRequests, Tool
 from pydantic_ai.capabilities import (
     AbstractCapability,
     Caching,
@@ -15,7 +15,9 @@ from pydantic_ai.capabilities import (
     RaiseContentFilterError,
 )
 from pydantic_ai.models import Model
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.toolsets import AbstractToolset, CombinedToolset, FunctionToolset
+from pydantic_ai.usage import UsageLimits
 from pydantic_ai_harness import Memory, SystemReminders, WarnOnCacheBusts
 from pydantic_ai_harness.repair_tool_arguments import RepairToolArguments
 from pydantic_ai_harness.system_reminders import Reminder
@@ -25,10 +27,11 @@ from bud.gateway.registry import Registry
 from bud.gateway.spend import build_spend_limits
 from bud.harness.actions import Action, GuardTools, Policy, RecordDecision
 from bud.harness.actions import _pinned as pinned_account
-from bud.harness.code import CODE_GUIDANCE, build_code_mode
+from bud.harness.code import CODE_GUIDANCE, ReadOnlyCodeMode, build_code_mode
 from bud.harness.context import BackgroundCompaction
 from bud.harness.live import LiveState, LiveTools
 from bud.harness.memory import MEMORY_RULES
+from bud.harness.operating_profile import BASELINE_PROFILE, OperatingProfile
 from bud.harness.results import SqliteResultStore, build_output_limits
 from bud.harness.review import Describer, SessionGrants, ToolReviewer
 from bud.harness.spiral import (
@@ -67,9 +70,18 @@ class Harness:
         state_dir: Path,
         result_path: Path,
         read_tools: set[str],
-        result_retention: timedelta = timedelta(hours=24),
+        result_retention: timedelta | None = None,
         capabilities: Sequence[AbstractCapability[None]] = (),
+        operating_profile: OperatingProfile = BASELINE_PROFILE,
     ) -> None:
+        self.operating_profile = operating_profile
+        harness_cfg = operating_profile.harness
+        result_cfg = operating_profile.tool_results
+        retention = (
+            result_retention
+            if result_retention is not None
+            else timedelta(hours=result_cfg.retention_hours)
+        )
         # Fixed for the process, unlike `tools`, which swap_tools replaces between runs.
         self.capabilities = list(capabilities)
         self.toolset = tools if isinstance(tools, AbstractToolset) else FunctionToolset[None](tools)
@@ -79,10 +91,12 @@ class Harness:
         self.live = LiveTools(state=LiveState(current=self.toolset))
         self.memory = memory
         tools_policy = policy.tools | MEMORY_RULES if memory else policy.tools
-        reads: dict[str, Action] = dict.fromkeys(
-            ("load_tool_result", "run_code", "search_tools", "search_conversation_history"),
-            "allow",
+        read_names = (
+            ("load_tool_result", "run_code", "search_tools", "search_conversation_history")
+            if harness_cfg.code_mode_enabled
+            else ("load_tool_result", "search_tools", "search_conversation_history")
         )
+        reads: dict[str, Action] = dict.fromkeys(read_names, "allow")
         # It only changes how long Bud's own saved copy of a result lasts.
         reads["keep_tool_result"] = "allow"
         self.policy = Policy(
@@ -92,25 +106,45 @@ class Harness:
             | SKILL_RULES,
             no_grants=policy.no_grants,
         )
-        self.results = SqliteResultStore(result_path, retention=result_retention)
-        self.output_limits = build_output_limits(self.results)
-        self.registry = registry
-        self.code_mode = build_code_mode(
-            {
-                name
-                for name in read_tools
-                | {
-                    "read_memory",
-                    "search_memory",
-                    "read_tool_result",
-                    "read_tool_result_chars",
-                    "load_tool_result",
-                    "keep_tool_result",
-                }
-                if self.policy.decide(name) == "allow"
-            }
+        self.results = SqliteResultStore(result_path, retention=retention)
+        self.output_limits = build_output_limits(
+            self.results,
+            spill_chars=result_cfg.spill_chars,
+            preview_chars=result_cfg.preview_chars,
+            truncate_max_chars=result_cfg.truncate_max_chars,
         )
-        self.system_prompt = f"{load_system_prompt()}\n{profile}\n{CODE_GUIDANCE}\n{SKILL_GUIDANCE}"
+        self.registry = registry
+        self.code_mode: ReadOnlyCodeMode | None = (
+            build_code_mode(
+                {
+                    name
+                    for name in read_tools
+                    | {
+                        "read_memory",
+                        "search_memory",
+                        "read_tool_result",
+                        "read_tool_result_chars",
+                        "load_tool_result",
+                        "keep_tool_result",
+                    }
+                    if self.policy.decide(name) == "allow"
+                },
+                max_retries=harness_cfg.code_mode_max_retries,
+                max_tool_calls=harness_cfg.code_mode_max_tool_calls,
+                max_duration_secs=harness_cfg.code_mode_max_duration_secs,
+                max_memory=harness_cfg.code_mode_max_memory_bytes,
+                max_suspensions=harness_cfg.code_mode_max_suspensions,
+            )
+            if harness_cfg.code_mode_enabled
+            else None
+        )
+        prompt_parts = [load_system_prompt(), profile]
+        if harness_cfg.code_mode_enabled:
+            prompt_parts.append(CODE_GUIDANCE)
+        prompt_parts.append(SKILL_GUIDANCE)
+        if harness_cfg.instruction_addendum:
+            prompt_parts.append(harness_cfg.instruction_addendum)
+        self.system_prompt = "\n".join(prompt_parts)
         # Set by the composition root (bud serve, evals); auto mode then lets it review each
         # write. None means nothing is ever reviewed and auto mode asks like strict.
         self.reviewer: ToolReviewer | None = None
@@ -137,7 +171,7 @@ class Harness:
         memory_guidance = (memory.guidance or "") if memory is not None else ""
         prompt = self.system_prompt + memory_guidance
         self.prompt_version = sha256(prompt.encode()).hexdigest()[:12]
-        self.spiral = SpiralConfig.from_settings()
+        self.spiral = SpiralConfig.from_profile(operating_profile.limits)
         settings = get_settings()
         # One daily cap for the whole install, so it lives in the data directory, not in
         # this account's session folder.
@@ -158,6 +192,49 @@ class Harness:
             "Call current_time when the exact time matters."
         )
 
+    def build_context(self, record: Callable[[dict], None]) -> BackgroundCompaction:
+        """Build the context compaction capability from the active operating profile."""
+        ctx = self.operating_profile.context
+        return BackgroundCompaction(
+            record=record,
+            result_store=self.results,
+            max_fraction=ctx.max_fraction,
+            background_fraction=ctx.background_fraction,
+            fallback_context_window=ctx.fallback_context_window,
+            keep_tokens=ctx.keep_tokens,
+            compacted_target=ctx.compacted_target,
+            clear_keep_pairs=ctx.clear_keep_pairs,
+            clear_min_tokens=ctx.clear_min_tokens,
+            summary_max_tokens=ctx.summary_max_tokens,
+            summary_tool_return_max_chars=ctx.summary_tool_return_max_chars,
+            history_spill_chars=self.operating_profile.tool_results.history_spill_chars,
+            max_age_seconds=ctx.max_age_seconds,
+            max_preparations=ctx.max_preparations,
+        )
+
+    def usage_limits(self) -> UsageLimits:
+        """Build run usage limits from the active operating profile."""
+        limits = self.operating_profile.limits
+        return UsageLimits(
+            request_limit=limits.request_limit,
+            tool_calls_limit=limits.tool_calls_limit,
+            total_tokens_limit=limits.total_tokens_limit,
+        )
+
+    def model_settings(self) -> ModelSettings | None:
+        """Return profile-level request settings when any deviate from gateway defaults."""
+        cfg = self.operating_profile.model
+        settings: ModelSettings = {}
+        if cfg.request_timeout_seconds != 120.0:
+            settings["timeout"] = cfg.request_timeout_seconds
+        if cfg.temperature is not None:
+            settings["temperature"] = cfg.temperature
+        if cfg.max_tokens is not None:
+            settings["max_tokens"] = cfg.max_tokens
+        if cfg.reasoning_effort is not None:
+            settings["thinking"] = False if cfg.reasoning_effort == "none" else cfg.reasoning_effort
+        return settings or None
+
     def agent(
         self,
         model: Model,
@@ -168,6 +245,28 @@ class Harness:
         durability: AbstractCapability | None = None,
         capabilities: tuple[AbstractCapability[None], ...] = (),
     ) -> Agent[None, str | DeferredToolRequests]:
+        harness_cfg = self.operating_profile.harness
+        limits = self.operating_profile.limits
+        retries: int | AgentRetries = (
+            {"tools": limits.retries, "output": limits.output_retries}
+            if limits.output_retries is not None
+            else limits.retries
+        )
+        reminders = (
+            [
+                SystemReminders(
+                    reminders=[
+                        Reminder(
+                            LONG_RUN_REMINDER,
+                            interval=harness_cfg.long_run_reminder_every,
+                            tag=None,
+                        )
+                    ]
+                )
+            ]
+            if harness_cfg.long_run_reminder_every is not None
+            else []
+        )
         return Agent(
             model,
             name="bud",
@@ -175,8 +274,12 @@ class Harness:
             instructions=[self.system_prompt, *self.live_instructions],
             toolsets=[self.live],
             output_type=[str, DeferredToolRequests],
+            model_settings=self.model_settings(),
+            retries=retries,
+            tool_timeout=limits.tool_timeout,
+            end_strategy=limits.end_strategy,
             capabilities=[
-                RepairToolArguments(),
+                *([RepairToolArguments()] if harness_cfg.repair_tool_arguments else []),
                 GuardTools(
                     policy=self.policy,
                     record=record,
@@ -191,7 +294,7 @@ class Harness:
                     grants=self.grants,
                 ),
                 self.output_limits,
-                self.code_mode,
+                *([self.code_mode] if self.code_mode is not None else []),
                 context,
                 *(
                     [loop_detector(self.spiral, loop_report or (lambda _: None))]
@@ -214,15 +317,11 @@ class Harness:
                 ),
                 *([self.memory] if self.memory is not None else []),
                 *([self.spend] if self.spend is not None else []),
-                Caching(),
-                WarnOnCacheBusts(),
+                *([Caching()] if harness_cfg.caching_enabled else []),
+                *([WarnOnCacheBusts()] if harness_cfg.warn_on_cache_busts else []),
                 RaiseContentFilterError(),
                 # Request-only reminders leave the cached history unchanged.
-                SystemReminders(
-                    reminders=[
-                        Reminder(LONG_RUN_REMINDER, interval=LONG_RUN_REMINDER_EVERY, tag=None)
-                    ]
-                ),
+                *reminders,
                 *([durability] if durability is not None else []),
                 *self.capabilities,
                 *capabilities,

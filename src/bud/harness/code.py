@@ -41,15 +41,23 @@ class ReadOnlyCodeMode(CodeMode):
             inside_code_mode.reset(token)
 
 
-def build_code_mode(read_tools: set[str]) -> ReadOnlyCodeMode:
+def build_code_mode(
+    read_tools: set[str],
+    *,
+    max_retries: int = 2,
+    max_tool_calls: int = CODE_TOOL_CALL_LIMIT,
+    max_duration_secs: float = 10,
+    max_memory: int = 128 * 1024 * 1024,
+    max_suspensions: int = 2_000,
+) -> ReadOnlyCodeMode:
     return ReadOnlyCodeMode(
         id="bud_read_only_code",
         tools=sorted(read_tools),
-        max_retries=2,
-        max_tool_calls=CODE_TOOL_CALL_LIMIT,
+        max_retries=max_retries,
+        max_tool_calls=max_tool_calls,
         resource_limits={
-            "max_duration_secs": 10,
-            "max_memory": 128 * 1024 * 1024,
-            "max_suspensions": 2_000,
+            "max_duration_secs": max_duration_secs,
+            "max_memory": max_memory,
+            "max_suspensions": max_suspensions,
         },
     )

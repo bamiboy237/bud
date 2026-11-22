@@ -23,7 +23,22 @@ from bud.gateway.errors import error_summary
 from bud.gateway.ledger import Ledger, LedgerEntry
 from bud.gateway.registry import ModelSpec
 
+
+@dataclass(frozen=True)
+class RequestAttribution:
+    """Run and operating-profile metadata attached to each request ledger entry."""
+
+    run_id: str | None = None
+    profile_id: str | None = None
+    profile_version: str | None = None
+    profile_digest: str | None = None
+    prompt_version: str | None = None
+
+
 request_session: ContextVar[str | None] = ContextVar("request_session", default=None)
+request_attribution: ContextVar[RequestAttribution | None] = ContextVar(
+    "request_attribution", default=None
+)
 
 
 @dataclass(init=False)
@@ -96,6 +111,7 @@ class TrackedModel(WrapperModel):
     async def _write(self, status: str, started: float, **fields: Any) -> None:
         # The write is SQLite, so it runs off the event loop. The entry is built here, where
         # the request's session context is still readable.
+        attr = request_attribution.get()
         await asyncio.to_thread(
             self.ledger.record,
             LedgerEntry(
@@ -104,6 +120,11 @@ class TrackedModel(WrapperModel):
                 status=status,
                 latency_ms=(perf_counter() - started) * 1000,
                 session_id=self.session_id or request_session.get(),
+                run_id=attr.run_id if attr else None,
+                profile_id=attr.profile_id if attr else None,
+                profile_version=attr.profile_version if attr else None,
+                profile_digest=attr.profile_digest if attr else None,
+                prompt_version=attr.prompt_version if attr else None,
                 **fields,
             ),
         )

@@ -70,6 +70,9 @@ class RunView(BaseModel):
     run_id: str
     status: str
     reason: str | None = None
+    model: str | None = None
+    profile: dict[str, str] | None = None
+    prompt_version: str | None = None
     loaded_skills: dict[str, str] = Field(default_factory=dict)
     artifacts: list[SavedArtifact] = Field(default_factory=list)
 
@@ -278,6 +281,14 @@ def runs(events: list[Event], *, summaries: bool = False) -> list[RunView]:
                     view.loaded_skills = dict(previous.loaded_skills)
             view.status = status
             view.reason = event.data.get("reason")
+            if event.data.get("model") is not None:
+                view.model = event.data["model"]
+            if isinstance(event.data.get("profile"), dict):
+                view.profile = event.data["profile"]
+            if event.data.get("prompt_version") is not None:
+                view.prompt_version = event.data["prompt_version"]
+            elif event.data.get("prompt") is not None and view.prompt_version is None:
+                view.prompt_version = event.data["prompt"]
         if not summaries:
             continue
         run_id = event.data.get("run_id")

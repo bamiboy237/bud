@@ -42,7 +42,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models import Model
-from pydantic_ai.usage import UsageLimits
+from pydantic_ai.models.fallback import FallbackModel
 
 from bud.config import get_settings
 from bud.core.events import RUN_END_EVENTS, Event, EventType
@@ -73,11 +73,16 @@ from bud.gateway import Gateway
 from bud.gateway.errors import NEXT_STEP, error_summary, failure
 from bud.gateway.registry import Tier
 from bud.gateway.router import NoModelAvailable
-from bud.gateway.tracked import TrackedModel, request_session
+from bud.gateway.tracked import (
+    RequestAttribution,
+    TrackedModel,
+    request_attribution,
+    request_session,
+)
 from bud.harness.agent import Harness
 from bud.harness.ask import AskAnswer, answer_from_text, ask_summary, questions_of, render_answers
-from bud.harness.context import BackgroundCompaction
 from bud.harness.learning import Learner
+from bud.harness.operating_profile import OperatingProfile
 from bud.harness.recall import CITATION, Recall, plain_citations, recalled_so_far, render
 from bud.harness.spiral import paused_in
 from bud.harness.verify import build_verifier
@@ -115,18 +120,22 @@ class Runner(DBOSConfiguredInstance):
         hub: Hub,
         gateway: Gateway,
         harness: Harness,
-        tier: Tier = "fast",
+        tier: Tier | None = None,
         *,
         durable: bool = False,
         jobs: bool = False,
         learner: Learner | None = None,
         recall: Recall | None = None,
         workspace: Path | None = None,
+        operating_profile: OperatingProfile | None = None,
     ) -> None:
         self.hub = hub
         self.gateway = gateway
         self.harness = harness
-        self.tier: Tier = tier
+        self.profile = operating_profile or harness.operating_profile
+        if self.profile.digest != harness.operating_profile.digest:
+            raise ValueError("Runner operating_profile must match harness.operating_profile")
+        self.tier: Tier = tier or self.profile.model.tier
         self.durable = durable
         self.tasks: dict[str, asyncio.Task] = {}
         self._monitors: set[asyncio.Task] = set()
@@ -150,13 +159,14 @@ class Runner(DBOSConfiguredInstance):
         self.version = replay_version()
         self.fingerprint = sha256(
             (
-                harness.prompt_version
+                self.profile.digest
+                + harness.prompt_version
                 + gateway.registry.model_dump_json()
                 + json.dumps(harness.policy.tools, sort_keys=True)
                 + str(gateway.selected_model)
                 + str(gateway.fallback)
                 + str(jobs)
-                + tier
+                + self.tier
                 + str(harness.results.retention.total_seconds())
             ).encode()
         ).hexdigest()
@@ -186,11 +196,9 @@ class Runner(DBOSConfiguredInstance):
             if durable
             else None
         )
-        self.context = BackgroundCompaction(
-            record=self._record_context, result_store=harness.results
-        )
+        self.context = harness.build_context(self._record_context)
         self.agent = harness.agent(
-            gateway.model(tier, require_tools=True),
+            gateway.model(self.tier, require_tools=True, selected=self.profile.model.model_id),
             self._record_decision,
             context=self.context,
             loop_report=self._loop_detected,
@@ -279,6 +287,32 @@ class Runner(DBOSConfiguredInstance):
             for item in self.work_items.items():
                 self._publish_task(item.session_id)
 
+    def _resolve_run_model(self, session_id: str) -> str:
+        override = self.session_models.get(session_id)
+        if override:
+            return override
+        if self.profile.model.model_id:
+            return self.profile.model.model_id
+        if self.gateway.selected_model:
+            return self.gateway.selected_model
+        model = self.agent.model
+        if isinstance(model, TrackedModel):
+            return model.spec.id
+        if isinstance(model, FallbackModel):
+            for candidate in model.models:
+                if isinstance(candidate, TrackedModel):
+                    return candidate.spec.id
+        tier_specs = self.gateway.registry.tier(self.tier)
+        if tier_specs:
+            return tier_specs[0].id
+        return f"tier:{self.tier}"
+
+    def _config_changed(self, run: dict) -> bool:
+        if run.get("version") != self.version or run.get("config") != self.fingerprint:
+            return True
+        profile = run.get("profile")
+        return isinstance(profile, dict) and profile.get("digest") != self.profile.digest
+
     def _inputs(
         self,
         session_id: str,
@@ -328,6 +362,9 @@ class Runner(DBOSConfiguredInstance):
             "history_seq": None if saved else (events[-1].seq if events else 0),
             "results": RESULTS.dump_json(results).decode() if results is not None else None,
             "skills": skills,
+            "model": self._resolve_run_model(session_id),
+            "profile": self.profile.attribution(),
+            "prompt_version": self.harness.prompt_version,
             "config": self.fingerprint,
             "version": self.version,
         }
@@ -796,11 +833,7 @@ class Runner(DBOSConfiguredInstance):
         if self.hub.log.stop_requested(run["run_id"]):
             raise StopRequested("Stopped before workflow launch")
         status = DBOS.get_workflow_status(run["run_id"]) if recovering else None
-        if (
-            run.get("version") != self.version
-            or run["config"] != self.fingerprint
-            or (status is not None and status.app_version != self.version)
-        ):
+        if self._config_changed(run) or (status is not None and status.app_version != self.version):
             if status is not None:
                 DBOS.cancel_workflow(run["run_id"])
             raise RecoveryRefused(
@@ -968,11 +1001,22 @@ class Runner(DBOSConfiguredInstance):
         self, session_id: str, run_id: str, owner: str, reply: str, signals: list[str]
     ) -> None:
         assert self.learner is not None
+        attr_token = request_attribution.set(
+            RequestAttribution(
+                run_id=run_id,
+                profile_id=self.profile.id,
+                profile_version=self.profile.version,
+                profile_digest=self.profile.digest,
+                prompt_version=self.harness.prompt_version,
+            )
+        )
         try:
             applied = await self.learner.learn(session_id, owner, reply, signals)
         except Exception as exc:  # learning is best effort; the turn already succeeded
             logger.warning("learning skipped for run %s: %s", run_id, error_summary(exc))
             return
+        finally:
+            request_attribution.reset(attr_token)
         if applied:
             self.hub.publish_once(
                 session_id,
@@ -1046,13 +1090,24 @@ class Runner(DBOSConfiguredInstance):
     async def _execute(self, run: dict) -> None:
         token = self._current.set(run)
         session_token = request_session.set(run["session_id"])
+        raw_profile = run.get("profile")
+        profile = raw_profile if isinstance(raw_profile, dict) else {}
+        attr_token = request_attribution.set(
+            RequestAttribution(
+                run_id=run["run_id"],
+                profile_id=profile.get("id", self.profile.id),
+                profile_version=profile.get("version", self.profile.version),
+                profile_digest=profile.get("digest", self.profile.digest),
+                prompt_version=run.get("prompt_version") or self.harness.prompt_version,
+            )
+        )
         task = asyncio.current_task()
         assert task is not None
         self._executing[run["run_id"]] = task
         try:
             if self.hub.log.stop_requested(run["run_id"]):
                 return
-            if run["config"] != self.fingerprint or run.get("version") != self.version:
+            if self._config_changed(run):
                 self._finish(
                     run,
                     "run.failed",
@@ -1164,10 +1219,8 @@ class Runner(DBOSConfiguredInstance):
                     "bud_inline_approval": run.get("task_id") is None
                     and run["trigger"] == "approval",
                 },
-                # No step cap: SpiralGuard ends runaway loops. Explicit, because pydantic-ai
-                # otherwise applies request_limit=50 to the whole conversation's running
-                # total, which fails every message once a long-lived thread passes 50.
-                usage_limits=UsageLimits(request_limit=None),
+                # No step cap: SpiralGuard ends runaway loops unless the profile sets a limit.
+                usage_limits=self.harness.usage_limits(),
                 # A job ends only by filing a typed report; chat ends in text.
                 output_type=self.job_output if run.get("task_id") is not None else None,
                 event_stream_handler=None if self.durable else self._stream,
@@ -1253,6 +1306,7 @@ class Runner(DBOSConfiguredInstance):
                 if self._loop is not None and not self._loop.is_closed():
                     self._loop.call_soon_threadsafe(self._drain, run["session_id"])
             self._executing.pop(run["run_id"], None)
+            request_attribution.reset(attr_token)
             request_session.reset(session_token)
             self._current.reset(token)
 
@@ -1274,7 +1328,10 @@ class Runner(DBOSConfiguredInstance):
             {
                 "run_id": run["run_id"],
                 "trigger": run["trigger"],
+                "model": run.get("model") or self._resolve_run_model(run["session_id"]),
+                "profile": run.get("profile") or self.profile.attribution(),
                 "prompt": self.harness.prompt_version,
+                "prompt_version": self.harness.prompt_version,
                 "skills": run.get("skills", {}),
             },
             key=f"{run['run_id']}:started",

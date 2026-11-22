@@ -12,31 +12,29 @@ from tempfile import TemporaryDirectory
 from time import perf_counter
 from uuid import uuid4
 
-from pydantic_ai.toolsets import CombinedToolset, FunctionToolset
-
 from bud.config import get_settings
+from bud.core.composition import compose_runner, compose_world_harness
 from bud.core.events import Event
 from bud.core.hub import Hub
 from bud.core.log import EventLog
-from bud.core.profiles import Mode, apply_mode
+from bud.core.profiles import Mode
 from bud.core.projection import snapshot, undecided_approvals
 from bud.core.runner import Runner
 from bud.core.tasks import FINISHED
 from bud.evals.tasks import SUITE, Outcome, Task
 from bud.gateway import Gateway, build_gateway
 from bud.harness.actions import load_policy
-from bud.harness.agent import Harness
 from bud.harness.learning import Learner
-from bud.harness.memory import build_memory
-from bud.harness.recall import Recall, embedder
+from bud.harness.operating_profile import (
+    BASELINE_PROFILE,
+    OperatingProfile,
+    OperatingProfileStore,
+    resolve_operating_profile,
+)
 from bud.harness.review import ToolReviewer, build_reviewer
 from bud.harness.spiral import NUDGE
-from bud.web import READ_TOOLS as WEB_READ_TOOLS
 from bud.web import Cassette
-from bud.web import build_tools as build_web_tools
-from bud.world.describe import build_describers, build_notifies_others
 from bud.world.store import World
-from bud.world.tools import READ_TOOLS, build_tools
 
 ATTEMPT_TIMEOUT_SECONDS = 180
 WEB_CASSETTE = Cassette(get_settings().data_dir / "evals" / "web-cassette.json")
@@ -56,6 +54,7 @@ class Attempt:
     session_id: str
     prompt_version: str
     models: list[dict[str, str]]
+    profile: dict[str, str] = field(default_factory=dict)
     requests: int = 0
     model_seconds: float = 0.0
     wasted: int = 0
@@ -157,53 +156,53 @@ def reviewed_calls(task: Task, events: list[Event], rule: str, outcome: str) -> 
     return calls
 
 
-async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> Attempt:
+async def run_attempt(
+    task: Task,
+    gateway: Gateway,
+    mode: Mode = "strict",
+    *,
+    profile: OperatingProfile = BASELINE_PROFILE,
+) -> Attempt:
     session_id = f"eval-{task.id}-{uuid4().hex[:8]}"
     timeout = task.timeout or ATTEMPT_TIMEOUT_SECONDS
     started = perf_counter()
+    settings = get_settings()
     with TemporaryDirectory() as folder:
-        log = EventLog(Path(folder) / "events.db")
-        world = World(Path(folder) / "world.db")
-        policy = load_policy()
+        root_dir = Path(folder)
+        log = EventLog(root_dir / "events.db")
+        world = World(root_dir / "world.db")
         extra = task.tools() if task.tools is not None else []
-        policy.tools.update({tool.name: "allow" for tool in extra})
-        policy.tools.update(dict.fromkeys(WEB_READ_TOOLS, "allow"))
-        harness = Harness(
-            CombinedToolset(
-                [
-                    FunctionToolset([*build_tools(world, include_ask_user=False), *extra]),
-                    # Production web tools behind a record/replay cassette: repeatable, free.
-                    build_web_tools(get_settings(), cassette=WEB_CASSETTE),
-                ]
-            ),
-            policy,
-            gateway.registry,
-            world.profile(),
-            memory=build_memory(Path(folder) / "memory.db", namespace="world"),
-            state_dir=Path(folder),
+        harness = compose_world_harness(
+            world,
+            gateway,
+            settings,
+            state_dir=root_dir,
             result_path=log.path,
-            read_tools=READ_TOOLS | WEB_READ_TOOLS,
+            memory_path=root_dir / "memory.db",
+            operating_profile=profile,
+            extra_tools=extra,
+            policy=load_policy(),
+            include_ask_user=False,
+            cassette=WEB_CASSETTE,
         )
-        harness.clock = lambda: datetime.fromisoformat(world.now)
         if task.spiral_config:
             harness.spiral = replace(harness.spiral, **task.spiral_config)
         # Set before the Runner builds its agent: auto mode needs the reviewer.
-        harness.reviewer = eval_reviewer() if mode == "auto" else None
-        harness.describers = build_describers(world)
-        harness.notifies_others = build_notifies_others(world)
-        apply_mode(harness.policy, mode, reviewer=harness.reviewer is not None)
-        assert harness.memory is not None
-        learner = Learner(
-            harness.memory,
-            lambda session: gateway.model("fast", f"{session}:learn", require_tools=True),
-        )
-        recall = Recall(
-            Path(folder) / "recall.db",
-            embedder=embedder(get_settings()),
-            memory=harness.memory,
-        )
+        reviewer = eval_reviewer() if mode == "auto" else None
         # Jobs on, as in production, so the suite measures the setup the owner gets.
-        runner = Runner(Hub(log), gateway, harness, jobs=True, learner=learner, recall=recall)
+        runner = compose_runner(
+            Hub(log),
+            gateway,
+            harness,
+            log,
+            settings,
+            approval_mode=mode,
+            recall_path=root_dir / "recall.db",
+            reviewer=reviewer,
+            durable=False,
+            jobs=True,
+            include_history_search=False,
+        )
         before = world.snapshot()
         scored_before = 0
         try:
@@ -251,13 +250,14 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
         allowed = reviewed_calls(task, events, "auto-allow", "allowed")
         held = reviewed_calls(task, events, "review", "asked")
         scored = list(harness.reviewer.recent)[scored_before:] if harness.reviewer else []
+        assert runner.learner is not None
         outcome = Outcome(
             before=before,
             after=world.snapshot(),
             answer=transcript[-1].text if transcript else "",
             approvals=approvals,
             failure=failure_reason(events),
-            memory=await memory_text(learner),
+            memory=await memory_text(runner.learner),
             loops=[e.data for e in [*events, *job_events] if e.type == "run.loop_detected"],
             notes=loop_notes([*events, *job_events]),
             auto_allowed=tuple(allowed),
@@ -294,6 +294,7 @@ async def run_attempt(task: Task, gateway: Gateway, mode: Mode = "strict") -> At
         session_id=session_id,
         prompt_version=harness.prompt_version,
         models=gateway.ledger.session_models(session_id),
+        profile=profile.attribution(),
         requests=requests,
         model_seconds=model_seconds,
         wasted=wasted,
@@ -329,13 +330,19 @@ async def memory_text(learner: Learner) -> str:
     return saved.content if saved else ""
 
 
-async def run_suite(tasks: list[Task], trials: int, mode: Mode = "strict") -> list[Attempt]:
+async def run_suite(
+    tasks: list[Task],
+    trials: int,
+    mode: Mode = "strict",
+    *,
+    profile: OperatingProfile = BASELINE_PROFILE,
+) -> list[Attempt]:
     gateway = build_gateway()
     limit = asyncio.Semaphore(MAX_CONCURRENT_ATTEMPTS)
 
     async def one(task: Task) -> Attempt:
         async with limit:
-            return await run_attempt(task, gateway, mode)
+            return await run_attempt(task, gateway, mode, profile=profile)
 
     try:
         return list(await asyncio.gather(*(one(task) for task in tasks for _ in range(trials))))
@@ -343,7 +350,14 @@ async def run_suite(tasks: list[Task], trials: int, mode: Mode = "strict") -> li
         gateway.close()
 
 
-def report(attempts: list[Attempt], trials: int, prompt_version: str, mode: Mode) -> Path:
+def report(
+    attempts: list[Attempt],
+    trials: int,
+    prompt_version: str,
+    mode: Mode,
+    *,
+    profile: dict[str, str] | None = None,
+) -> Path:
     by_task: dict[str, list[Attempt]] = {}
     for attempt in attempts:
         by_task.setdefault(attempt.task, []).append(attempt)
@@ -424,6 +438,7 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str, mode: Mode
         json.dumps(
             {
                 "prompt_version": prompt_version,
+                "profile": profile or (attempts[0].profile if attempts else {}),
                 "mode": mode,
                 "trials": trials,
                 "pass_rate": pass_rate,
@@ -438,10 +453,21 @@ def report(attempts: list[Attempt], trials: int, prompt_version: str, mode: Mode
     return path
 
 
-def evaluate(trials: int, task_id: str | None, mode: Mode = "strict") -> None:
+def evaluate(
+    trials: int,
+    task_id: str | None,
+    mode: Mode = "strict",
+    *,
+    profile_selector: str | None = None,
+) -> None:
     tasks = [task for task in SUITE if task_id in (None, task.id)]
     if not tasks:
         raise SystemExit(f"Unknown task: {task_id}")
-    attempts = asyncio.run(run_suite(tasks, trials, mode))
+    settings = get_settings()
+    profile = resolve_operating_profile(
+        profile_selector if profile_selector is not None else settings.operating_profile,
+        store=OperatingProfileStore(settings.data_dir / "operating-profile.json"),
+    )
+    attempts = asyncio.run(run_suite(tasks, trials, mode, profile=profile))
     version = attempts[0].prompt_version
-    report(attempts, trials, version, mode)
+    report(attempts, trials, version, mode, profile=profile.attribution())

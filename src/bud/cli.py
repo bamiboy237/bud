@@ -242,6 +242,10 @@ def _main(argv: list[str] | None = None) -> None:
         help="approval mode; auto reviews every write with the approval reviewer",
     )
     eval_parser.add_argument(
+        "--profile",
+        help="operating profile name or JSON path (defaults to the active profile)",
+    )
+    eval_parser.add_argument(
         "--probe",
         action="store_true",
         help="test the approval reviewer directly on hand-written good and bad calls",
@@ -255,6 +259,10 @@ def _main(argv: list[str] | None = None) -> None:
         help="use the simulated inbox and calendar instead of real accounts",
     )
     serve_parser.add_argument("--model", help="pin a model ID from `bud models`, without fallback")
+    serve_parser.add_argument(
+        "--profile",
+        help="operating profile name or JSON path (defaults to the active profile)",
+    )
     chat_parser = commands.add_parser("chat", help="open or attach to a session")
     chat_parser.add_argument("session", nargs="?", help="session id to attach to")
     chat_parser.add_argument("--new", action="store_true", help="start a separate conversation")
@@ -285,15 +293,25 @@ def _main(argv: list[str] | None = None) -> None:
 
             probe(args.trials)
         else:
-            evaluate(args.trials, args.task, args.mode)
+            evaluate(args.trials, args.task, args.mode, profile_selector=args.profile)
     elif args.command == "serve":
         from bud.core.server import create_app
+        from bud.harness.operating_profile import OperatingProfileStore, resolve_operating_profile
         from bud.tracing import tracing
 
+        settings = get_settings()
+        profile = (
+            resolve_operating_profile(
+                args.profile,
+                store=OperatingProfileStore(settings.data_dir / "operating-profile.json"),
+            )
+            if args.profile is not None
+            else None
+        )
         mode = "simulated tools" if args.simulate else "real accounts"
         print(f"Starting bud with {mode} at {LOCAL_URL}.", flush=True)
-        with tracing(get_settings()):
-            app = create_app(simulate=args.simulate, model_id=args.model)
+        with tracing(settings):
+            app = create_app(simulate=args.simulate, model_id=args.model, operating_profile=profile)
             # Event streams never end on their own; without a limit, one connected client (TUI,
             # Mac app) keeps a stopped server alive forever, holding bud.lock.
             # Clients resume by seq.

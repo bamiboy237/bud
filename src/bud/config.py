@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     models_file: Path | None = None
     default_model: str | None = None
     model_fallback: bool = True
+    operating_profile: str | None = None
     # Auto mode reviews each write with the OpenAI Decisions API when an OpenAI key exists.
     # Set APPROVAL_REVIEW=false to keep tool calls and requests off that API; auto mode then
     # asks about every write, like strict.
