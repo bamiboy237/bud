@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -25,11 +26,19 @@ TOKEN = "offline-process-test-owner-" + "x" * 32
 
 
 class ServerProcess:
-    def __init__(self, root: Path, checkpoint: str | None = None, *, accounts: bool = False):
+    def __init__(
+        self,
+        root: Path,
+        checkpoint: str | None = None,
+        *,
+        accounts: bool = False,
+        hold_model: bool = False,
+    ):
         self.root = root.resolve()
         self.data = self.root / "data"
         self.checkpoint = checkpoint
         self.accounts = accounts
+        self.hold_model = hold_model
         self.process = None
         self.client = None
         self.last_snapshot = None
@@ -60,6 +69,8 @@ class ServerProcess:
             }
             if self.accounts:
                 env["BUD_TEST_ACCOUNTS"] = "1"
+            if self.hold_model:
+                env["BUD_HOLD_MODEL"] = "1"
             command = [
                 sys.executable,
                 str(ROOT / "tests" / "server_process.py"),
@@ -194,8 +205,14 @@ class ServerProcess:
 
 
 @contextmanager
-def running(root: Path, checkpoint: str | None = None, *, accounts: bool = False):
-    process = ServerProcess(root, checkpoint, accounts=accounts)
+def running(
+    root: Path,
+    checkpoint: str | None = None,
+    *,
+    accounts: bool = False,
+    hold_model: bool = False,
+):
+    process = ServerProcess(root, checkpoint, accounts=accounts, hold_model=hold_model)
     try:
         yield process.start()
     finally:
@@ -573,3 +590,54 @@ def test_crash_at_workspace_dispatch_boundary(tmp_path, checkpoint):
                 assert target.stat().st_ino == saved_stat.st_ino
                 assert target.stat().st_mtime_ns == saved_stat.st_mtime_ns
         assert any(event["run_id"] for event in server.events("run.recovered"))
+
+
+def test_sigterm_during_inflight_durable_run_stops_fast_and_recovers(tmp_path):
+    """THE-182: SIGTERM while a durable run is in flight finishes quickly without marking the
+    DBOS workflow ERROR, and restarting against the same DATA_DIR completes the run."""
+    with running(tmp_path, hold_model=True) as server:
+        session = server.request("POST", "/sessions", status=201)["session_id"]
+        server.request(
+            "POST",
+            f"/sessions/{session}/messages",
+            status=202,
+            json={"text": "Hello", "message_id": "m-the182"},
+        )
+        marker = server.data / "checkpoint"
+        server.wait(
+            lambda: marker.exists() and marker.read_text() == "in_flight_model",
+            "durable model in flight",
+        )
+        run_id = server.events("run.started")[0]["run_id"]
+        assert server.process is not None
+        t0 = time.monotonic()
+        server.process.terminate()
+        returncode = server.process.wait(timeout=15)
+        elapsed = time.monotonic() - t0
+        assert returncode in (0, -signal.SIGTERM), (returncode, server.logs())
+        assert elapsed < 12.0, (elapsed, server.logs())
+        with sqlite3.connect(server.data / "runtime.db") as db:
+            row = db.execute(
+                "SELECT status FROM workflow_status WHERE workflow_uuid = ?",
+                (run_id,),
+            ).fetchone()
+            assert row is not None and row[0] != "ERROR", (row, server.logs())
+
+    with running(tmp_path) as server:
+        state = server.wait(
+            lambda: (
+                snap
+                if not (snap := server.snapshot(session))["run_active"]
+                and any(t["role"] == "assistant" for t in snap["transcript"])
+                else None
+            ),
+            "recovered run completes",
+        )
+        assert state["transcript"][-1]["text"] == "Offline reply."
+        assert len(server.events("run.completed")) == 1
+        with sqlite3.connect(server.data / "runtime.db") as db:
+            row = db.execute(
+                "SELECT status FROM workflow_status WHERE workflow_uuid = ?",
+                (run_id,),
+            ).fetchone()
+            assert row is not None and row[0] == "SUCCESS", (row, server.logs())

@@ -1,6 +1,7 @@
 """Offline entry point for the real HTTP server used by test_server."""
 
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -114,6 +115,9 @@ def scripted_response(messages: list[ModelMessage], info: AgentInfo) -> ModelRes
 
 
 async def scripted_stream(messages: list[ModelMessage], info: AgentInfo):
+    if os.environ.get("BUD_HOLD_MODEL") == "1":
+        (get_settings().data_dir / "checkpoint").write_text("in_flight_model")
+        await asyncio.Event().wait()
     response = scripted_response(messages, info)
     for index, part in enumerate(response.parts):
         if isinstance(part, ToolCallPart):
