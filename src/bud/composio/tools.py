@@ -78,8 +78,13 @@ ALLOWED_TOOLS = READ_TOOLS | WRITE_TOOLS
 # Reads Bud runs itself to preview, verify, or check a write. Search loads them with the write,
 # each with its own definition and version.
 COMPANION_READS = {
-    "GMAIL_CREATE_EMAIL_DRAFT": ("GMAIL_FETCH_MESSAGE_BY_THREAD_ID", "GMAIL_GET_DRAFT"),
-    "GMAIL_SEND_EMAIL": ("GMAIL_FETCH_MESSAGE_BY_THREAD_ID",),
+    # GMAIL_FETCH_EMAILS checks sent mail for a recipient Bud only read about.
+    "GMAIL_CREATE_EMAIL_DRAFT": (
+        "GMAIL_FETCH_MESSAGE_BY_THREAD_ID",
+        "GMAIL_GET_DRAFT",
+        "GMAIL_FETCH_EMAILS",
+    ),
+    "GMAIL_SEND_EMAIL": ("GMAIL_FETCH_MESSAGE_BY_THREAD_ID", "GMAIL_FETCH_EMAILS"),
     CALENDAR_CREATE: (CALENDAR_LIST, CALENDAR_GET, GET_CALENDAR),
     CALENDAR_PATCH: (CALENDAR_LIST, CALENDAR_GET, GET_CALENDAR),
 }

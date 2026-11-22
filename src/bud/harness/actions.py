@@ -36,7 +36,24 @@ from bud.harness.review import (
     owner_answers,
     too_long_to_review,
 )
-from bud.harness.writes import never_reviewed, reviewable_tools, self_hosted_writes
+from bud.harness.taint import (
+    ACCOUNT_TOOL,
+    KnownAddresses,
+    owner_replies,
+    owner_text,
+    read_text,
+    recipients,
+    sent_query,
+    sent_to,
+    tainted,
+)
+from bud.harness.taint import note as taint_note
+from bud.harness.writes import (
+    consequential_tools,
+    never_reviewed,
+    reviewable_tools,
+    self_hosted_writes,
+)
 
 Action = Literal["allow", "ask", "deny", "review"]
 RecordDecision = Callable[[dict[str, Any]], None]
@@ -96,6 +113,10 @@ def load_policy(path: Path | None = None) -> Policy:
 ACCOUNT_GENERATION: ContextVar[int | None] = ContextVar("bud_account_generation", default=None)
 
 
+def _failed(result: Any) -> bool:
+    return isinstance(result, dict) and result.get("successful") is False
+
+
 def _pinned() -> dict[str, Any]:
     generation = ACCOUNT_GENERATION.get()
     return {"account_generation": generation} if generation is not None else {}
@@ -122,6 +143,8 @@ class ActionGateway(WrapperToolset[None]):
     # Facts stamped on every approval card, such as the account generation it was asked
     # under, so the tool can refuse an approval given for an account that has since changed.
     stamp: Callable[[], dict[str, Any]] = field(kw_only=True, default=_pinned)
+    # Addresses the owner vouched for; a tainted one that is known needs no card.
+    known: KnownAddresses | None = field(kw_only=True, default=None)
     # Trusted, non-owner context for the reviewer, such as today's date.
     facts: Callable[[], str] = field(kw_only=True, default=lambda: "")
     grants: SessionGrants = field(kw_only=True, default_factory=SessionGrants)
@@ -186,6 +209,100 @@ class ActionGateway(WrapperToolset[None]):
             clarifications=owner_answers(ctx.messages),
             today=self.facts(),
         )
+
+    def _checks_targets(self, tool: ToolDefinition) -> bool:
+        """Whether a call's targets matter: every write that reaches outward, judged by the
+        tool's own rule before any standing grant. Reads, Gmail and Calendar ones included, are
+        not checked; an app action found at run time is checked unless it only reads."""
+        name = tool.name
+        if name in consequential_tools() or name in {"browser_upload", "read_webpage"}:
+            return True
+        found = (tool.metadata or {}).get(COMPOSIO_ACTION)
+        if name not in self.policy.tools and found is not None:
+            return not (isinstance(found, dict) and found.get("read_only") is True)
+        return bool(ACCOUNT_TOOL.fullmatch(name)) and self.policy.tools.get(name) != "allow"
+
+    def _tainted(
+        self, tool: ToolDefinition, tool_args: dict[str, Any], ctx: RunContext[None]
+    ) -> list[str]:
+        if not self._checks_targets(tool):
+            return []
+        request = (ctx.metadata or {}).get("bud_request")
+        # The owner's own words: this request, their earlier messages, and their answers.
+        # Never Bud's questions: the model wrote those, and an injection could plant a target
+        # in one.
+        # In a job, the messages hold the brief, which the main chat's model wrote: only the
+        # owner's own request (bud_request) and replies count.
+        in_job = (ctx.metadata or {}).get("bud_task_id") is not None
+        said = [
+            request if isinstance(request, str) else "",
+            "" if in_job else owner_text(ctx.messages),
+            *owner_replies(ctx.messages),
+        ]
+        read = read_text(ctx.messages, ctx.tool_call_id)
+        if in_job:
+            # The brief may carry a target from content the main chat read: it is read content.
+            read = f"{read}\n{owner_text(ctx.messages)}"
+        try:
+            # Only content from outside can show a link as given: not the model's own words or
+            # calls, and not a job's brief, which the model wrote.
+            given = read_text(ctx.messages, ctx.tool_call_id, model=False)
+            return tainted(tool.name, tool_args, "\n".join(said), read, given)
+        except Exception:
+            return []  # unsure: the call keeps its policy
+
+    async def _unknown(
+        self, name: str, tool_args: dict[str, Any], found: list[str], ctx: RunContext[None]
+    ) -> list[str]:
+        """Drop tainted recipients the owner already knows. Only a sending call's recipients:
+        an address someone emailed does not vouch for a command or a link naming its domain."""
+        sends_to = recipients(name, tool_args)
+        return [
+            target
+            for target in found
+            if target not in sends_to or not await self._known(target, ctx)
+        ]
+
+    async def _known(self, address: str, ctx: RunContext[None]) -> bool:
+        """Whether the owner vouched for `address`, for the account generation this run
+        entered: approved it as a recipient before, or emailed it from Gmail. Any failure
+        counts as unknown, so the card still shows."""
+        known = self.known
+        if known is None:
+            return False
+        generation = ACCOUNT_GENERATION.get()
+        search = "GMAIL_FETCH_EMAILS"
+
+        async def check() -> bool:
+            if known.has(address, generation):
+                return True
+            if self.policy.decide(search) != "allow":
+                return False
+            tools = await super(ActionGateway, self).get_tools(ctx)
+            if search not in tools:
+                return False
+            async with asyncio.timeout(8):
+                result = await super(ActionGateway, self).call_tool(
+                    search,
+                    {"query": sent_query(address), "max_results": 5, "user_id": "me"},
+                    replace(ctx, tool_name=search),
+                    tools[search],
+                )
+            sent = sent_to(result, address)
+            if sent:
+                known.add([address], generation)
+            return sent
+
+        try:
+            if DBOS.workflow_id is not None and DBOS.step_id is None:
+                # One step for the whole answer, the remembered list included, so recovery
+                # replays it in the same place instead of skipping or repeating a search.
+                return await DBOS.run_step_async(
+                    {"name": "bud.known_address", "retries_allowed": False}, check
+                )
+            return await check()
+        except Exception:
+            return False
 
     def _refusal(self, name: str, tool_args: dict[str, Any]) -> str | None:
         check = self.refuses.get(name)
@@ -260,6 +377,14 @@ class ActionGateway(WrapperToolset[None]):
             action = "deny"
         if action in ("ask", "review") and self._harmless(name, tool_args):
             action = "allow"
+        found = (
+            self._tainted(tool.tool_def, tool_args, ctx)
+            if action != "deny" and not ctx.tool_call_approved
+            else []
+        )
+        found = await self._unknown(name, tool_args, found, ctx) if found else found
+        if found and action in ("allow", "review"):
+            action = "ask"  # a target came from what Bud read, not from the owner
         if action == "review" and self._notifies_others(name, tool_args):
             action = "ask"  # hard rule: other people would be notified
         if action == "review" and too_long_to_review(tool_args):
@@ -272,7 +397,18 @@ class ActionGateway(WrapperToolset[None]):
             if action in ("ask", "review") and not ctx.tool_call_approved
             else None
         )
+        if found:
+            details = "\n".join(part for part in (details, taint_note(found)) if part)
         review: dict[str, Any] | None = None
+        # Recipients the owner approved, remembered once the call has gone through.
+        learned: set[str] = set()
+        if ctx.tool_call_approved and action != "deny" and self._checks_targets(tool.tool_def):
+            # A call whose rule is "allow" was held only by the target check, so running it
+            # now is an owner approval too.
+            if action == "allow":
+                rule, outcome = "ask", "approved"
+            if "draft" not in name.lower():
+                learned = recipients(name, tool_args)
         if action in ("ask", "review") and ctx.tool_call_approved:
             rule, outcome = "ask", "approved"  # the owner already approved this exact call
             held_review = (ctx.tool_call_metadata or {}).get("review")
@@ -336,7 +472,7 @@ class ActionGateway(WrapperToolset[None]):
         if action == "deny":
             return refusal or f"Refused by policy: {name} is not allowed."
         if DBOS.workflow_id is not None and DBOS.step_id is None:
-            return await DBOS.run_step_async(
+            result = await DBOS.run_step_async(
                 {"name": "bud.tool_call", "retries_allowed": False},
                 super().call_tool,
                 name,
@@ -344,7 +480,14 @@ class ActionGateway(WrapperToolset[None]):
                 ctx,
                 tool,
             )
-        return await super().call_tool(name, tool_args, ctx, tool)
+        else:
+            result = await super().call_tool(name, tool_args, ctx, tool)
+        # Only after the tool ran: an approval the account tools refused (another account,
+        # a stale card) raises above and teaches nothing.
+        if learned and self.known is not None and not _failed(result):
+            with contextlib.suppress(OSError):
+                self.known.add(learned, ACCOUNT_GENERATION.get())
+        return result
 
     async def _presentation(
         self, name: str, args: dict, ctx: RunContext[None], details: str | None
@@ -383,6 +526,7 @@ class GuardTools(AbstractCapability[None]):
     harmless: Mapping[str, Callable[[dict], bool]] = field(default_factory=dict)
     refuses: Mapping[str, Callable[[dict], str | None]] = field(default_factory=dict)
     stamp: Callable[[], dict[str, Any]] = _pinned
+    known: KnownAddresses | None = None
     facts: Callable[[], str] = lambda: ""
     # One set of grants for the life of the process, shared by every wrapper built from this.
     grants: SessionGrants = field(default_factory=SessionGrants)
@@ -421,6 +565,7 @@ class GuardTools(AbstractCapability[None]):
             harmless=self.harmless,
             refuses=self.refuses,
             stamp=self.stamp,
+            known=self.known,
             facts=self.facts,
             grants=self.grants,
         )
