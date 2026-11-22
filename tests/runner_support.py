@@ -66,11 +66,9 @@ async def running_bud(
     directory: Path,
     function: ResponseFunction,
     *,
-    durable: bool = False,
     jobs: bool = False,
     ask: bool = False,
     spiral: SpiralConfig | None = None,
-    model: Any = None,
 ):
     directory = directory.resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -80,8 +78,8 @@ async def running_bud(
     claims = directory / "dispatches.jsonl"
     spec = ModelSpec(provider="openai", name="scripted", tier="fast", input=0, output=0, cached=0)
     registry = Registry(models=[spec])
-    built_model = model if model is not None else scripted_model(function)
-    gateway = Gateway(registry, Ledger(directory / "costs.db"), lambda _: built_model)
+    model = scripted_model(function)
+    gateway = Gateway(registry, Ledger(directory / "costs.db"), lambda _: model)
     policy: dict[str, Action] = dict.fromkeys(READ_TOOLS, "allow")
     policy.update(dict.fromkeys(WRITE_TOOLS, "ask"))
     tools: list[Any] = [tool.function for tool in build_tools(root, claims)]
@@ -101,7 +99,7 @@ async def running_bud(
     harness.clock = lambda: datetime(2026, 11, 6, 12, tzinfo=UTC)
     if spiral is not None:
         harness.spiral = spiral
-    runner = Runner(Hub(log), gateway, harness, durable=durable, jobs=jobs, workspace=root)
+    runner = Runner(Hub(log), gateway, harness, jobs=jobs, workspace=root)
     try:
         yield RunningBud(runner, log, root, claims)
     finally:

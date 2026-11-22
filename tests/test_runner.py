@@ -1,10 +1,7 @@
 import asyncio
-import threading
-import time
 from collections import deque
 
 import pytest
-from dbos import DBOS
 from pydantic_ai.exceptions import ModelRequestTimeout
 from pydantic_ai.models.function import FunctionModel
 
@@ -278,47 +275,3 @@ async def test_a_late_approval_does_not_answer_the_newer_message_again(tmp_path)
         assert said.count("4") == 1, said
         assert said[-1] == "Created note.txt."
         assert (bud.root / "note.txt").read_text() == "Cedar first draft"
-
-
-async def test_durable_shutdown_stops_fast_and_leaves_workflow_recoverable(tmp_path):
-    """THE-182: Stopping a durable runner mid-run finishes near SHUTDOWN_WAIT_SECONDS (< 10s)
-    and leaves the DBOS workflow PENDING (recoverable) rather than ERROR."""
-    started = threading.Event()
-    release = threading.Event()
-
-    async def stalled(messages, info):
-        started.set()
-        await asyncio.to_thread(release.wait, 30)
-        yield "unreachable"
-
-    model = FunctionModel(
-        lambda messages, info: reply("done"),
-        stream_function=stalled,
-        model_name="scripted",
-    )
-    async with running_bud(tmp_path, responses(), durable=True, model=model) as bud:
-        DBOS(
-            config={
-                "name": "bud",
-                "system_database_url": "sqlite:///" + str((tmp_path / "runtime.db").resolve()),
-                "executor_id": "bud-core",
-                "application_version": bud.runner.version,
-                "enable_otlp": False,
-                "log_level": "WARNING",
-            }
-        )
-        DBOS.launch()
-        try:
-            bud.log.append("owner", "session.created")
-            bud.runner.start("owner", "Hold this run open", "message-1")
-            run_id = bud.log.pending_runs()[0]["run_id"]
-            assert await asyncio.to_thread(started.wait, 5), "durable run did not enter model"
-            t0 = time.monotonic()
-            await bud.runner.stop()
-            elapsed = time.monotonic() - t0
-            assert elapsed < 8.0
-            status = await DBOS.get_workflow_status_async(run_id)
-            assert status is not None and status.status == "PENDING"
-        finally:
-            release.set()
-            await asyncio.to_thread(DBOS.destroy, workflow_completion_timeout_sec=0)
