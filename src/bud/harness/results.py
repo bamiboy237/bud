@@ -33,7 +33,11 @@ PREVIEW_CHARS = 1_000
 
 
 async def spill_old_results(
-    store: SqliteResultStore, messages: list[ModelMessage], run_id: str
+    store: SqliteResultStore,
+    messages: list[ModelMessage],
+    run_id: str,
+    *,
+    spill_chars: int = SPILL_CHARS,
 ) -> list[ModelMessage]:
     projected: list[ModelMessage] = []
     for message in messages:
@@ -45,7 +49,7 @@ async def spill_old_results(
             if not isinstance(part, ToolReturnPart) or part.tool_name == "ask_user":
                 continue
             text = part.model_response_str(wrap_if_error=False)
-            if len(text) <= SPILL_CHARS:
+            if len(text) <= spill_chars:
                 continue
             data = text.encode()
             # Keyed by the run that produced it, so later turns resend identical text and
@@ -244,7 +248,13 @@ class SqliteResultStore:
         return len(deleted)
 
 
-def build_output_limits(store: SqliteResultStore) -> ToolOutputLimits[None]:
+def build_output_limits(
+    store: SqliteResultStore,
+    *,
+    spill_chars: int = SPILL_CHARS,
+    preview_chars: int = PREVIEW_CHARS,
+    truncate_max_chars: int = 4_000,
+) -> ToolOutputLimits[None]:
     def model_visible_result(ctx: RunContext[None], tool: ToolDefinition) -> bool:
         # Inner data stays whole; only the sandbox's public answer enters model context.
         return tool.name == "run_code" or (tool.name != "ask_user" and not inside_code_mode.get())
@@ -254,8 +264,11 @@ def build_output_limits(store: SqliteResultStore) -> ToolOutputLimits[None]:
         tool_filter=model_visible_result,
         bands=[
             Band(
-                over=SPILL_CHARS,
-                action=Spill(preview_chars=PREVIEW_CHARS, then=Truncate(max_chars=4_000)),
+                over=spill_chars,
+                action=Spill(
+                    preview_chars=preview_chars,
+                    then=Truncate(max_chars=truncate_max_chars),
+                ),
             )
         ],
     )

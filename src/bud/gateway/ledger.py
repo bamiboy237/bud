@@ -10,6 +10,7 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -18,8 +19,13 @@ CREATE TABLE IF NOT EXISTS model_requests (
     id INTEGER PRIMARY KEY,
     created_at TEXT NOT NULL,
     session_id TEXT,
+    run_id TEXT,
     model TEXT NOT NULL,
     billing TEXT NOT NULL DEFAULT 'api',
+    profile_id TEXT,
+    profile_version TEXT,
+    profile_digest TEXT,
+    prompt_version TEXT,
     status TEXT NOT NULL CHECK (status IN ('ok', 'failed', 'incomplete')),
     input_tokens INTEGER,
     output_tokens INTEGER,
@@ -33,6 +39,15 @@ CREATE INDEX IF NOT EXISTS model_requests_by_session ON model_requests(session_i
 CREATE INDEX IF NOT EXISTS model_requests_by_created ON model_requests(created_at);
 """
 
+_EXTRA_COLUMNS = {
+    "billing": "TEXT NOT NULL DEFAULT 'api'",
+    "run_id": "TEXT",
+    "profile_id": "TEXT",
+    "profile_version": "TEXT",
+    "profile_digest": "TEXT",
+    "prompt_version": "TEXT",
+}
+
 
 @dataclass(frozen=True)
 class LedgerEntry:
@@ -42,6 +57,7 @@ class LedgerEntry:
     status: str
     latency_ms: float
     session_id: str | None = None
+    run_id: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
     cached_tokens: int | None = None
@@ -49,6 +65,10 @@ class LedgerEntry:
     cost_usd: float | None = None
     error: str | None = None
     billing: str = "api"
+    profile_id: str | None = None
+    profile_version: str | None = None
+    profile_digest: str | None = None
+    prompt_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -72,10 +92,10 @@ class Ledger:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(SCHEMA)
             columns = {row[1] for row in db.execute("PRAGMA table_info(model_requests)")}
-            if "billing" not in columns:
-                db.execute(
-                    "ALTER TABLE model_requests ADD COLUMN billing TEXT NOT NULL DEFAULT 'api'"
-                )
+            for column, definition in _EXTRA_COLUMNS.items():
+                if column not in columns:
+                    db.execute(f"ALTER TABLE model_requests ADD COLUMN {column} {definition}")
+            db.execute("CREATE INDEX IF NOT EXISTS model_requests_by_run ON model_requests(run_id)")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -89,13 +109,16 @@ class Ledger:
                 db.execute(
                     """
                     INSERT INTO model_requests (
-                        created_at, session_id, model, status, input_tokens, output_tokens,
-                        cached_tokens, reasoning_tokens, latency_ms, cost_usd, error, billing
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        created_at, session_id, run_id, model, status, input_tokens,
+                        output_tokens, cached_tokens, reasoning_tokens, latency_ms, cost_usd,
+                        error, billing, profile_id, profile_version, profile_digest,
+                        prompt_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         datetime.now(UTC).isoformat(),
                         entry.session_id,
+                        entry.run_id,
                         entry.model,
                         entry.status,
                         entry.input_tokens,
@@ -106,10 +129,56 @@ class Ledger:
                         entry.cost_usd,
                         entry.error,
                         entry.billing,
+                        entry.profile_id,
+                        entry.profile_version,
+                        entry.profile_digest,
+                        entry.prompt_version,
                     ),
                 )
         except sqlite3.Error:
             logger.exception("could not write ledger entry for %s", entry.model)
+
+    def run_requests(self, run_id: str) -> list[dict[str, Any]]:
+        """All recorded model requests for one run, oldest first."""
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT model, billing, status, input_tokens, output_tokens, cost_usd,
+                       profile_id, profile_version, profile_digest, prompt_version, error
+                FROM model_requests
+                WHERE run_id = ?
+                ORDER BY id
+                """,
+                (run_id,),
+            ).fetchall()
+        return [
+            {
+                "model": model,
+                "billing": billing,
+                "status": status,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": cost_usd,
+                "profile_id": profile_id,
+                "profile_version": profile_version,
+                "profile_digest": profile_digest,
+                "prompt_version": prompt_version,
+                "error": error,
+            }
+            for (
+                model,
+                billing,
+                status,
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                profile_id,
+                profile_version,
+                profile_digest,
+                prompt_version,
+                error,
+            ) in rows
+        ]
 
     def session_totals(self, session_id: str) -> tuple[float, int]:
         """USD and tokens for one session."""

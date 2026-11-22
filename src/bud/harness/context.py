@@ -24,8 +24,8 @@ from pydantic_ai_harness.compaction._shared import (
 )
 
 from bud.gateway.errors import error_summary
-from bud.gateway.tracked import request_session
-from bud.harness.results import SqliteResultStore, spill_old_results
+from bud.gateway.tracked import RequestAttribution, request_attribution, request_session
+from bud.harness.results import SPILL_CHARS, SqliteResultStore, spill_old_results
 
 PARAMETERS = TypeAdapter(ModelRequestParameters)
 # After compaction the history should sit at this share of the trigger, so it lasts.
@@ -96,6 +96,12 @@ class BackgroundCompaction(AbstractCapability[None]):
     background_fraction: float = 0.8
     fallback_context_window: int = 64_000
     keep_tokens: int = 12_000
+    compacted_target: float = COMPACTED_TARGET
+    clear_keep_pairs: int = CLEAR_KEEP_PAIRS
+    clear_min_tokens: int = CLEAR_MIN_TOKENS
+    summary_max_tokens: int = 4_096
+    summary_tool_return_max_chars: int = 4_000
+    history_spill_chars: int = SPILL_CHARS
     max_age_seconds: float = 300
     max_preparations: int = 64
     id: str | None = "bud_background_compaction"
@@ -104,6 +110,8 @@ class BackgroundCompaction(AbstractCapability[None]):
     def __post_init__(self) -> None:
         if not 0 < self.max_fraction < 1 or not 0 < self.background_fraction < 1:
             raise ValueError("Context fractions must be between zero and one")
+        if not 0 < self.compacted_target < 1:
+            raise ValueError("Compacted target fraction must be between zero and one")
         if self.keep_tokens < 0 or self.fallback_context_window <= 0:
             raise ValueError("Invalid context window or retained token budget")
         if self.max_age_seconds <= 0 or self.max_preparations < 1:
@@ -135,7 +143,9 @@ class BackgroundCompaction(AbstractCapability[None]):
     ) -> ModelRequestContext:
         messages = list(request_context.messages)
         if self.result_store is not None and ctx.run_id:
-            messages = await spill_old_results(self.result_store, messages, ctx.run_id)
+            messages = await spill_old_results(
+                self.result_store, messages, ctx.run_id, spill_chars=self.history_spill_chars
+            )
         request_context = replace(request_context, messages=messages)
         threshold = resolve_token_trigger(
             None, self.max_fraction, ctx.model, self.fallback_context_window
@@ -244,8 +254,9 @@ class BackgroundCompaction(AbstractCapability[None]):
         snapshot_request = replace(request, messages=snapshot)
         session_id, run_id = ctx.conversation_id, ctx.run_id
         assert session_id is not None and run_id is not None
+        attribution = request_attribution.get()
         task = asyncio.create_task(
-            self._summarize(ctx, snapshot_request),
+            self._summarize(ctx, snapshot_request, attribution=attribution),
             context=Context(),
             name=f"bud-summary-{session_id}",
         )
@@ -270,11 +281,16 @@ class BackgroundCompaction(AbstractCapability[None]):
         task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
 
     async def _summarize(
-        self, ctx: RunContext[None], request: ModelRequestContext
+        self,
+        ctx: RunContext[None],
+        request: ModelRequestContext,
+        *,
+        attribution: RequestAttribution | None = None,
     ) -> list[ModelMessage]:
         session_id, run_id = ctx.conversation_id, ctx.run_id
         assert session_id is not None and run_id is not None
         token = request_session.set(session_id)
+        attr_token = request_attribution.set(attribution or request_attribution.get())
         usage = RunUsage()
         summary_ctx = RunContext(
             deps=None,
@@ -294,23 +310,23 @@ class BackgroundCompaction(AbstractCapability[None]):
             tiers=[
                 ClearToolResults(
                     max_tokens=1,  # Bypassed inside TieredCompaction; the target decides.
-                    keep_pairs=CLEAR_KEEP_PAIRS,
+                    keep_pairs=self.clear_keep_pairs,
                     # The owner's own answers are not re-fetchable: never blank them.
                     exclude_tools=frozenset({"ask_user"}),
                     # Small savings do not justify invalidating the prompt cache.
-                    min_clear_tokens=CLEAR_MIN_TOKENS,
+                    min_clear_tokens=self.clear_min_tokens,
                 ),
                 SummarizingCompaction(
                     max_fraction=self.max_fraction,
                     keep_tokens=self.keep_tokens,
                     preserve_first_user_message=False,
                     summary_prompt=SUMMARY_PROMPT,
-                    model_settings={"max_tokens": 4096},
+                    model_settings={"max_tokens": self.summary_max_tokens},
                     event_stream_handler=drain_summary_events,
-                    tool_return_max_chars=4000,
+                    tool_return_max_chars=self.summary_tool_return_max_chars,
                 ),
             ],
-            target_tokens=int(threshold * COMPACTED_TARGET),
+            target_tokens=int(threshold * self.compacted_target),
         )
         event = {"session_id": session_id, "run_id": run_id, "id": f"{run_id}:{ctx.run_step}"}
         try:
@@ -335,6 +351,7 @@ class BackgroundCompaction(AbstractCapability[None]):
             )
             return compacted
         finally:
+            request_attribution.reset(attr_token)
             request_session.reset(token)
 
     async def discard(self, session_id: str) -> None:

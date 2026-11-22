@@ -11,7 +11,7 @@ import logging
 import re
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any, TextIO
@@ -39,12 +39,11 @@ from bud.core.background import GUIDANCE as BACKGROUND_GUIDANCE
 from bud.core.background import STARTS as BACKGROUND_STARTS
 from bud.core.background import TOOLS as BACKGROUND_TOOLS
 from bud.core.background import Background
+from bud.core.composition import compose_runner, compose_world_harness
 from bud.core.events import Event, MessageOrigin
-from bud.core.history import conversation_search
 from bud.core.hub import Hub
 from bud.core.log import EventLog, QueueFull
 from bud.core.profiles import Mode, ProfileStore, apply_mode, as_mode, mode_summary
-from bud.core.profiles import guidance as MODE_GUIDANCE
 from bud.core.projection import Snapshot, parked_approvals, undecided_approvals
 from bud.core.runner import ACCOUNT_CHANGE, DecisionRejected, Runner, UnknownApproval
 from bud.core.setup import (
@@ -60,9 +59,12 @@ from bud.harness.actions import Policy, load_policy
 from bud.harness.agent import Harness
 from bud.harness.ask import MAX_QUESTIONS, AskAnswer
 from bud.harness.grants import Grants
-from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
-from bud.harness.recall import Recall, embedder
+from bud.harness.operating_profile import (
+    OperatingProfile,
+    OperatingProfileStore,
+    resolve_operating_profile,
+)
 from bud.harness.review import ToolReviewer, build_reviewer
 from bud.harness.taint import KnownAddresses
 from bud.limits import MAX_MESSAGE_CHARS
@@ -91,10 +93,7 @@ from bud.workspace import READ_TOOLS as WORKSPACE_READ_TOOLS
 from bud.workspace import WRITE_TOOLS as WORKSPACE_WRITE_TOOLS
 from bud.workspace import build_tools as build_workspace_tools
 from bud.workspace import read_capabilities as workspace_read_capabilities
-from bud.world.describe import build_describers, build_notifies_others
 from bud.world.store import World
-from bud.world.tools import READ_TOOLS as WORLD_READ_TOOLS
-from bud.world.tools import build_tools
 
 logger = logging.getLogger(__name__)
 # Workspace reads that never ask: the harness FileSystem tools and read_document.
@@ -274,7 +273,12 @@ def allow_file_tools(policy: Policy) -> None:
     policy.no_grants = policy.no_grants | {NETWORK_TOOL} | LOCAL_TOOLS
 
 
-def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAPI:
+def create_app(
+    *,
+    simulate: bool = False,
+    model_id: str | None = None,
+    operating_profile: OperatingProfile | None = None,
+) -> FastAPI:
     settings = get_settings()
     token = owner_token(settings)
     settings.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -284,7 +288,14 @@ def create_app(*, simulate: bool = False, model_id: str | None = None) -> FastAP
         None if simulate else hold_single_server_lock(settings.data_dir / "live-server.lock")
     )
     try:
-        return _create_app(settings, token, live_lock, simulate=simulate, model_id=model_id)
+        return _create_app(
+            settings,
+            token,
+            live_lock,
+            simulate=simulate,
+            model_id=model_id,
+            operating_profile=operating_profile,
+        )
     except BaseException:
         if live_lock is not None:
             live_lock.close()
@@ -298,6 +309,7 @@ def _create_app(
     *,
     simulate: bool,
     model_id: str | None,
+    operating_profile: OperatingProfile | None = None,
 ) -> FastAPI:
     connections = None
     binding = None
@@ -318,6 +330,15 @@ def _create_app(
     # Harness unions memory/skill rules in), one seam for every tool class.
     profile_store = ProfileStore(settings.data_dir / "approval-mode.json")
     approval_mode = profile_store.load()
+    active_profile = operating_profile or resolve_operating_profile(
+        settings.operating_profile,
+        store=OperatingProfileStore(settings.data_dir / "operating-profile.json"),
+    )
+    retention = (
+        timedelta(hours=settings.tool_result_retention_hours)
+        if settings.tool_result_retention_hours != 24
+        else None
+    )
     if not simulate and any(
         (
             settings.photon_api_key,
@@ -449,8 +470,11 @@ def _create_app(
             | WEB_READ_TOOLS
             | WORKSPACE_READ_TOOLS
             | {DOCUMENT_TOOL, "current_time"},
-            result_retention=timedelta(hours=settings.tool_result_retention_hours),
-            capabilities=workspace_read_capabilities(workspace, deferred=True),
+            result_retention=retention,
+            capabilities=workspace_read_capabilities(
+                workspace, deferred=active_profile.harness.defer_capabilities
+            ),
+            operating_profile=active_profile,
         )
         harness.known = KnownAddresses(session_dir / "known-addresses")
         tools_policy = harness.policy
@@ -473,48 +497,35 @@ def _create_app(
         gateway = build_gateway(settings, model_id=model_id)
         world = World(settings.data_dir / "world.db")
         tools_policy = load_policy()
-        # The simulated world gets the production web tools: research is read-only, and a
-        # mock search engine would teach habits that break against the real web.
-        tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS, "allow"))
         allow_file_tools(tools_policy)
-        harness = Harness(
-            CombinedToolset(
-                [
-                    FunctionToolset(build_tools(world)),
-                    build_web_tools(settings),
-                    workspace_tools(
-                        workspace,
-                        settings.data_dir,
-                        lambda: harness.reviewer,
-                        private_folders(settings),
-                        background,
-                    ),
-                ]
-            ),
-            tools_policy,
-            gateway.registry,
-            world.profile() + WEB_GUIDANCE + file_guidance(),
-            memory=build_memory(settings.data_dir / "world-memory.db", namespace="world"),
+        harness_ref: list[Harness] = []
+        harness = compose_world_harness(
+            world,
+            gateway,
+            settings,
             state_dir=settings.data_dir,
             result_path=db_path,
-            read_tools=WORLD_READ_TOOLS | WEB_READ_TOOLS | FILE_READS,
-            result_retention=timedelta(hours=settings.tool_result_retention_hours),
-            capabilities=workspace_read_capabilities(workspace, deferred=True),
+            memory_path=settings.data_dir / "world-memory.db",
+            operating_profile=active_profile,
+            extra_toolsets=[
+                workspace_tools(
+                    workspace,
+                    settings.data_dir,
+                    lambda: harness_ref[0].reviewer,
+                    private_folders(settings),
+                    background,
+                )
+            ],
+            policy=tools_policy,
+            extra_read_tools=FILE_READS,
+            prompt_suffix=WEB_GUIDANCE + file_guidance(),
+            result_retention=retention,
+            capabilities=workspace_read_capabilities(
+                workspace, deferred=active_profile.harness.defer_capabilities
+            ),
+            known_addresses=KnownAddresses(settings.data_dir / "known-addresses"),
         )
-    # One seam for both branches: memory/skill rules are unioned inside the
-    # Harness, so the profile overlay lands on the composed policy. The
-    # guards hold this Policy by reference and re-read decide() per call.
-    # Auto mode reviews each write when a reviewer exists (an OpenAI key, review not turned
-    # off). Set before the Runner builds its agent, which captures the reviewer.
-    harness.reviewer = build_reviewer()
-    # Standing permissions the owner granted from an approval card. The policy reads them on
-    # every call, so a new grant or a revoke applies without a restart.
-    grants = Grants(settings.data_dir / "grants.json")
-    harness.policy.grants = grants.tools
-    if world is not None:
-        harness.describers = build_describers(world)
-        harness.known = KnownAddresses(settings.data_dir / "known-addresses")
-        harness.notifies_others = build_notifies_others(world)
+        harness_ref.append(harness)
     # The card names the real file a local read opens, which a link cannot disguise.
     harness.harmless[OPEN_IN_APP] = quiet_open
     outside = local_blocked(Path.home(), private_folders(settings), workspace)
@@ -524,50 +535,40 @@ def _create_app(
     harness.refuses.update(
         dict.fromkeys(LOCAL_TOOLS, lambda tool_args: local_refusal(tool_args, outside))
     )
-    has_reviewer = harness.reviewer is not None
-    apply_mode(harness.policy, approval_mode, reviewer=has_reviewer)
+    reviewer = build_reviewer()
+    has_reviewer = reviewer is not None
+    # Standing permissions the owner granted from an approval card. The policy reads them on
+    # every call, so a new grant or a revoke applies without a restart.
+    grants = Grants(settings.data_dir / "grants.json")
     live_mode: dict[str, Mode] = {"mode": approval_mode}
-    harness.live_instructions.append(
-        lambda: MODE_GUIDANCE(live_mode["mode"], reviewer=has_reviewer)
+    gateway.model(
+        active_profile.model.tier,
+        require_tools=True,
+        selected=active_profile.model.model_id,
     )
-
-    harness.clock = (
-        (lambda: datetime.fromisoformat(world.now))
-        if world is not None
-        else (lambda: datetime.now().astimezone())
-    )
-    gateway.model("fast", require_tools=True)
     log = EventLog(db_path)
-    # Before the runner builds the agent, which reads the harness's capabilities.
-    harness.capabilities.append(conversation_search(log, deferred=True))
     hub = Hub(log)
     if setup_journal is not None:
         # The setup toolset was built before the log and hub existed; one seam
         # hands its journal over so every setup event is a journaled event.
         setup_journal.bind(hub)
     background.bind(hub)
-    learner = (
-        Learner(
-            harness.memory,
-            lambda session_id: gateway.model("fast", f"{session_id}:learn", require_tools=True),
-        )
-        if harness.memory is not None
-        else None
-    )
-    recall = Recall(
-        db_path.parent / ("world-recall.db" if world is not None else "recall.db"),
-        embedder=embedder(settings),
-        memory=harness.memory,
-    )
-    runner = Runner(
+    runner = compose_runner(
         hub,
         gateway,
         harness,
+        log,
+        settings,
+        approval_mode=approval_mode,
+        recall_path=db_path.parent / ("world-recall.db" if world is not None else "recall.db"),
+        reviewer=reviewer,
+        grants=grants.tools,
         durable=True,
         jobs=True,
-        learner=learner,
-        recall=recall,
         workspace=workspace,
+        include_history_search=True,
+        mode_holder=live_mode,
+        runner_cls=Runner,
     )
 
     async def every_minute() -> None:
@@ -687,6 +688,7 @@ def _create_app(
                 "restart_required": connections is not None and connections.restart_required(),
                 "messaging": messaging_state["status"],
                 "approval_mode": profile_store.load(),
+                "operating_profile": active_profile.attribution(),
             },
             headers={"Cache-Control": "no-store"},
         )

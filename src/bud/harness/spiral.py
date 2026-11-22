@@ -23,7 +23,10 @@ import logging
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from bud.harness.operating_profile import ExecutionLimitsConfig
 
 import httpx
 from pydantic_ai import RunContext
@@ -102,6 +105,28 @@ class SpiralConfig:
             progress_threshold=settings.loop_progress_threshold,
             judge_model=settings.loop_judge_model,
             judge_timeout=settings.loop_judge_timeout_seconds,
+            openai_api_key=settings.openai_api_key.get_secret_value()
+            if settings.openai_api_key
+            else None,
+        )
+
+    @classmethod
+    def from_profile(cls, limits: "ExecutionLimitsConfig") -> "SpiralConfig":
+        from bud.config import get_settings
+
+        settings = get_settings()
+        return cls(
+            enabled=settings.loop_detection
+            if limits.spiral_enabled is None
+            else limits.spiral_enabled,
+            repeat_note=limits.spiral_repeat_note,
+            cycle_repeats=limits.spiral_cycle_repeats,
+            chant_repeats=limits.spiral_chant_repeats,
+            progress_first=limits.spiral_progress_first,
+            progress_every=limits.spiral_progress_every,
+            progress_threshold=limits.spiral_progress_threshold,
+            judge_model=settings.loop_judge_model,
+            judge_timeout=limits.spiral_judge_timeout,
             openai_api_key=settings.openai_api_key.get_secret_value()
             if settings.openai_api_key
             else None,
