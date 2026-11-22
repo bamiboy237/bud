@@ -64,6 +64,31 @@ NAVIGATION = frozenset({"browser_navigate", "browser_tabs", "read_webpage"})
 # are not targets here: installing from them is what these commands are for.
 COMMANDS = frozenset({"run_command", "run_in_background"})
 HOST_KEYS = frozenset({"host", "hostname", "domain", "site"})
+# Tools whose output can hold text Bud or a job wrote (workspace files, memory notes,
+# job reports, earlier turns, shell stdout). They count as read content for flagging,
+# never as external content that vouches for a link as "given".
+_SELF_AUTHORED_TOOLS = frozenset(
+    {
+        "read_file",
+        "search_files",
+        "find_files",
+        "list_directory",
+        "file_info",
+        "read_document",
+        "workspace_create",
+        "workspace_update",
+        "read_memory",
+        "search_memory",
+        "write_memory",
+        "delete_memory",
+        "inspect_task",
+        "start_task",
+        "update_task",
+        "search_conversation_history",
+        "run_command",
+        "run_in_background",
+    }
+)
 # Argument names that say who receives a message. Addresses the owner approved under these
 # become known; an address in a reminder's text does not.
 RECIPIENT = re.compile(r"(^|_)(to|cc|bcc|recipients?|attendees?|emails?|invitees?|guests?)$")
@@ -359,8 +384,9 @@ def read_text(
 
     The model's own earlier text, thinking, and tool calls count too: clearing old tool
     results leaves what the model repeated from them. The response holding `current_call` is
-    left out, so a call is not flagged for its own arguments. With `model=False`, the model's
-    own words are left out entirely: what remains is what Bud was given."""
+    left out, so a call is not flagged for its own arguments. With `model=False`, only external
+    tool returns remain: model words, memory snapshots, job updates, compaction summaries, and
+    Bud's own local or self-authored tool outputs are left out."""
     parts = []
     for message in messages:
         if isinstance(message, ModelResponse):
@@ -380,6 +406,14 @@ def read_text(
         if not isinstance(message, ModelRequest):
             continue
         for part in message.parts:
+            if not model:
+                if (
+                    isinstance(part, ToolReturnPart)
+                    and part.tool_name != "ask_user"
+                    and part.tool_name not in _SELF_AUTHORED_TOOLS
+                ):
+                    parts.append(_content(part))
+                continue
             if isinstance(part, UserPromptPart):
                 text, added = _prompt_split(part)
                 parts.append(added)
@@ -517,9 +551,9 @@ def tainted(
 
 # What may follow a link in text: its end, a space, a closing quote or bracket, or sentence
 # punctuation before a space or the end.
-_LINK_END = r"/?(?=$|[\s\"'<>)\]}]|[.,;:!?]+(?:\s|$))"
+_LINK_END = r"/?(?=$|[\s\"'<>)\]}\x60]|[.,;:!?]+(?:\s|$))"
 # Characters a link given whole never holds: past them, a match would run on into other text.
-_NOT_IN_LINK = re.compile(r"[\s\"'<>{}]")
+_NOT_IN_LINK = re.compile(r"[\s\"'<>{}`\\]")
 
 
 def _given(value: str, given: "Words") -> bool:
