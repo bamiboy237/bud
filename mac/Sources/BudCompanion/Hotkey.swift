@@ -1,11 +1,16 @@
 import AppKit
 import Carbon.HIToolbox
 
+@MainActor
+protocol HotkeyToken: AnyObject {
+    func unregister()
+}
+
 /// A system-wide shortcut that reports both the press and the release, which hold-to-talk
 /// needs. Carbon's hot-key API is old, but it's still the one macOS offers for this: it works
 /// while another app is in front and needs no extra permission, unlike watching every key.
 @MainActor
-final class Hotkey {
+final class Hotkey: HotkeyToken {
     private let id: UInt32
     private var ref: EventHotKeyRef?
     private let onPress: () -> Void
@@ -82,26 +87,36 @@ final class RightOptionHold {
 
     private var monitors: [Any] = []
     private var down = false
+    private let onPress: () -> Void
+    private let onRelease: () -> Void
 
-    init(onPress: @escaping () -> Void, onRelease: @escaping () -> Void) {
-        let handle: (NSEvent) -> Void = { [weak self] event in
-            guard let self else { return }
-            // The right key's own bit (NX_DEVICERALTKEYMASK), not the shared Option flag, which
-            // stays set while the left Option key is still down.
-            let held = event.modifierFlags.rawValue & 0x40 != 0
-            if held, !down {
-                down = true
-                onPress()
-            } else if !held, down {
-                down = false
-                onRelease()
-            }
+    init(onPress: @escaping () -> Void, onRelease: @escaping () -> Void, monitorEvents: Bool = true) {
+        self.onPress = onPress
+        self.onRelease = onRelease
+        guard monitorEvents else { return }
+        let handleEvent: (NSEvent) -> Void = { [weak self] event in
+            self?.handle(modifierFlags: event.modifierFlags)
         }
-        if let global = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged, handler: handle) {
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged, handler: handleEvent) {
             monitors.append(global)
         }
-        if let local = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged, handler: { handle($0); return $0 }) {
+        if let local = NSEvent.addLocalMonitorForEvents(
+            matching: .flagsChanged, handler: { handleEvent($0); return $0 }
+        ) {
             monitors.append(local)
+        }
+    }
+
+    func handle(modifierFlags: NSEvent.ModifierFlags) {
+        // The right key's own bit (NX_DEVICERALTKEYMASK), not the shared Option flag, which
+        // stays set while the left Option key is still down.
+        let held = modifierFlags.rawValue & 0x40 != 0
+        if held, !down {
+            down = true
+            onPress()
+        } else if !held, down {
+            down = false
+            onRelease()
         }
     }
 
