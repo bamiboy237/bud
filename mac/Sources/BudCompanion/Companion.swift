@@ -464,7 +464,7 @@ final class Companion {
         let previous = Dictionary(uniqueKeysWithValues: setups.map { ($0.id, $0) })
         setups = (snapshot["pending_setup"] as? [[String: Any]] ?? []).compactMap {
             guard var setup = CapabilitySetup($0),
-                  !["connected", "cancelled"].contains(setup.status) else { return nil }
+                  !["connected", "cancelled", "rejected", "dismissed"].contains(setup.status) else { return nil }
             setup.url = setup.status == "failed" ? nil : setup.url ?? previous[setup.id]?.url
             return setup
         }
@@ -568,7 +568,7 @@ final class Companion {
 
     func receiveSetup(_ data: [String: Any], replacing: Bool = false) {
         guard var incoming = CapabilitySetup(data) else { return }
-        if ["connected", "cancelled"].contains(incoming.status) {
+        if ["connected", "cancelled", "rejected", "dismissed"].contains(incoming.status) {
             setups.removeAll { $0.id == incoming.id }
             updatingSetups.remove(incoming.id)
             setupProblems.removeValue(forKey: incoming.id)
@@ -1171,7 +1171,7 @@ final class Companion {
             bubbleOpen = true
         case "run.started", "run.recovered":
             settle?.cancel()
-            if event.string("trigger") == "job" {
+            if ["job", "setup"].contains(event.string("trigger")) {
                 archiveReply()
                 reply = ""
                 showWhole()

@@ -51,6 +51,9 @@ class QueuedMessage(BaseModel):
     origin: MessageOrigin | None = None
 
 
+TERMINAL_SETUP_STATUSES = frozenset({"connected", "cancelled", "rejected", "dismissed"})
+
+
 class PendingSetup(BaseModel):
     """One capability setup card, tracked until it connects or is replaced."""
 
@@ -61,6 +64,7 @@ class PendingSetup(BaseModel):
     url: str | None = None
     steps: list[str] = Field(default_factory=list)
     reason: str | None = None
+    setup_id: str | None = None
 
 
 class SavedArtifact(BaseModel):
@@ -311,7 +315,7 @@ def pending_setups(events: list[Event]) -> list[PendingSetup]:
                 update={"status": incoming.status, "reason": incoming.reason}
             )
         cards[incoming.capability] = incoming
-    return [card for card in cards.values() if card.status not in {"connected", "cancelled"}]
+    return [card for card in cards.values() if card.status not in TERMINAL_SETUP_STATUSES]
 
 
 def runs(events: list[Event], *, summaries: bool = False) -> list[RunView]:
@@ -628,12 +632,20 @@ def _failure_note(
 
 # Job news bud reports without being asked. The owner cancelled the others themselves.
 JOB_NEWS = ("task.completed", "task.failed", "task.paused", "task.stalled")
-# Runs that start a turn in the conversation: the owner's message, or a job report.
-PROMPTED = ("message", "job")
+# Runs that start a turn in the conversation: the owner's message, a job report, or a setup wakeup.
+PROMPTED = ("message", "job", "setup")
 JOB_REPORT = (
     "[bud system note] A job you started has ended or looks stuck. Tell the owner, in a few "
     "sentences, what it delivered, why it stopped, or that it seems stuck and they can ask you "
     "to stop it. Do not start new work."
+)
+SETUP_WAKEUP = (
+    "[bud system note] Capability setup changed. Review the <setup_updates> below. "
+    "If a capability is now connected, continue the owner's previous request using it "
+    "(load a connected app's actions with find_app_actions; after browser setup, call "
+    "enable_browser). If a capability setup was cancelled or declined, briefly acknowledge "
+    "that it will not be connected and offer alternatives or wrap up without reopening "
+    "setup unless asked."
 )
 
 
