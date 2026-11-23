@@ -10,15 +10,17 @@ import SwiftUI
 /// Unchanged replies reuse their parse when the conversation is rebuilt.
 struct MarkdownView: View {
     let blocks: [any Markup]
+    let rich: Bool
     @Environment(\.replyType) private var type
 
-    init(_ text: String) {
+    init(_ text: String, rich: Bool = false) {
+        self.rich = rich
         blocks = ParsedMarkdown.blocks(text)
     }
 
     var body: some View {
         // Links and citations take the one accent, scoped here so pickers elsewhere keep theirs.
-        Blocks(blocks: blocks, spacing: type.blockSpacing)
+        Blocks(blocks: blocks, spacing: type.blockSpacing, rich: rich)
             .tint(Paper.accent)
     }
 }
@@ -108,11 +110,12 @@ private enum Metrics {
 private struct Blocks: View {
     let blocks: [any Markup]
     let spacing: CGFloat
+    var rich = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: spacing) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { index, block in
-                Block(markup: block, first: index == 0)
+                Block(markup: block, first: index == 0, rich: rich)
             }
         }
     }
@@ -121,6 +124,7 @@ private struct Blocks: View {
 private struct Block: View {
     let markup: any Markup
     let first: Bool
+    var rich = false
     @Environment(\.replyType) private var type
 
     var body: some View {
@@ -141,7 +145,26 @@ private struct Block: View {
             }
             .padding(.top, first ? 0 : heading.level <= 2 ? type.blockSpacing * 0.6 : 2)
         case let paragraph as Paragraph:
-            Prose(text: inline(paragraph, code: type.code))
+            if rich, paragraph.childCount == 1, let child = paragraph.child(at: 0) {
+                switch child {
+                case let link as Markdown.Link:
+                    if let url = SafePreviewURL(link.destination) {
+                        WebLinkCard(url: url.value, title: String(inline(link).characters))
+                    } else {
+                        Prose(text: inline(paragraph, code: type.code))
+                    }
+                case let image as Markdown.Image:
+                    if let url = SafePreviewURL(image.source) {
+                        WebImageCard(url: url.value, title: String(inline(image).characters))
+                    } else {
+                        Prose(text: inline(paragraph, code: type.code))
+                    }
+                default:
+                    Prose(text: inline(paragraph, code: type.code))
+                }
+            } else {
+                Prose(text: inline(paragraph, code: type.code))
+            }
         case let list as UnorderedList:
             ListBlock(items: Array(list.listItems), start: nil)
         case let list as OrderedList:
