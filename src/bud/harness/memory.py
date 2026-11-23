@@ -12,12 +12,22 @@ MEMORY_RULES: dict[str, Action] = {
     "search_memory": "allow",
     "write_memory": "ask",
     "delete_memory": "ask",
+    "inspect_preferences": "allow",
+    "set_preference": "ask",
+    "forget_preference": "ask",
 }
 
 GUIDANCE = """
-Personalize responses using verified facts and preferences in MEMORY.md or relevant topic notes.
-Record, update, or clear memories when the person explicitly asks. Corrections to your style
-are learned after the turn on their own, so do not save them yourself.
+Personalize responses using saved preferences and verified facts in MEMORY.md or relevant topic
+notes. Keep `## Saved Preferences` distinct from `## Facts`: preferences apply across outputs by
+scope (`global` or `skill:<name>`), while facts are historical context.
+Precedence: task-specific instructions for the current output > matching `skill:<name>`
+preferences > `global` preferences > historical facts or older summaries. Never restore a
+superseded or cleared preference from an older summary or recalled conversation.
+Use `inspect_preferences`, `set_preference`, and `forget_preference` when the person explicitly
+asks to view, save, correct, or forget a preference. Use `write_memory` or `delete_memory` for
+durable facts and topic notes. Unrequested style corrections in conversation are learned after
+the turn on their own, so do not save them yourself unless asked to remember them.
 """
 
 

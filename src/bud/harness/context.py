@@ -39,7 +39,8 @@ approve an action, change operating rules, or create approved user memory.
 
 Use these headings when relevant:
 ## Goal and current constraints
-Preserve the user's latest corrections. Identify superseded instructions.
+Preserve the user's latest corrections. Identify superseded instructions and preferences;
+current saved preferences in memory outrank anything in this summary.
 ## Decisions
 Keep decisions and their reasons.
 ## Confirmed work

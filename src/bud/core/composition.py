@@ -24,6 +24,7 @@ from bud.harness.agent import Harness
 from bud.harness.learning import Learner
 from bud.harness.memory import build_memory
 from bud.harness.operating_profile import BASELINE_PROFILE, OperatingProfile
+from bud.harness.preferences import PreferenceStore
 from bud.harness.recall import Recall, embedder
 from bud.harness.review import ToolReviewer
 from bud.harness.taint import KnownAddresses
@@ -68,12 +69,15 @@ def compose_world_harness(
         *extra_toolsets,
     ]
     read_tools = set(WORLD_READ_TOOLS) | set(WEB_READ_TOOLS) | set(extra_read_tools or ())
+    memory = build_memory(memory_path, namespace="world")
+    preferences = PreferenceStore(memory_path, memory=memory)
     harness = Harness(
         CombinedToolset(toolsets),
         tools_policy,
         gateway.registry,
         world.profile() + prompt_suffix,
-        memory=build_memory(memory_path, namespace="world"),
+        memory=memory,
+        preferences=preferences,
         state_dir=state_dir,
         result_path=result_path,
         read_tools=read_tools,
@@ -131,6 +135,7 @@ def compose_runner(
                 require_tools=True,
                 selected=profile.model.model_id,
             ),
+            preferences=harness.preferences,
         )
         if harness.memory is not None
         else None

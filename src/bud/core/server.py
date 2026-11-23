@@ -65,6 +65,7 @@ from bud.harness.operating_profile import (
     OperatingProfileStore,
     resolve_operating_profile,
 )
+from bud.harness.preferences import PreferenceStore
 from bud.harness.review import ToolReviewer, build_reviewer
 from bud.harness.taint import KnownAddresses
 from bud.limits import MAX_MESSAGE_CHARS
@@ -448,6 +449,8 @@ def _create_app(
                     deny_stale_approvals(binding.generation)
 
         refresh_tools = refresh_account_tools
+        memory_path = session_dir / "memory.db"
+        memory = build_memory(memory_path, namespace="owner")
         harness = Harness(
             account_toolset(binding, loaded["browse"]),
             tools_policy,
@@ -463,7 +466,8 @@ def _create_app(
             + file_guidance()
             + (browser.GUIDANCE if browsing else "")
             + f"Your workspace is the folder {display_path(workspace)} on the person's Mac.\n",
-            memory=build_memory(session_dir / "memory.db", namespace="owner"),
+            memory=memory,
+            preferences=PreferenceStore(memory_path, memory=memory),
             state_dir=session_dir,
             result_path=db_path,
             read_tools=READ_TOOLS

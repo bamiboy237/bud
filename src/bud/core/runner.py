@@ -1033,18 +1033,25 @@ class Runner(DBOSConfiguredInstance):
         if not session_id:
             return ""
         lessons = [
-            lesson["fact"]
+            lesson
             for event in self.hub.log.read(session_id)
             if event.type == "memory.learned"
             for lesson in event.data["lessons"]
         ][-RECENT_LESSONS:]
         if not lessons:
             return ""
-        listed = "\n".join(f"- {fact}" for fact in lessons)
+        lines = []
+        for lesson in lessons:
+            if lesson.get("scope") and lesson.get("key"):
+                lines.append(f"- [{lesson['scope']} | key: {lesson['key']}] {lesson['fact']}")
+            else:
+                lines.append(f"- {lesson['fact']}")
+        listed = "\n".join(lines)
         return (
             "\nbud saved these to memory in this conversation and told the owner:\n"
-            f"{listed}\nIf the owner says to forget or undo one, remove that MEMORY.md line "
-            "with write_memory (old_text) and confirm."
+            f"{listed}\nIf the owner says to forget or undo a saved preference, call "
+            "`forget_preference(scope, key)` and confirm. For a fact in `MEMORY.md`, remove "
+            "that line with `write_memory` (`old_text`) and confirm."
         )
 
     async def stop(self) -> None:
