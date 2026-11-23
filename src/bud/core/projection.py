@@ -24,6 +24,13 @@ class Attachment(BaseModel):
         return f"attachments/{session_id}/{self.id}/{self.name}"
 
 
+class RoutineCard(BaseModel):
+    routine_id: str
+    title: str
+    kind: str
+    occurrence_id: str | None = None
+
+
 class Turn(BaseModel):
     role: str
     text: str
@@ -33,6 +40,7 @@ class Turn(BaseModel):
     # What the reply's [S1]-style tags cite: session_id, seq, date, and a display label.
     sources: dict[str, dict] | None = None
     attachments: list[Attachment] = Field(default_factory=list)
+    routine: RoutineCard | None = None
 
 
 class PendingApproval(BaseModel):
@@ -485,13 +493,29 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
                 # A reminder or a background command, posted by the server: no model turn.
                 transcript.append(Turn(role="assistant", text=event.data["text"]))
             case (
-                "routine.completed"
+                "routine.created"
+                | "routine.completed"
                 | "routine.failed"
                 | "routine.cancelled"
                 | "routine.needs_review"
             ):
-                if event.data.get("text"):
-                    transcript.append(Turn(role="assistant", text=event.data["text"]))
+                card = None
+                if event.data.get("routine_id") and event.data.get("title"):
+                    card = RoutineCard(
+                        routine_id=event.data["routine_id"],
+                        title=event.data["title"],
+                        kind=event.type.removeprefix("routine."),
+                        occurrence_id=event.data.get("occurrence_id"),
+                    )
+                if card or event.data.get("text"):
+                    transcript.append(
+                        Turn(
+                            role="assistant",
+                            text=event.data.get("text", ""),
+                            seq=event.seq,
+                            routine=card,
+                        )
+                    )
             case "text.reset" | "text.delta":
                 # Logs written before text became live-only stored each streamed piece.
                 run_id = event.data["run_id"]

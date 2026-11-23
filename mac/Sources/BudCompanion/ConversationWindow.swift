@@ -220,12 +220,13 @@ private struct ConversationView: View {
             companion.openSource(url) ? .handled : .systemAction
         })
         .inspector(isPresented: Binding(
-            get: { companion.sourcePanel != nil || companion.attachmentSelection != nil || companion.browserSelection != nil },
+            get: { companion.sourcePanel != nil || companion.attachmentSelection != nil || companion.browserSelection != nil || companion.routineSelection != nil },
             set: {
                 if !$0 {
                     companion.sourcePanel = nil
                     companion.attachmentSelection = nil
                     companion.browserSelection = nil
+                    companion.routineSelection = nil
                 }
             }
         )) {
@@ -234,6 +235,9 @@ private struct ConversationView: View {
                     .id(selection.id)
             } else if let selection = companion.browserSelection {
                 BrowserInspector(selection: selection) { companion.browserSelection = nil }
+                    .id(selection.id)
+            } else if let selection = companion.routineSelection {
+                RoutineInspector(selection: selection) { companion.routineSelection = nil }
                     .id(selection.id)
             } else if let panel = companion.sourcePanel {
                 SourcePanelView(panel: panel, companion: companion)
@@ -280,6 +284,12 @@ private struct ConversationView: View {
             .buttonStyle(IconButton(size: 24))
             .help("Browser")
             .accessibilityLabel("Browser")
+            Button { companion.openRoutines() } label: {
+                Image(systemName: "clock.arrow.circlepath")
+            }
+            .buttonStyle(IconButton(size: 24))
+            .help("Routines")
+            .accessibilityLabel("Routines")
             pin
         }
         .padding(.trailing, 10)
@@ -615,7 +625,14 @@ private struct TurnView: View {
         } else {
             VStack(alignment: .leading, spacing: 12) {
                 if let work = turn.work { WorkLine(work: work) }
-                Reply(text: turn.text, sources: turn.sources, companion: companion, finished: true)
+                if let card = turn.routine {
+                    RoutineMessageCard(card: card) {
+                        companion.openRoutines(card.id, occurrence: card.occurrenceID)
+                    }
+                }
+                if !turn.text.isEmpty {
+                    Reply(text: turn.text, sources: turn.sources, companion: companion, finished: true)
+                }
             }
         }
     }
@@ -635,7 +652,7 @@ private struct Reply: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            MarkdownView(Citations.linked(text, sources: sources))
+            MarkdownView(Citations.linked(text, sources: sources), rich: finished)
             if finished {
                 HStack(spacing: 2) {
                     action(copied.on ? "checkmark" : "doc.on.doc", label: copied.on ? "Copied" : "Copy") {

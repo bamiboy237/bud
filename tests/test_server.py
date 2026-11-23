@@ -833,6 +833,11 @@ def test_routine_and_task_survive_real_process_restart_and_paused_stays_paused(t
 
     with running(tmp_path) as server:
         snap = server.snapshot(session)
+        cards = [t["routine"] for t in snap["transcript"] if t.get("routine")]
+        assert {c["routine_id"] for c in cards if c["kind"] == "created"} == {
+            active_routine["routine_id"],
+            paused_routine["routine_id"],
+        }
         routines_by_id = {r["routine_id"]: r for r in snap["routines"]}
         assert routines_by_id[active_routine["routine_id"]]["status"] == "active"
         assert routines_by_id[paused_routine["routine_id"]]["status"] == "paused"
@@ -858,6 +863,16 @@ def test_routine_and_task_survive_real_process_restart_and_paused_stays_paused(t
                 else None
             ),
             "routine occurrence completes and confirms delivery after restart",
+        )
+        rid = active_routine["routine_id"]
+        oid = finished["occurrence_id"]
+        report = server.request("GET", f"/routines/{rid}/occurrences/{oid}/report")
+        assert "Routine saved report." in report["content"]
+        other = paused_routine["routine_id"]
+        server.request("GET", f"/routines/{other}/occurrences/{oid}/report", status=404)
+        assert any(
+            t.get("routine") and t["routine"]["occurrence_id"] == oid
+            for t in server.snapshot(session)["transcript"]
         )
         assert finished["delivery_status"] == "confirmed"
         assert (server.data / "workspace" / FILENAME).read_text() == DRAFT

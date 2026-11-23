@@ -1316,6 +1316,24 @@ def _create_app(
             raise HTTPException(404, str(exc)) from None
         return store.view(routine).model_dump()
 
+    @app.get("/routines/{routine_id}/occurrences/{occurrence_id}/report")
+    def get_routine_report(routine_id: str, occurrence_id: str) -> dict[str, str]:
+        store = _require_routines()
+        try:
+            occurrence = store.occurrence(occurrence_id)
+        except RoutineNotFoundError:
+            raise HTTPException(404, "Unknown routine run.") from None
+        if occurrence.routine_id != routine_id or not occurrence.report_path:
+            raise HTTPException(404, "No report for this routine run.")
+        try:
+            relative = Path(occurrence.report_path).relative_to(workspace)
+        except ValueError:
+            raise HTTPException(404, "Report is outside Bud's workspace.") from None
+        found = read_workspace_text(workspace, relative.as_posix())
+        if found is None:
+            raise HTTPException(404, "The saved report is unavailable.")
+        return {"title": relative.name, "content": found[0]}
+
     @app.patch("/routines/{routine_id}")
     def edit_routine(routine_id: str, body: EditRoutine) -> dict[str, Any]:
         store = _require_routines()
