@@ -43,6 +43,7 @@ def arguments(commands: argparse._SubParsersAction) -> None:
     decision.add_argument("session")
     decision.add_argument("job_id")
     decision.add_argument("decision", choices=["approve", "cancel", "verify"])
+    decision.add_argument("--desktop", help="the destination you reviewed before approving")
     retarget = actions.add_parser("retarget", help="change the browser desktop before approval")
     retarget.add_argument("session")
     retarget.add_argument("job_id")
@@ -177,7 +178,8 @@ def main(args: argparse.Namespace) -> None:
                 )
             case "browser":
                 response = client.post(
-                    f"/sessions/{args.session}/desktop-jobs/{args.job_id}/browser/{args.decision}"
+                    f"/sessions/{args.session}/desktop-jobs/{args.job_id}/browser/{args.decision}",
+                    json={"desktop": args.desktop} if args.desktop else None,
                 )
             case "retarget":
                 response = client.post(

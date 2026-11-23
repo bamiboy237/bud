@@ -242,11 +242,14 @@ class DesktopHandoffs:
 
         @router.post("/sessions/{session}/desktop-jobs/{job_id}/browser/{decision}")
         def decide_browser(
-            session: Id, job_id: Id, decision: Literal["approve", "cancel", "verify"]
+            session: Id,
+            job_id: Id,
+            decision: Literal["approve", "cancel", "verify"],
+            approval: BrowserTarget | None = None,
         ):
             with self.transaction() as db:
                 found = db.execute(
-                    """SELECT b.step, b.phase FROM handoff_browser b
+                    """SELECT b.step, b.phase, s.desktop FROM handoff_browser b
                        JOIN handoff_steps s ON s.id = b.step
                        JOIN handoff_jobs j ON j.id = s.job
                        WHERE j.id = ? AND j.session = ?""",
@@ -254,6 +257,10 @@ class DesktopHandoffs:
                 ).fetchone()
                 if found is None:
                     raise HTTPException(404, "Unknown browser job.")
+                if decision == "approve" and (
+                    approval is None or approval.desktop != found["desktop"]
+                ):
+                    raise HTTPException(409, "Review the current desktop before approving.")
                 current = found["phase"]
                 if decision == "approve" and current == "ready":
                     target = "approved"
