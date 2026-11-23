@@ -699,8 +699,14 @@ class TaskFlow(AbstractCapability[None]):
         # and the job controls, so it can, for example, pass the answer on with update_task.
         return (ctx.metadata or {}).get("bud_task_id") is not None
 
+    @staticmethod
+    def _routine(ctx: RunContext[None]) -> bool:
+        return (ctx.metadata or {}).get("bud_occurrence_id") is not None
+
     def get_instructions(self):
         def instructions(ctx: RunContext[None]) -> str:
+            if self._routine(ctx):
+                return ""
             if self._worker(ctx):
                 return (
                     "Complete the supplied job brief using tools. Submit requested changes "
@@ -735,7 +741,7 @@ class TaskFlow(AbstractCapability[None]):
     ) -> list[ToolDefinition]:
         if (ctx.metadata or {}).get("bud_revision_pending"):
             return []
-        worker = self._worker(ctx)
+        worker = self._worker(ctx) or self._routine(ctx)
         return [
             tool
             for tool in tool_defs

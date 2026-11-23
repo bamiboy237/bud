@@ -67,7 +67,7 @@ def scripted_response(messages: list[ModelMessage], info: AgentInfo) -> ModelRes
         return ModelResponse(parts=[TextPart(f"Tuesday.{cited} [S99]")])
 
     # Recall may append earlier context after the request itself.
-    if prompt.startswith("Send hello on Slack"):
+    if prompt.startswith("Send hello on Slack") or "Send hello on Slack" in prompt:
         if any(part.tool_name == "SLACK_SEND_MESSAGE" for part in returns):
             return ModelResponse(parts=[TextPart(f"Sent to Slack.{cited}")])
         if "SLACK_SEND_MESSAGE" in tools:
@@ -76,6 +76,16 @@ def scripted_response(messages: list[ModelMessage], info: AgentInfo) -> ModelRes
         if previous is not None:
             raise AssertionError(f"Slack action not exposed after discovery: {previous!r}")
         return call("find_app_actions", {"app": "slack", "query": "send message"})
+
+    if prompt.startswith("<routine ") and "Save note" in prompt:
+        written = next(
+            (part for part in reversed(returns) if part.tool_name == "workspace_create"), None
+        )
+        if written is not None:
+            return ModelResponse(parts=[TextPart("Routine saved report.")])
+        return call("workspace_create", {"path": FILENAME, "content": DRAFT})
+    if prompt.startswith("<routine "):
+        return ModelResponse(parts=[TextPart("Routine briefing ready.")])
 
     if "finish_job" in outputs:
         written = next(
@@ -233,6 +243,9 @@ def fake_accounts(settings: Settings):
 
     def execute(name, **values):
         record("execute", name=name, **values)
+        if os.environ.get("BUD_HOLD_EXTERNAL_EXEC") == "1":
+            (settings.data_dir / "checkpoint").write_text("in_flight_external")
+            threading.Event().wait()
         return SimpleNamespace(model_dump=lambda **_: {"successful": True, "data": {"id": "one"}})
 
     def rank(session, queries):

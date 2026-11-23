@@ -57,7 +57,17 @@ from bud.harness.writes import (
 
 Action = Literal["allow", "ask", "deny", "review"]
 RecordDecision = Callable[[dict[str, Any]], None]
+PriorDispatchCheck = Callable[[str, str, str], str | None]
 COMPOSIO_ACTION = "bud_composio_action"
+
+
+class UncertainSideEffectError(Exception):
+    """A consequential tool already recorded permission before a crash with no confirmed result."""
+
+    def __init__(self, tool: str, call_id: str) -> None:
+        self.tool = tool
+        self.call_id = call_id
+        super().__init__(f"Uncertain outcome for {tool} ({call_id}): inspect before retrying.")
 
 
 class Policy(BaseModel):
@@ -148,6 +158,7 @@ class ActionGateway(WrapperToolset[None]):
     # Trusted, non-owner context for the reviewer, such as today's date.
     facts: Callable[[], str] = field(kw_only=True, default=lambda: "")
     grants: SessionGrants = field(kw_only=True, default_factory=SessionGrants)
+    prior_dispatch: PriorDispatchCheck | None = field(kw_only=True, default=None)
 
     async def get_tools(self, ctx: RunContext[None]) -> dict[str, ToolsetTool[None]]:
         tools = await super().get_tools(ctx)
@@ -231,9 +242,11 @@ class ActionGateway(WrapperToolset[None]):
         # The owner's own words: this request, their earlier messages, and their answers.
         # Never Bud's questions: the model wrote those, and an injection could plant a target
         # in one.
-        # In a job, the messages hold the brief, which the main chat's model wrote: only the
-        # owner's own request (bud_request) and replies count.
-        in_job = (ctx.metadata or {}).get("bud_task_id") is not None
+        # In a job or routine occurrence, the messages hold a system-written brief/prompt:
+        # only the owner's own request (bud_request) and replies count as owner words.
+        in_job = (ctx.metadata or {}).get("bud_task_id") is not None or (ctx.metadata or {}).get(
+            "bud_occurrence_id"
+        ) is not None
         said = [
             request if isinstance(request, str) else "",
             "" if in_job else owner_text(ctx.messages),
@@ -459,6 +472,23 @@ class ActionGateway(WrapperToolset[None]):
                 tool_call_metadata={"approval_id": f"auto:{ctx.run_id}:{ctx.tool_call_id}"},
             )
 
+        # Check before recording this attempt: if a prior crash happened mid-tool after
+        # recording permission, DBOS step replay enters `_dispatch` only when the step never
+        # recorded an output, so we inspect and refuse rather than repeating the side effect.
+        session_id = (ctx.metadata or {}).get("bud_session_id")
+        prior_uncertain = (
+            self.prior_dispatch(session_id, ctx.run_id, ctx.tool_call_id)
+            if self.prior_dispatch is not None
+            and isinstance(session_id, str)
+            and ctx.run_id is not None
+            and ctx.tool_call_id is not None
+            and action != "deny"
+            and name not in self_hosted_writes()
+            and name not in {"install_skill", "disable_skill", "remind_me", "run_in_background"}
+            and (self._checks_targets(tool.tool_def) or name in consequential_tools())
+            else None
+        )
+
         # The record comes first, so no tool can act without leaving a trace.
         record: dict[str, Any] = {
             "call_id": ctx.tool_call_id,
@@ -471,17 +501,19 @@ class ActionGateway(WrapperToolset[None]):
         self.record(record)
         if action == "deny":
             return refusal or f"Refused by policy: {name} is not allowed."
+
+        async def _dispatch() -> Any:
+            if prior_uncertain is not None:
+                raise UncertainSideEffectError(name, ctx.tool_call_id or "")
+            return await super(ActionGateway, self).call_tool(name, tool_args, ctx, tool)
+
         if DBOS.workflow_id is not None and DBOS.step_id is None:
             result = await DBOS.run_step_async(
                 {"name": "bud.tool_call", "retries_allowed": False},
-                super().call_tool,
-                name,
-                tool_args,
-                ctx,
-                tool,
+                _dispatch,
             )
         else:
-            result = await super().call_tool(name, tool_args, ctx, tool)
+            result = await _dispatch()
         # Only after the tool ran: an approval the account tools refused (another account,
         # a stale card) raises above and teaches nothing.
         if learned and self.known is not None and not _failed(result):
@@ -530,6 +562,7 @@ class GuardTools(AbstractCapability[None]):
     facts: Callable[[], str] = lambda: ""
     # One set of grants for the life of the process, shared by every wrapper built from this.
     grants: SessionGrants = field(default_factory=SessionGrants)
+    prior_dispatch: PriorDispatchCheck | None = None
     id: str | None = "bud_action_gateway"
 
     async def before_tool_execute(
@@ -568,4 +601,5 @@ class GuardTools(AbstractCapability[None]):
             known=self.known,
             facts=self.facts,
             grants=self.grants,
+            prior_dispatch=self.prior_dispatch,
         )
