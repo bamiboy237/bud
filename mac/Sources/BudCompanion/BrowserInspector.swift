@@ -171,7 +171,7 @@ struct BrowserInspector: View {
         }
     }
 
-    private func send(_ action: String, body: [String: Any]? = nil) async {
+    private func send(_ action: String, body: [String: String]? = nil) async {
         guard !sending else { return }
         sending = true
         screenshot = nil
