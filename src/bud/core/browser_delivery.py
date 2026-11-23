@@ -90,7 +90,10 @@ return {state: await page.evaluate(({form, reference}) => {
         !(number instanceof HTMLInputElement) || number.type !== "text" ||
         !(submit instanceof HTMLButtonElement) || submit.type !== "submit" ||
         !upload.form || number.form !== upload.form || submit.form !== upload.form ||
-        upload.form.method !== "post" ||
+        (submit.getAttribute("formmethod") || upload.form.method).toLowerCase() !== "post" ||
+        (submit.getAttribute("formenctype") || upload.form.enctype).toLowerCase()
+            !== "multipart/form-data" ||
+        !["", "_self"].includes(submit.getAttribute("formtarget") || upload.form.target) ||
         new URL(submit.getAttribute("formaction") || upload.form.action, location.href).origin
             !== location.origin)
         return "other_page";
