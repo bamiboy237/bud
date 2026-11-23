@@ -45,6 +45,11 @@ struct HeldMessage: Identifiable {
     var attachments: [DraftAttachment] = []
 }
 
+struct PendingMessage: Identifiable, Equatable {
+    let id: String
+    var text: String
+}
+
 /// A short job milestone, with the saved report behind a "finished" one.
 struct Notice: Identifiable, Equatable {
     let id = UUID()
@@ -266,6 +271,7 @@ final class Companion {
     var draft = ""
     @ObservationIgnored private var savedDrafts: [InputPurpose: String] = [:]
     private(set) var heldMessages: [HeldMessage] = []
+    private(set) var pendingMessages: [PendingMessage] = []
     private(set) var retryingHeldMessage = false
     /// Short job milestones (started, needs you, finished). Progress notes never come here.
     var notices: [Notice] = []
@@ -450,6 +456,12 @@ final class Companion {
         default: activity = .idle
         }
         setOpenApprovals(from: snapshot)
+        pendingMessages = (snapshot["queued_messages"] as? [[String: Any]] ?? []).compactMap {
+            guard let id = $0["message_id"] as? String, let text = $0["text"] as? String else {
+                return nil
+            }
+            return PendingMessage(id: id, text: text)
+        }
         // The main chat's turns; a job's messages live in the job, not here.
         let transcript = (snapshot["transcript"] as? [[String: Any]] ?? []).filter {
             $0["task_id"] == nil || $0["task_id"] is NSNull
@@ -908,19 +920,25 @@ final class Companion {
             draftAttachments = []
             inputOpen = false
         }
-        // The old reply moves into the conversation now, so the bubble clears at once.
-        archiveReply()
-        reply = ""
-        question = text
         // A reply to something bud said carries it as a markdown quote, so bud sees what you mean.
         let message = retry?.payload ?? (replyingTo.map { Self.quote($0) + "\n\n" + text } ?? text)
         replyingTo = nil
-        blocks = []
-        bubbleOpen = true
+        let messageID = heldID ?? retry?.id ?? UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        if running {
+            if !pendingMessages.contains(where: { $0.id == messageID }) {
+                pendingMessages.append(PendingMessage(id: messageID, text: message))
+            }
+        } else {
+            // The old reply moves into the conversation now, so the bubble clears at once.
+            archiveReply()
+            reply = ""
+            question = text
+            blocks = []
+            bubbleOpen = true
+        }
         // The pet starts working when bud says so (user.message), not on a hopeful send.
         sentAt = .now
         lastFirstText = nil
-        let messageID = heldID ?? retry?.id ?? UUID().uuidString.replacingOccurrences(of: "-", with: "")
         let destination = session
         // A typed message waiting for its retry keeps its id; speech never clears it.
         if spoken == nil { unsent = nil }
@@ -931,6 +949,7 @@ final class Companion {
                 try await connection.postMessage(
                     message, id: messageID, session: destination, attachments: files)
             } catch {
+                pendingMessages.removeAll { $0.id == messageID }
                 // Keep what was typed: put it back in the field so one Return resends it. The
                 // request may have arrived before the error, so the resend reuses its id and
                 // bud runs it at most once.
@@ -1433,9 +1452,30 @@ final class Companion {
     func handle(_ event: BudEvent) {
         if !event.live { seenSeq = max(seenSeq, event.seq) }
         switch event.type {
+        case "message.queued":
+            let id = event.string("message_id")
+            let text = event.string("text")
+            if !id.isEmpty, !text.isEmpty {
+                if let index = pendingMessages.firstIndex(where: { $0.id == id }) {
+                    pendingMessages[index].text = text
+                } else {
+                    pendingMessages.append(PendingMessage(id: id, text: text))
+                }
+            }
+        case "message.edited":
+            let id = event.string("message_id")
+            let text = event.string("text")
+            if let index = pendingMessages.firstIndex(where: { $0.id == id }) {
+                pendingMessages[index].text = text
+            }
+        case "message.cancelled", "message.dispatched":
+            let id = event.string("message_id")
+            pendingMessages.removeAll { $0.id == id }
         case "user.message":
             // A new turn, from this app or any other interface: the old reply no longer applies.
             settle?.cancel()
+            let messageID = event.string("message_id")
+            if !messageID.isEmpty { pendingMessages.removeAll { $0.id == messageID } }
             // The previous reply joins the conversation, and the new message follows it.
             archiveReply()
             let said = event.string("text")
@@ -1744,10 +1784,14 @@ final class Companion {
         return json
     }
 
-    /// Matches projection.reply_text, including filtering legacy self-check notes in saved runs.
+    /// Matches projection.reply_text for the trailing segment after any mid-run steer.
     static func replyText(_ data: [String: Any]) -> String {
         let messages = data["messages"] as? [[String: Any]] ?? []
-        return messages
+        let start = messages.lastIndex { message in
+            message["kind"] as? String == "request"
+                && ((message["metadata"] as? [String: Any])?["bud_steer"] as? Bool == true)
+        }.map { $0 + 1 } ?? 0
+        return messages[start...]
             .filter { $0["kind"] as? String == "response" }
             .flatMap { message -> [String] in
                 let spiral = (message["metadata"] as? [String: Any])?["bud_spiral"] as? [String: Any]

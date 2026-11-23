@@ -106,6 +106,7 @@ from bud.harness.learning import Learner
 from bud.harness.operating_profile import OperatingProfile
 from bud.harness.recall import CITATION, Recall, plain_citations, recalled_so_far, render
 from bud.harness.spiral import paused_in
+from bud.harness.steering import SteeringCapability, SteerSignal
 from bud.harness.verify import build_verifier
 from bud.limits import MAX_MESSAGE_CHARS
 
@@ -220,6 +221,8 @@ class Runner(DBOSConfiguredInstance):
         self.tasks: dict[str, asyncio.Task] = {}
         self._monitors: set[asyncio.Task] = set()
         self._executing: dict[str, asyncio.Task] = {}
+        self._signals: dict[str, SteerSignal] = {}
+        self._session_signals: dict[str, SteerSignal] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._bursts: dict[str, asyncio.TimerHandle] = {}
         self._routine_wake: asyncio.Event | None = None
@@ -273,7 +276,9 @@ class Runner(DBOSConfiguredInstance):
             for spec in self.gateway.registry.models:
                 built = self.gateway.build_model(spec)
                 if built is not None:
-                    runtime_models[spec.id] = TrackedModel(built, spec, self.gateway.ledger)
+                    runtime_models[spec.id] = TrackedModel(
+                        built, spec, self.gateway.ledger, steer_signal=self._steer_signal
+                    )
         self.runtime_model_ids = frozenset(runtime_models)
         durability = (
             DBOSDurability(
@@ -303,14 +308,25 @@ class Runner(DBOSConfiguredInstance):
             )
         if self.routines is not None:
             runner_capabilities.append(RoutineChat(store=self.routines, create=self.create_routine))
+        default_model = gateway.model(
+            self.tier, require_tools=True, selected=self.profile.model.model_id
+        )
+        self._attach_steer_signal(default_model)
+        steering = SteeringCapability(
+            claim=self._claim_steer,
+            get_signal=self._steer_signal,
+            wake=self.hub.wake,
+            wrap_model=not durable,
+        )
         self.agent = harness.agent(
-            gateway.model(self.tier, require_tools=True, selected=self.profile.model.model_id),
+            default_model,
             self._record_decision,
             context=self.context,
             loop_report=self._loop_detected,
             durability=durability,
             capabilities=tuple(runner_capabilities),
             prior_dispatch=self.hub.log.has_unreturned_decision,
+            steering=steering,
         )
 
     def _clock_utc(self) -> datetime:
@@ -548,10 +564,10 @@ class Runner(DBOSConfiguredInstance):
         imessage = (
             event is not None and bool(origin) and (origin or {}).get("channel") == "imessage"
         )
-        self._on_loop(self._after_message, session_id, imessage)
+        self._on_loop(self._after_message, session_id, imessage, not attachments)
         return event
 
-    def _after_message(self, session_id: str, imessage: bool) -> None:
+    def _after_message(self, session_id: str, imessage: bool, steer: bool) -> None:
         if imessage and not self._busy(session_id):
             if session_id not in self._bursts:
                 # A fixed window, not an indefinitely reset timer. Accepted text
@@ -559,7 +575,35 @@ class Runner(DBOSConfiguredInstance):
                 assert self._loop is not None
                 self._bursts[session_id] = self._loop.call_later(1, self._flush_burst, session_id)
         else:
+            if steer:
+                self._signal_steer(session_id)
             self._drain(session_id)
+
+    def _attach_steer_signal(self, model: Model) -> None:
+        if isinstance(model, TrackedModel):
+            model.steer_signal = self._steer_signal
+        elif isinstance(model, FallbackModel):
+            for candidate in model.models:
+                self._attach_steer_signal(candidate)
+
+    def _steer_signal(self, session_id: str, run_id: str | None) -> SteerSignal | None:
+        if run_id is not None:
+            signal = self._signals.get(run_id)
+            if signal is not None:
+                return signal
+        return self._session_signals.get(session_id)
+
+    def _signal_steer(self, session_id: str) -> None:
+        signal = self._session_signals.get(session_id)
+        if signal is None:
+            return
+        if self.hub.log.stop_requested(signal.run_id):
+            return
+        if signal.in_model_call:
+            signal.abort_stream.set()
+
+    async def _claim_steer(self, session_id: str, run_id: str) -> list[dict]:
+        return await asyncio.to_thread(self.hub.log.claim_steering_messages, session_id, run_id)
 
     def _flush_burst(self, session_id: str) -> None:
         self._bursts.pop(session_id, None)
@@ -597,7 +641,7 @@ class Runner(DBOSConfiguredInstance):
         changed = self.hub.log.set_queue_paused(session_id, paused)
         self.hub.wake(session_id)
         if not paused:
-            self._on_loop(self._drain, session_id)
+            self._on_loop(self._resume_and_drain, session_id)
         return changed
 
     def wake_setup(self, session_id: str) -> None:
@@ -609,6 +653,10 @@ class Runner(DBOSConfiguredInstance):
         if running is None and (self._loop is None or self._loop.is_closed()):
             return
         self._on_loop(self._drain, session_id)
+
+    def _resume_and_drain(self, session_id: str) -> None:
+        self._signal_steer(session_id)
+        self._drain(session_id)
 
     def _drain(self, session_id: str) -> None:
         if self._closing or session_id in self._bursts or self._busy(session_id):
@@ -1901,6 +1949,9 @@ class Runner(DBOSConfiguredInstance):
         task = asyncio.current_task()
         assert task is not None
         self._executing[run["run_id"]] = task
+        signal = SteerSignal(run_id=run["run_id"])
+        self._signals[run["run_id"]] = signal
+        self._session_signals[run["session_id"]] = signal
         try:
             if self.hub.log.stop_requested(run["run_id"]):
                 return
@@ -2139,6 +2190,9 @@ class Runner(DBOSConfiguredInstance):
                 if self._loop is not None and not self._loop.is_closed():
                     self._loop.call_soon_threadsafe(self._drain, run["session_id"])
             self._executing.pop(run["run_id"], None)
+            self._signals.pop(run["run_id"], None)
+            if self._session_signals.get(run["session_id"]) is signal:
+                self._session_signals.pop(run["session_id"], None)
             request_attribution.reset(attr_token)
             request_session.reset(session_token)
             self._current.reset(token)

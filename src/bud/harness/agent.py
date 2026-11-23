@@ -272,6 +272,7 @@ class Harness:
         durability: AbstractCapability | None = None,
         capabilities: tuple[AbstractCapability[None], ...] = (),
         prior_dispatch: PriorDispatchCheck | None = None,
+        steering: AbstractCapability[None] | None = None,
     ) -> Agent[None, str | DeferredToolRequests]:
         harness_cfg = self.operating_profile.harness
         limits = self.operating_profile.limits
@@ -324,6 +325,7 @@ class Harness:
                 ),
                 self.output_limits,
                 *([self.code_mode] if self.code_mode is not None else []),
+                *([steering] if steering is not None else []),
                 context,
                 *(
                     [loop_detector(self.spiral, loop_report or (lambda _: None))]
