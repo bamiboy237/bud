@@ -108,7 +108,7 @@ private struct ConversationView: View {
                     .frame(maxWidth: column, alignment: .leading)
                     .padding(.horizontal, 32)
                     .padding(.top, 20)
-                    .padding(.bottom, 24)
+                    .padding(.bottom, 36)
                     .frame(maxWidth: .infinity)
                 }
                 // Opens at the latest message, and stays there as a reply streams in, unless
@@ -116,8 +116,9 @@ private struct ConversationView: View {
                 .defaultScrollAnchor(.bottom)
                 .defaultScrollAnchor(.bottom, for: .sizeChanges)
                 .onScrollGeometryChange(for: Bool.self) { geometry in
-                    // Measured by what's on screen, which already accounts for the scroll insets.
-                    geometry.visibleRect.maxY >= geometry.contentSize.height - 24
+                    let distanceFromBottom = geometry.contentSize.height - geometry.visibleRect.maxY
+                    return geometry.contentSize.height <= geometry.containerSize.height + 24
+                        || distanceFromBottom <= 60
                 } action: { _, atBottom in
                     scroll.atBottom = atBottom
                 }
@@ -156,6 +157,7 @@ private struct ConversationView: View {
             }
             field
         }
+        .ignoresSafeArea(.container, edges: .top)
         .foregroundStyle(Paper.inkPrimary)
         .background(Paper.canvas)
         .environment(\.replyType, pageType)
@@ -310,17 +312,26 @@ private struct ConversationView: View {
                 .transition(.opacity)
             }
             HStack(alignment: .bottom, spacing: 8) {
-                TextField(companion.inputPurpose.prompt, text: $companion.draft, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(Paper.Typography.body)
-                    .lineLimit(1...6)
-                    .focused($typing)
-                    .onSubmit { companion.send() }
-                    .onExitCommand {
-                        companion.inputPurpose = .ask
-                        companion.replyingTo = nil
+                ZStack(alignment: .leading) {
+                    if companion.draft.isEmpty {
+                        Text(companion.inputPurpose.prompt)
+                            .font(Paper.Typography.body)
+                            .foregroundStyle(Paper.placeholder)
+                            .lineLimit(1)
+                            .allowsHitTesting(false)
                     }
-                    .padding(.vertical, 4)
+                    TextField("", text: $companion.draft, axis: .vertical)
+                        .textFieldStyle(.plain)
+                        .font(Paper.Typography.body)
+                        .lineLimit(1...6)
+                        .focused($typing)
+                        .onSubmit { companion.send() }
+                        .onExitCommand {
+                            companion.inputPurpose = .ask
+                            companion.replyingTo = nil
+                        }
+                }
+                .padding(.vertical, 4)
                 if canCancel && companion.replyingTo == nil {
                     KeybindChip("Esc")
                         .padding(.bottom, 3)
@@ -346,11 +357,8 @@ private struct ConversationView: View {
             composerShape,
             lift: 1,
             fill: Paper.elevated,
-            border: typing ? Paper.borderFocus : Paper.borderSubtle
-        )
-        .overlay(
-            composerShape
-                .stroke(typing ? Paper.focusHalo : .clear, lineWidth: 3)
+            border: typing ? Paper.accent : Paper.borderSubtle,
+            borderWidth: typing ? 1 : 0.5
         )
         .animation(.easeOut(duration: 0.15), value: typing)
         .animation(.easeOut(duration: 0.15), value: companion.replyingTo)
@@ -379,30 +387,6 @@ private struct ConversationView: View {
             .help("Back to the bubble")
             .accessibilityLabel("Collapse to the bubble")
         }
-    }
-}
-
-/// Quiet 11pt mono keybind chip on recessed paper with a 0.5pt hairline border.
-private struct KeybindChip: View {
-    let key: String
-
-    init(_ key: String) {
-        self.key = key
-    }
-
-    var body: some View {
-        Text(key)
-            .font(Paper.Typography.ledgerMeta)
-            .foregroundStyle(Paper.inkMuted)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 2)
-            .background(
-                Paper.recessed,
-                in: RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous)
-                    .strokeBorder(Paper.borderSubtle, lineWidth: 0.5))
-            .accessibilityHidden(true)
     }
 }
 
@@ -642,24 +626,6 @@ private struct JumpButton: View {
         .buttonStyle(IconButton(size: 30, highlight: false))
         .help("Jump to the latest")
         .accessibilityLabel("Jump to the latest message")
-    }
-}
-
-private struct RoundButton: View {
-    let symbol: String
-    let label: String
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 11, weight: .bold))
-                .frame(width: 26, height: 26)
-                .background(Paper.inkPrimary, in: Circle())
-        }
-        .buttonStyle(IconButton(size: 26, highlight: false))
-        .help(label)
-        .accessibilityLabel(label)
     }
 }
 

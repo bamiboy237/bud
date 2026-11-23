@@ -99,9 +99,13 @@ struct TypographyTests {
                 #expect(canvas == 0xF7F7F8)
                 #expect(elevated == 0xFFFFFF)
             } else {
-                #expect(recessed == 0x141518)
-                #expect(canvas == 0x191A1D)
-                #expect(elevated == 0x222429)
+                #expect(recessed == 0x111215)
+                #expect(canvas == 0x18191D)
+                #expect(elevated == 0x22242A)
+                #expect(alpha(Paper.placeholder, in: appearance) >= 0.45)
+                #expect(alpha(Paper.citationFill, in: appearance) >= 0.15)
+                #expect(alpha(Paper.citationBorder, in: appearance) >= 0.30)
+                #expect(alpha(Paper.codeChipFill, in: appearance) >= 0.07)
             }
 
             #expect(Syntax.color(.plain) == nil)
@@ -109,6 +113,15 @@ struct TypographyTests {
                 #expect(Syntax.color(kind) != nil)
             }
         }
+    }
+
+    private func alpha(_ color: Color, in appearance: NSAppearance) -> CGFloat {
+        var resolved: CGFloat = 0
+        appearance.performAsCurrentDrawingAppearance {
+            let srgb = NSColor(color).usingColorSpace(.sRGB) ?? NSColor(color)
+            resolved = srgb.alphaComponent
+        }
+        return resolved
     }
 
     private func hex(_ color: Color, in appearance: NSAppearance) -> UInt32 {

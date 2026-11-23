@@ -189,7 +189,11 @@ private struct Prose: View {
             .font(font ?? type.body)
             .tracking(tracking)
             .lineSpacing(spacing ?? type.lineSpacing)
-            .textRenderer(InlinePillRenderer(codeFill: Paper.fillHover, citationFill: Paper.accentFill))
+            .textRenderer(InlinePillRenderer(
+                codeFill: Paper.codeChipFill,
+                codeBorder: Paper.codeChipBorder,
+                citationFill: Paper.citationFill,
+                citationBorder: Paper.citationBorder))
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -198,6 +202,7 @@ private struct Prose: View {
 
 private enum ChipMetrics {
     static let gap: CGFloat = 3
+    static let punctuationGap: CGFloat = 2
 }
 
 /// Marks a run that is inline code, so `InlinePillRenderer` can draw its chip.
@@ -212,14 +217,24 @@ private enum CitationRun: AttributedStringKey {
     static let name = "bud.citationRun"
 }
 
+/// Marks a pill run whose trailing character abuts punctuation (`.,:;!?)`).
+private enum TightTrailingRun: AttributedStringKey {
+    typealias Value = Bool
+    static let name = "bud.tightTrailingRun"
+}
+
 private struct CodeChipAttribute: TextAttribute {}
 private struct CitationPillAttribute: TextAttribute {}
+private struct TightTrailingAttribute: TextAttribute {}
 
 /// One Text from an attributed string, with inline code and citations tagged for pills.
 private func chipped(_ text: AttributedString) -> SwiftUI.Text {
     var out = SwiftUI.Text(verbatim: "")
     for run in text.runs {
-        let piece = SwiftUI.Text(AttributedString(text[run.range]))
+        var piece = SwiftUI.Text(AttributedString(text[run.range]))
+        if run[TightTrailingRun.self] == true {
+            piece = piece.customAttribute(TightTrailingAttribute())
+        }
         if run[CitationRun.self] == true {
             out = out + piece.customAttribute(CitationPillAttribute())
         } else if run[CodeRun.self] == true {
@@ -234,12 +249,16 @@ private func chipped(_ text: AttributedString) -> SwiftUI.Text {
 /// Draws rounded micro-pills behind inline code and clickable source citations.
 private struct InlinePillRenderer: TextRenderer {
     let codeFill: Color
+    let codeBorder: Color
     let citationFill: Color
+    let citationBorder: Color
 
     func draw(layout: SwiftUI.Text.Layout, in context: inout GraphicsContext) {
         for line in layout {
-            drawPills(in: line, context: &context, isCitation: false, fill: codeFill)
-            drawPills(in: line, context: &context, isCitation: true, fill: citationFill)
+            drawPills(in: line, context: &context, isCitation: false, fill: codeFill, border: codeBorder)
+            drawPills(
+                in: line, context: &context, isCitation: true,
+                fill: citationFill, border: citationBorder)
             for run in line { context.draw(run) }
         }
     }
@@ -248,10 +267,12 @@ private struct InlinePillRenderer: TextRenderer {
         in line: SwiftUI.Text.Layout.Line,
         context: inout GraphicsContext,
         isCitation: Bool,
-        fill: Color
+        fill: Color,
+        border: Color?
     ) {
-        var pills: [CGRect] = []
+        var pills: [(rect: CGRect, tightRight: Bool)] = []
         var current: CGRect?
+        var tightRight = false
         for run in line {
             let matches = isCitation
                 ? run[CitationPillAttribute.self] != nil
@@ -259,19 +280,30 @@ private struct InlinePillRenderer: TextRenderer {
             if matches {
                 let bounds = run.typographicBounds.rect
                 current = current.map { $0.union(bounds) } ?? bounds
+                tightRight = run[TightTrailingAttribute.self] != nil
             } else if let done = current {
-                pills.append(done)
+                pills.append((done, tightRight))
                 current = nil
+                tightRight = false
             }
         }
-        if let done = current { pills.append(done) }
-        for var pill in pills {
+        if let done = current { pills.append((done, tightRight)) }
+        for item in pills {
+            let trailingGap = item.tightRight ? ChipMetrics.punctuationGap : ChipMetrics.gap
+            var pill = item.rect
             // The stretch's bounds include the kerning after its last character.
-            pill.size.width = max(0, pill.size.width - ChipMetrics.gap)
-            context.fill(
-                RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous)
-                    .path(in: pill.insetBy(dx: -3, dy: -1)),
-                with: .color(fill))
+            pill.size.width = max(0, pill.size.width - trailingGap)
+            let padded = CGRect(
+                x: pill.minX - ChipMetrics.gap,
+                y: pill.minY - 1,
+                width: pill.width + ChipMetrics.gap + trailingGap,
+                height: pill.height + 2)
+            let path = RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous)
+                .path(in: padded)
+            context.fill(path, with: .color(fill))
+            if let border {
+                context.stroke(path, with: .color(border), lineWidth: 0.5)
+            }
         }
     }
 }
@@ -443,7 +475,11 @@ private struct TableView: View {
         ForEach(Array(cells.enumerated()), id: \.offset) { index, cell in
             let alignment = alignment(index)
             chipped(inline(cell, code: Fonts.mono(size: max(10, type.codeSize - 1))))
-                .textRenderer(InlinePillRenderer(codeFill: Paper.fillHover, citationFill: Paper.accentFill))
+                .textRenderer(InlinePillRenderer(
+                    codeFill: Paper.codeChipFill,
+                    codeBorder: Paper.codeChipBorder,
+                    citationFill: Paper.citationFill,
+                    citationBorder: Paper.citationBorder))
                 .fontWeight(header ? .semibold : .regular)
                 .foregroundStyle(header ? Paper.inkSecondary : Paper.inkPrimary)
                 .multilineTextAlignment(alignment.text)
@@ -478,7 +514,14 @@ private func inline(
     _ markup: any Markup, intent: InlinePresentationIntent = [], code codeFont: Font? = nil
 ) -> AttributedString {
     var out = AttributedString()
-    for child in markup.children {
+    let children = Array(markup.children)
+    for (index, child) in children.enumerated() {
+        let nextStartsWithPunctuation: Bool = {
+            guard index + 1 < children.count, let nextText = children[index + 1] as? Markdown.Text,
+                  let first = nextText.string.first
+            else { return false }
+            return ".,:;!?)]".contains(first)
+        }()
         switch child {
         case let text as Markdown.Text:
             var run = AttributedString(text.string)
@@ -499,13 +542,16 @@ private func inline(
                 run.inlinePresentationIntent = intent.union(.code)
             }
             run[CodeRun.self] = true
-            // Extra kerning on either side keeps the chip off the words beside it. It is
-            // spacing, not characters, so copying the text copies only the code.
-            if let last = out.characters.indices.last {
+            if nextStartsWithPunctuation { run[TightTrailingRun.self] = true }
+            if let lastChar = out.characters.last, !lastChar.isWhitespace,
+               let last = out.characters.indices.last
+            {
                 out[last..<out.endIndex].kern = ChipMetrics.gap
             }
             if let last = run.characters.indices.last {
-                run[last..<run.endIndex].kern = ChipMetrics.gap
+                run[last..<run.endIndex].kern = nextStartsWithPunctuation
+                    ? ChipMetrics.punctuationGap
+                    : ChipMetrics.gap
             }
             out += run
         case let link as Markdown.Link:
@@ -513,15 +559,20 @@ private func inline(
             if let destination = link.destination, let url = URL(string: destination) {
                 run.link = url
                 if url.scheme == Citations.scheme {
-                    // Citations render as 11pt mono micro-pills in Prussian Ink.
+                    // Citations render as high-contrast 11pt mono micro-pills.
                     run.font = Paper.Typography.ledgerMeta
-                    run.foregroundColor = Paper.accent
+                    run.foregroundColor = Paper.citationInk
                     run[CitationRun.self] = true
-                    if let last = out.characters.indices.last {
+                    if nextStartsWithPunctuation { run[TightTrailingRun.self] = true }
+                    if let lastChar = out.characters.last, !lastChar.isWhitespace,
+                       let last = out.characters.indices.last
+                    {
                         out[last..<out.endIndex].kern = ChipMetrics.gap
                     }
                     if let last = run.characters.indices.last {
-                        run[last..<run.endIndex].kern = ChipMetrics.gap
+                        run[last..<run.endIndex].kern = nextStartsWithPunctuation
+                            ? ChipMetrics.punctuationGap
+                            : ChipMetrics.gap
                     }
                 } else {
                     run.underlineStyle = .single

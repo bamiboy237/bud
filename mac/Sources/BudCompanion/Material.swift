@@ -7,27 +7,41 @@ import SwiftUI
 enum Paper {
     // 4-step surface ladder (recessed -> canvas -> elevated -> overlay).
     static let recessed = dynamic(
-        light: 0xEFEFF1, dark: 0x141518, contrastLight: 0xE5E6EA, contrastDark: 0x101114)
-    static let canvas = dynamic(light: 0xF7F7F8, dark: 0x191A1D)
-    static let elevated = dynamic(light: 0xFFFFFF, dark: 0x222429)
-    static let overlay = dynamic(light: 0xFFFFFF, dark: 0x292C33)
+        light: 0xEFEFF1, dark: 0x111215, contrastLight: 0xE5E6EA, contrastDark: 0x0C0D10)
+    static let canvas = dynamic(light: 0xF7F7F8, dark: 0x18191D)
+    static let elevated = dynamic(light: 0xFFFFFF, dark: 0x22242A)
+    static let overlay = dynamic(light: 0xFFFFFF, dark: 0x2A2D35)
 
     // Borders.
     static let hairline = dynamic(
-        light: 0xE1E3E8, dark: 0x2F323A, contrastLight: 0x7D828C, contrastDark: 0x747985)
+        light: 0xE1E3E8,
+        dark: 0xFFFFFF,
+        contrastLight: 0x7D828C,
+        contrastDark: 0xFFFFFF,
+        darkAlpha: 0.09,
+        contrastDarkAlpha: 0.35)
     static let borderSubtle = hairline
     static let borderStrong = dynamic(
-        light: 0xC2C7D0, dark: 0x464A56, contrastLight: 0x5E636E, contrastDark: 0x8E94A2)
+        light: 0xC2C7D0,
+        dark: 0xFFFFFF,
+        contrastLight: 0x5E636E,
+        contrastDark: 0xFFFFFF,
+        darkAlpha: 0.15,
+        contrastDarkAlpha: 0.48)
     static let borderFocus = dynamic(light: 0x1E4E79, dark: 0x7BB3EB)
     static let inkRule = borderStrong
 
-    // Interactive fills.
+    // Interactive fills & inline code pills.
     static let fillSubtle = dynamic(
         light: 0x151619, dark: 0xF0F2F5, lightAlpha: 0.045, darkAlpha: 0.055)
     static let fillHover = dynamic(
-        light: 0x151619, dark: 0xF0F2F5, lightAlpha: 0.065, darkAlpha: 0.08)
+        light: 0x151619, dark: 0xF0F2F5, lightAlpha: 0.065, darkAlpha: 0.085)
     static let fillPressed = dynamic(
-        light: 0x151619, dark: 0xF0F2F5, lightAlpha: 0.115, darkAlpha: 0.13)
+        light: 0x151619, dark: 0xF0F2F5, lightAlpha: 0.115, darkAlpha: 0.135)
+    static let codeChipFill = dynamic(
+        light: 0x151619, dark: 0xFFFFFF, lightAlpha: 0.065, darkAlpha: 0.08)
+    static let codeChipBorder = dynamic(
+        light: 0x151619, dark: 0xFFFFFF, lightAlpha: 0.10, darkAlpha: 0.12)
 
     // 4-tier ink hierarchy.
     static let inkPrimary = dynamic(light: 0x151619, dark: 0xF0F2F5)
@@ -36,11 +50,17 @@ enum Paper {
         light: 0x626670, dark: 0x8A8F9B, contrastLight: 0x4E525B, contrastDark: 0xA4A8B2)
     static let inkFaint = dynamic(
         light: 0x8A8F99, dark: 0x636874, contrastLight: 0x626670, contrastDark: 0x8A8F9B)
+    static let placeholder = dynamic(
+        light: 0x626670, dark: 0xFFFFFF, lightAlpha: 0.88, darkAlpha: 0.48)
 
     /// Prussian Ink: links, citations, the active pin, focus border, and cited margin bars.
     static let accent = dynamic(light: 0x1E4E79, dark: 0x7BB3EB)
     static let accentFill = accent.opacity(0.09)
-    static let focusHalo = accent.opacity(0.16)
+    static let citationInk = dynamic(light: 0x1E4E79, dark: 0x8FC4FA)
+    static let citationFill = dynamic(
+        light: 0x1E4E79, dark: 0x8FC4FA, lightAlpha: 0.10, darkAlpha: 0.18)
+    static let citationBorder = dynamic(
+        light: 0x1E4E79, dark: 0x8FC4FA, lightAlpha: 0.28, darkAlpha: 0.35)
 
     // Transient decision stamps, and genuine failures.
     static let approveInk = dynamic(light: 0x0F6B46, dark: 0x4ADE9F)
@@ -87,7 +107,9 @@ enum Paper {
         contrastLight: UInt32? = nil,
         contrastDark: UInt32? = nil,
         lightAlpha: CGFloat = 1,
-        darkAlpha: CGFloat = 1
+        darkAlpha: CGFloat = 1,
+        contrastLightAlpha: CGFloat? = nil,
+        contrastDarkAlpha: CGFloat? = nil
     ) -> Color {
         Color(nsColor: NSColor(name: nil) { appearance in
             let match = appearance.bestMatch(from: [
@@ -99,10 +121,10 @@ enum Paper {
             switch match {
             case .accessibilityHighContrastAqua:
                 hex = contrastLight ?? light
-                alpha = lightAlpha
+                alpha = contrastLightAlpha ?? lightAlpha
             case .accessibilityHighContrastDarkAqua:
                 hex = contrastDark ?? dark
-                alpha = darkAlpha
+                alpha = contrastDarkAlpha ?? darkAlpha
             case .darkAqua:
                 hex = dark
                 alpha = darkAlpha
@@ -125,9 +147,11 @@ extension View {
         _ shape: S,
         lift: CGFloat = 1,
         fill: Color = Paper.canvas,
-        border: Color = Paper.borderSubtle
+        border: Color = Paper.borderSubtle,
+        borderWidth: CGFloat = 0.5
     ) -> some View {
-        modifier(PaperSurface(shape: shape, lift: lift, fill: fill, border: border))
+        modifier(PaperSurface(
+            shape: shape, lift: lift, fill: fill, border: border, borderWidth: borderWidth))
     }
 }
 
@@ -136,16 +160,18 @@ private struct PaperSurface<S: Shape>: ViewModifier {
     let lift: CGFloat
     let fill: Color
     let border: Color
+    let borderWidth: CGFloat
     @Environment(\.colorScheme) private var scheme
 
     func body(content: Content) -> some View {
         content
             .background(shape.fill(fill))
-            .overlay(shape.stroke(border, lineWidth: 0.5))
-            // Dark paper catches light along its top edge; without it, a floating card sinks.
+            .overlay(shape.stroke(border, lineWidth: borderWidth))
+            // Razor-sharp 0.5pt light-alpha rim on dark floating panels over light wallpapers/apps.
             .overlay(
-                shape.stroke(.white.opacity(scheme == .dark && lift > 0 ? 0.08 : 0), lineWidth: 0.5)
-                    .mask(LinearGradient(colors: [.white, .clear], startPoint: .top, endPoint: .center))
+                shape.stroke(
+                    .white.opacity(scheme == .dark && lift > 0 ? 0.10 : 0),
+                    lineWidth: 0.5)
             )
             .shadow(color: .black.opacity((scheme == .dark ? 0.22 : 0.05) * lift), radius: 1, y: 0.5)
             .shadow(color: .black.opacity((scheme == .dark ? 0.30 : 0.08) * lift), radius: 8 * lift, y: 3 * lift)

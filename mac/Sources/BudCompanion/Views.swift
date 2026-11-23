@@ -455,7 +455,7 @@ private struct Bubble: View {
     @Bindable var companion: Companion
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             header
             if !compact, !companion.question.isEmpty, companion.setups.isEmpty {
                 // What you asked, so the answer keeps its context. One line: a reminder.
@@ -533,13 +533,13 @@ private struct Bubble: View {
                     .transition(.opacity)
             }
         }
-        .foregroundStyle(Paper.ink)
-        .padding(.horizontal, 16)
+        .foregroundStyle(Paper.inkPrimary)
+        .padding(.horizontal, 18)
         // The tail's edge gets its extra room, toward the pet.
-        .padding(.top, 12 + (companion.anchor.below ? BubbleShape.tail : 0))
-        .padding(.bottom, 14 + (companion.anchor.below ? 0 : BubbleShape.tail))
+        .padding(.top, 14 + (companion.anchor.below ? BubbleShape.tail : 0))
+        .padding(.bottom, 16 + (companion.anchor.below ? 0 : BubbleShape.tail))
         // Only the name line: a small tag over the pet, not a wide empty card.
-        .frame(width: compact ? nil : 320, alignment: .leading)
+        .frame(width: compact ? nil : 332, alignment: .leading)
         .frame(minWidth: 132, alignment: .leading)
         .fixedSize(horizontal: compact, vertical: false)
         .surface(BubbleShape(anchor: companion.anchor))
@@ -634,24 +634,29 @@ private struct Bubble: View {
 
     /// Shown only on hover: less chrome on a surface that floats over your work.
     private var close: some View {
-        chrome("xmark", label: "Close reply") { companion.bubbleOpen = false }
+        chrome("xmark", label: "Close reply", restOpacity: 0) { companion.bubbleOpen = false }
     }
 
     /// Opens the whole conversation in a window, for long replies and earlier messages.
     private var expand: some View {
-        chrome("arrow.up.left.and.arrow.down.right", label: "Open in a window") {
+        chrome("arrow.up.left.and.arrow.down.right", label: "Open in a window", restOpacity: 0.7) {
             ConversationWindow.shared.show()
         }
         .help("Open in a window")
     }
 
-    private func chrome(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
+    private func chrome(
+        _ symbol: String,
+        label: String,
+        restOpacity: Double,
+        action: @escaping () -> Void
+    ) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 9, weight: .semibold))
         }
         .buttonStyle(IconButton(size: 20))
-        .opacity(companion.bubbleHovered ? 1 : 0)
+        .opacity(companion.bubbleHovered ? 1 : restOpacity)
         .animation(.easeOut(duration: 0.12), value: companion.bubbleHovered)
         .accessibilityLabel(label)
     }
@@ -1245,35 +1250,98 @@ private struct Shimmer: ViewModifier {
 
 // MARK: Input
 
+/// Quiet 11pt mono keybind chip on recessed paper with a 0.5pt hairline border.
+struct KeybindChip: View {
+    let key: String
+
+    init(_ key: String) {
+        self.key = key
+    }
+
+    var body: some View {
+        Text(key)
+            .font(Paper.Typography.ledgerMeta)
+            .foregroundStyle(Paper.inkMuted)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(
+                Paper.recessed,
+                in: RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous)
+                    .strokeBorder(Paper.borderSubtle, lineWidth: 0.5))
+            .accessibilityHidden(true)
+    }
+}
+
+struct RoundButton: View {
+    let symbol: String
+    let label: String
+    var size: CGFloat = 26
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: size >= 26 ? 11 : 10, weight: .bold))
+                .frame(width: size, height: size)
+                .background(Paper.inkPrimary, in: Circle())
+        }
+        .buttonStyle(IconButton(size: size, highlight: false))
+        .help(label)
+        .accessibilityLabel(label)
+    }
+}
+
 /// Opens without animation: you open it often, often from the keyboard.
 private struct InputField: View {
     @Bindable var companion: Companion
     @FocusState private var focused: Bool
 
     var body: some View {
+        let hasText = !companion.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let shape = RoundedRectangle(cornerRadius: Paper.radiusLG, style: .continuous)
-        TextField(companion.inputPurpose.prompt, text: $companion.draft, axis: .vertical)
-            .textFieldStyle(.plain)
-            .font(Paper.Typography.body)
-            .lineLimit(1...5)
-            .focused($focused)
-            .onSubmit { companion.send() }
-            .onExitCommand {
-                companion.inputOpen = false
-                companion.inputPurpose = .ask
+        HStack(alignment: .bottom, spacing: 8) {
+            ZStack(alignment: .leading) {
+                if companion.draft.isEmpty {
+                    Text(companion.inputPurpose.prompt)
+                        .font(Paper.Typography.body)
+                        .foregroundStyle(Paper.placeholder)
+                        .lineLimit(1)
+                        .allowsHitTesting(false)
+                }
+                TextField("", text: $companion.draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(Paper.Typography.body)
+                    .lineLimit(1...5)
+                    .focused($focused)
+                    .onSubmit { companion.send() }
+                    .onExitCommand {
+                        companion.inputOpen = false
+                        companion.inputPurpose = .ask
+                    }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 11)
-            .foregroundStyle(Paper.inkPrimary)
-            .frame(width: 320)
-            .surface(
-                shape,
-                lift: 1,
-                fill: Paper.elevated,
-                border: focused ? Paper.borderFocus : Paper.borderSubtle
-            )
-            .overlay(shape.stroke(focused ? Paper.focusHalo : .clear, lineWidth: 3))
-            .onAppear { focused = true }
+            .padding(.vertical, 3)
+
+            KeybindChip("↩")
+                .padding(.bottom, 2)
+            RoundButton(symbol: "arrow.up", label: "Send", size: 22, action: { companion.send() })
+                .opacity(hasText ? 1 : 0.35)
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 8)
+        .padding(.vertical, 8)
+        .foregroundStyle(Paper.inkPrimary)
+        .frame(width: 332)
+        .surface(
+            shape,
+            lift: 1,
+            fill: Paper.elevated,
+            border: focused ? Paper.accent : Paper.borderSubtle,
+            borderWidth: focused ? 1 : 0.5
+        )
+        .animation(.easeOut(duration: 0.12), value: focused)
+        .onAppear { focused = true }
     }
 }
 
