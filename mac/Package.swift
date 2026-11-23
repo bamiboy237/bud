@@ -20,7 +20,10 @@ let package = Package(
                 .product(name: "Markdown", package: "swift-markdown"),
                 .product(name: "FluidAudio", package: "FluidAudio"),
             ],
-            path: "Sources/BudCompanion"
+            path: "Sources/BudCompanion",
+            resources: [
+                .process("Resources"),
+            ]
         ),
         .testTarget(name: "BudCompanionTests", dependencies: ["BudCompanion"]),
     ]

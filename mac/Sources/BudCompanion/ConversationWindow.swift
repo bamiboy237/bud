@@ -48,11 +48,11 @@ final class ConversationWindow: NSObject, NSWindowDelegate {
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered, defer: false)
         window.title = "bud"
-        // The paper runs to the top edge; the traffic lights sit on it.
+        // The paper runs to the top edge; the traffic lights sit in our 38pt header bar.
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isReleasedWhenClosed = false
-        window.backgroundColor = NSColor(Paper.surface)
+        window.backgroundColor = NSColor(Paper.canvas)
         window.minSize = NSSize(width: 380, height: 420)
         window.level = pinned ? .floating : .normal
         window.delegate = self
@@ -63,20 +63,18 @@ final class ConversationWindow: NSObject, NSWindowDelegate {
     }
 }
 
-/// Replies in the window read like a page: the same SF Pro scale as the bubble, a step up in
-/// size, with more air between lines.
+/// Replies in the window read at 14pt Inter with comfortable line spacing and 12.5pt IBM Plex Mono.
 private let pageType = ReplyType(
-    size: 14.5, lineSpacing: 4.5, blockSpacing: 13, itemSpacing: 5.5, compact: false)
+    size: 14, lineSpacing: 4.5, blockSpacing: 13, itemSpacing: 5.5, compact: false)
 
 /// The rhythm that separates speakers without labels: a wide gap before each of your
-/// messages starts a new exchange, a shorter one joins bud's answer to your question, about
-/// two to three as in claude.ai. The exchange gap includes the row of hover actions under a
-/// reply, which is always laid out, so the gap reads the same whether or not they show.
+/// messages starts a new exchange, a shorter one joins bud's answer to your question.
 private enum Rhythm {
     static let exchange: CGFloat = 52
     static let answer: CGFloat = 22
     /// The actions row under a reply: its spacing and height.
     static let actions: CGFloat = 6 + 24
+    static let headerHeight: CGFloat = 38
 }
 
 private final class ScrollState: ObservableObject {
@@ -94,6 +92,8 @@ private struct ConversationView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            headerBar
+            Rectangle().fill(Paper.borderSubtle).frame(height: 0.5)
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
@@ -107,7 +107,7 @@ private struct ConversationView: View {
                     }
                     .frame(maxWidth: column, alignment: .leading)
                     .padding(.horizontal, 32)
-                    .padding(.top, 52)
+                    .padding(.top, 20)
                     .padding(.bottom, 24)
                     .frame(maxWidth: .infinity)
                 }
@@ -120,14 +120,6 @@ private struct ConversationView: View {
                     geometry.visibleRect.maxY >= geometry.contentSize.height - 24
                 } action: { _, atBottom in
                     scroll.atBottom = atBottom
-                }
-                // Text slides under the title bar softly rather than meeting a hard edge.
-                .mask {
-                    VStack(spacing: 0) {
-                        LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom)
-                            .frame(height: 44)
-                        Color.black
-                    }
                 }
                 .overlay(alignment: .bottom) {
                     if !scroll.atBottom {
@@ -164,14 +156,12 @@ private struct ConversationView: View {
             }
             field
         }
-        .foregroundStyle(Paper.ink)
-        .background(Paper.surface)
+        .foregroundStyle(Paper.inkPrimary)
+        .background(Paper.canvas)
         .environment(\.replyType, pageType)
         .environment(\.openURL, OpenURLAction { url in
             companion.openSource(url) ? .handled : .systemAction
         })
-        // On the chat, not the source panel, so the panel keeps its own corner.
-        .overlay(alignment: .topTrailing) { pin }
         .inspector(isPresented: Binding(
             get: { companion.sourcePanel != nil },
             set: { if !$0 { companion.sourcePanel = nil } }
@@ -187,6 +177,53 @@ private struct ConversationView: View {
         }
         .onChange(of: companion.replyingTo) { _, quote in
             if quote != nil { typing = true }
+        }
+    }
+
+    /// Clean 38pt chrome bar aligned with macOS traffic lights: wordmark + status dot on the
+    /// left, pin and collapse controls on the right.
+    private var headerBar: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 7) {
+                Text("bud")
+                    .font(Paper.Typography.wordmark)
+                    .foregroundStyle(Paper.inkPrimary)
+                Circle()
+                    .fill(statusDotColor)
+                    .frame(width: 6, height: 6)
+                    .help(statusTooltip)
+                    .accessibilityLabel(statusTooltip)
+            }
+            .padding(.leading, 76)
+            Spacer(minLength: 8)
+            pin
+        }
+        .padding(.trailing, 10)
+        .frame(height: Rhythm.headerHeight)
+        .background(Paper.canvas)
+    }
+
+    private var statusDotColor: Color {
+        switch companion.link {
+        case .connecting:
+            return Paper.inkFaint
+        case .problem:
+            return Paper.errorInk
+        case .connected:
+            switch companion.status {
+            case .working: return Paper.accent
+            case .needsYou: return Paper.inkPrimary
+            case .failed: return Paper.errorInk
+            case .idle, .done: return Paper.approveInk
+            }
+        }
+    }
+
+    private var statusTooltip: String {
+        switch companion.link {
+        case .connecting: return "Connecting…"
+        case .problem(let detail): return detail
+        case .connected: return companion.status.label
         }
     }
 
@@ -208,7 +245,7 @@ private struct ConversationView: View {
             ForEach(companion.notices) { notice in
                 VStack(alignment: .leading, spacing: 4) {
                     Label(notice.text, systemImage: "arrow.turn.down.right")
-                        .font(.callout)
+                        .font(Paper.Typography.callout)
                         .foregroundStyle(Paper.inkSecondary)
                     if let report = notice.report { OpenReport(file: report) }
                 }
@@ -241,7 +278,11 @@ private struct ConversationView: View {
     /// One field for everything: a new message, a reply to something bud said, or your answer
     /// when bud asked for one.
     private var field: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let hasText = !companion.draft.trimmingCharacters(in: .whitespaces).isEmpty
+        let canCancel = companion.replyingTo != nil || companion.inputPurpose != .ask
+        let composerShape = RoundedRectangle(cornerRadius: Paper.radiusLG, style: .continuous)
+
+        return VStack(alignment: .leading, spacing: 8) {
             if let quote = companion.replyingTo {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "arrowshape.turn.up.left")
@@ -249,21 +290,21 @@ private struct ConversationView: View {
                         .foregroundStyle(Paper.inkSecondary)
                         .padding(.top, 2)
                     Text(quote)
-                        .font(.callout)
+                        .font(Paper.Typography.callout)
                         .foregroundStyle(Paper.inkSecondary)
                         .lineLimit(2)
                         .truncationMode(.tail)
                     Spacer(minLength: 4)
+                    KeybindChip("Esc")
                     Button {
                         companion.replyingTo = nil
                     } label: {
                         Image(systemName: "xmark")
                             .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(Paper.inkSecondary)
                             .frame(width: 16, height: 16)
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(IconButton(size: 18))
                     .accessibilityLabel("Don't reply to this")
                 }
                 .transition(.opacity)
@@ -271,7 +312,7 @@ private struct ConversationView: View {
             HStack(alignment: .bottom, spacing: 8) {
                 TextField(companion.inputPurpose.prompt, text: $companion.draft, axis: .vertical)
                     .textFieldStyle(.plain)
-                    .font(.body)
+                    .font(Paper.Typography.body)
                     .lineLimit(1...6)
                     .focused($typing)
                     .onSubmit { companion.send() }
@@ -280,20 +321,38 @@ private struct ConversationView: View {
                         companion.replyingTo = nil
                     }
                     .padding(.vertical, 4)
+                if canCancel && companion.replyingTo == nil {
+                    KeybindChip("Esc")
+                        .padding(.bottom, 3)
+                }
+                if hasText {
+                    KeybindChip("↩")
+                        .padding(.bottom, 3)
+                }
                 // Stop while bud works and the field is empty; typed text (an answer to a job's
                 // question, or a message to queue) turns it back into Send.
-                if companion.running, companion.draft.trimmingCharacters(in: .whitespaces).isEmpty {
+                if companion.running, !hasText {
                     RoundButton(symbol: "stop.fill", label: "Stop bud", action: companion.stop)
                 } else {
                     RoundButton(symbol: "arrow.up", label: "Send", action: { companion.send() })
-                        .opacity(companion.draft.trimmingCharacters(in: .whitespaces).isEmpty ? 0.35 : 1)
+                        .opacity(hasText ? 1 : 0.35)
                 }
             }
         }
-        .padding(.leading, 16)
+        .padding(.leading, 14)
         .padding(.trailing, 8)
         .padding(.vertical, 8)
-        .surface(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .surface(
+            composerShape,
+            lift: 1,
+            fill: Paper.elevated,
+            border: typing ? Paper.borderFocus : Paper.borderSubtle
+        )
+        .overlay(
+            composerShape
+                .stroke(typing ? Paper.focusHalo : .clear, lineWidth: 3)
+        )
+        .animation(.easeOut(duration: 0.15), value: typing)
         .animation(.easeOut(duration: 0.15), value: companion.replyingTo)
         .frame(maxWidth: column)
         .padding(.horizontal, 24)
@@ -301,12 +360,13 @@ private struct ConversationView: View {
         .padding(.top, 6)
     }
 
-    /// Top right, where Siri keeps its own: back to the bubble, and keep on top.
+    /// Top right, where Siri keeps its own: keep on top, and back to the bubble.
     private var pin: some View {
         HStack(spacing: 2) {
             Button(action: window.togglePin) {
                 Image(systemName: window.pinned ? "pin.fill" : "pin")
                     .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(window.pinned ? Paper.accent : Paper.inkSecondary)
             }
             .buttonStyle(IconButton(size: 28))
             .help(window.pinned ? "Stop keeping on top" : "Keep on top of other windows")
@@ -319,13 +379,35 @@ private struct ConversationView: View {
             .help("Back to the bubble")
             .accessibilityLabel("Collapse to the bubble")
         }
-        .padding(.top, 6)
-        .padding(.trailing, 10)
     }
 }
 
-/// One message. Yours sits to the right in a filled box, with any reply quote inside it;
-/// bud's is plain text at full width, the way a page reads, since it's what you came for.
+/// Quiet 11pt mono keybind chip on recessed paper with a 0.5pt hairline border.
+private struct KeybindChip: View {
+    let key: String
+
+    init(_ key: String) {
+        self.key = key
+    }
+
+    var body: some View {
+        Text(key)
+            .font(Paper.Typography.ledgerMeta)
+            .foregroundStyle(Paper.inkMuted)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(
+                Paper.recessed,
+                in: RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous)
+                    .strokeBorder(Paper.borderSubtle, lineWidth: 0.5))
+            .accessibilityHidden(true)
+    }
+}
+
+/// One message. Yours sits to the right on recessed paper with a 0.5pt hairline; bud's is plain
+/// text at full width, the way a page reads, since it's what you came for.
 private struct TurnView: View {
     let turn: Turn
     let companion: Companion
@@ -335,8 +417,8 @@ private struct TurnView: View {
     var body: some View {
         content
             .background(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Paper.ink.opacity(focused ? 0.06 : 0))
+                RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous)
+                    .fill(focused ? Paper.accentFill : .clear)
                     .padding(-8)
             )
             .animation(.easeOut(duration: 0.3), value: focused)
@@ -345,27 +427,29 @@ private struct TurnView: View {
     @ViewBuilder private var content: some View {
         if turn.fromOwner {
             let parts = Companion.unquoted(turn.text)
+            let bubbleShape = RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous)
             HStack {
                 Spacer(minLength: 80)
                 VStack(alignment: .leading, spacing: 6) {
                     if let quote = parts.quote {
                         HStack(spacing: 8) {
-                            RoundedRectangle(cornerRadius: 1).fill(Paper.ink.opacity(0.2)).frame(width: 2)
+                            RoundedRectangle(cornerRadius: 1).fill(Paper.borderStrong).frame(width: 2)
                             Text(quote)
-                                .font(.callout)
+                                .font(Paper.Typography.callout)
                                 .foregroundStyle(Paper.inkSecondary)
                                 .lineLimit(3)
                         }
                         .fixedSize(horizontal: false, vertical: true)
                     }
                     Text(parts.text)
-                        .font(.system(size: 14))
-                        .lineSpacing(3)
+                        .font(Paper.Typography.body)
+                        .lineSpacing(3.5)
                         .textSelection(.enabled)
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
-                .background(Paper.ink.opacity(0.065), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .background(Paper.recessed, in: bubbleShape)
+                .overlay(bubbleShape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5))
             }
         } else {
             VStack(alignment: .leading, spacing: 12) {
@@ -376,8 +460,8 @@ private struct TurnView: View {
     }
 }
 
-/// bud's words, with copy and reply under them when you hover, as T3 Code does: the actions
-/// are there when you reach for them and out of the way when you read.
+/// bud's words, with copy and reply under them when you hover: the actions are there when you
+/// reach for them and out of the way when you read.
 private struct Reply: View {
     let text: String
     /// What the reply's `[S1]` tags cite; they show as dates that open the cited message.
@@ -457,17 +541,25 @@ private struct Working: View {
     let steps: [Step]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            TimelineView(.periodic(from: since, by: 1)) { context in
-                Text("Working for \(elapsed(Int(context.date.timeIntervalSince(since))))")
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(Paper.inkSecondary)
-                    .shimmer(active: true)
-            }
-            if !steps.isEmpty {
-                StepList(steps: steps, live: true)
+        HStack(alignment: .top, spacing: 10) {
+            RoundedRectangle(cornerRadius: 1)
+                .fill(Paper.accent.opacity(0.4))
+                .frame(width: 2)
+            VStack(alignment: .leading, spacing: 8) {
+                TimelineView(.periodic(from: since, by: 1)) { context in
+                    let stepSuffix = steps.isEmpty ? "" : " · \(steps.count) \(steps.count == 1 ? "step" : "steps")"
+                    Text("Working for \(elapsed(Int(context.date.timeIntervalSince(since))))\(stepSuffix)")
+                        .font(Paper.Typography.ledgerMeta)
+                        .foregroundStyle(Paper.inkSecondary)
+                        .shimmer(active: true)
+                }
+                if !steps.isEmpty {
+                    StepList(steps: steps, live: true)
+                }
             }
         }
+        .fixedSize(horizontal: false, vertical: true)
+        .animation(.spring(duration: 0.25, bounce: 0), value: steps.count)
     }
 }
 
@@ -475,30 +567,45 @@ private struct Working: View {
 private struct WorkLine: View {
     let work: Work
     @StateObject private var open = Flag()
+    @StateObject private var hovered = Flag()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if work.steps.isEmpty {
-                summary
-            } else {
-                Button { open.on.toggle() } label: {
-                    HStack(spacing: 4) {
-                        summary
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(Paper.inkMuted)
-                            .rotationEffect(.degrees(open.on ? 90 : 0))
+        HStack(alignment: .top, spacing: 10) {
+            RoundedRectangle(cornerRadius: 1)
+                .fill(Paper.accent.opacity(open.on ? 0.45 : 0.28))
+                .frame(width: 2)
+            VStack(alignment: .leading, spacing: 8) {
+                if work.steps.isEmpty {
+                    summary
+                } else {
+                    Button { open.on.toggle() } label: {
+                        HStack(spacing: 5) {
+                            summary
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(hovered.on ? Paper.inkPrimary : Paper.inkMuted)
+                                .rotationEffect(.degrees(open.on ? 90 : 0))
+                        }
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(
+                            hovered.on ? Paper.fillHover : .clear,
+                            in: RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
+                        .contentShape(Rectangle())
                     }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(open.on ? "Hide bud's steps" : "Show bud's steps")
-                if open.on {
-                    StepList(steps: work.steps, live: false, limit: nil)
-                        .transition(.opacity)
+                    .buttonStyle(.plain)
+                    .pointerStyle(.link)
+                    .onHover { hovered.on = $0 }
+                    .padding(.leading, -5)
+                    .accessibilityLabel(open.on ? "Hide bud's steps" : "Show bud's steps")
+                    if open.on {
+                        StepList(steps: work.steps, live: false, limit: nil)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
                 }
             }
         }
+        .fixedSize(horizontal: false, vertical: true)
         .animation(.spring(duration: 0.25, bounce: 0), value: open.on)
     }
 
@@ -506,12 +613,12 @@ private struct WorkLine: View {
         let count = work.steps.count
         let steps = count == 0 ? "" : " · \(count) \(count == 1 ? "step" : "steps")"
         return Text("Worked for \(elapsed(work.seconds))\(steps)")
-            .font(.callout.monospacedDigit())
-            .foregroundStyle(Paper.inkSecondary)
+            .font(Paper.Typography.ledgerMeta)
+            .foregroundStyle(hovered.on ? Paper.inkPrimary : Paper.inkSecondary)
     }
 }
 
-/// "8s", "1m 05s", "1h 02m": the same shape T3 Code uses, so a ticking timer doesn't jitter.
+/// "8s", "1m 05s", "1h 02m": compact monotonic timer shape so a ticking timer doesn't jitter.
 private func elapsed(_ seconds: Int) -> String {
     let seconds = max(0, seconds)
     if seconds < 60 { return "\(seconds)s" }
@@ -528,9 +635,9 @@ private struct JumpButton: View {
         Button(action: action) {
             Image(systemName: "arrow.down")
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Paper.ink)
+                .foregroundStyle(Paper.inkPrimary)
                 .frame(width: 30, height: 30)
-                .surface(Circle(), lift: 0.6)
+                .surface(Circle(), lift: 0.8, fill: Paper.elevated)
         }
         .buttonStyle(IconButton(size: 30, highlight: false))
         .help("Jump to the latest")
@@ -548,7 +655,7 @@ private struct RoundButton: View {
             Image(systemName: symbol)
                 .font(.system(size: 11, weight: .bold))
                 .frame(width: 26, height: 26)
-                .background(Paper.ink, in: Circle())
+                .background(Paper.inkPrimary, in: Circle())
         }
         .buttonStyle(IconButton(size: 26, highlight: false))
         .help(label)
@@ -583,16 +690,18 @@ private struct SourcePanelView: View {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(subtitle)
-                        .font(.caption)
+                        .font(Paper.Typography.ledgerMeta)
                         .foregroundStyle(Paper.inkSecondary)
                     Text(headline)
-                        .font(.headline)
+                        .font(Paper.Typography.h3)
+                        .tracking(Paper.Typography.h3Tracking)
                 }
                 Spacer()
                 if companion.chatFocus(for: panel) != nil {
                     Button("Scroll to message") { companion.scrollToSource(panel) }
                         .buttonStyle(.link)
-                        .font(.caption)
+                        .pointerStyle(.link)
+                        .font(Paper.Typography.captionMedium)
                         .help("Show this message in the chat")
                 }
                 Button { companion.sourcePanel = nil } label: {
@@ -605,10 +714,10 @@ private struct SourcePanelView: View {
             .padding(.horizontal, 16)
             .padding(.top, 16)
             .padding(.bottom, 12)
-            Divider().overlay(Paper.hairline)
+            Rectangle().fill(Paper.borderSubtle).frame(height: 0.5)
             if let problem = panel.problem {
                 Text(problem)
-                    .font(.callout)
+                    .font(Paper.Typography.callout)
                     .foregroundStyle(Paper.inkSecondary)
                     .padding(16)
                 Spacer()
@@ -642,8 +751,8 @@ private struct SourcePanelView: View {
                 }
             }
         }
-        .foregroundStyle(Paper.ink)
-        .background(Paper.surface)
+        .foregroundStyle(Paper.inkPrimary)
+        .background(Paper.canvas)
     }
 
     /// The cited reply and the message it answered.
@@ -664,11 +773,11 @@ private struct SourceTurn: View {
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             RoundedRectangle(cornerRadius: 1)
-                .fill(Paper.ink.opacity(cited ? 0.35 : 0))
+                .fill(cited ? Paper.accent.opacity(0.6) : .clear)
                 .frame(width: 2)
             VStack(alignment: .leading, spacing: 4) {
                 Text(turn.fromOwner ? "You" : "bud")
-                    .font(.caption.weight(.medium))
+                    .font(Paper.Typography.captionMedium)
                     .foregroundStyle(Paper.inkSecondary)
                 MarkdownView(Citations.linked(turn.text, sources: turn.sources))
                     .textSelection(.enabled)

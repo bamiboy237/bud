@@ -158,7 +158,7 @@ struct QuestionCards: View {
                 .accessibilityLabel("Previous question")
                 .help("Previous question")
             Text("\(answers.index + 1) of \(answers.questions.count)")
-                .font(.caption)
+                .font(Paper.Typography.ledgerMeta)
                 .foregroundStyle(Paper.inkSecondary)
                 .accessibilityLabel("Question \(answers.index + 1) of \(answers.questions.count)")
             Spacer(minLength: 0)
@@ -184,7 +184,7 @@ private struct QuestionPage: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(question.text)
-                        .font(.callout)
+                        .font(Paper.Typography.callout)
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.bottom, 4)
                     ForEach(Array(question.options.enumerated()), id: \.offset) { index, option in
@@ -227,14 +227,16 @@ private struct QuestionPage: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(option.label).fixedSize(horizontal: false, vertical: true)
                 if let description = option.description {
-                    Text(description).font(.caption).foregroundStyle(Paper.inkSecondary)
+                    Text(description)
+                        .font(Paper.Typography.caption)
+                        .foregroundStyle(Paper.inkSecondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
             Spacer(minLength: 0)
             RowSymbol(name: symbol)
         }
-        .font(.callout)
+        .font(Paper.Typography.callout)
     }
 
     private var answerRow: some View {
@@ -245,6 +247,6 @@ private struct QuestionPage: View {
             Spacer(minLength: 0)
             RowSymbol(name: typed == nil ? "pencil" : "checkmark")
         }
-        .font(.callout)
+        .font(Paper.Typography.callout)
     }
 }

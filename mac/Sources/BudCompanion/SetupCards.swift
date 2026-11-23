@@ -67,7 +67,7 @@ struct SetupCard: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Text(setup.label)
-                    .font(.callout.weight(.medium))
+                    .font(Paper.Typography.label)
                     .lineLimit(1)
                 Spacer(minLength: 4)
                 Button("Cancel") { companion.cancelSetup(setup) }
@@ -88,12 +88,12 @@ struct SetupCard: View {
             if !setup.steps.isEmpty {
                 Text(setup.steps.enumerated().map { "\($0.offset + 1). \($0.element)" }
                     .joined(separator: "\n"))
-                    .font(.callout)
+                    .font(Paper.Typography.callout)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let problem = companion.setupProblems[setup.id] ?? setup.reason {
                 Text(problem)
-                    .font(.caption)
+                    .font(Paper.Typography.caption)
                     .foregroundStyle(Paper.errorInk)
                     .fixedSize(horizontal: false, vertical: true)
             }
