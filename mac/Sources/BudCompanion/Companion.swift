@@ -111,6 +111,7 @@ struct Turn: Identifiable, Equatable {
     /// What the reply's `[S1]` tags cite.
     var sources: [String: Source] = [:]
     var attachments: [ChatAttachment] = []
+    var routine: RoutineCard?
 }
 
 /// A run's work, for the folded line above its reply: "Worked for 34s · 4 steps".
@@ -205,6 +206,7 @@ final class Companion {
     /// A cited message and its conversation, shown beside the chat.
     var sourcePanel: SourcePanel?
     var attachmentSelection: AttachmentSelection?
+    var routineSelection: RoutineSelection?
     var draftAttachments: [DraftAttachment] = []
     private(set) var readingAttachments = false
     private(set) var uploadingAttachments = false
@@ -346,6 +348,7 @@ final class Companion {
     private func startConnection(resetBackoff: Bool) {
         attachmentSelection = nil
         citedConversations = []
+        routineSelection = nil
         setupMonitor?.cancel()
         setupMonitor = nil
         fastPollRemaining = 0
@@ -451,17 +454,19 @@ final class Companion {
         }
         turns = transcript.compactMap { turn in
             let attachments = ChatAttachment.decode(turn["attachments"])
-            guard let text = turn["text"] as? String, !text.isEmpty || !attachments.isEmpty
+            let routine = RoutineCard(turn["routine"])
+            guard let text = turn["text"] as? String,
+                  !text.isEmpty || !attachments.isEmpty || routine != nil
             else { return nil }
             return Turn(
                 fromOwner: turn["role"] as? String == "user", text: text, seq: turn["seq"] as? Int,
                 sources: Citations.sources(turn["sources"]),
-                attachments: attachments)
+                attachments: attachments, routine: routine)
         }
         question = turns.last(where: \.fromOwner)?.text ?? ""
         // Only a reply to the latest message: after a newer message, an older reply misleads.
         // It becomes the reply, not a turn: the latest reply is always `reply`, so it's drawn once.
-        if let last = turns.last, !last.fromOwner {
+        if let last = turns.last, !last.fromOwner, last.routine == nil {
             replySeq = last.seq
             replySources = last.sources
             reply = last.text
@@ -585,6 +590,7 @@ final class Companion {
         guard let connection else { return true }
         let mine = generation
         attachmentSelection = nil
+        routineSelection = nil
         let requested = SourcePanel(target: target)
         if let focus = chatFocus(for: requested) {
             citedConversations.removeAll()
@@ -655,7 +661,19 @@ final class Companion {
             return
         }
         sourcePanel = nil
+        routineSelection = nil
         attachmentSelection = selection
+    }
+
+    func openRoutines(_ id: String? = nil, occurrence: String? = nil) {
+        guard let connection else {
+            nudge("Reconnect to Bud to view routines.")
+            return
+        }
+        sourcePanel = nil
+        attachmentSelection = nil
+        routineSelection = RoutineSelection(
+            connection: connection, session: session, routineID: id, occurrenceID: occurrence)
     }
 
     /// Where the panel's cited message sits in the chat on screen, if it's there.
@@ -1551,6 +1569,20 @@ final class Companion {
             }
             notice(event)
             refreshApprovals()
+        case "routine.created", "routine.completed", "routine.failed", "routine.cancelled",
+             "routine.needs_review":
+            var data = event.data
+            data["kind"] = String(event.type.dropFirst("routine.".count))
+            let card = RoutineCard(data)
+            let text = event.string("text")
+            if card != nil || !text.isEmpty {
+                if !running {
+                    archiveReply()
+                    reply = ""
+                    showWhole()
+                }
+                turns.append(Turn(fromOwner: false, text: text, seq: event.seq, routine: card))
+            }
         case "background.finished":
             // A reminder or a background command, posted by the server; no run follows.
             notice(event)
