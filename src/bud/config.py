@@ -39,8 +39,8 @@ class Settings(BaseSettings):
     model_fallback: bool = True
     operating_profile: str | None = None
     # Auto mode reviews each write with the OpenAI Decisions API when an OpenAI key exists.
-    # Set APPROVAL_REVIEW=false to keep tool calls and requests off that API; auto mode then
-    # asks about every write, like strict.
+    # With APPROVAL_REVIEW=false, Bud asks about calls that would have gone to the reviewer.
+    # Auto mode still allows workspace writes. Use strict mode to ask about those too.
     approval_review: bool = True
     approval_review_model: str = "gpt-6-luna"
     model_api_keys: dict[str, SecretStr] = Field(default_factory=dict, repr=False)
