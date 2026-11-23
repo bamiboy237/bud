@@ -104,8 +104,11 @@ def test_browser_worker_recovers_without_reissuing_submission(tmp_path, cut):
                 state["signed_in"] = True
                 work_once(mac_client, tmp_path / "mac", local)
                 assert server.request("GET", job)["steps"][-1]["browser_state"] == "ready"
-                server.request("POST", f"{job}/browser/approve")
-                server.request("POST", f"{job}/browser/approve")  # Idempotent approval.
+                server.request(
+                    "POST", f"{job}/browser/approve", status=409, json={"desktop": cloud["id"]}
+                )
+                for _ in range(2):  # Idempotent approval binds the reviewed desktop.
+                    server.request("POST", f"{job}/browser/approve", json={"desktop": mac["id"]})
                 with pytest.raises(httpx.ReadTimeout):
                     work_once(mac_client, tmp_path / "mac", local)
                 assert server.request("GET", job)["steps"][-1]["browser_state"] == "sending"
