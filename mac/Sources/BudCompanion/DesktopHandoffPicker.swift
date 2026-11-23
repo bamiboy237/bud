@@ -15,21 +15,26 @@ private struct PairedDesktop: Identifiable {
 }
 
 @MainActor
+private final class DesktopHandoffState: ObservableObject {
+    @Published var desktops: [PairedDesktop]?
+    @Published var chosen: [String] = []
+    @Published var problem: String?
+    @Published var dispatching = false
+    @Published var queued = false
+    @Published var jobID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+}
+
+@MainActor
 struct DesktopHandoffPicker: View {
     let selection: AttachmentSelection
-    @State private var desktops: [PairedDesktop]?
-    @State private var chosen: [String] = []
-    @State private var problem: String?
-    @State private var dispatching = false
-    @State private var queued = false
-    @State private var jobID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    @StateObject private var state = DesktopHandoffState()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Verify on paired desktops").font(Paper.Typography.body)
-            if queued {
+            if state.queued {
                 Label("Queued. Results will appear in this chat.", systemImage: "checkmark.circle")
-            } else if let desktops {
+            } else if let desktops = state.desktops {
                 if desktops.isEmpty {
                     Text("Pair a desktop first with bud desktop pair.")
                         .foregroundStyle(Paper.inkSecondary)
@@ -38,32 +43,32 @@ struct DesktopHandoffPicker: View {
                         .foregroundStyle(Paper.inkSecondary)
                     ForEach(desktops) { desktop in
                         Button {
-                            if chosen.contains(desktop.id) {
-                                chosen.removeAll { $0 == desktop.id }
-                            } else if chosen.count < 2 {
-                                chosen.append(desktop.id)
+                            if state.chosen.contains(desktop.id) {
+                                state.chosen.removeAll { $0 == desktop.id }
+                            } else if state.chosen.count < 2 {
+                                state.chosen.append(desktop.id)
                             }
-                            jobID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+                            state.jobID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
                         } label: {
                             HStack {
-                                Image(systemName: chosen.contains(desktop.id)
+                                Image(systemName: state.chosen.contains(desktop.id)
                                     ? "checkmark.circle.fill" : "circle")
                                 Text(desktop.label)
-                                if let order = chosen.firstIndex(of: desktop.id) {
+                                if let order = state.chosen.firstIndex(of: desktop.id) {
                                     Text("\(order + 1)").foregroundStyle(Paper.inkSecondary)
                                 }
                             }
                         }
                         .buttonStyle(.plain)
-                        .disabled(dispatching)
+                        .disabled(state.dispatching)
                     }
                     Button("Queue verification") { Task { await dispatch() } }
-                        .disabled(chosen.isEmpty || dispatching)
+                        .disabled(state.chosen.isEmpty || state.dispatching)
                 }
-            } else if problem == nil {
+            } else if state.problem == nil {
                 ProgressView().controlSize(.small)
             }
-            if let problem { Text(problem).foregroundStyle(Paper.inkSecondary) }
+            if let problem = state.problem { Text(problem).foregroundStyle(Paper.inkSecondary) }
         }
         .frame(width: 280, alignment: .leading)
         .task { await load() }
@@ -73,24 +78,24 @@ struct DesktopHandoffPicker: View {
         do {
             let result = try await selection.connection.getBytes("desktops", queryItems: [])
             let entries = try JSONSerialization.jsonObject(with: result) as? [[String: Any]] ?? []
-            desktops = entries.compactMap(PairedDesktop.init)
+            state.desktops = entries.compactMap(PairedDesktop.init)
         } catch {
-            problem = "Couldn’t load the paired desktops."
+            state.problem = "Couldn’t load the paired desktops."
         }
     }
 
     private func dispatch() async {
-        guard !dispatching else { return }
-        dispatching = true
-        problem = nil
-        defer { dispatching = false }
+        guard !state.dispatching else { return }
+        state.dispatching = true
+        state.problem = nil
+        defer { state.dispatching = false }
         do {
             _ = try await selection.connection.send(
                 "POST", "sessions/\(selection.session)/desktop-jobs",
-                json: ["job_id": jobID, "file": selection.file.fields, "desktops": chosen])
-            queued = true
+                json: ["job_id": state.jobID, "file": selection.file.fields, "desktops": state.chosen])
+            state.queued = true
         } catch {
-            problem = "\(error)"
+            state.problem = "\(error)"
         }
     }
 }

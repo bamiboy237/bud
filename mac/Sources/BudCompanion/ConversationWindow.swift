@@ -99,7 +99,7 @@ private struct ConversationView: View {
     @Bindable var companion: Companion
     let window: ConversationWindow
     @FocusState private var typing: Bool
-    @State private var restoreTyping = false
+    @StateObject private var restoreTyping = Flag()
     @StateObject private var scroll = ScrollState()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -112,7 +112,7 @@ private struct ConversationView: View {
             : .scale(scale: 0.96).combined(with: .opacity)
     }
 
-    @State private var pickingAttachments = false
+    @StateObject private var pickingAttachments = Flag()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -250,11 +250,11 @@ private struct ConversationView: View {
         .onAppear { typing = true }
         .onChange(of: companion.citedConversation != nil) { _, reading in
             if reading {
-                restoreTyping = typing
+                restoreTyping.on = typing
                 typing = false
-            } else if restoreTyping {
+            } else if restoreTyping.on {
                 typing = true
-                restoreTyping = false
+                restoreTyping.on = false
             }
         }
         .onChange(of: companion.inputPurpose) { _, purpose in
@@ -477,7 +477,7 @@ private struct ConversationView: View {
             // Bottom utility strip: minimal by default, with send/stop action on the right.
             HStack(alignment: .center, spacing: 8) {
                 if companion.inputPurpose == .ask {
-                    Button { pickingAttachments = true } label: {
+                    Button { pickingAttachments.on = true } label: {
                         Image(systemName: "paperclip")
                     }
                     .buttonStyle(IconButton(size: 26))
@@ -515,7 +515,7 @@ private struct ConversationView: View {
             border: typing ? Paper.accent : Paper.borderSubtle,
             borderWidth: typing ? 1 : 0.5
         )
-        .fileImporter(isPresented: $pickingAttachments, allowedContentTypes: [.item],
+        .fileImporter(isPresented: $pickingAttachments.on, allowedContentTypes: [.item],
                       allowsMultipleSelection: true) { result in
             if case .success(let urls) = result { companion.addAttachments(urls) }
         }
