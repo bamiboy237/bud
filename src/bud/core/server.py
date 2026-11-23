@@ -466,7 +466,9 @@ def _create_app(
             + WEB_GUIDANCE
             + file_guidance()
             + (browser.GUIDANCE if browsing else "")
-            + f"Your workspace is the folder {display_path(workspace)} on the person's Mac.\n",
+            + f"Your workspace is the folder {display_path(workspace)} on the machine running "
+            "the Bud server. Local file paths resolve on that machine, even when the person "
+            "chats from another device.\n",
             memory=memory,
             preferences=PreferenceStore(memory_path, memory=memory),
             state_dir=session_dir,
