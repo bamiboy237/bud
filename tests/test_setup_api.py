@@ -210,7 +210,8 @@ async def test_account_mode_works_in_the_home_workspace(setup_api, tmp_path):
     )
     await subject.run("Where do you keep files?")
 
-    assert f"Your workspace is the folder {home} on the person's Mac." in seen[0]
+    assert f"Your workspace is the folder {home} on the machine running the Bud server." in seen[0]
+    assert "Local file paths resolve on that machine" in seen[0]
     assert home.is_dir()
     # No per-account workspace any more; the account folder keeps only Bud's own state.
     assert not (tmp_path / "composio" / "sessions" / "scope" / "workspace").exists()
