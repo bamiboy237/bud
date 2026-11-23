@@ -38,6 +38,7 @@ struct BrowserInspector: View {
     @State private var privateInput = false
     @State private var handoffOpen = false
     @State private var sending = false
+    @State private var requestingTakeover = false
     @State private var problem: String?
     @State private var previewIssue: String?
 
@@ -63,7 +64,12 @@ struct BrowserInspector: View {
             .padding(12)
             Divider()
             Group {
-                if privateInput {
+                if requestingTakeover {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ProgressView().controlSize(.small)
+                        Text("Waiting for Bud to stop browser work. Wait before entering private information.")
+                    }
+                } else if privateInput {
                     VStack(alignment: .leading, spacing: 12) {
                         Label("Private input", systemImage: "lock.fill")
                             .font(Paper.Typography.callout)
@@ -177,13 +183,14 @@ struct BrowserInspector: View {
         screenshot = nil
         previewIssue = nil
         problem = nil
-        if action == "takeover" { privateInput = true }
+        requestingTakeover = action == "takeover"
         do {
             let state = try await selection.connection.send("POST", "browser/view/\(action)", json: body)
             privateInput = state["private"] as? Bool == true
             handoffOpen = privateInput
         } catch { problem = "\(error)" }
         sending = false
+        requestingTakeover = false
         await refresh()
     }
 }
