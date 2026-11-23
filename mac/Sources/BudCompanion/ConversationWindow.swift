@@ -316,6 +316,14 @@ private struct ConversationView: View {
                     text: companion.shown, sources: companion.replySources, companion: companion,
                     finished: !companion.running)
             }
+            ForEach(companion.pendingMessages) { item in
+                TurnView(
+                    turn: Turn(fromOwner: true, text: item.text),
+                    companion: companion,
+                    focused: false
+                )
+                .opacity(0.75)
+            }
             if !companion.setups.isEmpty {
                 SetupDeck(companion: companion)
                     .frame(maxWidth: 460, alignment: .leading)
