@@ -223,6 +223,7 @@ private struct ConversationView: View {
             get: {
                 companion.sourcePanel != nil || companion.attachmentSelection != nil
                     || companion.routineSelection != nil || companion.browserSelection != nil
+                    || companion.deliverySelection != nil
             },
             set: {
                 if !$0 {
@@ -230,6 +231,7 @@ private struct ConversationView: View {
                     companion.attachmentSelection = nil
                     companion.routineSelection = nil
                     companion.browserSelection = nil
+                    companion.deliverySelection = nil
                 }
             }
         )) {
@@ -241,6 +243,9 @@ private struct ConversationView: View {
                     .id(selection.id)
             } else if let selection = companion.browserSelection {
                 BrowserInspector(selection: selection) { companion.browserSelection = nil }
+                    .id(selection.id)
+            } else if let selection = companion.deliverySelection {
+                DesktopDeliveryInspector(selection: selection) { companion.deliverySelection = nil }
                     .id(selection.id)
             } else if let panel = companion.sourcePanel {
                 SourcePanelView(panel: panel, companion: companion)
@@ -633,7 +638,18 @@ private struct TurnView: View {
                         companion.openRoutines(card.id, occurrence: card.occurrenceID)
                     }
                 }
-                if !turn.text.isEmpty {
+                if let jobID = turn.desktopJobID {
+                    Button {
+                        companion.openDesktopDelivery(jobID)
+                    } label: {
+                        Label(turn.text, systemImage: "macwindow")
+                            .font(Paper.Typography.callout)
+                            .padding(10)
+                            .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusMD))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open browser delivery")
+                } else if !turn.text.isEmpty {
                     Reply(text: turn.text, sources: turn.sources, companion: companion, finished: true)
                 }
             }

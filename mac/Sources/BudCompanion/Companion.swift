@@ -117,6 +117,7 @@ struct Turn: Identifiable, Equatable {
     var sources: [String: Source] = [:]
     var attachments: [ChatAttachment] = []
     var routine: RoutineCard?
+    var desktopJobID: String?
 }
 
 /// A run's work, for the folded line above its reply: "Worked for 34s · 4 steps".
@@ -213,6 +214,7 @@ final class Companion {
     var attachmentSelection: AttachmentSelection?
     var routineSelection: RoutineSelection?
     var browserSelection: BrowserSelection?
+    var deliverySelection: DesktopDeliverySelection?
     var draftAttachments: [DraftAttachment] = []
     private(set) var readingAttachments = false
     private(set) var uploadingAttachments = false
@@ -357,6 +359,7 @@ final class Companion {
         citedConversations = []
         routineSelection = nil
         browserSelection = nil
+        deliverySelection = nil
         setupMonitor?.cancel()
         setupMonitor = nil
         fastPollRemaining = 0
@@ -475,12 +478,13 @@ final class Companion {
             return Turn(
                 fromOwner: turn["role"] as? String == "user", text: text, seq: turn["seq"] as? Int,
                 sources: Citations.sources(turn["sources"]),
-                attachments: attachments, routine: routine)
+                attachments: attachments, routine: routine,
+                desktopJobID: turn["desktop_job_id"] as? String)
         }
         question = turns.last(where: \.fromOwner)?.text ?? ""
         // Only a reply to the latest message: after a newer message, an older reply misleads.
         // It becomes the reply, not a turn: the latest reply is always `reply`, so it's drawn once.
-        if let last = turns.last, !last.fromOwner, last.routine == nil {
+        if let last = turns.last, !last.fromOwner, last.routine == nil, last.desktopJobID == nil {
             replySeq = last.seq
             replySources = last.sources
             reply = last.text
@@ -605,6 +609,7 @@ final class Companion {
         let mine = generation
         attachmentSelection = nil
         browserSelection = nil
+        deliverySelection = nil
         routineSelection = nil
         let requested = SourcePanel(target: target)
         if let focus = chatFocus(for: requested) {
@@ -678,6 +683,7 @@ final class Companion {
         sourcePanel = nil
         routineSelection = nil
         browserSelection = nil
+        deliverySelection = nil
         attachmentSelection = selection
     }
 
@@ -689,6 +695,7 @@ final class Companion {
         sourcePanel = nil
         attachmentSelection = nil
         browserSelection = nil
+        deliverySelection = nil
         routineSelection = RoutineSelection(
             connection: connection, session: session, routineID: id, occurrenceID: occurrence)
     }
@@ -701,7 +708,21 @@ final class Companion {
         sourcePanel = nil
         attachmentSelection = nil
         routineSelection = nil
+        deliverySelection = nil
         browserSelection = BrowserSelection(connection: connection)
+    }
+
+    func openDesktopDelivery(_ jobID: String) {
+        guard let connection else {
+            nudge("Reconnect to Bud to open the browser delivery.")
+            return
+        }
+        sourcePanel = nil
+        attachmentSelection = nil
+        routineSelection = nil
+        browserSelection = nil
+        deliverySelection = DesktopDeliverySelection(
+            connection: connection, session: session, jobID: jobID)
     }
 
     /// Where the panel's cited message sits in the chat on screen, if it's there.
@@ -723,6 +744,7 @@ final class Companion {
         attachmentSelection = nil
         routineSelection = nil
         browserSelection = nil
+        deliverySelection = nil
     }
 
     func receiveSetup(_ data: [String: Any], replacing: Bool = false) {
@@ -1642,6 +1664,17 @@ final class Companion {
                 turns.append(Turn(fromOwner: false, text: text, seq: event.seq, routine: card))
             }
         case "background.finished":
+            if let jobID = event.data["desktop_job_id"] as? String {
+                if !running {
+                    archiveReply()
+                    reply = ""
+                    showWhole()
+                }
+                turns.append(Turn(
+                    fromOwner: false, text: event.string("text"), seq: event.seq,
+                    desktopJobID: jobID))
+                break
+            }
             // A reminder or a background command, posted by the server; no run follows.
             notice(event)
             react(.hop)

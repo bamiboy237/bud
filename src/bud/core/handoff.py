@@ -92,8 +92,11 @@ class DesktopHandoffs:
             (hashlib.sha256(token.encode()).hexdigest(),),
         ).fetchone()
 
-    def _publish(self, session: str, key: str, text: str) -> None:
-        self.hub.publish_once(session, "background.finished", {"text": text}, key=key)
+    def _publish(self, session: str, key: str, text: str, *, job: str | None = None) -> None:
+        data = {"text": text}
+        if job:
+            data["desktop_job_id"] = job
+        self.hub.publish_once(session, "background.finished", data, key=key)
 
     def routes(self) -> APIRouter:
         router = APIRouter()
@@ -175,6 +178,7 @@ class DesktopHandoffs:
                         session,
                         f"handoff:{body.job_id}:queued",
                         f"Queued {body.file.name} for browser delivery to {body.browser.origin}.",
+                        job=body.job_id,
                     )
             return {"id": body.job_id}
 
@@ -184,7 +188,8 @@ class DesktopHandoffs:
                 steps = [
                     dict(row)
                     for row in db.execute(
-                        """SELECT s.id, d.label AS desktop, d.revoked, s.platform,
+                        """SELECT s.id, d.label AS desktop, d.id AS desktop_id,
+                                  d.revoked, s.platform,
                                   b.phase AS browser_state, j.request
                            FROM handoff_steps s JOIN handoff_desktops d ON d.id = s.desktop
                            JOIN handoff_jobs j ON j.id = s.job
@@ -363,7 +368,7 @@ class DesktopHandoffs:
     def _step(self, db: sqlite3.Connection, request: Request, step_id: str) -> sqlite3.Row:
         desktop = self._worker(db, request)
         step = db.execute(
-            """SELECT s.platform, j.session, j.request, j.sha256, d.label, b.phase
+            """SELECT s.platform, j.session, j.request, j.sha256, d.label, b.phase, j.id AS job
                FROM handoff_steps s JOIN handoff_jobs j ON j.id = s.job
                JOIN handoff_desktops d ON d.id = s.desktop
                LEFT JOIN handoff_browser b ON b.step = s.id
@@ -399,7 +404,12 @@ class DesktopHandoffs:
             "delivered": f"{step['label']} confirmed the browser receipt {update.step_id}.",
         }
         if target in messages:
-            self._publish(step["session"], f"handoff:{update.step_id}:{target}", messages[target])
+            self._publish(
+                step["session"],
+                f"handoff:{update.step_id}:{target}",
+                messages[target],
+                job=step["job"],
+            )
         db.execute("UPDATE handoff_browser SET phase = ? WHERE step = ?", (target, update.step_id))
         if target == "delivered":
             db.execute(
