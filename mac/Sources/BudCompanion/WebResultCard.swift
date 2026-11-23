@@ -40,10 +40,10 @@ struct WebLinkCard: View {
 struct WebImageCard: View {
     let url: URL
     let title: String
-    @State private var requested = false
+    @StateObject private var requested = Flag()
 
     var body: some View {
-        if requested {
+        if requested.on {
             AsyncImage(url: url) { phase in
                 switch phase {
                 case .success(let image):
@@ -58,7 +58,7 @@ struct WebImageCard: View {
                 }
             }
         } else {
-            Button { requested = true } label: {
+            Button { requested.on = true } label: {
                 HStack(spacing: 9) {
                     Image(systemName: "photo").foregroundStyle(Paper.accent)
                     VStack(alignment: .leading, spacing: 4) {

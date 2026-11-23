@@ -87,33 +87,38 @@ private struct RoutineRun: Decodable, Identifiable {
 }
 
 @MainActor
+private final class RoutineInspectorState: ObservableObject {
+    @Published var list: [RoutineSummary] = []
+    @Published var routine: RoutineSummary?
+    @Published var report: String?
+    @Published var listing = true
+    @Published var pending = true
+    @Published var problem: String?
+    @Published var editing = false
+    @Published var title = ""
+    @Published var prompt = ""
+    @Published var cron = ""
+    @Published var timezone = ""
+    @Published var markedRun: String?
+    @Published var triggerID = UUID().uuidString
+}
+
+@MainActor
 struct RoutineInspector: View {
     let selection: RoutineSelection
     let close: () -> Void
-    @State private var list: [RoutineSummary] = []
-    @State private var routine: RoutineSummary?
-    @State private var report: String?
-    @State private var listing = true
-    @State private var pending = true
-    @State private var problem: String?
-    @State private var editing = false
-    @State private var title = ""
-    @State private var prompt = ""
-    @State private var cron = ""
-    @State private var timezone = ""
-    @State private var markedRun: String?
-    @State private var triggerID = UUID().uuidString
+    @StateObject private var state = RoutineInspectorState()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                if report != nil || !listing {
+                if state.report != nil || !state.listing {
                     Button { back() } label: { Image(systemName: "chevron.left") }
                         .buttonStyle(IconButton(size: 24))
                         .accessibilityLabel("Back")
-                        .disabled(pending)
+                        .disabled(state.pending)
                 }
-                Text(report != nil ? "Run report" : listing ? "Routines" : routine?.title ?? "Routine")
+                Text(state.report != nil ? "Run report" : state.listing ? "Routines" : state.routine?.title ?? "Routine")
                     .font(Paper.Typography.callout).lineLimit(1)
                 Spacer()
                 Button(action: close) { Image(systemName: "xmark") }
@@ -124,17 +129,17 @@ struct RoutineInspector: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    if let problem {
+                    if let problem = state.problem {
                         Text(problem).foregroundStyle(Paper.errorInk).textSelection(.enabled)
                     }
-                    if let report {
+                    if let report = state.report {
                         MarkdownView(report, rich: true).textSelection(.enabled)
-                    } else if listing {
-                        if list.isEmpty, !pending, problem == nil {
+                    } else if state.listing {
+                        if state.list.isEmpty, !state.pending, state.problem == nil {
                             Text("Ask Bud in chat to schedule a routine.")
                                 .foregroundStyle(Paper.inkSecondary)
                         }
-                        ForEach(list) { item in
+                        ForEach(state.list) { item in
                             Button {
                                 Task { await show(item.id) }
                             } label: {
@@ -151,10 +156,10 @@ struct RoutineInspector: View {
                                 .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusMD))
                             }.buttonStyle(.plain)
                         }
-                    } else if let routine {
+                    } else if let routine = state.routine {
                         detail(routine)
                     }
-                    if pending { ProgressView().controlSize(.small) }
+                    if state.pending { ProgressView().controlSize(.small) }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(14)
@@ -165,7 +170,7 @@ struct RoutineInspector: View {
         .inspectorColumnWidth(min: 270, ideal: 340, max: 470)
         .task {
             if let id = selection.routineID {
-                markedRun = selection.occurrenceID
+                state.markedRun = selection.occurrenceID
                 await show(id)
             } else {
                 await loadList()
@@ -175,24 +180,24 @@ struct RoutineInspector: View {
 
     @ViewBuilder
     private func detail(_ value: RoutineSummary) -> some View {
-        if editing {
+        if state.editing {
             VStack(alignment: .leading, spacing: 10) {
-                LabeledContent("Name") { TextField("Routine name", text: $title) }
-                LabeledContent("Schedule") { TextField("Five-field cron", text: $cron) }
-                LabeledContent("Time zone") { TextField("America/Chicago", text: $timezone) }
+                LabeledContent("Name") { TextField("Routine name", text: $state.title) }
+                LabeledContent("Schedule") { TextField("Five-field cron", text: $state.cron) }
+                LabeledContent("Time zone") { TextField("America/Chicago", text: $state.timezone) }
                 Text("Instructions").font(.caption)
-                TextEditor(text: $prompt).frame(minHeight: 96)
+                TextEditor(text: $state.prompt).frame(minHeight: 96)
                 HStack {
-                    Button("Cancel") { editing = false }
+                    Button("Cancel") { state.editing = false }
                     Spacer()
                     Button("Save") {
                         Task {
                             await change(value.id, method: "PATCH", body: [
-                                "title": title, "prompt": prompt, "cron": cron, "timezone": timezone,
+                                "title": state.title, "prompt": state.prompt, "cron": state.cron, "timezone": state.timezone,
                             ])
                         }
                     }
-                    .disabled(pending || [title, prompt, cron, timezone].contains {
+                    .disabled(state.pending || [state.title, state.prompt, state.cron, state.timezone].contains {
                         $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     })
                 }
@@ -208,19 +213,19 @@ struct RoutineInspector: View {
             }
             HStack {
                 Button("Edit") {
-                    (title, prompt, cron, timezone) = (value.title, value.prompt, value.cron, value.timezone)
-                    editing = true
+                    (state.title, state.prompt, state.cron, state.timezone) = (value.title, value.prompt, value.cron, value.timezone)
+                    state.editing = true
                 }
                 if value.status == "active" {
                     Button("Pause") { Task { await change(value.id, path: "/pause") } }
                     Button("Run now") {
-                        Task { await change(value.id, path: "/run-now", body: ["trigger_id": triggerID]) }
+                        Task { await change(value.id, path: "/run-now", body: ["trigger_id": state.triggerID]) }
                     }
                 } else if value.status == "paused", value.pauseReason != "uncertain" {
                     Button("Resume") { Task { await change(value.id, path: "/resume") } }
                 }
             }
-            .disabled(pending)
+            .disabled(state.pending)
         }
         if !value.recentOccurrences.isEmpty {
             Divider()
@@ -232,13 +237,13 @@ struct RoutineInspector: View {
                         .font(.caption).foregroundStyle(Paper.inkSecondary)
                     if run.reportPath != nil {
                         Button("Open report") { Task { await openReport(value.id, run.id) } }
-                            .buttonStyle(.link).disabled(pending)
+                            .buttonStyle(.link).disabled(state.pending)
                     }
                 }
                 .padding(8)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(
-                    run.id == markedRun ? Paper.accentFill : Paper.elevated,
+                    run.id == state.markedRun ? Paper.accentFill : Paper.elevated,
                     in: RoundedRectangle(cornerRadius: Paper.radiusMD))
             }
         }
@@ -261,61 +266,61 @@ struct RoutineInspector: View {
     }
 
     private func back() {
-        if report != nil {
-            report = nil
+        if state.report != nil {
+            state.report = nil
         } else {
-            markedRun = nil
-            listing = true
-            editing = false
+            state.markedRun = nil
+            state.listing = true
+            state.editing = false
             Task { await loadList() }
         }
     }
 
     private func loadList() async {
-        pending = true
-        problem = nil
-        defer { pending = false }
+        state.pending = true
+        state.problem = nil
+        defer { state.pending = false }
         do {
             let response = try await selection.connection.send(
                 "GET", "routines", queryItems: [URLQueryItem(name: "feed_id", value: selection.session)])
-            list = try (response["routines"] as? [[String: Any]] ?? []).map(decode)
-        } catch { problem = "\(error)" }
+            state.list = try (response["routines"] as? [[String: Any]] ?? []).map(decode)
+        } catch { state.problem = "\(error)" }
     }
 
     private func show(_ id: String) async {
-        listing = false
-        pending = true
-        problem = nil
-        defer { pending = false }
+        state.listing = false
+        state.pending = true
+        state.problem = nil
+        defer { state.pending = false }
         do {
             let response = try await selection.connection.send("GET", "routines/\(id)")
-            routine = try decode(response)
-        } catch { problem = "\(error)" }
+            state.routine = try decode(response)
+        } catch { state.problem = "\(error)" }
     }
 
     private func change(
         _ id: String, path: String = "", method: String = "POST", body: [String: String]? = nil
     ) async {
-        guard !pending else { return }
-        pending = true
-        problem = nil
-        defer { pending = false }
+        guard !state.pending else { return }
+        state.pending = true
+        state.problem = nil
+        defer { state.pending = false }
         do {
             _ = try await selection.connection.send(method, "routines/\(id)\(path)", json: body)
-            if path == "/run-now" { triggerID = UUID().uuidString }
-            editing = false
+            if path == "/run-now" { state.triggerID = UUID().uuidString }
+            state.editing = false
             await show(id)
-        } catch { problem = "\(error)" }
+        } catch { state.problem = "\(error)" }
     }
 
     private func openReport(_ routineID: String, _ occurrenceID: String) async {
-        pending = true
-        problem = nil
-        defer { pending = false }
+        state.pending = true
+        state.problem = nil
+        defer { state.pending = false }
         do {
             let response = try await selection.connection.send(
                 "GET", "routines/\(routineID)/occurrences/\(occurrenceID)/report")
-            report = response["content"] as? String
-        } catch { problem = "\(error)" }
+            state.report = response["content"] as? String
+        } catch { state.problem = "\(error)" }
     }
 }
