@@ -102,7 +102,7 @@ return {state: await page.evaluate(({form, reference}) => {
 async def _inspect(view: BrowserView, path: Path, tab: str, body: LocalBrowserStep) -> str:
     args = json.dumps({"form": body.form.model_dump(), "reference": body.step})
     cmd = _INSPECT.replace("ARGS", args)
-    raw = await view._command(path, "execute", "--tab", tab, "--code", cmd, timeout=15)
+    raw = await view._command(path, "execute", cmd, f"--tab={tab}", timeout=15)
     # The CLI can add tab diagnostics before its JSON result.
     for line in reversed(raw.decode("utf-8", "replace").splitlines()):
         with suppress(ValueError, AttributeError, TypeError):
@@ -165,9 +165,8 @@ def local_routes(view: BrowserView) -> APIRouter:
             state = await _inspect_existing(view, path, tab, body)
             if state != "ready":
                 return {"state": "delivered" if state == "delivered" else "uncertain"}
-            view.relay.home.mkdir(parents=True, exist_ok=True, mode=0o700)
             try:
-                with TemporaryDirectory(dir=view.relay.home) as folder:
+                with TemporaryDirectory(prefix="bud-delivery-") as folder:
                     copy = Path(folder) / body.file.name
                     if copy.parent != Path(folder) or body.file.name in {".", ".."}:
                         raise HTTPException(422, "Invalid file name.")
