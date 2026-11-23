@@ -130,6 +130,14 @@ class RecoveryRefused(Exception):
     pass
 
 
+class StaleApproval(Exception):
+    def __init__(self) -> None:
+        super().__init__(
+            "Bud was updated after this action was proposed. "
+            "Revise the request for a fresh approval."
+        )
+
+
 class ApprovalExpired(Exception):
     def __init__(self, approval_id: str) -> None:
         self.approval_id = approval_id
@@ -1239,6 +1247,8 @@ class Runner(DBOSConfiguredInstance):
         if request.get("tool") == "ask_user":
             # Questions carry information; a decision cannot. Send the answer instead.
             raise DecisionRejected(approval_id, expects_answer=True)
+        if approved and self._config_changed(_proposing_run(events, request["run_id"])):
+            raise StaleApproval()
         event_type = "approval.granted" if approved else "approval.denied"
         event = self.hub.publish_once(
             session_id, event_type, {"approval_id": approval_id, "origin": origin}
@@ -1378,11 +1388,7 @@ class Runner(DBOSConfiguredInstance):
             },
         )
         run = self._inputs(session_id, None, results)
-        queued = next(
-            event.data
-            for event in events
-            if event.type == "run.queued" and event.data["run_id"] == request["run_id"]
-        )
+        queued = _proposing_run(events, request["run_id"])
         run |= {
             # Rebuild history from the log, then append the approved call to it.
             "conversation_run": None,
@@ -1395,6 +1401,9 @@ class Runner(DBOSConfiguredInstance):
             },
             "skills": queued.get("skills", run["skills"]),
             "request": queued.get("request"),
+            # Fence a grant recorded before an upgrade but queued afterward.
+            "version": queued.get("version"),
+            "config": queued.get("config"),
         }
         self.hub.publish_once(
             session_id, "run.queued", run, key=f"late:{request['approval_id']}:queued"
@@ -1499,14 +1508,15 @@ class Runner(DBOSConfiguredInstance):
                 None,
             )
         run = self._inputs(session_id, None, results, origin=origin)
-        prev_queued = next(
-            (
-                event.data
-                for event in reversed(events)
-                if event.type == "run.queued" and event.data["run_id"] == batch[0]["run_id"]
-            ),
-            {},
-        )
+        prev_queued = _proposing_run(events, batch[0]["run_id"])
+        if any(
+            decided.get(request["approval_id"]) and request["tool"] != "ask_user"
+            for request in batch
+        ):
+            # A recorded approval authorizes the proposing build, even if the server
+            # restarted before it could queue the continuation.
+            run["version"] = prev_queued.get("version")
+            run["config"] = prev_queued.get("config")
         run["skills"] = prev_queued.get("skills", run["skills"])
         run["request"] = prev_queued.get("request")
         for key in (
@@ -2213,6 +2223,17 @@ class Runner(DBOSConfiguredInstance):
 
 
 NOTE_CHARS = 300
+
+
+def _proposing_run(events: list[Event], run_id: str) -> dict:
+    return next(
+        (
+            event.data
+            for event in reversed(events)
+            if event.type == "run.queued" and event.data["run_id"] == run_id
+        ),
+        {},
+    )
 
 
 def _failure(error: BaseException) -> dict[str, str]:
