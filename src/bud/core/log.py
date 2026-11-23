@@ -344,12 +344,28 @@ class EventLog:
         return row[0] if row and row[0] else None
 
     def completed_turn_source(self, session_id: str, run_id: str) -> tuple[int, datetime] | None:
-        """Locate a recalled turn in its original conversation, without loading the transcript."""
+        """Locate the start of a recalled exchange, including the owner's original words."""
         with self._connect() as db:
             row = db.execute(
-                "SELECT seq, created_at FROM events "
-                "WHERE session_id = ? AND event_key = ? AND type = 'run.completed'",
-                (session_id, f"{run_id}:terminal"),
+                """
+                WITH completion AS (
+                    SELECT seq, created_at FROM events
+                    WHERE session_id = :session AND event_key = :terminal
+                      AND type = 'run.completed'
+                )
+                SELECT seq, created_at FROM events
+                WHERE session_id = :session AND type = 'user.message'
+                  AND seq < (SELECT seq FROM completion)
+                  AND seq > COALESCE((
+                      SELECT MAX(seq) FROM events
+                      WHERE session_id = :session AND type = 'run.completed'
+                        AND seq < (SELECT seq FROM completion)
+                  ), 0)
+                UNION ALL
+                SELECT seq, created_at FROM completion
+                ORDER BY seq LIMIT 1
+                """,
+                {"session": session_id, "terminal": f"{run_id}:terminal"},
             ).fetchone()
         return (row[0], datetime.fromisoformat(row[1])) if row else None
 

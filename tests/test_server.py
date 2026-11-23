@@ -363,9 +363,15 @@ def test_fresh_conversation_cites_tagged_sources_after_restart(tmp_path):
         model_messages = json.dumps(result.data["messages"])
         # Each earlier turn is a tagged excerpt; the run keeps what each tag points to.
         recalled = result.data["recalled"]
+        original_message, correction_message = [
+            event
+            for event in EventLog(server.data / "bud.db").read(first_session)
+            if event.type == "user.message"
+        ]
+        said, asked = original_message.seq, correction_message.seq
         assert {(s["session_id"], s["seq"]) for s in recalled.values()} == {
-            (first_session, first.seq),
-            (first_session, second.seq),
+            (first_session, said),
+            (first_session, asked),
         }
         for tag, source in recalled.items():
             assert f"[{tag}] (earlier conversation, {source['date']})" in model_messages
@@ -379,22 +385,18 @@ def test_fresh_conversation_cites_tagged_sources_after_restart(tmp_path):
         # The transcript carries the sources, so a client can show the tag as a link.
         assert server.snapshot(fresh)["transcript"][-1]["sources"] == sources
 
-        said, asked = [
-            event.seq
-            for event in EventLog(server.data / "bud.db").read(first_session)
-            if event.type == "user.message"
-        ]
-        cited = server.request("GET", f"/sessions/{first_session}/source/{second.seq}")
-        assert cited["date"] == second.created_at.date().isoformat()
-        # The whole conversation, so the client can open it at the cited reply.
+        cited = server.request("GET", f"/sessions/{first_session}/source/{asked}")
+        assert cited["date"] == correction_message.created_at.date().isoformat()
+        # The whole conversation, so the client can open it at the owner correction.
         assert [(t["role"], t["seq"]) for t in cited["turns"]] == [
             ("user", said),
             ("assistant", first.seq),
             ("user", asked),
             ("assistant", second.seq),
         ]
-        assert cited["turns"][2]["text"] == correction
-        source_url = f"/sessions/{first_session}/source/{second.seq}"
+        assert cited["seq"] == asked
+        assert next(t["text"] for t in cited["turns"] if t["seq"] == asked) == correction
+        source_url = f"/sessions/{first_session}/source/{asked}"
         assert server.client.get(source_url, headers={"Authorization": ""}).status_code == 401
         server.request("GET", f"/sessions/{first_session}/source/999999", status=404)
 
