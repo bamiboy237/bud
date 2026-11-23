@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 import shlex
+import socket
 import sys
 from collections.abc import Callable
 from dataclasses import replace
@@ -13,16 +14,20 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from pydantic_ai import RunContext, Tool
+from pydantic_ai import Agent, RunContext, Tool
 from pydantic_ai.exceptions import ApprovalRequired, ToolFailed
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
-from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.toolsets import CombinedToolset, FunctionToolset
 from pydantic_ai.usage import RunUsage
 
-from bud import browser
+from bud import browser, web
 from bud.composio.binding import ConnectionError
+from bud.config import Settings
 from bud.core.profiles import Mode, apply_mode
 from bud.harness.actions import ActionGateway, Policy
+from bud.harness.agent import load_system_prompt
 from bud.harness.review import ReviewResult, ToolReviewer, Verdict
 from bud.photon_ui import action_preview
 
@@ -602,3 +607,111 @@ def test_a_page_cannot_write_its_own_words_onto_the_card():
     # A long address keeps its end, where the action is.
     long = "https://shop.example/" + "a" * 400 + "/delete"
     assert describe({"tag": "a", "label": "x", "href": long}).endswith("/delete")
+
+
+async def test_prompt_and_tool_guidance_prefer_web_tools_before_enable_browser(relay, tmp_path):
+    system_prompt = load_system_prompt()
+    assert "search_web" in system_prompt
+    assert "read_webpage" in system_prompt
+    assert "enable_browser" in system_prompt
+
+    assert "search_web" in web.GUIDANCE
+    assert "read_webpage" in web.GUIDANCE
+    assert "enable_browser" in web.GUIDANCE
+
+    assert "search_web" in browser.GUIDANCE
+    assert "read_webpage" in browser.GUIDANCE
+    assert "enable_browser" in browser.GUIDANCE
+
+    consent = browser.Consent(tmp_path / "consent.json")
+    web_tools = await web.build_tools(Settings(data_dir=tmp_path)).get_tools(ctx())
+    control_tools = await FunctionToolset(browser.control_tools(consent, relay)).get_tools(ctx())
+
+    search_desc = web_tools["search_web"].tool_def.description or ""
+    read_desc = web_tools["read_webpage"].tool_def.description or ""
+    enable_desc = control_tools["enable_browser"].tool_def.description or ""
+
+    assert "before any browser tools" in search_desc
+    assert "without opening a browser" in read_desc
+    assert "fallback" in enable_desc
+    assert "search_web" in enable_desc
+    assert "read_webpage" in enable_desc
+
+
+async def test_deterministic_model_tries_web_lookup_before_falling_back_to_enable_browser(
+    relay, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 0))],
+    )
+    cassette = web.Cassette(tmp_path / "cassette.json")
+    cassette.put(
+        "web_search_exa",
+        {"query": "latest Python release", "objective": "Find current version", "numResults": 5},
+        {"results": [{"url": "https://www.python.org/", "title": "Python 3.14"}]},
+    )
+
+    consent = browser.Consent(tmp_path / "consent.json")
+    toolset = CombinedToolset(
+        [
+            web.build_tools(Settings(data_dir=tmp_path), cassette=cassette),
+            FunctionToolset(browser.control_tools(consent, relay)),
+        ]
+    )
+    instructions = load_system_prompt() + web.GUIDANCE + browser.GUIDANCE
+
+    seen_calls: list[str] = []
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.instructions is not None
+        assert "search_web and read_webpage" in info.instructions
+        by_name = {tool.name: tool.description or "" for tool in info.function_tools}
+        assert "search_web" in by_name["enable_browser"]
+        assert "read_webpage" in by_name["enable_browser"]
+
+        prompt = str(getattr(messages[0].parts[-1], "content", ""))
+        tool_returns = [
+            part
+            for message in messages
+            for part in message.parts
+            if part.part_kind == "tool-return"
+        ]
+        if "latest Python release" in prompt:
+            if not tool_returns:
+                seen_calls.append("search_web")
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            "search_web",
+                            {
+                                "query": "latest Python release",
+                                "objective": "Find current version",
+                            },
+                        )
+                    ]
+                )
+            return ModelResponse(parts=[TextPart("Python 3.14 (https://www.python.org/).")])
+
+        if not tool_returns:
+            seen_calls.append("read_webpage")
+            return ModelResponse(
+                parts=[ToolCallPart("read_webpage", {"urls": ["https://public.example/login"]})]
+            )
+        if len(tool_returns) == 1:
+            seen_calls.append("enable_browser")
+            return ModelResponse(parts=[ToolCallPart("enable_browser", {})])
+        return ModelResponse(parts=[TextPart("Fallback requested.")])
+
+    agent = Agent(FunctionModel(respond), instructions=instructions, toolsets=[toolset])
+
+    plain = await agent.run("What is the latest Python release?")
+    assert "Python 3.14" in plain.output
+    assert seen_calls == ["search_web"]
+    assert not consent.on()
+
+    seen_calls.clear()
+    fallback = await agent.run("Check https://public.example/login")
+    assert "Fallback requested." in fallback.output
+    assert seen_calls == ["read_webpage", "enable_browser"]
