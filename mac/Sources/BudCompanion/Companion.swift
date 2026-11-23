@@ -235,13 +235,15 @@ final class Companion {
     /// How many things wait on you: decisions, setups, and stalled jobs. The pet's badge.
     var waitingCount: Int { openApprovals.count + setups.count + stalledCount }
     private var stalledCount: Int { activeTasks.filter { $0.status == "stalled" }.count }
+    /// Pure approval deck state machine (selection index, deciding set, batch lock, failures).
+    private(set) var approvalDeck = ApprovalDeckMachine()
     /// Decisions sent and not yet confirmed: their buttons stay disabled, so one click is one call.
-    private(set) var deciding: Set<String> = []
+    var deciding: Set<String> { approvalDeck.deciding }
     /// True while a batch approval is running, so single decisions wait for it.
-    private(set) var approvingBatch = false
+    var approvingBatch: Bool { approvalDeck.approvingBatch }
     /// Why the last decision didn't go through, shown on the card.
-    private(set) var decisionProblem: String?
-    private(set) var approvalFailures: [String: String] = [:]
+    var decisionProblem: String? { approvalDeck.decisionProblem }
+    var approvalFailures: [String: String] { approvalDeck.failures }
     /// True while any pending item is a question rather than a permission request.
     var hasQuestion: Bool { approvals.contains(where: \.isQuestion) }
     /// What the input field's text is for.
@@ -273,12 +275,18 @@ final class Companion {
     /// Send to first streamed text, for the latency baseline.
     var lastFirstText: Duration?
 
+    /// Pure connection lifecycle state machine with monotonic attempt fencing and exponential backoff.
+    private(set) var connectionMachine = ConnectionMachine()
+    /// Brief confirmation flag for the menu bar when diagnostics are copied.
+    private(set) var diagnosticsCopied = false
+    @ObservationIgnored private var diagnosticsClearTask: Task<Void, Never>?
+
     @ObservationIgnored private var connection: BudConnection?
     @ObservationIgnored private var session = ""
     @ObservationIgnored private var follower: Task<Void, Never>?
     @ObservationIgnored private var handshake: Task<Void, Never>?
     /// Bumped by each start(), so a slower earlier connection can't install itself afterwards.
-    @ObservationIgnored private var generation = 0
+    private var generation: Int { connectionMachine.attempt }
     @ObservationIgnored private var approvalPoll: Task<Void, Never>?
     @ObservationIgnored private var batchTask: Task<Void, Never>?
     /// The newest stored event handled, so an older snapshot can't undo a newer event.
@@ -296,7 +304,6 @@ final class Companion {
     /// step after a restart, so its partial text is dropped instead of shown twice.
     @ObservationIgnored private var seenRequests: Set<String> = []
     @ObservationIgnored private var retry: Task<Void, Never>?
-    @ObservationIgnored private var retryDelay: Duration = .seconds(1)
     @ObservationIgnored private var sentAt: ContinuousClock.Instant?
     @ObservationIgnored private var settle: Task<Void, Never>?
     @ObservationIgnored private var pacer: Task<Void, Never>?
@@ -330,64 +337,97 @@ final class Companion {
 
     /// Connect (or reconnect after a settings change): handshake, primary session, snapshot, stream.
     func start() {
-        generation += 1
+        startConnection(resetBackoff: true)
+    }
+
+    private func startConnection(resetBackoff: Bool) {
         attachmentSelection = nil
         setupMonitor?.cancel()
         setupMonitor = nil
         fastPollRemaining = 0
         batchTask?.cancel()
-        approvingBatch = false
-        deciding.removeAll()
-        approvalFailures = [:]
+        approvalDeck.reset()
         setups = []
         updatingSetups = []
         setupProblems = [:]
         activeTasks = []
         connection = nil
-        let mine = generation
-        handshake?.cancel()
-        follower?.cancel()
-        retry?.cancel()
-        approvalPoll?.cancel()
-        link = .connecting
-        handshake = Task {
-            do {
-                var connection = try BudConnection(settings: BudSettings.load())
-                let runtime = try await connection.send("GET", "runtime")
-                connection.scope = runtime["scope"] as? String ?? ""
-                let primary = try await connection.send("POST", "sessions/primary", json: [:])
-                guard let session = primary["session_id"] as? String else {
-                    throw ConnectionError.http(0, "no session returned")
-                }
-                let snapshot = try await connection.send("GET", "sessions/\(session)")
-                // A newer start() owns the companion now; this one bows out.
-                guard mine == generation else { return }
-                self.connection = connection
-                self.session = session
-                seenSeq = 0
-                apply(snapshot: snapshot)
-                let start = snapshot["last_seq"] as? Int ?? 0
-                // The companion lives as long as the app, so a strong capture is fine.
-                follower = Task {
-                    await followEvents(connection, session: session, after: start) { signal in
-                        Companion.shared.receive(signal, generation: mine)
+        let effects = connectionMachine.reduce(.start(resetBackoff: resetBackoff))
+        link = connectionMachine.link
+        applyConnectionEffects(effects)
+    }
+
+    private func applyConnectionEffects(_ effects: [ConnectionMachine.Effect]) {
+        for effect in effects {
+            switch effect {
+            case .cancelPending:
+                handshake?.cancel()
+                follower?.cancel()
+                retry?.cancel()
+                approvalPoll?.cancel()
+            case .beginHandshake(let mine):
+                handshake = Task {
+                    do {
+                        var connection = try BudConnection(settings: BudSettings.load())
+                        let runtime = try await connection.send("GET", "runtime")
+                        connection.scope = runtime["scope"] as? String ?? ""
+                        let primary = try await connection.send("POST", "sessions/primary", json: [:])
+                        guard let session = primary["session_id"] as? String else {
+                            throw ConnectionError.http(0, "no session returned")
+                        }
+                        let snapshot = try await connection.send("GET", "sessions/\(session)")
+                        let nextEffects = connectionMachine.reduce(.handshakeSucceeded(attempt: mine))
+                        guard !nextEffects.isEmpty else { return }
+                        self.connection = connection
+                        self.session = session
+                        seenSeq = 0
+                        apply(snapshot: snapshot)
+                        let startSeq = snapshot["last_seq"] as? Int ?? 0
+                        for next in nextEffects {
+                            if case .startStream(let attempt) = next {
+                                // The companion lives as long as the app, so a strong capture is fine.
+                                follower = Task {
+                                    await followEvents(connection, session: session, after: startSeq) { signal in
+                                        Companion.shared.receive(signal, generation: attempt)
+                                    }
+                                }
+                            }
+                        }
+                    } catch ConnectionError.unreachable {
+                        let nextEffects = connectionMachine.reduce(
+                            .handshakeFailed(
+                                attempt: mine,
+                                reason: "\(ConnectionError.unreachable)",
+                                retryable: true,
+                                jitterUnit: Double.random(in: 0...1)
+                            ))
+                        guard !nextEffects.isEmpty else { return }
+                        link = connectionMachine.link
+                        applyConnectionEffects(nextEffects)
+                    } catch {
+                        let nextEffects = connectionMachine.reduce(
+                            .handshakeFailed(
+                                attempt: mine,
+                                reason: "\(error)",
+                                retryable: false,
+                                jitterUnit: 0.5
+                            ))
+                        guard !nextEffects.isEmpty else { return }
+                        link = connectionMachine.link
+                        applyConnectionEffects(nextEffects)
                     }
                 }
-                retryDelay = .seconds(1)
-            } catch ConnectionError.unreachable {
-                guard mine == generation else { return }
-                // bud isn't up yet (or is restarting): keep trying quietly, backing off to 15 s.
-                link = .problem("\(ConnectionError.unreachable)")
-                let delay = retryDelay
-                retryDelay = min(retryDelay * 2, .seconds(15))
+            case .scheduleRetry(let mine, let delay):
                 retry = Task {
                     try? await Task.sleep(for: delay)
-                    if !Task.isCancelled { start() }
+                    guard !Task.isCancelled else { return }
+                    let nextEffects = connectionMachine.reduce(.retryTimerFired(attempt: mine))
+                    guard !nextEffects.isEmpty else { return }
+                    link = connectionMachine.link
+                    applyConnectionEffects(nextEffects)
                 }
-            } catch {
-                guard mine == generation else { return }
-                // A bad token or URL: retrying can't help, so wait for Settings or Reconnect.
-                link = .problem("\(error)")
+            case .startStream:
+                break
             }
         }
     }
@@ -509,9 +549,7 @@ final class Companion {
         if !Set(approvals.map(\.id)).isSubset(of: openApprovals) { arrivals += 1 }
         openApprovals = Set(approvals.map(\.id))
         questionFlows = questionFlows.filter { openApprovals.contains($0.key) }
-        deciding.formIntersection(openApprovals)
-        approvalFailures = approvalFailures.filter { openApprovals.contains($0.key) }
-        if approvals.isEmpty { decisionProblem = nil }
+        approvalDeck.sync(ids: approvals.map(\.id))
         approvalPoll?.cancel()
         // Child-session activity is not streamed here. Refresh until open decisions and
         // stalled jobs no longer need the owner.
@@ -999,14 +1037,23 @@ final class Companion {
         approve(failedApprovals(for: approval))
     }
 
+    func selectPreviousApproval() {
+        approvalDeck.selectPrevious()
+    }
+
+    func selectNextApproval() {
+        approvalDeck.selectNext()
+    }
+
+    func setApprovalAnimating(_ animating: Bool) {
+        approvalDeck.setAnimating(animating)
+    }
+
     private func approve(_ batch: [Approval]) {
-        guard let connection, !approvingBatch, deciding.isEmpty, !batch.isEmpty else { return }
         let ids = batch.map(\.id)
+        guard let connection, let attempt = approvalDeck.beginBatch(ids: ids) else { return }
         let route = "sessions/\(session)/approvals/"
         let mine = generation
-        approvingBatch = true
-        deciding.formUnion(ids)
-        decisionProblem = nil
         batchTask = Task {
             let result = await ApprovalBatch.approve(ids) { id in
                 try Task.checkCancellation()
@@ -1014,19 +1061,16 @@ final class Companion {
                 return try await connection.send("POST", route + id, json: ["approved": true])
             }
             guard mine == generation else { return }
-            completeBatch(result, ids: ids)
+            completeBatch(result, ids: ids, attempt: attempt)
         }
     }
 
-    func completeBatch(_ result: ApprovalBatch.Result, ids: [String]) {
+    func completeBatch(_ result: ApprovalBatch.Result, ids: [String], attempt: Int? = nil) {
+        guard approvalDeck.completeBatch(
+            attempt: attempt, ids: ids, approved: result.approved, failures: result.failures
+        ) else { return }
         approvals.removeAll { result.approved.contains($0.id) }
         openApprovals.subtract(result.approved)
-        deciding.subtract(ids)
-        approvingBatch = false
-        for id in ids { approvalFailures.removeValue(forKey: id) }
-        for (id, failure) in result.failures where openApprovals.contains(id) {
-            approvalFailures[id] = failure
-        }
         showReceipt(text: "Approved \(result.approved.count) of \(ids.count) actions")
         refreshApprovals()
     }
@@ -1114,9 +1158,7 @@ final class Companion {
     private func respond(
         to id: String, path: String?, body: [String: any Sendable], after delay: Duration? = nil
     ) -> Bool {
-        guard let connection, !approvingBatch, !deciding.contains(id) else { return false }
-        deciding.insert(id)
-        decisionProblem = nil
+        guard let connection, let decisionAttempt = approvalDeck.beginDecision(id: id) else { return false }
         let route = "sessions/\(session)/approvals/\(id)" + (path.map { "/\($0)" } ?? "")
         // Typed in the field for this approval (an answer or a change), as opposed to a
         // button. A draft opened for another approval stays where it is.
@@ -1144,6 +1186,9 @@ final class Companion {
                 // Answers report `answered`; approvals and revisions report `applied`.
                 try ApprovalBatch.requireApplied(
                     response, key: path == "answer" ? "answered" : "applied")
+                guard approvalDeck.completeDecision(
+                    id: id, attempt: decisionAttempt, succeeded: true
+                ) else { return }
                 if let approval {
                     showReceipt(for: approval, path: path, approved: body["approved"] as? Bool,
                                 remember: body["remember"] as? Bool == true, answer: answer)
@@ -1151,14 +1196,11 @@ final class Companion {
                 // Gone from the card at once; the snapshot confirms and brings the next one.
                 approvals.removeAll { $0.id == id }
                 openApprovals.remove(id)
-                approvalFailures.removeValue(forKey: id)
             } catch {
                 guard mine == generation else { return }
-                if approvalFailures[id] != nil {
-                    approvalFailures[id] = "\(error)"
-                } else {
-                    decisionProblem = "That didn't go through: \(error)"
-                }
+                guard approvalDeck.completeDecision(
+                    id: id, attempt: decisionAttempt, succeeded: false, errorMessage: "\(error)"
+                ) else { return }
                 if !typed.isEmpty {
                     // Keep what was typed, so trying again is one Return.
                     savedDrafts[inputPurpose] = draft
@@ -1167,10 +1209,124 @@ final class Companion {
                     inputOpen = true
                 }
             }
-            deciding.remove(id)
             refreshApprovals()
         }
         return true
+    }
+
+    // MARK: Diagnostics
+
+    func diagnosticsSnapshot(
+        settings: BudSettings = BudSettings.load(),
+        voice: Voice = .shared,
+        bundle: Bundle = .main,
+        processInfo: ProcessInfo = .processInfo
+    ) -> DiagnosticsSnapshot {
+        let info = bundle.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "0.1.0"
+        let build = info?["CFBundleVersion"] as? String ?? "1"
+        let voiceStateText: String
+        var voiceError: String?
+        switch voice.state {
+        case .off:
+            voiceStateText = "off"
+        case .preparing(let fraction):
+            voiceStateText = "preparing (\(Int((fraction * 100).rounded()))%)"
+        case .ready:
+            voiceStateText = "ready"
+        case .listening:
+            voiceStateText = "listening"
+        case .transcribing:
+            voiceStateText = "transcribing"
+        case .failed(let message):
+            voiceStateText = "failed"
+            voiceError = "voice: \(message)"
+        }
+
+        var errors: [String] = []
+        if case .problem(let detail) = link {
+            errors.append("link: \(detail)")
+        }
+        if let decisionProblem {
+            errors.append("decision: \(decisionProblem)")
+        }
+        for key in approvalFailures.keys.sorted() {
+            if let value = approvalFailures[key] {
+                errors.append("approval[\(key)]: \(value)")
+            }
+        }
+        for key in setupProblems.keys.sorted() {
+            if let value = setupProblems[key] {
+                errors.append("setup[\(key)]: \(value)")
+            }
+        }
+        if let voiceError {
+            errors.append(voiceError)
+        }
+
+        return DiagnosticsSnapshot(
+            appVersion: version,
+            appBuild: build,
+            macOSVersion: processInfo.operatingSystemVersionString,
+            connectionPhase: connectionMachine.phase.label,
+            connectionAttempt: connectionMachine.attempt,
+            backoffAttempt: connectionMachine.backoffAttempt,
+            sessionID: session,
+            serverURL: connection?.base.absoluteString ?? settings.url,
+            petStatus: status.rawValue,
+            running: running,
+            pendingApprovalsCount: approvals.count,
+            pendingSetupsCount: setups.count,
+            activeTasksCount: activeTasks.count,
+            stalledTasksCount: stalledCount,
+            decidingCount: deciding.count,
+            approvingBatch: approvingBatch,
+            voiceState: voiceStateText,
+            voiceKey: voice.keyName,
+            needsAccessibility: voice.needsAccessibility,
+            recentNotices: notices.map(\.text),
+            recentErrors: errors
+        )
+    }
+
+    func formattedDiagnostics(
+        settings: BudSettings = BudSettings.load(),
+        voice: Voice = .shared,
+        bundle: Bundle = .main,
+        processInfo: ProcessInfo = .processInfo
+    ) -> String {
+        var secrets: [String] = []
+        if let token = connection?.token { secrets.append(token) }
+        if let envToken = processInfo.environment["OWNER_TOKEN"] { secrets.append(envToken) }
+        return DiagnosticsFormatter.format(
+            diagnosticsSnapshot(
+                settings: settings, voice: voice, bundle: bundle, processInfo: processInfo),
+            knownSecrets: secrets
+        )
+    }
+
+    func copyDiagnostics() {
+        let report = formattedDiagnostics()
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(report, forType: .string)
+
+        diagnosticsClearTask?.cancel()
+        diagnosticsCopied = true
+        let notice = Notice(text: "Diagnostics copied")
+        let openedBubbleHere = !windowOpen && !bubbleOpen
+        if !notices.contains(where: { $0.text == notice.text }) {
+            notices = Array((notices + [notice]).suffix(3))
+        }
+        if !windowOpen { bubbleOpen = true }
+        diagnosticsClearTask = Task {
+            try? await Task.sleep(for: .seconds(2.5))
+            guard !Task.isCancelled else { return }
+            diagnosticsCopied = false
+            notices.removeAll { $0.id == notice.id }
+            if openedBubbleHere, !needsAttention, shown.isEmpty, notices.isEmpty, receipt == nil {
+                bubbleOpen = false
+            }
+        }
     }
 
     // MARK: Events
@@ -1179,16 +1335,32 @@ final class Companion {
         guard from == generation else { return }
         switch signal {
         case .connected:
-            link = .connected
+            connectionMachine.reduce(.streamConnected(attempt: from))
+            link = connectionMachine.link
         case .lost:
-            link = .problem("Lost bud. Reconnecting…")
+            connectionMachine.reduce(
+                .streamLost(
+                    attempt: from,
+                    reason: "Lost bud. Reconnecting…",
+                    jitterUnit: Double.random(in: 0...1)
+                ))
+            link = connectionMachine.link
         case .fatal(401):
-            link = .problem("bud rejected the owner token.")
+            connectionMachine.reduce(
+                .streamFatal(attempt: from, reason: "bud rejected the owner token."))
+            link = connectionMachine.link
         case .fatal(409):
-            link = .problem("bud switched accounts. Reconnect from the menu.")
+            connectionMachine.reduce(
+                .streamFatal(
+                    attempt: from, reason: "bud switched accounts. Reconnect from the menu."))
+            link = connectionMachine.link
         case .fatal(let code):
-            link = .problem("bud closed the stream (\(code)).")
+            connectionMachine.reduce(
+                .streamFatal(attempt: from, reason: "bud closed the stream (\(code))."))
+            link = connectionMachine.link
         case .event(let event):
+            connectionMachine.reduce(.streamEventReceived(attempt: from))
+            if link != connectionMachine.link { link = connectionMachine.link }
             handle(event)
         }
     }
@@ -1270,6 +1442,7 @@ final class Companion {
                !approvals.contains(where: { $0.id == approval.id })
             {
                 approvals.append(approval)
+                approvalDeck.append(id: approval.id)
                 openApprovals.insert(approval.id)
                 arrivals += 1
             }
@@ -1287,6 +1460,7 @@ final class Companion {
                     approved: event.type == "approval.granted", remember: false,
                     answer: event.string("text"))
                 approvals.removeAll { $0.id == id }
+                approvalDeck.remove(id: id)
                 openApprovals.remove(id)
                 closeStaleInput()
             }

@@ -40,6 +40,9 @@ private struct MenuContent: View {
         voice
         Divider()
         Button("Reconnect") { companion.start() }
+        Button(companion.diagnosticsCopied ? "Diagnostics copied" : "Copy Diagnostics") {
+            companion.copyDiagnostics()
+        }
         SettingsLink { Text("Settings…") }
         Divider()
         Button("Quit bud") { NSApp.terminate(nil) }.keyboardShortcut("q")
