@@ -964,3 +964,53 @@ def test_crash_during_external_tool_inspects_uncertain_side_effect_without_repea
         )
         assert resumed["status"] == "active"
         assert resumed["pause_reason"] is None
+
+
+def test_chat_can_create_and_review_an_exact_routine(tmp_path):
+    owner_words = "Schedule the Monday briefing every Monday at 9 AM America/Chicago."
+    with running(tmp_path) as server:
+        session = server.request("POST", "/sessions", status=201)["session_id"]
+        server.request(
+            "POST", f"/sessions/{session}/messages", status=202, json={"text": owner_words}
+        )
+        approval = server.wait(
+            lambda: next(iter(server.snapshot(session)["pending_approvals"]), None),
+            "routine creation approval",
+        )
+        assert approval["tool"] == "create_routine"
+        assert approval["args"]["cron"] == "0 9 * * 1"
+        assert approval["args"]["timezone"] == "America/Chicago"
+        assert approval["grantable"] is False
+        assert server.request("GET", "/routines") == {"routines": []}
+        assert decide(server, session, approval, True) == {"applied": True}
+        routine = server.wait(
+            lambda: next(iter(server.snapshot(session)["routines"]), None),
+            "routine saved after approval",
+        )
+        assert routine["title"] == "Monday briefing"
+        assert routine["feed_id"] == routine["destination"]["feed_id"] == session
+        with sqlite3.connect(server.data / "bud.db") as db:
+            assert db.execute("SELECT owner_request FROM routines").fetchall() == [(owner_words,)]
+
+    with running(tmp_path) as server:
+        assert decide(server, session, approval, True) == {"applied": False}
+        assert len(server.request("GET", "/routines")["routines"]) == 1
+        other = server.request("POST", "/sessions", status=201)["session_id"]
+        for target, expected in (
+            (session, "Monday briefing"),
+            (other, "No routines in this chat."),
+        ):
+            server.request(
+                "POST",
+                f"/sessions/{target}/messages",
+                status=202,
+                json={"text": "List my routines"},
+            )
+            server.wait(
+                lambda target=target, expected=expected: (
+                    (turns := server.snapshot(target)["transcript"])
+                    and turns[-1]["text"] == expected
+                ),
+                "routine review in chat",
+            )
+            assert not server.snapshot(target)["pending_approvals"]

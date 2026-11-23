@@ -118,6 +118,7 @@ struct AttachmentInspector: View {
     let close: () -> Void
     @State private var content: Content?
     @State private var expanded = false
+    @State private var showDesktops = false
 
     private enum Content {
         case pdf(PDFDocument)
@@ -136,6 +137,15 @@ struct AttachmentInspector: View {
                     .truncationMode(.middle)
                     .help(selection.file.name)
                 Spacer()
+                Button { showDesktops.toggle() } label: {
+                    Image(systemName: "desktopcomputer.and.arrow.down")
+                }
+                .buttonStyle(IconButton(size: 24))
+                .help("Verify on paired desktops")
+                .accessibilityLabel("Verify on paired desktops")
+                .popover(isPresented: $showDesktops, arrowEdge: .bottom) {
+                    DesktopHandoffPicker(selection: selection).padding(16)
+                }
                 Button { expanded.toggle() } label: {
                     Image(systemName: expanded
                         ? "arrow.down.right.and.arrow.up.left"

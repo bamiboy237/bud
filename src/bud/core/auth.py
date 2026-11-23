@@ -9,15 +9,19 @@ import os
 import re
 import secrets
 import stat
+from collections.abc import Callable
 from contextlib import suppress
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer
 from pydantic import SecretStr
+from starlette.concurrency import run_in_threadpool
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from bud.config import Settings
+
+_WORKER_FILE = re.compile(r"/desktop-worker/work/[a-f0-9]{32}/file")
 
 
 class OwnerAuthError(Exception):
@@ -121,10 +125,17 @@ class OwnerAuthentication:
     entire app (including docs and future endpoints), rather than a route list.
     """
 
-    def __init__(self, app: ASGIApp, token: SecretStr, scope_id: str | None = None) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        token: SecretStr,
+        scope_id: str | None = None,
+        desktop_worker: Callable[[str], bool] | None = None,
+    ) -> None:
         self.app = app
         self.token = token
         self.scope_id = scope_id
+        self.desktop_worker = desktop_worker
         self.bearer = HTTPBearer(auto_error=False)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -137,6 +148,18 @@ class OwnerAuthentication:
         request = Request(scope)
         credentials = await self.bearer(request)
         headers = request.headers.getlist("authorization")
+        if (
+            self.desktop_worker is not None
+            and credentials is not None
+            and len(headers) == 1
+            and (
+                (request.method in {"GET", "PUT"} and scope["path"] == "/desktop-worker/work")
+                or (request.method == "GET" and _WORKER_FILE.fullmatch(scope["path"]))
+            )
+            and await run_in_threadpool(self.desktop_worker, credentials.credentials)
+        ):
+            await self.app(scope, receive, send)
+            return
         if (
             len(headers) != 1
             or credentials is None
