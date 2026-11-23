@@ -67,7 +67,7 @@ With two desktop IDs, the first verifies the file and the second opens the form.
 Bud reports readiness in the originating chat. If the site requires sign-in,
 complete it on the destination browser and click **Continue**. Then approve the
 file and destination with
-`bud desktop --url "$COORDINATOR" browser CHAT JOB_ID approve`.
+`bud desktop --url "$COORDINATOR" browser CHAT JOB_ID approve --desktop DESKTOP_ID`.
 
 While approval is still pending, Bud can wait for the destination or the owner
 can change it with `bud desktop retarget CHAT JOB_ID DESKTOP_ID`. The new
