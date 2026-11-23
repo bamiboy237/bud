@@ -78,12 +78,19 @@ private enum Rhythm {
 }
 
 private final class ScrollState: ObservableObject {
-    @Published var atBottom = true
-    var jumpingUntil: Date = .distantPast
+    @Published private(set) var machine = ScrollFollowMachine()
+
+    var atBottom: Bool { machine.atBottom }
+    var showsJumpButton: Bool { machine.showsJumpButton }
+
+    func update(nearBottom: Bool) {
+        var next = machine
+        next.reduce(.nearBottomChanged(nearBottom, now: .now))
+        if next != machine { machine = next }
+    }
 
     func jumpToBottom() {
-        jumpingUntil = Date.now.addingTimeInterval(0.35)
-        atBottom = true
+        machine.reduce(.jumpToBottom(now: .now))
     }
 }
 
@@ -133,18 +140,16 @@ private struct ConversationView: View {
                 .defaultScrollAnchor(.bottom)
                 .defaultScrollAnchor(.bottom, for: .sizeChanges)
                 .onScrollGeometryChange(for: Bool.self) { geometry in
-                    let scrollable = geometry.contentSize.height > geometry.containerSize.height + 80
-                    let distanceFromBottom = geometry.contentSize.height - geometry.visibleRect.maxY
-                    return !scrollable || distanceFromBottom <= 140
-                } action: { _, atBottom in
-                    if Date.now < scroll.jumpingUntil {
-                        if !scroll.atBottom { scroll.atBottom = true }
-                    } else if scroll.atBottom != atBottom {
-                        scroll.atBottom = atBottom
-                    }
+                    ScrollFollowMachine.isNearBottom(
+                        contentHeight: geometry.contentSize.height,
+                        containerHeight: geometry.containerSize.height,
+                        visibleMaxY: geometry.visibleRect.maxY
+                    )
+                } action: { _, nearBottom in
+                    scroll.update(nearBottom: nearBottom)
                 }
                 .overlay(alignment: .bottom) {
-                    if !scroll.atBottom {
+                    if scroll.showsJumpButton {
                         JumpButton {
                             scroll.jumpToBottom()
                             withAnimation(.easeOut(duration: 0.14)) {

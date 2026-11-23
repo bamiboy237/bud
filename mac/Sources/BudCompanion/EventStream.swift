@@ -32,13 +32,19 @@ enum StreamSignal: Sendable {
 /// No cookies, cache or credential store: the owner token is the only credential, sent per request.
 let budSession = URLSession(configuration: .ephemeral)
 
-/// Follows a session's events forever: reconnects after a second, resuming after the last
-/// stored event it saw, so a dropped connection or a server restart loses and repeats nothing.
+/// Follows a session's events forever: reconnects with exponential backoff and bounded jitter,
+/// resuming after the last stored event it saw, so a dropped connection or a server restart
+/// loses and repeats nothing.
 func followEvents(
-    _ connection: BudConnection, session: String, after start: Int,
+    _ connection: BudConnection,
+    session: String,
+    after start: Int,
+    initialBackoff: ReconnectBackoff = ReconnectBackoff(),
+    sleep: @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
     deliver: @escaping @Sendable @MainActor (StreamSignal) -> Void
 ) async {
     var lastSeq = start
+    var backoff = initialBackoff
     while !Task.isCancelled {
         var request = connection.request("GET", "sessions/\(session)/events")
         // bud sends a keep-alive every 15 s, so 45 s of silence means a dead connection.
@@ -52,6 +58,7 @@ func followEvents(
                 return
             }
             if (200..<300).contains(code) {
+                backoff.reset()
                 await deliver(.connected)
                 // bud writes each event as one `data:` line of JSON, so a line is a whole event.
                 // (`lines` drops the blank lines that end SSE frames; we don't need them.)
@@ -61,6 +68,7 @@ func followEvents(
                         continue
                     }
                     if !event.live { lastSeq = max(lastSeq, event.seq) }
+                    backoff.reset()
                     await deliver(.event(event))
                 }
             }
@@ -68,6 +76,7 @@ func followEvents(
             if Task.isCancelled { return }
         }
         await deliver(.lost)
-        try? await Task.sleep(for: .seconds(1))
+        let delay = backoff.nextDelay()
+        try? await sleep(delay)
     }
 }
