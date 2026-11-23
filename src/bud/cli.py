@@ -15,6 +15,7 @@ from pydantic_settings.exceptions import SettingsError
 from bud import __version__
 from bud.composio.binding import ConnectionError
 from bud.config import HOST, LOCAL_URL, PORT, get_settings
+from bud.core import handoff_client
 from bud.core.auth import OwnerAuthError
 from bud.core.client import chat
 from bud.evals.runner import evaluate
@@ -267,6 +268,7 @@ def _main(argv: list[str] | None = None) -> None:
     chat_parser.add_argument("session", nargs="?", help="session id to attach to")
     chat_parser.add_argument("--new", action="store_true", help="start a separate conversation")
     chat_parser.add_argument("--url", default=LOCAL_URL)
+    handoff_client.arguments(commands)
     args = parser.parse_args(argv)
     if args.command == "ask":
         asyncio.run(ask(args.prompt, args.tier, args.model))
@@ -316,6 +318,8 @@ def _main(argv: list[str] | None = None) -> None:
             # Mac app) keeps a stopped server alive forever, holding bud.lock.
             # Clients resume by seq.
             uvicorn.run(app, host=HOST, port=PORT, timeout_graceful_shutdown=SHUTDOWN_SECONDS)
+    elif args.command == "desktop":
+        handoff_client.main(args)
     elif args.command == "chat":
         if args.new and args.session:
             parser.error("Use either a session ID or --new, not both.")
