@@ -1,27 +1,48 @@
 import Foundation
 
-/// An earlier message a reply cites: which conversation, which message in it, and its date.
+enum SourceKind: Equatable {
+    case turn(session: String, seq: Int)
+    case workspace(path: String)
+}
+
+/// An earlier message or workspace file a reply cites, with its short display label.
 struct Source: Equatable {
-    let session: String
-    let seq: Int
-    /// "Nov 18", or "Nov 18, 2025" from another year.
+    let kind: SourceKind
+    /// "Nov 18", "Nov 18, 2025", or a workspace relative path like "reports/weekly.md".
     let label: String
 }
 
-/// A reply cites an earlier message by a short tag, like `[S1]`, which bud chose and the
-/// model copied. The run's `sources` say what each tag points to. Here a tag becomes a link
-/// you can click; a tag the run doesn't know is dropped, since the model made it up.
+enum SourceTarget: Equatable {
+    case turn(session: String, seq: Int)
+    case workspace(path: String)
+}
+
+/// A reply cites an earlier message or workspace file by a short tag, like `[S1]`, which bud
+/// chose and the model copied. The run's `sources` say what each tag points to. Here a tag becomes
+/// a link you can click; a tag the run doesn't know is dropped, since the model made it up.
 enum Citations {
     static let scheme = "bud-source"
 
-    /// Tags as markdown links that open the cited message.
+    /// Tags as markdown links that open the cited message or workspace file.
     static func linked(_ text: String, sources: [String: Source]) -> String {
         replacing(text, sources) { source in
-            " [\(source.label)](\(scheme)://\(source.session)/\(source.seq))"
+            switch source.kind {
+            case .turn(let session, let seq):
+                return " [\(source.label)](\(scheme)://\(session)/\(seq))"
+            case .workspace(let path):
+                var components = URLComponents()
+                components.scheme = scheme
+                components.host = "workspace"
+                components.queryItems = [URLQueryItem(name: "path", value: path)]
+                let destination = (components.string ?? "\(scheme)://workspace")
+                    .replacingOccurrences(of: "(", with: "%28")
+                    .replacingOccurrences(of: ")", with: "%29")
+                return " [\(source.label)](\(destination))"
+            }
         }
     }
 
-    /// Tags as plain dates, for copying a reply somewhere links don't open.
+    /// Tags as plain dates or paths, for copying a reply somewhere links don't open.
     static func plain(_ text: String, sources: [String: Source]) -> String {
         replacing(text, sources) { " (\($0.label))" }
     }
@@ -31,20 +52,32 @@ enum Citations {
         guard let raw = raw as? [String: Any] else { return [:] }
         return raw.compactMapValues { value in
             guard let value = value as? [String: Any],
-                  let session = value["session_id"] as? String,
-                  let seq = value["seq"] as? Int,
                   let label = value["label"] as? String
             else { return nil }
-            return Source(session: session, seq: seq, label: label)
+            if value["kind"] as? String == "workspace",
+               let path = value["path"] as? String, !path.isEmpty {
+                return Source(kind: .workspace(path: path), label: label)
+            }
+            guard let session = value["session_id"] as? String,
+                  let seq = value["seq"] as? Int
+            else { return nil }
+            return Source(kind: .turn(session: session, seq: seq), label: label)
         }
     }
 
-    /// The conversation and message a source link opens, or nil for any other link.
-    static func target(_ url: URL) -> (session: String, seq: Int)? {
-        guard url.scheme == scheme, let session = url.host(), !session.isEmpty,
-              let seq = Int(url.lastPathComponent)
-        else { return nil }
-        return (session, seq)
+    /// The conversation message or workspace file a source link opens, or nil for any other link.
+    static func target(_ url: URL) -> SourceTarget? {
+        guard url.scheme == scheme, let host = url.host(), !host.isEmpty else { return nil }
+        if host == "workspace" {
+            let path = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?
+                .first(where: { $0.name == "path" })?
+                .value
+            guard let path, !path.isEmpty else { return nil }
+            return .workspace(path: path)
+        }
+        guard let seq = Int(url.lastPathComponent) else { return nil }
+        return .turn(session: host, seq: seq)
     }
 
     private static func replacing(
@@ -64,31 +97,39 @@ enum Focus: Equatable {
     case latest
 }
 
-/// A cited message and the whole conversation it belongs to, opened at that message.
+/// A cited message or workspace file opened beside the chat.
 struct SourcePanel: Equatable {
-    let session: String
-    let seq: Int
+    let target: SourceTarget
     /// "Tuesday, Nov 18, 2026"; empty while loading.
     var date = ""
     var turns: [Turn] = []
+    var document: String?
     var problem: String?
 
-    var loading: Bool { turns.isEmpty && problem == nil }
+    var loading: Bool { turns.isEmpty && document == nil && problem == nil }
 
-    init(session: String, seq: Int, problem: String? = nil) {
-        self.session = session
-        self.seq = seq
+    init(target: SourceTarget, problem: String? = nil) {
+        self.target = target
         self.problem = problem
     }
 
     init?(_ raw: [String: Any]) {
+        let formattedDate = (raw["date"] as? String)
+            .flatMap(Self.day.date(from:))
+            .map { $0.formatted(.dateTime.weekday(.wide).month(.abbreviated).day().year()) } ?? ""
+        if raw["kind"] as? String == "workspace",
+           let path = raw["path"] as? String,
+           let content = raw["content"] as? String {
+            self.init(target: .workspace(path: path))
+            date = formattedDate
+            document = content
+            return
+        }
         guard let session = raw["session_id"] as? String, let seq = raw["seq"] as? Int else {
             return nil
         }
-        self.init(session: session, seq: seq)
-        if let day = (raw["date"] as? String).flatMap(Self.day.date(from:)) {
-            date = day.formatted(.dateTime.weekday(.wide).month(.abbreviated).day().year())
-        }
+        self.init(target: .turn(session: session, seq: seq))
+        date = formattedDate
         turns = (raw["turns"] as? [[String: Any]] ?? []).compactMap { turn in
             guard let text = turn["text"] as? String, !text.isEmpty else { return nil }
             return Turn(

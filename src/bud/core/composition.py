@@ -144,6 +144,7 @@ def compose_runner(
         recall_path,
         embedder=embedder(settings),
         memory=harness.memory,
+        workspace=workspace,
     )
     return runner_cls(
         hub,

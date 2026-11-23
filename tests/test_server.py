@@ -399,6 +399,70 @@ def test_fresh_conversation_cites_tagged_sources_after_restart(tmp_path):
         server.request("GET", f"/sessions/{first_session}/source/999999", status=404)
 
 
+def test_workspace_report_is_recalled_cited_and_opened_in_fresh_chat(tmp_path):
+    ask = completed_turn
+    with running(tmp_path) as server:
+        workspace = server.data / "workspace"
+        reports = workspace / "reports"
+        reports.mkdir(parents=True, exist_ok=True)
+        rel = "reports/2026-11-19-job-1-marigold.md"
+        report = workspace / rel
+        report.write_text("# Marigold Review\n\nThe Marigold review is on Tuesday.\n")
+        (workspace / ".env").write_text("MARIGOLD_SECRET=do-not-recall\n")
+        (workspace / "secrets.md").write_text("The Marigold review secret token.\n")
+
+        fresh = server.request("POST", "/sessions", status=201)["session_id"]
+        result = ask(server, fresh, "When is the Marigold review?", "recall", 1)
+        model_messages = json.dumps(result.data["messages"])
+        recalled = result.data["recalled"]
+        assert list(recalled.values()) == [
+            {
+                "kind": "workspace",
+                "path": rel,
+                "date": recalled["S1"]["date"],
+                "label": rel,
+            }
+        ]
+        assert f"[S1] (workspace file {rel}, {recalled['S1']['date']})" in model_messages
+        assert result.data["sources"] == recalled
+        assert server.snapshot(fresh)["transcript"][-1]["sources"] == recalled
+
+        opened = server.request("GET", "/workspace/source", params={"path": rel})
+        assert opened == {
+            "kind": "workspace",
+            "path": rel,
+            "date": recalled["S1"]["date"],
+            "content": "# Marigold Review\n\nThe Marigold review is on Tuesday.\n",
+        }
+        assert (
+            server.client.get(
+                "/workspace/source", params={"path": rel}, headers={"Authorization": ""}
+            ).status_code
+            == 401
+        )
+        for denied in (".env", "secrets.md", "../bud.db"):
+            server.request("GET", "/workspace/source", params={"path": denied}, status=404)
+
+        # Updating and then deleting workspace files updates and removes them from recall.
+        report.write_text("# Weekly Summary\n\nSaffron launch is on Thursday.\n")
+        ephemeral = workspace / "notes" / "tangerine.md"
+        ephemeral.parent.mkdir(parents=True, exist_ok=True)
+        ephemeral.write_text("Tangerine deadline is Friday.\n")
+
+        second = server.request("POST", "/sessions", status=201)["session_id"]
+        after_update = ask(server, second, "Saffron launch", "recall-2", 1)
+        assert "Saffron launch is on Thursday." in json.dumps(after_update.data["messages"])
+        assert after_update.data["recalled"]["S1"]["path"] == rel
+
+        ephemeral.unlink()
+        third = server.request("POST", "/sessions", status=201)["session_id"]
+        after_delete = ask(server, third, "Tangerine deadline", "recall-3", 1)
+        assert "recalled" not in after_delete.data
+
+        report.unlink()
+        server.request("GET", "/workspace/source", params={"path": rel}, status=404)
+
+
 def test_recall_skips_turns_of_this_chat_still_in_context(tmp_path):
     ask = completed_turn
     with running(tmp_path) as server:

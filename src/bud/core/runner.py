@@ -962,7 +962,7 @@ class Runner(DBOSConfiguredInstance):
             logger.warning("recall embedding skipped for run %s: %s", run_id, error_summary(exc))
 
     async def _recalled(self, run: dict, in_context: list[str]) -> dict:
-        """Background for a new message: memory lines and earlier turns that bear on it.
+        """Background for a new message: memory lines, workspace files, and earlier turns.
 
         Earlier turns of this conversation count too, except the recent ones compaction always
         keeps in context (`in_context`, as recall chunk IDs). Older turns may still be in the
@@ -976,6 +976,7 @@ class Runner(DBOSConfiguredInstance):
             return nothing  # a job brief is bud's own words
         try:
             await self.recall.index_memory()
+            await self.recall.index_workspace()
             hits = await self.recall.search(run["text"], exclude_turns=in_context)
             sources = {
                 hit.id: source
@@ -988,13 +989,16 @@ class Runner(DBOSConfiguredInstance):
                 )
                 is not None
             }
+            workspace_dates = self.recall.workspace_dates(
+                hit.path for hit in hits if hit.source == "workspace" and hit.path is not None
+            )
         except Exception as exc:
             logger.warning("recall skipped for run %s: %s", run["run_id"], error_summary(exc))
             return nothing
         clock = run.get("clock")
         today = (datetime.fromisoformat(clock) if clock else datetime.now(UTC)).date()
         known = recalled_so_far(self.hub.log.read(run["session_id"]))
-        text, cited = render(hits, sources, today, known)
+        text, cited = render(hits, sources, today, known, workspace_dates=workspace_dates)
         return {"text": text, "sources": cited}
 
     async def _learn(

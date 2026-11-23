@@ -532,26 +532,33 @@ final class Companion {
         ConversationWindow.shared.show()
         guard let connection else { return true }
         let mine = generation
-        sourcePanel = SourcePanel(session: target.session, seq: target.seq)
+        sourcePanel = SourcePanel(target: target)
         Task {
-            let found = try? await connection.send(
-                "GET", "sessions/\(target.session)/source/\(target.seq)")
+            let found: [String: Any]?
+            let unavailable: String
+            switch target {
+            case .turn(let session, let seq):
+                found = try? await connection.send("GET", "sessions/\(session)/source/\(seq)")
+                unavailable = "This message isn't available anymore."
+            case .workspace(let path):
+                found = try? await connection.send(
+                    "GET", "workspace/source", queryItems: [URLQueryItem(name: "path", value: path)])
+                unavailable = "This file isn't available anymore."
+            }
             // Another link was followed, or the connection changed, while this one loaded.
-            guard mine == generation, sourcePanel?.session == target.session,
-                  sourcePanel?.seq == target.seq
-            else { return }
+            guard mine == generation, sourcePanel?.target == target else { return }
             sourcePanel = found.flatMap(SourcePanel.init) ?? SourcePanel(
-                session: target.session, seq: target.seq,
-                problem: "This message isn't available anymore.")
+                target: target, problem: unavailable)
         }
         return true
     }
 
     /// Where the panel's cited message sits in the chat on screen, if it's there.
     func chatFocus(for panel: SourcePanel) -> Focus? {
-        guard panel.session == session else { return nil }
-        if let turn = turns.first(where: { $0.seq == panel.seq }) { return .turn(turn.id) }
-        return panel.seq == replySeq ? .latest : nil
+        guard case .turn(let sourceSession, let seq) = panel.target,
+              sourceSession == session else { return nil }
+        if let turn = turns.first(where: { $0.seq == seq }) { return .turn(turn.id) }
+        return seq == replySeq ? .latest : nil
     }
 
     /// Scrolls the chat to the message the side panel shows.

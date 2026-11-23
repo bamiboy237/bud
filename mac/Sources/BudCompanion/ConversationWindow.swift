@@ -556,20 +556,36 @@ private struct RoundButton: View {
     }
 }
 
-/// A cited message beside the chat: its date, then its whole conversation, opened at the cited
-/// message, which is marked by a rule with the question it answered.
+/// A cited message or workspace file beside the chat.
 private struct SourcePanelView: View {
     let panel: SourcePanel
     let companion: Companion
+
+    private var subtitle: String {
+        if case .workspace = panel.target {
+            return panel.date.isEmpty ? "Workspace file" : "Workspace file · \(panel.date)"
+        }
+        return companion.chatFocus(for: panel) == nil ? "Earlier conversation" : "This conversation"
+    }
+
+    private var headline: String {
+        if case .workspace(let path) = panel.target { return path }
+        return panel.date.isEmpty ? " " : panel.date
+    }
+
+    private var targetSeq: Int? {
+        if case .turn(_, let seq) = panel.target { return seq }
+        return nil
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(companion.chatFocus(for: panel) == nil ? "Earlier conversation" : "This conversation")
+                    Text(subtitle)
                         .font(.caption)
                         .foregroundStyle(Paper.inkSecondary)
-                    Text(panel.date.isEmpty ? " " : panel.date)
+                    Text(headline)
                         .font(.headline)
                 }
                 Spacer()
@@ -599,6 +615,13 @@ private struct SourcePanelView: View {
             } else if panel.loading {
                 ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(24)
                 Spacer()
+            } else if let document = panel.document {
+                ScrollView {
+                    MarkdownView(document)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
+                }
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -611,7 +634,8 @@ private struct SourcePanelView: View {
                         .padding(16)
                     }
                     .onAppear {
-                        if let anchor = panel.turns.first(where: { $0.seq == panel.seq }) {
+                        if let seq = targetSeq,
+                           let anchor = panel.turns.first(where: { $0.seq == seq }) {
                             proxy.scrollTo(anchor.id, anchor: .center)
                         }
                     }
@@ -624,7 +648,9 @@ private struct SourcePanelView: View {
 
     /// The cited reply and the message it answered.
     private var cited: Set<UUID> {
-        guard let index = panel.turns.firstIndex(where: { $0.seq == panel.seq }) else { return [] }
+        guard let seq = targetSeq,
+              let index = panel.turns.firstIndex(where: { $0.seq == seq })
+        else { return [] }
         var marked: Set<UUID> = [panel.turns[index].id]
         if index > 0, panel.turns[index - 1].fromOwner { marked.insert(panel.turns[index - 1].id) }
         return marked

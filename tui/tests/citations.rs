@@ -27,3 +27,24 @@ fn a_finished_reply_uses_its_runs_sources() {
     });
     assert_eq!(reply_text(&data), "Tuesday (Mar 2, 2025).");
 }
+
+#[test]
+fn workspace_sources_render_their_path_label() {
+    let data = json!({
+        "sources": {
+            "S1": {
+                "kind": "workspace",
+                "path": "reports/weekly.md",
+                "date": "2026-11-18",
+                "label": "reports/weekly.md",
+            }
+        },
+        "messages": [{"kind": "response", "parts": [
+            {"part_kind": "text", "content": "See the weekly summary [S1]."}
+        ]}],
+    });
+    assert_eq!(
+        reply_text(&data),
+        "See the weekly summary (reports/weekly.md)."
+    );
+}
