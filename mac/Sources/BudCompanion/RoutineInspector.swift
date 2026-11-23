@@ -294,7 +294,7 @@ struct RoutineInspector: View {
     }
 
     private func change(
-        _ id: String, path: String = "", method: String = "POST", body: [String: Any]? = nil
+        _ id: String, path: String = "", method: String = "POST", body: [String: String]? = nil
     ) async {
         guard !pending else { return }
         pending = true
