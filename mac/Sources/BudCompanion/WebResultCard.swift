@@ -17,7 +17,7 @@ struct WebLinkCard: View {
     let title: String
 
     var body: some View {
-        Link(destination: url) {
+        SwiftUI.Link(destination: url) {
             HStack(spacing: 10) {
                 Image(systemName: "link").foregroundStyle(Paper.accent)
                 VStack(alignment: .leading, spacing: 4) {
