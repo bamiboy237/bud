@@ -113,7 +113,6 @@ struct QuestionCards: View {
     let approval: Approval
     @ObservedObject var flow: QuestionFlow
     let listLimit: CGFloat
-    var onDismiss: (() -> Void)? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.replyType) private var replyType
 
@@ -193,6 +192,13 @@ struct QuestionCards: View {
                 }
                 .clipped()
                 .animation(.easeOut(duration: 0.25), value: answers.index)
+
+                if let problem = companion.approvalFailures[approval.id] ?? companion.decisionProblem {
+                    Text(problem)
+                        .font(Paper.Typography.caption)
+                        .foregroundStyle(Paper.errorInk)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 14)
@@ -201,8 +207,8 @@ struct QuestionCards: View {
             Rectangle().fill(Paper.hairline).frame(height: 0.5)
 
             HStack(spacing: 8) {
-                if let onDismiss {
-                    Button("Dismiss", action: onDismiss)
+                if answers.questions.count > 1 && !answers.isFirst {
+                    Button("Back") { flow.back() }
                         .buttonStyle(CardButton(kind: .quiet))
                 }
                 Spacer(minLength: 8)

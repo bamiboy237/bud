@@ -899,8 +899,7 @@ struct ApprovalCard: View {
                     companion: companion,
                     approval: approval,
                     flow: companion.questionFlow(for: approval),
-                    listLimit: detailLimit,
-                    onDismiss: { onDecide(false) }
+                    listLimit: detailLimit
                 )
             } else {
                 VStack(alignment: .leading, spacing: 10) {
