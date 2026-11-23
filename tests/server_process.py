@@ -27,6 +27,7 @@ from bud.composio.binding import AccountBinding
 from bud.composio.connection import Connections
 from bud.config import Settings, get_settings
 from bud.core import runner, server
+from bud.core.projection import RoutineView
 from bud.gateway.ledger import Ledger
 from bud.gateway.registry import ModelSpec, Registry
 from bud.gateway.router import Gateway
@@ -76,6 +77,31 @@ def scripted_response(messages: list[ModelMessage], info: AgentInfo) -> ModelRes
         if previous is not None:
             raise AssertionError(f"Slack action not exposed after discovery: {previous!r}")
         return call("find_app_actions", {"app": "slack", "query": "send message"})
+
+    if prompt.startswith("Schedule the Monday briefing"):
+        if any(part.tool_name == "create_routine" for part in returns):
+            return ModelResponse(parts=[TextPart("Monday briefing scheduled.")])
+        return call(
+            "create_routine",
+            {
+                "title": "Monday briefing",
+                "skill": "attention-briefing",
+                "prompt": "Prepare the owner's weekly briefing.",
+                "cron": "0 9 * * 1",
+                "timezone": "America/Chicago",
+            },
+        )
+
+    if prompt.startswith("List my routines"):
+        recalled_routines = next(
+            (part for part in returns if part.tool_name == "list_routines"), None
+        )
+        if recalled_routines is not None:
+            routines = recalled_routines.content
+            assert isinstance(routines, list)
+            titles = ", ".join(RoutineView.model_validate(routine).title for routine in routines)
+            return ModelResponse(parts=[TextPart(titles or "No routines in this chat.")])
+        return call("list_routines", {})
 
     if prompt.startswith("<routine ") and "Save note" in prompt:
         written = next(
