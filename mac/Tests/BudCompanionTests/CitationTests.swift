@@ -52,6 +52,8 @@ struct CitationTests {
             ],
         ]))
         #expect(panel.turns.map(\.seq) == [11, 13])
+        #expect(panel.citedTurn?.seq == 13)
+        #expect(panel.citedTurn?.text == "Got it.")
         #expect(panel.turns.map(\.fromOwner) == [true, false])
         #expect(panel.date.contains("Nov 18"))
         #expect(!panel.loading)

@@ -41,6 +41,7 @@ from bud.core.background import TOOLS as BACKGROUND_TOOLS
 from bud.core.background import Background
 from bud.core.composition import compose_runner, compose_world_harness
 from bud.core.events import Event, MessageOrigin
+from bud.core.handoff import DesktopHandoffs
 from bud.core.hub import Hub
 from bud.core.log import EventLog, QueueFull
 from bud.core.profiles import Mode, ProfileStore, apply_mode, as_mode, mode_summary
@@ -757,7 +758,11 @@ def _create_app(
         else hashlib.sha256(str(db_path.resolve()).encode()).hexdigest()
     )
     app = FastAPI(title="bud core", lifespan=lifespan)
-    app.add_middleware(OwnerAuthentication, token=token, scope_id=scope_id)
+    handoffs = DesktopHandoffs(db_path.with_suffix(".handoff.db"), workspace, hub)
+    app.include_router(handoffs.routes())
+    app.add_middleware(
+        OwnerAuthentication, token=token, scope_id=scope_id, desktop_worker=handoffs.authorized
+    )
 
     async def messaging_events(session_id: str, after: int) -> AsyncIterator[dict]:
         # The server-owned adapter reads this scope's hub directly. ASGITransport

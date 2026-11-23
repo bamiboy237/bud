@@ -99,6 +99,7 @@ private struct ConversationView: View {
     @Bindable var companion: Companion
     let window: ConversationWindow
     @FocusState private var typing: Bool
+    @State private var restoreTyping = false
     @StateObject private var scroll = ScrollState()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -186,16 +187,24 @@ private struct ConversationView: View {
                 }
                 // A source link pointed into this conversation: bring that message into view,
                 // marked for a moment so your eye lands on it.
-                .onChange(of: companion.focus) { _, focus in
-                    guard let focus else { return }
+                .onChange(of: companion.focusRequest) { _, request in
+                    guard let focus = companion.focus else { return }
                     withAnimation(.spring(duration: 0.4, bounce: 0)) { scrollTo(focus, proxy) }
                     Task {
                         try? await Task.sleep(for: .seconds(2))
-                        if companion.focus == focus { companion.focus = nil }
+                        if companion.focusRequest == request { companion.focus = nil }
                     }
                 }
             }
             field
+        }
+        .accessibilityHidden(companion.citedConversation != nil)
+        .allowsHitTesting(companion.citedConversation == nil)
+        .overlay {
+            if let panel = companion.citedConversation {
+                CitedConversationView(panel: panel, companion: companion)
+                    .id(panel.target)
+            }
         }
         .ignoresSafeArea(.container, edges: .top)
         .foregroundStyle(Paper.inkPrimary)
@@ -232,8 +241,17 @@ private struct ConversationView: View {
             }
         }
         .onAppear { typing = true }
+        .onChange(of: companion.citedConversation != nil) { _, reading in
+            if reading {
+                restoreTyping = typing
+                typing = false
+            } else if restoreTyping {
+                typing = true
+                restoreTyping = false
+            }
+        }
         .onChange(of: companion.inputPurpose) { _, purpose in
-            if purpose != .ask { typing = true }
+            if purpose != .ask, companion.citedConversation == nil { typing = true }
         }
         .onChange(of: companion.replyingTo) { _, quote in
             if quote != nil { typing = true }
@@ -295,7 +313,7 @@ private struct ConversationView: View {
     private func scrollTo(_ focus: Focus, _ proxy: ScrollViewProxy) {
         switch focus {
         case .turn(let id): proxy.scrollTo(id, anchor: .center)
-        case .latest: proxy.scrollTo("end", anchor: .bottom)
+        case .latest: proxy.scrollTo("latest-reply", anchor: .center)
         }
     }
 
@@ -325,6 +343,20 @@ private struct ConversationView: View {
                 Reply(
                     text: companion.shown, sources: companion.replySources, companion: companion,
                     finished: !companion.running)
+                    .background(alignment: .leading) {
+                        if companion.focus == .latest {
+                            RoundedRectangle(cornerRadius: Paper.radiusMD).fill(Paper.accentFill)
+                        }
+                    }
+                    .id("latest-reply")
+            }
+            ForEach(companion.pendingMessages) { item in
+                TurnView(
+                    turn: Turn(fromOwner: true, text: item.text),
+                    companion: companion,
+                    focused: false
+                )
+                .opacity(0.75)
             }
             if !companion.setups.isEmpty {
                 SetupDeck(companion: companion)
@@ -830,13 +862,6 @@ private struct SourcePanelView: View {
                         .tracking(Paper.Typography.h3Tracking)
                 }
                 Spacer()
-                if companion.chatFocus(for: panel) != nil {
-                    Button("Scroll to message") { companion.scrollToSource(panel) }
-                        .buttonStyle(.link)
-                        .pointerStyle(.link)
-                        .font(Paper.Typography.captionMedium)
-                        .help("Show this message in the chat")
-                }
                 Button { companion.sourcePanel = nil } label: {
                     Image(systemName: "xmark").font(.system(size: 10, weight: .semibold))
                 }
@@ -891,14 +916,9 @@ private struct SourcePanelView: View {
         }
     }
 
-    /// The cited reply and the message it answered.
     private var cited: Set<UUID> {
-        guard let seq = targetSeq,
-              let index = panel.turns.firstIndex(where: { $0.seq == seq })
-        else { return [] }
-        var marked: Set<UUID> = [panel.turns[index].id]
-        if index > 0, panel.turns[index - 1].fromOwner { marked.insert(panel.turns[index - 1].id) }
-        return marked
+        guard let turn = panel.citedTurn else { return [] }
+        return [turn.id]
     }
 }
 
@@ -921,5 +941,69 @@ private struct SourceTurn: View {
         }
         .fixedSize(horizontal: false, vertical: true)
         .opacity(cited ? 1 : 0.7)
+    }
+}
+
+/// A cited thread in the main chat area. The live conversation stays mounted underneath.
+private struct CitedConversationView: View {
+    let panel: SourcePanel
+    let companion: Companion
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Button(action: companion.backFromCitation) {
+                    Label("Back", systemImage: "chevron.left")
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.escape, modifiers: [])
+                Spacer()
+                Text(panel.date.isEmpty ? "Cited conversation" : panel.date)
+                    .font(Paper.Typography.callout)
+                Spacer()
+            }
+            .padding(.leading, 84)
+            .padding(.trailing, 20)
+            .frame(height: 40)
+            Divider()
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 20) {
+                        ForEach(panel.turns) { turn in
+                            VStack(alignment: .leading, spacing: 8) {
+                                SourceTurn(turn: turn, cited: turn.id == panel.citedTurn?.id)
+                                if case .turn(let sourceSession, _) = panel.target {
+                                    ForEach(turn.attachments) { file in
+                                        SentAttachment(
+                                            file: file,
+                                            selection: companion.selection(for: file, in: sourceSession)
+                                        ) { companion.openAttachment(file, in: sourceSession) }
+                                    }
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+                            .background {
+                                if turn.id == panel.citedTurn?.id {
+                                    RoundedRectangle(cornerRadius: Paper.radiusMD)
+                                        .fill(Paper.accentFill)
+                                }
+                            }
+                            .id(turn.id)
+                        }
+                    }
+                    .frame(maxWidth: 640)
+                    .padding(32)
+                    .frame(maxWidth: .infinity)
+                }
+                .task {
+                    guard let cited = panel.citedTurn else { return }
+                    await Task.yield()
+                    proxy.scrollTo(cited.id, anchor: .center)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Paper.canvas)
     }
 }
