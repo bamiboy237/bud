@@ -202,6 +202,7 @@ final class Companion {
     /// A cited message and its conversation, shown beside the chat.
     var sourcePanel: SourcePanel?
     var attachmentSelection: AttachmentSelection?
+    var browserSelection: BrowserSelection?
     var draftAttachments: [DraftAttachment] = []
     private(set) var readingAttachments = false
     private(set) var uploadingAttachments = false
@@ -342,6 +343,7 @@ final class Companion {
 
     private func startConnection(resetBackoff: Bool) {
         attachmentSelection = nil
+        browserSelection = nil
         setupMonitor?.cancel()
         setupMonitor = nil
         fastPollRemaining = 0
@@ -581,6 +583,7 @@ final class Companion {
         guard let connection else { return true }
         let mine = generation
         attachmentSelection = nil
+        browserSelection = nil
         sourcePanel = SourcePanel(target: target)
         Task {
             let found: [String: Any]?
@@ -632,7 +635,18 @@ final class Companion {
             return
         }
         sourcePanel = nil
+        browserSelection = nil
         attachmentSelection = selection
+    }
+
+    func openBrowserView() {
+        guard let connection else {
+            nudge("Reconnect to Bud to view the browser.")
+            return
+        }
+        sourcePanel = nil
+        attachmentSelection = nil
+        browserSelection = BrowserSelection(connection: connection)
     }
 
     /// Where the panel's cited message sits in the chat on screen, if it's there.
