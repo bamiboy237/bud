@@ -151,9 +151,10 @@ class TaskBrief(BaseModel):
         default_factory=list,
         max_length=12,
         description="Each separate piece of content the person asked to receive, as a short "
-        "checkable item, for example 'renewal date' or 'booking links'. Not steps (searching, "
-        "reading) and not the format (a saved file is checked separately). The finished job "
-        "is checked against these. When the person asked to hear once something happens, the "
+        "checkable item, for example 'renewal date' or 'booking links'. Put execution "
+        "constraints like waiting for approval before writing in goal. List only content the "
+        "finished deliverable should contain. A requested saved file is checked separately "
+        "using deliver_file. When the person asked to hear once something happens, the "
         "item is that it happened, for example 'report R-2291 is ready', not its status.",
     )
     deliver_file: bool = Field(
