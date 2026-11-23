@@ -32,6 +32,7 @@ from bud.harness.context import BackgroundCompaction
 from bud.harness.live import LiveState, LiveTools
 from bud.harness.memory import MEMORY_RULES
 from bud.harness.operating_profile import BASELINE_PROFILE, OperatingProfile
+from bud.harness.preferences import PreferenceStore
 from bud.harness.results import SqliteResultStore, build_output_limits
 from bud.harness.review import Describer, SessionGrants, ToolReviewer
 from bud.harness.spiral import (
@@ -67,6 +68,7 @@ class Harness:
         profile: str,
         *,
         memory: Memory | None = None,
+        preferences: PreferenceStore | None = None,
         state_dir: Path,
         result_path: Path,
         read_tools: set[str],
@@ -84,12 +86,25 @@ class Harness:
         )
         # Fixed for the process, unlike `tools`, which swap_tools replaces between runs.
         self.capabilities = list(capabilities)
-        self.toolset = tools if isinstance(tools, AbstractToolset) else FunctionToolset[None](tools)
+        self.toolset: AbstractToolset[None] = (
+            tools if isinstance(tools, AbstractToolset) else FunctionToolset[None](tools)
+        )
         self.skills = SkillStore(state_dir / "skills")
-        self.toolset = CombinedToolset([self.toolset, FunctionToolset[None](self.skills.tools())])
+        self.memory = memory
+        self.preferences = (
+            preferences
+            if preferences is not None
+            else (PreferenceStore(state_dir / "preferences.db", memory=memory) if memory else None)
+        )
+        toolsets: list[AbstractToolset[None]] = [
+            self.toolset,
+            FunctionToolset[None](self.skills.tools()),
+        ]
+        if self.preferences is not None:
+            toolsets.append(FunctionToolset[None](self.preferences.tools()))
+        self.toolset = CombinedToolset(toolsets)
         # The agent holds this wrapper, so tools can be replaced between runs.
         self.live = LiveTools(state=LiveState(current=self.toolset))
-        self.memory = memory
         tools_policy = policy.tools | MEMORY_RULES if memory else policy.tools
         read_names = (
             ("load_tool_result", "run_code", "search_tools", "search_conversation_history")
@@ -122,6 +137,7 @@ class Harness:
                     | {
                         "read_memory",
                         "search_memory",
+                        "inspect_preferences",
                         "read_tool_result",
                         "read_tool_result_chars",
                         "load_tool_result",
@@ -151,6 +167,9 @@ class Harness:
         # What each write's ids point to, rendered from the store: the reviewer's only view
         # of a target that is not spelled out in the call's own arguments.
         self.describers: dict[str, Describer] = {}
+        if self.preferences is not None:
+            self.describers["set_preference"] = self.preferences.describe_change
+            self.describers["forget_preference"] = self.preferences.describe_change
         # Per tool: does this call notify people other than the owner? Computed in code.
         self.notifies_others: dict[str, Callable[[dict], bool]] = {}
         # Per tool: is this call harmless, judged by its arguments? It then runs unasked.
@@ -168,6 +187,8 @@ class Harness:
         self.live_instructions: list[Callable[..., str]] = [self._today]
         # The person's clock: real time, or the simulated world's fixed "now".
         self.clock: Callable[[], datetime] = lambda: datetime.now().astimezone()
+        if self.preferences is not None:
+            self.preferences.today = lambda: self.clock().date()
         memory_guidance = (memory.guidance or "") if memory is not None else ""
         prompt = self.system_prompt + memory_guidance
         self.prompt_version = sha256(prompt.encode()).hexdigest()[:12]
@@ -181,7 +202,13 @@ class Harness:
 
     def swap_tools(self, toolset: AbstractToolset[None]) -> None:
         """Replace the tools the next run sees; the running step keeps the ones it started with."""
-        self.live.swap(CombinedToolset([toolset, FunctionToolset[None](self.skills.tools())]))
+        toolsets: list[AbstractToolset[None]] = [
+            toolset,
+            FunctionToolset[None](self.skills.tools()),
+        ]
+        if self.preferences is not None:
+            toolsets.append(FunctionToolset[None](self.preferences.tools()))
+        self.live.swap(CombinedToolset(toolsets))
 
     def _today(self) -> str:
         # Day granularity: instructions lead the prompt, so a per-minute clock here
