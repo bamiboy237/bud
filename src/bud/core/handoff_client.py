@@ -7,7 +7,7 @@ import os
 import sqlite3
 import sys
 import time
-from contextlib import closing
+from contextlib import ExitStack, closing
 from getpass import getpass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -17,6 +17,8 @@ import httpx
 
 from bud.config import LOCAL_URL, get_settings
 from bud.core.auth import owner_token
+from bud.core.browser_delivery import BrowserForm
+from bud.core.browser_worker import browser_step, local_browser
 from bud.core.handoff import WORKER_PATH
 
 
@@ -36,12 +38,24 @@ def arguments(commands: argparse._SubParsersAction) -> None:
     dispatch.add_argument("file_name")
     dispatch.add_argument("devices", nargs="+")
     dispatch.add_argument("--job-id", default=None, help="reuse this ID for an identical retry")
+    dispatch.add_argument("--form", type=Path, help="JSON description of a selected browser form")
+    decision = actions.add_parser("browser", help="approve, cancel, or verify a browser delivery")
+    decision.add_argument("session")
+    decision.add_argument("job_id")
+    decision.add_argument("decision", choices=["approve", "cancel", "verify"])
+    retarget = actions.add_parser("retarget", help="change the browser desktop before approval")
+    retarget.add_argument("session")
+    retarget.add_argument("job_id")
+    retarget.add_argument("device")
     status = actions.add_parser("status", help="show progress in one conversation")
     status.add_argument("session")
     status.add_argument("job_id")
     run = actions.add_parser("run", help="start an outbound worker on this desktop")
     run.add_argument("--once", action="store_true", help="check for work once and exit")
     run.add_argument("--state", type=Path, help="private directory for this worker's receipts")
+    run.add_argument(
+        "--browser-local", help="loopback URL for this computer's own Browse-enabled Bud server"
+    )
 
 
 def connection(url: str, token: str) -> httpx.Client:
@@ -59,10 +73,13 @@ def connection(url: str, token: str) -> httpx.Client:
     )
 
 
-def work_once(client: httpx.Client, state: Path) -> str | None:
-    response = client.get(WORKER_PATH).raise_for_status()
-    if (step := response.json()["step_id"]) is None:
+def work_once(client: httpx.Client, state: Path, browser: httpx.Client | None = None) -> str | None:
+    response = client.get(WORKER_PATH, params={"browser": browser is not None}).raise_for_status()
+    work = response.json()
+    if (step := work["step_id"]) is None:
         return None
+    if browser is not None and work.get("phase"):
+        return step if browser_step(client, browser, work) else None
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     if state.stat().st_mode & 0o077 or state.stat().st_uid != os.getuid():
         raise ValueError("The desktop receipt directory must be private and owned by you.")
@@ -88,12 +105,18 @@ def main(args: argparse.Namespace) -> None:
     settings = get_settings()
     if action == "run":
         token = os.environ.get("BUD_DESKTOP_TOKEN") or getpass("Desktop pairing token: ")
-        with connection(args.url, token) as client:
+        with ExitStack() as stack:
+            client = stack.enter_context(connection(args.url, token))
+            browser = None
+            if args.browser_local:
+                browser = stack.enter_context(
+                    local_browser(args.browser_local, owner_token(settings).get_secret_value())
+                )
             state = args.state or (settings.data_dir / "desktop-worker")
             delay = 1
             while True:
                 try:
-                    step = work_once(client, state)
+                    step = work_once(client, state, browser)
                 except (httpx.TransportError, httpx.HTTPStatusError) as exc:
                     transient = (
                         isinstance(exc, httpx.TransportError) or exc.response.status_code >= 500
@@ -140,13 +163,26 @@ def main(args: argparse.Namespace) -> None:
             case "dispatch":
                 job_id = args.job_id or uuid4().hex
                 print(f"Job ID {job_id}", file=sys.stderr, flush=True)
+                form = (
+                    BrowserForm.model_validate_json(args.form.read_bytes()) if args.form else None
+                )
                 response = client.post(
                     f"/sessions/{args.session}/desktop-jobs",
                     json={
                         "job_id": job_id,
                         "file": {"id": args.file_id, "name": args.file_name},
                         "desktops": args.devices,
+                        **({"browser": form.model_dump()} if form else {}),
                     },
+                )
+            case "browser":
+                response = client.post(
+                    f"/sessions/{args.session}/desktop-jobs/{args.job_id}/browser/{args.decision}"
+                )
+            case "retarget":
+                response = client.post(
+                    f"/sessions/{args.session}/desktop-jobs/{args.job_id}/browser/retarget",
+                    json={"desktop": args.device},
                 )
             case "status":
                 response = client.get(f"/sessions/{args.session}/desktop-jobs/{args.job_id}")
