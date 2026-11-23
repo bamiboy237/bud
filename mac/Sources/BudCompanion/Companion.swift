@@ -211,6 +211,7 @@ final class Companion {
     /// A cited message and its conversation, shown beside the chat.
     var sourcePanel: SourcePanel?
     var attachmentSelection: AttachmentSelection?
+    var browserSelection: BrowserSelection?
     var routineSelection: RoutineSelection?
     var draftAttachments: [DraftAttachment] = []
     private(set) var readingAttachments = false
@@ -353,6 +354,7 @@ final class Companion {
 
     private func startConnection(resetBackoff: Bool) {
         attachmentSelection = nil
+        browserSelection = nil
         routineSelection = nil
         citedConversations = []
         setupMonitor?.cancel()
@@ -602,6 +604,7 @@ final class Companion {
         guard let connection else { return true }
         let mine = generation
         attachmentSelection = nil
+        browserSelection = nil
         routineSelection = nil
         let requested = SourcePanel(target: target)
         if let focus = chatFocus(for: requested) {
@@ -673,8 +676,20 @@ final class Companion {
             return
         }
         sourcePanel = nil
+        browserSelection = nil
         routineSelection = nil
         attachmentSelection = selection
+    }
+
+    func openBrowserView() {
+        guard let connection else {
+            nudge("Reconnect to Bud to view the browser.")
+            return
+        }
+        sourcePanel = nil
+        attachmentSelection = nil
+        routineSelection = nil
+        browserSelection = BrowserSelection(connection: connection)
     }
 
     func openRoutines(_ id: String? = nil, occurrence: String? = nil) {
@@ -684,6 +699,7 @@ final class Companion {
         }
         sourcePanel = nil
         attachmentSelection = nil
+        browserSelection = nil
         routineSelection = RoutineSelection(
             connection: connection, session: session, routineID: id, occurrenceID: occurrence)
     }

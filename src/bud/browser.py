@@ -31,7 +31,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from pydantic_ai import RunContext, Tool
@@ -44,6 +44,9 @@ from pydantic_ai.toolsets.abstract import ToolsetTool
 from bud.composio.binding import ConnectionError
 from bud.core.setup import SetupEntry, SetupInitiation, SetupStatus
 from bud.harness.actions import Policy
+
+if TYPE_CHECKING:
+    from bud.core.browser_view import BrowserView
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +181,8 @@ def control_tools(
     relay: Relay,
     find: Callable[[], Path | None] | None = None,
     launch: Callable[[], None] = launch_chrome,
+    *,
+    view: "BrowserView | None" = None,
 ) -> list[Tool[None]]:
     locate = find or executable
 
@@ -203,6 +208,8 @@ def control_tools(
     async def open_chrome() -> str:
         """Open the person's Chrome when browser_status says no browser is connected, then
         wait for the browse extension to connect."""
+        if view is not None and view.private:
+            return "The owner is using private input. Wait for the browser handback."
         if not consent.on():
             return "The browser is off. Call enable_browser first."
         path = locate()
@@ -258,6 +265,7 @@ class BrowseTools(AbstractToolset[None]):
     path: Path
     consent: Consent
     relay: Relay
+    view: "BrowserView | None" = None
 
     @property
     def id(self) -> str | None:
@@ -296,6 +304,23 @@ class BrowseTools(AbstractToolset[None]):
             return "The browser is off, so nothing was done."
         if name in NEEDS_TAB and tool_args.get("tab") is None:
             return "Nothing was done: pass the tab id from browser_navigate as tab."
+        if self.view is None:
+            return await self._call(name, tool_args, ctx)
+        while True:
+            await self.view.ready.wait()
+            async with self.view.lock:
+                if self.view.private:
+                    continue
+                if not self.consent.on():
+                    return "The browser is off, so nothing was done."
+                if name == "browser_handoff":
+                    tab, message = tool_args.get("tab"), tool_args.get("message")
+                    if not isinstance(tab, (int, str)) or not isinstance(message, str):
+                        return "Pass the tab id and a message for the owner."
+                    return await self.view.request_handoff(self.path, str(tab), message)
+                return await self._call(name, tool_args, ctx)
+
+    async def _call(self, name: str, tool_args: dict[str, Any], ctx: RunContext[None]) -> Any:
         try:
             async with self._connect() as connection:
                 tools = await connection.get_tools(ctx)
@@ -309,9 +334,11 @@ class BrowseTools(AbstractToolset[None]):
             return "Browse could not be reached, so nothing was done. Call browser_status."
 
 
-def toolset(path: Path, consent: Consent, relay: Relay) -> AbstractToolset[None]:
+def toolset(
+    path: Path, consent: Consent, relay: Relay, view: "BrowserView | None" = None
+) -> AbstractToolset[None]:
     """Browse's chosen tools, deferred until the model searches for them."""
-    return DeferredLoadingToolset(BrowseTools(path, consent, relay))
+    return DeferredLoadingToolset(BrowseTools(path, consent, relay, view))
 
 
 def _site(url: object) -> str:
@@ -474,7 +501,11 @@ def describe_element(found: dict[str, Any]) -> str:
     return words
 
 
-def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> dict[str, Callable]:
+def describers(
+    relay: Relay,
+    find: Callable[[], Path | None] = executable,
+    view: "BrowserView | None" = None,
+) -> dict[str, Callable]:
     """Facts for the reviewer that the model cannot fake: which site a tab really shows.
     Nothing the model wrote is repeated here; the reviewer sees the arguments separately."""
 
@@ -520,7 +551,20 @@ def describers(relay: Relay, find: Callable[[], Path | None] = executable) -> di
         return CAUTION
 
     # Every client shows the caution, because it rides the approval as a looked-up fact.
-    return {**dict.fromkeys(STEPS | {UPLOAD}, step), TABS: tabs, ENABLE: caution}
+    def guarded(call):
+        async def read(tool_args):
+            if view is None:
+                return await call(tool_args)
+            if view.private:
+                return "Browser details are paused for private input."
+            async with view.lock:
+                if view.private:
+                    return "Browser details are paused for private input."
+                return await call(tool_args)
+
+        return read
+
+    return {**dict.fromkeys(STEPS | {UPLOAD}, guarded(step)), TABS: guarded(tabs), ENABLE: caution}
 
 
 def _tab_ref(value: object) -> bool:
