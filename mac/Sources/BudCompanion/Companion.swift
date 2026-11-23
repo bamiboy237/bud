@@ -42,6 +42,7 @@ struct HeldMessage: Identifiable {
     let session: String
     let base: URL
     let scope: String
+    var attachments: [DraftAttachment] = []
 }
 
 /// A short job milestone, with the saved report behind a "finished" one.
@@ -109,6 +110,7 @@ struct Turn: Identifiable, Equatable {
     var seq: Int?
     /// What the reply's `[S1]` tags cite.
     var sources: [String: Source] = [:]
+    var attachments: [ChatAttachment] = []
 }
 
 /// A run's work, for the folded line above its reply: "Worked for 34s · 4 steps".
@@ -199,6 +201,10 @@ final class Companion {
     var focus: Focus?
     /// A cited message and its conversation, shown beside the chat.
     var sourcePanel: SourcePanel?
+    var attachmentSelection: AttachmentSelection?
+    var draftAttachments: [DraftAttachment] = []
+    private(set) var readingAttachments = false
+    private(set) var uploadingAttachments = false
     /// What you last asked, shown faded above the reply so the answer keeps its context.
     private(set) var question = ""
     /// When the current run began, for "Working for 12s"; nil when bud isn't working.
@@ -325,6 +331,7 @@ final class Companion {
     /// Connect (or reconnect after a settings change): handshake, primary session, snapshot, stream.
     func start() {
         generation += 1
+        attachmentSelection = nil
         setupMonitor?.cancel()
         setupMonitor = nil
         fastPollRemaining = 0
@@ -399,10 +406,13 @@ final class Companion {
             $0["task_id"] == nil || $0["task_id"] is NSNull
         }
         turns = transcript.compactMap { turn in
-            guard let text = turn["text"] as? String, !text.isEmpty else { return nil }
+            let attachments = ChatAttachment.decode(turn["attachments"])
+            guard let text = turn["text"] as? String, !text.isEmpty || !attachments.isEmpty
+            else { return nil }
             return Turn(
                 fromOwner: turn["role"] as? String == "user", text: text, seq: turn["seq"] as? Int,
-                sources: Citations.sources(turn["sources"]))
+                sources: Citations.sources(turn["sources"]),
+                attachments: attachments)
         }
         question = turns.last(where: \.fromOwner)?.text ?? ""
         // Only a reply to the latest message: after a newer message, an older reply misleads.
@@ -532,6 +542,7 @@ final class Companion {
         ConversationWindow.shared.show()
         guard let connection else { return true }
         let mine = generation
+        attachmentSelection = nil
         sourcePanel = SourcePanel(target: target)
         Task {
             let found: [String: Any]?
@@ -551,6 +562,39 @@ final class Companion {
                 target: target, problem: unavailable)
         }
         return true
+    }
+
+    func addAttachments(_ urls: [URL]) {
+        guard inputPurpose == .ask, !readingAttachments, !urls.isEmpty else { return }
+        let available = 5 - draftAttachments.count
+        if urls.count > available { nudge("You can attach up to five files per message.") }
+        guard available > 0 else { return }
+        readingAttachments = true
+        Task {
+            defer { readingAttachments = false }
+            for url in urls.prefix(available) {
+                do {
+                    let file = try await Task.detached { try DraftAttachment.read(url) }.value
+                    guard draftAttachments.count < 5 else { break }
+                    draftAttachments.append(file)
+                } catch {
+                    nudge("Couldn't attach \(url.lastPathComponent). Choose a file up to 25 MiB.")
+                }
+            }
+        }
+    }
+
+    func selection(for file: ChatAttachment) -> AttachmentSelection? {
+        connection.map { AttachmentSelection(file: file, session: session, connection: $0) }
+    }
+
+    func openAttachment(_ file: ChatAttachment) {
+        guard let selection = selection(for: file) else {
+            nudge("Reconnect to Bud to open the attachment.")
+            return
+        }
+        sourcePanel = nil
+        attachmentSelection = selection
     }
 
     /// Where the panel's cited message sits in the chat on screen, if it's there.
@@ -718,15 +762,18 @@ final class Companion {
     /// for you to send with Return.
     /// `messageID` resends a held recording under its first id, so it can't arrive twice.
     func send(spoken: String? = nil, messageID heldID: String? = nil) {
+        if spoken == nil, inputPurpose == .ask, readingAttachments || uploadingAttachments { return }
         let text = (spoken ?? draft).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        let files = spoken == nil && inputPurpose == .ask ? draftAttachments : []
+        guard !text.isEmpty || !files.isEmpty else { return }
         guard let connection else {
             // Never lose what was said: it waits apart from the field, ready to resend.
             if spoken != nil { holdSpeech(text, because: "bud isn't connected, so that wasn't sent.") }
             return
         }
-        if spoken == nil, inputPurpose == .ask, let unsent, unsent.text == text,
-           (unsent.session != session || unsent.base != connection.base || unsent.scope != connection.scope) {
+        let retry = spoken == nil && unsent?.text == text && unsent?.attachments == files ? unsent : nil
+        if inputPurpose == .ask, let retry,
+           (retry.session != session || retry.base != connection.base || retry.scope != connection.scope) {
             nudge("Reconnect to the original bud session to retry this message.")
             return
         }
@@ -755,6 +802,7 @@ final class Companion {
         }
         if spoken == nil {
             draft = ""
+            draftAttachments = []
             inputOpen = false
         }
         // The old reply moves into the conversation now, so the bubble clears at once.
@@ -762,26 +810,23 @@ final class Companion {
         reply = ""
         question = text
         // A reply to something bud said carries it as a markdown quote, so bud sees what you mean.
-        let message = spoken == nil && unsent?.text == text
-            ? unsent!.payload : replyingTo.map { Self.quote($0) + "\n\n" + text } ?? text
+        let message = retry?.payload ?? (replyingTo.map { Self.quote($0) + "\n\n" + text } ?? text)
         replyingTo = nil
         blocks = []
         bubbleOpen = true
         // The pet starts working when bud says so (user.message), not on a hopeful send.
         sentAt = .now
         lastFirstText = nil
-        let messageID = heldID ?? (spoken == nil && unsent?.text == text
-            ? unsent!.id : UUID().uuidString.replacingOccurrences(of: "-", with: ""))
+        let messageID = heldID ?? retry?.id ?? UUID().uuidString.replacingOccurrences(of: "-", with: "")
         let destination = session
         // A typed message waiting for its retry keeps its id; speech never clears it.
         if spoken == nil { unsent = nil }
+        if !files.isEmpty { uploadingAttachments = true }
         sendTask = Task {
+            defer { if !files.isEmpty { uploadingAttachments = false } }
             do {
-                // Built here: a [String: Any] can't cross into the task under Swift 6 checking.
-                let body: [String: Any] = [
-                    "text": message, "message_id": messageID, "origin": BudConnection.origin,
-                ]
-                _ = try await connection.send("POST", "sessions/\(destination)/messages", json: body)
+                try await connection.postMessage(
+                    message, id: messageID, session: destination, attachments: files)
             } catch {
                 // Keep what was typed: put it back in the field so one Return resends it. The
                 // request may have arrived before the error, so the resend reuses its id and
@@ -789,18 +834,20 @@ final class Companion {
                 nudge("Couldn't send: \(error)")
                 if spoken != nil {
                     holdSpeech(text, id: messageID, because: "That didn't send.")
-                } else if draft.isEmpty, inputPurpose == .ask, session == destination,
+                } else if draft.isEmpty, draftAttachments.isEmpty, inputPurpose == .ask,
+                          session == destination,
                           self.connection?.base == connection.base,
                           self.connection?.scope == connection.scope {
                     draft = text
+                    draftAttachments = files
                     unsent = HeldMessage(
                         id: messageID, text: text, payload: message, session: destination,
-                        base: connection.base, scope: connection.scope)
+                        base: connection.base, scope: connection.scope, attachments: files)
                     inputOpen = true
                 } else {
                     heldMessages.append(HeldMessage(
                         id: messageID, text: text, payload: message, session: destination,
-                        base: connection.base, scope: connection.scope))
+                        base: connection.base, scope: connection.scope, attachments: files))
                 }
             }
         }
@@ -815,9 +862,8 @@ final class Companion {
         retryingHeldMessage = true
         sendTask = Task {
             do {
-                _ = try await connection.send("POST", "sessions/\(held.session)/messages", json: [
-                    "text": held.payload, "message_id": held.id, "origin": BudConnection.origin,
-                ])
+                try await connection.postMessage(
+                    held.payload, id: held.id, session: held.session, attachments: held.attachments)
                 heldMessages.removeAll { $0.id == held.id }
             } catch {
                 nudge("Couldn't send: \(error)")
@@ -1157,7 +1203,10 @@ final class Companion {
             archiveReply()
             let said = event.string("text")
             question = Self.unquoted(said).text
-            if !said.isEmpty { turns.append(Turn(fromOwner: true, text: said, seq: event.seq)) }
+            let files = ChatAttachment.decode(event.data["attachments"])
+            if !said.isEmpty || !files.isEmpty {
+                turns.append(Turn(fromOwner: true, text: said, seq: event.seq, attachments: files))
+            }
             runStart = .now
             blocks = []
             seenRequests = []

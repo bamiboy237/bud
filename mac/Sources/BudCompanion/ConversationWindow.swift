@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// The whole conversation in a normal Mac window, for long replies and earlier messages. The
 /// pet's bubble is for a glance; this is for reading. While it's open, bud talks here and the
@@ -103,6 +104,8 @@ private struct ConversationView: View {
             : .scale(scale: 0.96).combined(with: .opacity)
     }
 
+    @State private var pickingAttachments = false
+
     var body: some View {
         VStack(spacing: 0) {
             headerBar
@@ -203,10 +206,18 @@ private struct ConversationView: View {
             companion.openSource(url) ? .handled : .systemAction
         })
         .inspector(isPresented: Binding(
-            get: { companion.sourcePanel != nil },
-            set: { if !$0 { companion.sourcePanel = nil } }
+            get: { companion.sourcePanel != nil || companion.attachmentSelection != nil },
+            set: {
+                if !$0 {
+                    companion.sourcePanel = nil
+                    companion.attachmentSelection = nil
+                }
+            }
         )) {
-            if let panel = companion.sourcePanel {
+            if let selection = companion.attachmentSelection {
+                AttachmentInspector(selection: selection) { companion.attachmentSelection = nil }
+                    .id(selection.id)
+            } else if let panel = companion.sourcePanel {
                 SourcePanelView(panel: panel, companion: companion)
                     .inspectorColumnWidth(min: 240, ideal: 300, max: 420)
             }
@@ -323,6 +334,7 @@ private struct ConversationView: View {
     /// and a quiet utility strip below.
     private var field: some View {
         let hasText = !companion.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let canSend = hasText || (companion.inputPurpose == .ask && !companion.draftAttachments.isEmpty)
         let canCancel = companion.replyingTo != nil || companion.inputPurpose != .ask
         let composerShape = RoundedRectangle(cornerRadius: Paper.radiusLG, style: .continuous)
 
@@ -357,6 +369,27 @@ private struct ConversationView: View {
                 Rectangle().fill(Paper.hairline).frame(height: 0.5)
             }
 
+            if companion.inputPurpose == .ask, !companion.draftAttachments.isEmpty {
+                ScrollView(.horizontal) {
+                    HStack(spacing: 8) {
+                        ForEach(companion.draftAttachments) { file in
+                            HStack(spacing: 3) {
+                                AttachmentChip(name: file.reference.name)
+                                Button {
+                                    companion.draftAttachments.removeAll { $0.id == file.id }
+                                } label: {
+                                    Image(systemName: "xmark")
+                                }
+                                .buttonStyle(IconButton(size: 20))
+                                .accessibilityLabel("Remove \(file.reference.name)")
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.top, 8)
+            }
+
             // Top row: multi-line text input with generous breathing room.
             ZStack(alignment: .topLeading) {
                 if companion.draft.isEmpty {
@@ -383,6 +416,19 @@ private struct ConversationView: View {
 
             // Bottom utility strip: minimal by default, with send/stop action on the right.
             HStack(alignment: .center, spacing: 8) {
+                if companion.inputPurpose == .ask {
+                    Button { pickingAttachments = true } label: {
+                        Image(systemName: "paperclip")
+                    }
+                    .buttonStyle(IconButton(size: 26))
+                    .help("Attach files")
+                    .accessibilityLabel("Attach files")
+                    .disabled(companion.readingAttachments || companion.draftAttachments.count >= 5)
+                    if companion.readingAttachments || companion.uploadingAttachments {
+                        ProgressView().controlSize(.small)
+                            .accessibilityLabel(companion.readingAttachments ? "Reading files" : "Uploading files")
+                    }
+                }
                 if canCancel && companion.replyingTo == nil {
                     Text("Esc cancel")
                         .font(Paper.Typography.ledgerMeta)
@@ -390,11 +436,11 @@ private struct ConversationView: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 8)
-                if companion.running, !hasText {
+                if companion.running, !canSend {
                     RoundButton(symbol: "stop.fill", label: "Stop bud", action: companion.stop)
                 } else {
                     RoundButton(symbol: "arrow.up", label: "Send", action: { companion.send() })
-                        .opacity(hasText ? 1 : 0.35)
+                        .opacity(canSend ? 1 : 0.35)
                 }
             }
             .padding(.leading, 14)
@@ -409,6 +455,16 @@ private struct ConversationView: View {
             border: typing ? Paper.accent : Paper.borderSubtle,
             borderWidth: typing ? 1 : 0.5
         )
+        .fileImporter(isPresented: $pickingAttachments, allowedContentTypes: [.item],
+                      allowsMultipleSelection: true) { result in
+            if case .success(let urls) = result { companion.addAttachments(urls) }
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            let files = urls.filter(\.isFileURL)
+            guard companion.inputPurpose == .ask, !files.isEmpty else { return false }
+            companion.addAttachments(files)
+            return true
+        }
         .animation(.easeOut(duration: 0.15), value: typing)
         .animation(.easeOut(duration: 0.15), value: companion.replyingTo)
         .frame(maxWidth: column)
@@ -492,10 +548,17 @@ private struct TurnView: View {
                         }
                         .fixedSize(horizontal: false, vertical: true)
                     }
-                    Text(parts.text)
-                        .font(Paper.Typography.body)
-                        .lineSpacing(3.5)
-                        .textSelection(.enabled)
+                    ForEach(turn.attachments) { file in
+                        SentAttachment(
+                            file: file, selection: companion.selection(for: file)
+                        ) { companion.openAttachment(file) }
+                    }
+                    if !parts.text.isEmpty {
+                        Text(parts.text)
+                            .font(Paper.Typography.body)
+                            .lineSpacing(3.5)
+                            .textSelection(.enabled)
+                    }
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
