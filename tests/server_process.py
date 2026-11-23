@@ -26,7 +26,7 @@ from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 from bud.composio.binding import AccountBinding
 from bud.composio.connection import Connections
 from bud.config import Settings, get_settings
-from bud.core import server
+from bud.core import runner, server
 from bud.gateway.ledger import Ledger
 from bud.gateway.registry import ModelSpec, Registry
 from bud.gateway.router import Gateway
@@ -276,6 +276,11 @@ def main() -> None:
         Settings.model_config["env_file"] = None
         get_settings.cache_clear()
         stack.enter_context(patch.object(server, "build_gateway", offline_gateway))
+        replay_version = get_settings().data_dir / "test-replay-version"
+        if replay_version.is_file():
+            stack.enter_context(
+                patch.object(runner, "replay_version", return_value=replay_version.read_text())
+            )
         accounts = os.environ.get("BUD_TEST_ACCOUNTS") == "1"
         if accounts:
             stack.enter_context(patch.object(server, "Connections", fake_accounts))

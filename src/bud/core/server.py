@@ -64,6 +64,7 @@ from bud.core.runner import (
     ApprovalExpired,
     DecisionRejected,
     Runner,
+    StaleApproval,
     UnknownApproval,
 )
 from bud.core.setup import (
@@ -1089,7 +1090,7 @@ def _create_app(
             )
         except UnknownApproval:
             raise HTTPException(404, "unknown approval") from None
-        except (DecisionRejected, ApprovalExpired) as exc:
+        except (DecisionRejected, ApprovalExpired, StaleApproval) as exc:
             raise HTTPException(409, str(exc)) from None
         if applied and grant_tool is not None and grants.add(grant_tool):
             runner.harness.policy.grants = grants.tools

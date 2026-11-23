@@ -522,6 +522,55 @@ def test_a_grant_is_recorded_only_for_an_approved_decision(tmp_path):
         assert server.settled(session)["tasks"][0]["outcome"] == "not_delivered"
 
 
+@pytest.mark.parametrize("decision_recorded", [False, True])
+def test_workspace_approval_is_bound_to_the_proposing_build(tmp_path, decision_recorded):
+    strict_from_boot(tmp_path)
+    with running(tmp_path) as server:
+        session, approval = start_report(server)
+        child = server.snapshot(session)["tasks"][0]["session_id"]
+        server.kill()
+        if decision_recorded:
+            # Simulate a crash after persisting the decision but before queuing its continuation.
+            EventLog(server.data / "bud.db").append_once(
+                child, "approval.granted", {"approval_id": approval["approval_id"]}
+            )
+
+    (tmp_path / "data" / "test-replay-version").write_text("upgraded-build")
+    with running(tmp_path) as server:
+        if decision_recorded:
+            state = server.settled(session)
+            assert state["tasks"][0]["status"] == "failed"
+            assert server.events("run.failed")[-1]["kind"] == "recovery"
+        else:
+            assert server.pending(session, DRAFT)["approval_id"] == approval["approval_id"]
+            error = server.request(
+                "POST",
+                f"/sessions/{session}/approvals/{approval['approval_id']}",
+                status=409,
+                json={"approved": True, "remember": True},
+            )
+            assert "fresh approval" in error["detail"]
+            assert not server.events("approval.granted")
+            assert server.request("GET", "/grants") == {"tools": []}
+        assert not (server.data / "workspace" / FILENAME).exists()
+        assert server.claims() == []
+        if not decision_recorded:
+            server.request(
+                "POST",
+                f"/sessions/{session}/approvals/{approval['approval_id']}/revise",
+                json={
+                    "text": "Save report.md with revised text.",
+                    "message_id": "upgrade-revision",
+                },
+            )
+            fresh = server.pending(session, REVISED)
+            assert fresh["approval_id"] != approval["approval_id"]
+            assert decide(server, session, fresh, True) == {"applied": True}
+            assert server.settled(session)["tasks"][0]["outcome"] == "delivered"
+            assert (server.data / "workspace" / FILENAME).read_text() == REVISED
+            assert_claim(server, fresh)
+
+
 def test_revised_workspace_approval_survives_process_restart(tmp_path):
     strict_from_boot(tmp_path)
     with running(tmp_path) as server:
