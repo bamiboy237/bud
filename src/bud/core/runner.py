@@ -75,6 +75,7 @@ from bud.core.projection import (
     unreported_job_news,
     waiting_batch,
 )
+from bud.core.routine_chat import CREATE_ROUTINE, LIST_ROUTINES, RoutineChat
 from bud.core.routines import (
     DEFAULT_APPROVAL_EXPIRY_SECONDS,
     MissedRunPolicy,
@@ -243,6 +244,9 @@ class Runner(DBOSConfiguredInstance):
             harness.live_instructions.append(self._recent_lessons)
         if jobs:
             harness.policy.tools.update(dict.fromkeys(CONTROL_TOOLS, "allow"))
+        if self.routines is not None:
+            harness.policy.tools.update({CREATE_ROUTINE: "ask", LIST_ROUTINES: "allow"})
+            harness.policy.no_grants |= {CREATE_ROUTINE}
         self.version = replay_version()
         self.fingerprint = sha256(
             (
@@ -297,6 +301,8 @@ class Runner(DBOSConfiguredInstance):
                     withdraw=self._withdraw,
                 )
             )
+        if self.routines is not None:
+            runner_capabilities.append(RoutineChat(store=self.routines, create=self.create_routine))
         self.agent = harness.agent(
             gateway.model(self.tier, require_tools=True, selected=self.profile.model.model_id),
             self._record_decision,
@@ -748,6 +754,7 @@ class Runner(DBOSConfiguredInstance):
         budget: RoutineBudget | None = None,
         destination: RoutineDestination | None = None,
         source_id: str | None = None,
+        owner_request: str | None = None,
     ) -> RoutineDefinition:
         assert self.routines is not None
         routine = self.routines.create(
@@ -763,6 +770,7 @@ class Runner(DBOSConfiguredInstance):
             budget=budget,
             destination=destination,
             source_id=source_id,
+            owner_request=owner_request,
             now=self._clock_utc(),
         )
         self.wake_routines()

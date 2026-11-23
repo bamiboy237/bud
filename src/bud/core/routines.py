@@ -470,6 +470,7 @@ class RoutineStore:
         budget: RoutineBudget | None = None,
         destination: RoutineDestination | None = None,
         source_id: str | None = None,
+        owner_request: str | None = None,
         now: datetime | None = None,
     ) -> RoutineDefinition:
         clean_title = self._validate_text(title, "Title", max_len=120)
@@ -489,7 +490,7 @@ class RoutineStore:
         next_run = next_slot_after(clean_cron, timezone, now_utc)
         src = source_id or uuid4().hex
         routine_id = uuid4().hex
-        owner_request = clean_prompt
+        request = clean_prompt if owner_request is None else owner_request
 
         with self.log._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -505,6 +506,7 @@ class RoutineStore:
                     found.title,
                     found.skill,
                     found.prompt,
+                    found.owner_request,
                     found.cron,
                     found.timezone,
                     found.missed_run_policy,
@@ -517,6 +519,7 @@ class RoutineStore:
                     clean_title,
                     clean_skill,
                     clean_prompt,
+                    request,
                     clean_cron,
                     timezone,
                     missed_run_policy,
@@ -549,7 +552,7 @@ class RoutineStore:
                     overlap_policy,
                     approval_expiry_seconds,
                     budget_cfg.model_dump_json(),
-                    owner_request,
+                    request,
                     dest_cfg.model_dump_json(),
                     "active",
                     None,
