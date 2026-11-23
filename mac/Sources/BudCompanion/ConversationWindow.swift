@@ -220,12 +220,16 @@ private struct ConversationView: View {
             companion.openSource(url) ? .handled : .systemAction
         })
         .inspector(isPresented: Binding(
-            get: { companion.sourcePanel != nil || companion.attachmentSelection != nil || companion.routineSelection != nil },
+            get: {
+                companion.sourcePanel != nil || companion.attachmentSelection != nil
+                    || companion.routineSelection != nil || companion.browserSelection != nil
+            },
             set: {
                 if !$0 {
                     companion.sourcePanel = nil
                     companion.attachmentSelection = nil
                     companion.routineSelection = nil
+                    companion.browserSelection = nil
                 }
             }
         )) {
@@ -234,6 +238,9 @@ private struct ConversationView: View {
                     .id(selection.id)
             } else if let selection = companion.routineSelection {
                 RoutineInspector(selection: selection) { companion.routineSelection = nil }
+                    .id(selection.id)
+            } else if let selection = companion.browserSelection {
+                BrowserInspector(selection: selection) { companion.browserSelection = nil }
                     .id(selection.id)
             } else if let panel = companion.sourcePanel {
                 SourcePanelView(panel: panel, companion: companion)
@@ -280,6 +287,12 @@ private struct ConversationView: View {
             .buttonStyle(IconButton(size: 24))
             .help("Routines")
             .accessibilityLabel("Routines")
+            Button { companion.openBrowserView() } label: {
+                Image(systemName: "macwindow")
+            }
+            .buttonStyle(IconButton(size: 24))
+            .help("Browser")
+            .accessibilityLabel("Browser")
             pin
         }
         .padding(.trailing, 10)

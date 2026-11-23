@@ -39,6 +39,7 @@ from bud.core.background import GUIDANCE as BACKGROUND_GUIDANCE
 from bud.core.background import STARTS as BACKGROUND_STARTS
 from bud.core.background import TOOLS as BACKGROUND_TOOLS
 from bud.core.background import Background
+from bud.core.browser_view import BrowserView
 from bud.core.composition import compose_runner, compose_world_harness
 from bud.core.events import Event, MessageOrigin
 from bud.core.handoff import DesktopHandoffs
@@ -393,6 +394,7 @@ def _create_app(
     # stops when the server stops.
     relay = browser.Relay(browser.RELAY_HOME)
     pairing = browser.Pairing(relay)
+    browser_view: BrowserView | None = None
 
     # Set by the account branch: reloads the tool list after a new app connects.
     refresh_tools: Callable[[], None] = _noop
@@ -456,6 +458,8 @@ def _create_app(
         tools_policy.tools["setup_capability"] = "allow"
         browsing = settings.browser_tools
         consent = browser.Consent(settings.data_dir / "browser-consent.json")
+        if browsing:
+            browser_view = BrowserView(settings.data_dir / "browser-private", consent, relay)
         setup = setup_registry(connections)
         if browsing:
             browser.allow_tools(tools_policy)
@@ -472,8 +476,8 @@ def _create_app(
             if browse is None:
                 return []
             return [
-                browser.toolset(browse, consent, relay),
-                FunctionToolset(browser.control_tools(consent, relay)),
+                browser.toolset(browse, consent, relay, browser_view),
+                FunctionToolset(browser.control_tools(consent, relay, view=browser_view)),
             ]
 
         def account_toolset(
@@ -555,7 +559,7 @@ def _create_app(
         harness.known = KnownAddresses(session_dir / "known-addresses")
         tools_policy = harness.policy
         if browsing:
-            harness.describers.update(browser.describers(relay))
+            harness.describers.update(browser.describers(relay, view=browser_view))
             harness.harmless.update(browser.harmless(consent))
         harness.live_instructions.append(
             lambda: (
@@ -743,6 +747,8 @@ def _create_app(
                         cleanup.cancel()
                         await asyncio.gather(cleanup, return_exceptions=True)
                     await background.close()
+                    if browser_view is not None:
+                        await browser_view.stop()
                     await runner.stop()
                     await asyncio.to_thread(DBOS.destroy, workflow_completion_timeout_sec=5)
             finally:
@@ -758,6 +764,8 @@ def _create_app(
         else hashlib.sha256(str(db_path.resolve()).encode()).hexdigest()
     )
     app = FastAPI(title="bud core", lifespan=lifespan)
+    if browser_view is not None:
+        app.include_router(browser_view.routes())
     handoffs = DesktopHandoffs(db_path.with_suffix(".handoff.db"), workspace, hub)
     app.include_router(handoffs.routes())
     app.add_middleware(

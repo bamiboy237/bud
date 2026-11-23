@@ -207,6 +207,7 @@ final class Companion {
     var sourcePanel: SourcePanel?
     var attachmentSelection: AttachmentSelection?
     var routineSelection: RoutineSelection?
+    var browserSelection: BrowserSelection?
     var draftAttachments: [DraftAttachment] = []
     private(set) var readingAttachments = false
     private(set) var uploadingAttachments = false
@@ -349,6 +350,7 @@ final class Companion {
         attachmentSelection = nil
         citedConversations = []
         routineSelection = nil
+        browserSelection = nil
         setupMonitor?.cancel()
         setupMonitor = nil
         fastPollRemaining = 0
@@ -590,6 +592,7 @@ final class Companion {
         guard let connection else { return true }
         let mine = generation
         attachmentSelection = nil
+        browserSelection = nil
         routineSelection = nil
         let requested = SourcePanel(target: target)
         if let focus = chatFocus(for: requested) {
@@ -662,6 +665,7 @@ final class Companion {
         }
         sourcePanel = nil
         routineSelection = nil
+        browserSelection = nil
         attachmentSelection = selection
     }
 
@@ -672,8 +676,20 @@ final class Companion {
         }
         sourcePanel = nil
         attachmentSelection = nil
+        browserSelection = nil
         routineSelection = RoutineSelection(
             connection: connection, session: session, routineID: id, occurrenceID: occurrence)
+    }
+
+    func openBrowserView() {
+        guard let connection else {
+            nudge("Reconnect to Bud to view the browser.")
+            return
+        }
+        sourcePanel = nil
+        attachmentSelection = nil
+        routineSelection = nil
+        browserSelection = BrowserSelection(connection: connection)
     }
 
     /// Where the panel's cited message sits in the chat on screen, if it's there.
@@ -693,6 +709,8 @@ final class Companion {
         _ = citedConversations.popLast()
         sourcePanel = nil
         attachmentSelection = nil
+        routineSelection = nil
+        browserSelection = nil
     }
 
     func receiveSetup(_ data: [String: Any], replacing: Bool = false) {
