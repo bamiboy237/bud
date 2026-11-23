@@ -13,24 +13,22 @@ struct QuestionTests {
     @Test
     func parsesListAndLegacyQuestions() throws {
         let list = Question.parse(Self.listArgs)
-        #expect(list.isList)
-        #expect(list.questions.map(\.header) == ["Which Sam", "Day"])
-        #expect(list.questions[0].options[0].description == "your manager")
-        #expect(!list.questions[0].multiSelect)
-        #expect(list.questions[1].multiSelect)
+        #expect(list.map(\.header) == ["Which Sam", "Day"])
+        #expect(list[0].options[0].description == "your manager")
+        #expect(!list[0].multiSelect)
+        #expect(list[1].multiSelect)
         let legacy = Question.parse(["question": "Which one?", "choices": ["A", "B"]])
-        #expect(!legacy.isList)
-        let question = try #require(legacy.questions.first)
+        let question = try #require(legacy.first)
         #expect(question.header == "Question")
         #expect(question.options.map(\.label) == ["A", "B"])
         #expect(Question.parse(["questions": [
             ["header": "Name", "question": "What name?", "options": [] as [[String: Any]]],
-        ]]).questions.first?.options.isEmpty == true)
+        ]]).first?.options.isEmpty == true)
     }
 
     @Test
     func onlyCompleteAnswersAreEncodedInQuestionOrder() throws {
-        var state = QuestionAnswers(questions: Question.parse(Self.listArgs).questions)
+        var state = QuestionAnswers(questions: Question.parse(Self.listArgs))
         state.type("  Sam from finance  ", at: 0)
         #expect(state.completedAnswers == nil)
         state.show(1)
@@ -73,7 +71,7 @@ struct QuestionTests {
     @Test @MainActor
     func backPreservesAnswersAndFinalAdvanceSubmits() {
         var sent: [[QuestionAnswer]] = []
-        let flow = QuestionFlow(questions: Question.parse(Self.listArgs).questions) { sent.append($0) }
+        let flow = QuestionFlow(questions: Question.parse(Self.listArgs)) { sent.append($0) }
         flow.answers.choose("Sam Lee")
         flow.advance()
         flow.answers.choose("Wed")
@@ -88,36 +86,74 @@ struct QuestionTests {
     }
 
     @Test @MainActor
-    func typedAnswerAdvancesThenSends() {
+    func inlineAnswerRequiresTextBeforeAdvancing() {
         var sent: [[QuestionAnswer]] = []
-        let flow = QuestionFlow(questions: Question.parse(Self.listArgs).questions) { sent.append($0) }
-        flow.startTyping()
-        flow.answerTyped("Sam Chen")
+        let flow = QuestionFlow(questions: Question.parse(Self.listArgs)) { sent.append($0) }
+        flow.answers.type("   ", at: 0)
+        flow.advance()
+        #expect(flow.answers.index == 0)
+        #expect(!flow.answers.canAdvance)
+        #expect(sent.isEmpty)
+
+        flow.answers.type(" Sam Chen ", at: 0)
+        #expect(flow.answers.typed(at: 0) == " Sam Chen ")
+        #expect(sent.isEmpty)
+        flow.advance()
         #expect(flow.answers.index == 1)
         #expect(sent.isEmpty)
         flow.answers.choose("Thu")
         flow.advance()
         #expect(sent.count == 1)
         #expect(sent.first?.first?.custom == "Sam Chen")
+        flow.back()
+        #expect(flow.answers.typed(at: 0) == " Sam Chen ")
     }
 
-    @Test @MainActor
-    func customAnswerRestoresTheChatDraft() throws {
-        let approval = try #require(Approval([
-            "approval_id": "question", "tool": "ask_user", "args": Self.listArgs,
-        ], jobs: [:]))
+    @Test(.timeLimit(.minutes(1))) @MainActor
+    func rejectedInlineAnswerKeepsTheCardAndComposerDrafts() async throws {
         let companion = Companion()
+        let (requests, continuation) = AsyncStream.makeStream(of: URLRequest.self)
+        companion.connectForTesting(BudConnection(
+            base: URL(string: "http://127.0.0.1:8420")!, token: ""
+        ) { request in
+            continuation.yield(request)
+            if request.httpMethod == "GET" { continuation.finish() }
+            return (
+                Data(#"{"detail":"Try again"}"#.utf8),
+                HTTPURLResponse(url: request.url!, statusCode: 503, httpVersion: nil, headerFields: nil)!
+            )
+        })
+        companion.apply(snapshot: [
+            "last_seq": 1, "pending_approvals": [[
+                "approval_id": "question", "tool": "ask_user", "args": Self.listArgs,
+            ]],
+        ])
+        let approval = try #require(companion.approvals.first)
         companion.draft = "My next request"
-        companion.write(.answer(approval.id))
+        let file = DraftAttachment(reference: ChatAttachment(id: "file", name: "notes.md"), data: Data())
+        companion.draftAttachments = [file]
+        companion.inputOpen = true
         let flow = companion.questionFlow(for: approval)
-        flow.startTyping()
-        companion.draft = "Sam Chen"
-        companion.answerQuestionText(companion.draft, for: approval)
+        flow.answers.type("Sam Chen", at: 0)
+        flow.advance()
+        flow.answers.type("Friday", at: 1)
+        flow.advance()
+
+        var posts: [URLRequest] = []
+        for await request in requests where request.httpMethod == "POST" { posts.append(request) }
+        let post = try #require(posts.first)
+        let body = try #require(post.httpBody)
+        let payload = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let answers = try #require(payload["answers"] as? [[String: Any]])
+        #expect(posts.count == 1)
+        #expect(post.url?.path == "/sessions/s1/approvals/question/answer")
+        #expect(answers.compactMap { $0["custom"] as? String } == ["Sam Chen", "Friday"])
+        #expect(companion.decisionProblem?.contains("Try again") == true)
         #expect(companion.inputPurpose == .ask)
         #expect(companion.draft == "My next request")
+        #expect(companion.draftAttachments == [file])
         #expect(companion.inputOpen)
         #expect(flow.answers.index == 1)
-        flow.back()
-        #expect(flow.answers.typed == "Sam Chen")
+        #expect(flow.answers.typed(at: 1) == "Friday")
     }
 }

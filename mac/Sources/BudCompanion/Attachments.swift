@@ -1,4 +1,5 @@
 import AppKit
+import CoreTransferable
 import Foundation
 import ImageIO
 import PDFKit
@@ -30,6 +31,7 @@ struct ChatAttachment: Codable, Identifiable, Equatable, Sendable {
 
 struct DraftAttachment: Identifiable, Equatable, Sendable {
     static let limit = 25 * 1024 * 1024
+    static let maxCount = 5
     let reference: ChatAttachment
     let data: Data
     var id: String { reference.id }
@@ -50,6 +52,54 @@ struct DraftAttachment: Identifiable, Equatable, Sendable {
                 id: UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased(),
                 name: url.lastPathComponent),
             data: data)
+    }
+}
+
+struct DroppedAttachment: Transferable {
+    let url: URL
+
+    init(fileURLData: Data) throws {
+        guard let url = URL(dataRepresentation: fileURLData, relativeTo: nil), url.isFileURL else {
+            throw CocoaError(.fileReadUnsupportedScheme)
+        }
+        self.url = url
+    }
+
+    static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(importedContentType: .fileURL) { data in
+            try Self(fileURLData: data)
+        }
+    }
+}
+
+extension View {
+    @MainActor
+    func dropAttachments(into companion: Companion, isTargeted: Binding<Bool>) -> some View {
+        dropDestination(for: DroppedAttachment.self) { items, _ in
+            guard companion.canAddAttachments, !items.isEmpty else { return false }
+            companion.addAttachments(items.map(\.url))
+            return true
+        } isTargeted: { isTargeted.wrappedValue = $0 }
+    }
+}
+
+struct DraftAttachmentChips: View {
+    let files: [DraftAttachment]
+    let remove: (String) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 8) {
+                ForEach(files) { file in
+                    HStack(spacing: 3) {
+                        AttachmentChip(name: file.reference.name)
+                        Button { remove(file.id) } label: { Image(systemName: "xmark") }
+                            .buttonStyle(IconButton(size: 20))
+                            .accessibilityLabel("Remove \(file.reference.name)")
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -90,7 +140,7 @@ struct SentAttachment: View {
                 AttachmentChip(name: file.name)
             }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PaperHit(shape: RoundedRectangle(cornerRadius: Paper.radiusMD)))
         .help("Open \(file.name)")
         .accessibilityLabel("Open attachment \(file.name)")
         .task(id: selection?.id) {

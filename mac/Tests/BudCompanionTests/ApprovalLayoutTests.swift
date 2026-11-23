@@ -130,6 +130,49 @@ struct ApprovalLayoutTests {
     }
 
     @Test
+    func inlineAnswerFitsTheCardAtCompactAndWindowWidths() async throws {
+        _ = NSApplication.shared
+        let companion = Companion()
+        companion.apply(snapshot: [
+            "last_seq": 1, "pending_approvals": [[
+                "approval_id": "question", "tool": "ask_user",
+                "args": ["question": "Who should come to the meeting?", "choices": ["Sam", "Priya"]],
+            ]],
+        ])
+        companion.link = .connected
+        let approval = try #require(companion.approvals.first)
+        companion.questionFlow(for: approval).answers.type("Sam from finance", at: 0)
+
+        for inWindow in [false, true] {
+            companion.windowOpen = inWindow
+            let width: CGFloat = inWindow ? 396 : 288
+            for scheme: ColorScheme in [.light, .dark] {
+                let host = NSHostingView(rootView: ApprovalCard(
+                    companion: companion, approval: approval, onDecide: { _ in }
+                )
+                .frame(width: width)
+                .environment(\.colorScheme, scheme)
+                .transaction { $0.disablesAnimations = true })
+                let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: 275),
+                                      styleMask: [.borderless], backing: .buffered, defer: false)
+                window.isReleasedWhenClosed = false
+                window.appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)
+                window.contentView = host
+                defer { window.close() }
+                host.layoutSubtreeIfNeeded()
+                try await Task.sleep(for: .milliseconds(150))
+                host.layoutSubtreeIfNeeded()
+                #expect(host.fittingSize.height <= 275)
+                #expect(host.fittingSize.width == width)
+                if let directory = ProcessInfo.processInfo.environment["BUD_APPROVAL_SNAPSHOTS"] {
+                    let name = "inline-answer-\(inWindow ? "window" : "compact")-\(scheme).png"
+                    try snapshot(host, to: URL(filePath: directory).appending(path: name))
+                }
+            }
+        }
+    }
+
+    @Test
     func longEmailFitsThePetPanelWithActionsVisible() async throws {
         _ = NSApplication.shared
         let companion = Companion()

@@ -58,12 +58,17 @@ struct DesktopHandoffPicker: View {
                                     Text("\(order + 1)").foregroundStyle(Paper.inkSecondary)
                                 }
                             }
+                            .padding(6)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(PaperHit(shape: RoundedRectangle(cornerRadius: Paper.radiusSM)))
                         .disabled(state.dispatching)
+                        .accessibilityAddTraits(state.chosen.contains(desktop.id) ? .isSelected : [])
                     }
                     Button("Queue verification") { Task { await dispatch() } }
+                        .buttonStyle(CardButton(kind: .primary))
                         .disabled(state.chosen.isEmpty || state.dispatching)
+                        .opacity(state.chosen.isEmpty || state.dispatching ? 0.45 : 1)
                 }
             } else if state.problem == nil {
                 ProgressView().controlSize(.small)

@@ -56,9 +56,8 @@ struct RoutineMessageCard: View {
             }
             .padding(10)
             .frame(maxWidth: 320, alignment: .leading)
-            .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusMD))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PaperHit(shape: RoundedRectangle(cornerRadius: Paper.radiusMD), fill: Paper.elevated))
         .accessibilityLabel("\(card.title), \(card.label)")
     }
 }
@@ -97,7 +96,7 @@ private final class RoutineInspectorState: ObservableObject {
     @Published var editing = false
     @Published var title = ""
     @Published var prompt = ""
-    @Published var cron = ""
+    @Published var schedule = RoutineSchedule(cron: "0 9 * * *")
     @Published var timezone = ""
     @Published var markedRun: String?
     @Published var triggerID = UUID().uuidString
@@ -118,7 +117,7 @@ struct RoutineInspector: View {
                         .accessibilityLabel("Back")
                         .disabled(state.pending)
                 }
-                Text(state.report != nil ? "Run report" : state.listing ? "Routines" : state.routine?.title ?? "Routine")
+                Text(heading)
                     .font(Paper.Typography.callout).lineLimit(1)
                 Spacer()
                 Button(action: close) { Image(systemName: "xmark") }
@@ -129,7 +128,7 @@ struct RoutineInspector: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    if let problem = state.problem {
+                    if !state.editing, let problem = state.problem {
                         Text(problem).foregroundStyle(Paper.errorInk).textSelection(.enabled)
                     }
                     if let report = state.report {
@@ -153,8 +152,10 @@ struct RoutineInspector: View {
                                     Image(systemName: "chevron.right").font(.caption2)
                                 }
                                 .padding(9)
-                                .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusMD))
-                            }.buttonStyle(.plain)
+                            }
+                            .buttonStyle(PaperHit(
+                                shape: RoundedRectangle(cornerRadius: Paper.radiusMD), fill: Paper.elevated))
+                            .disabled(state.pending)
                         }
                     } else if let routine = state.routine {
                         detail(routine)
@@ -178,56 +179,76 @@ struct RoutineInspector: View {
         }
     }
 
+    private var heading: String {
+        if state.report != nil { return "Run report" }
+        if state.listing { return "Routines" }
+        return state.editing ? "Edit routine" : "Routine"
+    }
+
     @ViewBuilder
     private func detail(_ value: RoutineSummary) -> some View {
         if state.editing {
-            VStack(alignment: .leading, spacing: 10) {
-                LabeledContent("Name") { TextField("Routine name", text: $state.title) }
-                LabeledContent("Schedule") { TextField("Five-field cron", text: $state.cron) }
-                LabeledContent("Time zone") { TextField("America/Chicago", text: $state.timezone) }
-                Text("Instructions").font(.caption)
-                TextEditor(text: $state.prompt).frame(minHeight: 96)
-                HStack {
-                    Button("Cancel") { state.editing = false }
-                    Spacer()
-                    Button("Save") {
-                        Task {
-                            await change(value.id, method: "PATCH", body: [
-                                "title": state.title, "prompt": state.prompt, "cron": state.cron, "timezone": state.timezone,
-                            ])
-                        }
-                    }
-                    .disabled(state.pending || [state.title, state.prompt, state.cron, state.timezone].contains {
-                        $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    })
-                }
-            }
+            editor(value)
         } else {
-            Text(value.status.capitalized).font(.caption).foregroundStyle(Paper.inkSecondary)
-            Text(value.prompt).textSelection(.enabled)
-            LabeledContent("Schedule", value: "\(value.cron) · \(value.timezone)")
-            if let next = value.nextRunAt { LabeledContent("Next run", value: date(next)) }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(value.title)
+                    .font(Paper.Typography.h2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(value.status.capitalized)
+                    .font(Paper.Typography.caption)
+                    .foregroundStyle(Paper.inkSecondary)
+            }
+            section("Plan") {
+                let plan = Text(value.prompt)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                ViewThatFits(in: .vertical) {
+                    plan
+                    ScrollView { plan }.scrollBounceBehavior(.basedOnSize)
+                }
+                .font(Paper.Typography.callout)
+                .textSelection(.enabled)
+                .frame(maxHeight: 132)
+                .padding(8)
+                .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusSM))
+            }
+            scheduleSummary(RoutineSchedule(cron: value.cron), timezone: value.timezone)
+            if let next = value.nextRunAt {
+                LabeledContent("Next run", value: date(next, timezone: TimeZone(identifier: value.timezone) ?? .current))
+                    .font(Paper.Typography.callout)
+            }
             if value.pauseReason == "uncertain" {
                 Text("Review the last run before resuming. Bud could not confirm an action.")
                     .foregroundStyle(Paper.inkSecondary)
             }
-            HStack {
-                Button("Edit") {
-                    (state.title, state.prompt, state.cron, state.timezone) = (value.title, value.prompt, value.cron, value.timezone)
-                    state.editing = true
-                }
+            HStack(spacing: 6) {
                 if value.status == "active" {
                     Button("Pause") { Task { await change(value.id, path: "/pause") } }
+                        .buttonStyle(CardButton(kind: .quiet))
+                } else if value.status == "paused", value.pauseReason != "uncertain" {
+                    Button("Resume") { Task { await change(value.id, path: "/resume") } }
+                        .buttonStyle(CardButton(kind: .primary))
+                }
+                Spacer(minLength: 0)
+                Button("Edit") {
+                    state.title = value.title
+                    state.prompt = value.prompt
+                    state.schedule = RoutineSchedule(cron: value.cron)
+                    state.timezone = value.timezone
+                    state.editing = true
+                }
+                .buttonStyle(CardButton(kind: .secondary))
+                if value.status == "active" {
                     Button("Run now") {
                         Task { await change(value.id, path: "/run-now", body: ["trigger_id": state.triggerID]) }
                     }
-                } else if value.status == "paused", value.pauseReason != "uncertain" {
-                    Button("Resume") { Task { await change(value.id, path: "/resume") } }
+                    .buttonStyle(CardButton(kind: .primary))
                 }
             }
             .disabled(state.pending)
+            .opacity(state.pending ? 0.55 : 1)
         }
-        if !value.recentOccurrences.isEmpty {
+        if !state.editing && !value.recentOccurrences.isEmpty {
             Divider()
             Text("Run history").font(Paper.Typography.callout)
             ForEach(value.recentOccurrences) { run in
@@ -249,14 +270,152 @@ struct RoutineInspector: View {
         }
     }
 
+    private func editor(_ value: RoutineSummary) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            section("Title") {
+                TextField("Title", text: $state.title)
+                    .textFieldStyle(.roundedBorder)
+                    .font(Paper.Typography.callout)
+            }
+            section("Plan") {
+                TextEditor(text: $state.prompt)
+                    .font(Paper.Typography.callout)
+                    .scrollContentBackground(.hidden)
+                    .padding(6)
+                    .frame(height: 112)
+                    .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusSM))
+                    .accessibilityLabel("Plan")
+            }
+            scheduleEditor
+            if let problem = state.problem {
+                Text(problem).foregroundStyle(Paper.errorInk).textSelection(.enabled)
+            }
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                Button("Cancel") {
+                    state.editing = false
+                    state.problem = nil
+                }
+                .buttonStyle(CardButton(kind: .quiet))
+                Button("Save") { Task { await save(value) } }
+                    .buttonStyle(CardButton(kind: .primary))
+                    .disabled(!canSave)
+                    .opacity(canSave ? 1 : 0.45)
+            }
+        }
+        .disabled(state.pending)
+    }
+
+    private var canSave: Bool {
+        !state.pending && [state.title, state.prompt, state.schedule.cron, state.timezone].allSatisfy {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    private var scheduleEditor: some View {
+        frequencySection {
+            Picker("Repeat", selection: Binding(
+                get: { state.schedule.frequency },
+                set: { state.schedule.select($0) }
+            )) {
+                ForEach(RoutineSchedule.Repeat.allCases, id: \.self) { repeatValue in
+                    Text(repeatValue.rawValue).tag(repeatValue)
+                }
+            }
+            if state.schedule.frequency == .custom {
+                Divider()
+                TextField("Cron expression", text: $state.schedule.customCron,
+                          prompt: Text("Minute hour day month weekday"))
+                    .font(Paper.Typography.code)
+                    .accessibilityLabel("Cron expression")
+            } else {
+                Divider()
+                DatePicker("Time", selection: $state.schedule.time, displayedComponents: .hourAndMinute)
+                    .environment(\.calendar, RoutineSchedule.clockCalendar)
+                    .environment(\.timeZone, .gmt)
+                if state.schedule.frequency == .weekly {
+                    Divider()
+                    Picker("Day", selection: $state.schedule.weekday) {
+                        ForEach(weekdayNames.indices, id: \.self) { day in
+                            Text(weekdayNames[day]).tag(day)
+                        }
+                    }
+                } else if state.schedule.frequency == .monthly {
+                    Divider()
+                    Picker("Day of month", selection: $state.schedule.monthDay) {
+                        ForEach(1...31, id: \.self) { day in Text("\(day)").tag(day) }
+                    }
+                    if state.schedule.monthDay > 28 {
+                        Text("Skips months without this day.")
+                            .font(Paper.Typography.caption)
+                            .foregroundStyle(Paper.inkSecondary)
+                    }
+                }
+            }
+            Divider()
+            LabeledContent("Time zone") {
+                TextField("Time zone", text: $state.timezone)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 156)
+            }
+        }
+    }
+
+    private func scheduleSummary(_ schedule: RoutineSchedule, timezone: String) -> some View {
+        frequencySection {
+            LabeledContent("Repeat", value: schedule.frequency.rawValue)
+            if schedule.frequency != .custom {
+                Divider()
+                LabeledContent("Time", value: schedule.time.formatted(
+                    Date.FormatStyle(date: .omitted, time: .shortened, timeZone: .gmt)))
+                if schedule.frequency == .weekly {
+                    Divider()
+                    LabeledContent("Day", value: weekdayNames[schedule.weekday])
+                } else if schedule.frequency == .monthly {
+                    Divider()
+                    LabeledContent("Day of month", value: "\(schedule.monthDay)")
+                }
+            }
+            Divider()
+            LabeledContent("Time zone", value: timezone)
+        }
+    }
+
+    private var weekdayNames: [String] { Calendar(identifier: .gregorian).weekdaySymbols }
+
+    private func section<Content: View>(
+        _ title: String, @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(Paper.Typography.label)
+            content()
+        }
+    }
+
+    private func frequencySection<Rows: View>(@ViewBuilder rows: () -> Rows) -> some View {
+        section("Frequency") {
+            VStack(alignment: .leading, spacing: 7, content: rows)
+                .font(Paper.Typography.callout)
+                .padding(10)
+                .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusMD))
+        }
+    }
+
+    private func save(_ value: RoutineSummary) async {
+        var changes = ["title": state.title, "prompt": state.prompt, "timezone": state.timezone]
+        let cron = state.schedule.cron
+        if cron != RoutineSchedule(cron: value.cron).cron { changes["cron"] = cron }
+        await change(value.id, method: "PATCH", body: changes)
+    }
+
     private func label(_ raw: String) -> String {
         raw.replacingOccurrences(of: "_", with: " ").capitalized
     }
 
-    private func date(_ raw: String) -> String {
+    private func date(_ raw: String, timezone: TimeZone = .current) -> String {
         guard let value = (try? Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(raw))
                 ?? (try? Date.ISO8601FormatStyle().parse(raw)) else { return raw }
-        return value.formatted(date: .abbreviated, time: .shortened)
+        return value.formatted(Date.FormatStyle(date: .abbreviated, time: .shortened, timeZone: timezone))
     }
 
     private func decode(_ data: [String: Any]) throws -> RoutineSummary {
