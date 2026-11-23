@@ -11,12 +11,13 @@ enum Syntax {
     static func color(_ kind: Kind) -> Color? {
         switch kind {
         case .plain: nil
-        case .keyword: Paper.dynamic(light: 0xA626A4, dark: 0xC678DD)
-        case .string: Paper.dynamic(light: 0x50A14F, dark: 0x98C379)
-        case .number: Paper.dynamic(light: 0x986801, dark: 0xD19A66)
-        case .comment: Paper.dynamic(light: 0xA0A1A7, dark: 0x7F848E)
-        case .function: Paper.dynamic(light: 0x4078F2, dark: 0x61AFEF)
-        case .type: Paper.dynamic(light: 0xC18401, dark: 0xE5C07B)
+        // Calmer (~20–25% desaturated) One Light / One Dark tones harmonized with Cotton Stock & Prussian Ink.
+        case .keyword: Paper.dynamic(light: 0x8A3E88, dark: 0xB582C4)
+        case .string: Paper.dynamic(light: 0x4C884C, dark: 0x8BB077)
+        case .number: Paper.dynamic(light: 0x876724, dark: 0xBF976F)
+        case .comment: Paper.dynamic(light: 0x7A7E87, dark: 0x787D88)
+        case .function: Paper.dynamic(light: 0x3E68BA, dark: 0x6B9FD1)
+        case .type: Paper.dynamic(light: 0x9C7526, dark: 0xCBB17E)
         }
     }
 

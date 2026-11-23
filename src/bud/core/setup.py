@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
 from pydantic_ai import RunContext
@@ -23,7 +24,12 @@ from bud.composio.binding import ConnectionError, valid_toolkit
 from bud.composio.connection import Connections
 from bud.core.events import EventType
 from bud.core.hub import Hub
-from bud.core.projection import PendingSetup, pending_setups, setup_status_version
+from bud.core.projection import (
+    TERMINAL_SETUP_STATUSES,
+    PendingSetup,
+    pending_setups,
+    setup_status_version,
+)
 
 SetupState = Literal["waiting", "connected", "failed"]
 
@@ -99,9 +105,11 @@ class SetupJournal:
 
     def __init__(self) -> None:
         self._hub: Hub | None = None
+        self._on_wakeup: Callable[[str], None] | None = None
 
-    def bind(self, hub: Hub) -> None:
+    def bind(self, hub: Hub, *, on_wakeup: Callable[[str], None] | None = None) -> None:
         self._hub = hub
+        self._on_wakeup = on_wakeup
 
     @property
     def _live(self) -> Hub:
@@ -125,11 +133,21 @@ class SetupJournal:
         return setup_status_version(self._live.log.read(session_id), capability)
 
     def update_status(
-        self, session_id: str, data: dict[str, Any], version: str | None, *, key: str
+        self,
+        session_id: str,
+        data: dict[str, Any],
+        version: str | None,
+        *,
+        key: str,
+        origin: dict[str, Any] | None = None,
     ) -> bool:
-        applied = self._live.log.update_setup_status(session_id, data, version, key=key)
+        applied = self._live.log.update_setup_status(
+            session_id, data, version, key=key, origin=origin
+        )
         if applied:
             self._live.wake(session_id)
+            if data.get("status") in TERMINAL_SETUP_STATUSES and self._on_wakeup is not None:
+                self._on_wakeup(session_id)
         return applied
 
 
@@ -183,7 +201,7 @@ def check_setup(
         return {
             **data,
             "note": "The capability is connected. Its tools load for the next "
-            "message. End this turn and continue when the person sends a message.",
+            "turn. End this turn so Bud can wake up with the new tools and continue.",
         }
     return data
 
@@ -223,6 +241,9 @@ def setup_tool(
         if card is not None and card.status == "waiting":
             # The card is up: a new call rechecks it, never hands out a second link.
             return check_setup(entry, journal, session, capability, key=key, refresh=refresh)
+        setup_id = uuid4().hex
+        origin = (ctx.metadata or {}).get("bud_origin")
+        origin_data = {"origin": origin} if isinstance(origin, dict) else {}
         try:
             initiation = entry.initiate()
         except ConnectionError as exc:
@@ -231,16 +252,19 @@ def setup_tool(
                 session,
                 "capability.setup",
                 {
+                    "setup_id": setup_id,
                     "capability": capability,
                     "label": entry.label,
                     "kind": entry.kind,
                     "status": "failed",
                     "reason": reason,
+                    **origin_data,
                 },
                 key=key,
             )
             return {"error": reason, "capability": capability, "label": entry.label}
-        data = {
+        data: dict[str, Any] = {
+            "setup_id": setup_id,
             "capability": capability,
             "label": entry.label,
             "kind": initiation.kind,
@@ -255,7 +279,7 @@ def setup_tool(
         # is waiting; the link itself goes once, live, to the owner's open streams. A client
         # that connects later gets the card without it, and /connect issues a fresh link.
         link = data.pop("url", None)
-        journal.publish(session, "capability.setup", data, key=key)
+        journal.publish(session, "capability.setup", {**data, **origin_data}, key=key)
         if link is not None:
             journal.show_live(session, "capability.setup", {**data, "url": link})
         note = (

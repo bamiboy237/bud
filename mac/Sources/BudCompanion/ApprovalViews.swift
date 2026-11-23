@@ -11,7 +11,6 @@ enum DecisionDirection: Equatable {
 }
 
 final class DeckState: ObservableObject {
-    @Published var currentIndex: Int = 0
     @Published var flyOpacity: Double = 1.0
     @Published var activeDecision: DecisionDirection? = nil
     @Published var isAnimating: Bool = false
@@ -38,7 +37,7 @@ struct ApprovalDeck: View {
 
     private var totalCount: Int { companion.approvals.count }
     private var safeIndex: Int {
-        totalCount == 0 ? 0 : min(max(deck.currentIndex, 0), totalCount - 1)
+        totalCount == 0 ? 0 : min(companion.approvalDeck.safeIndex, totalCount - 1)
     }
     private var currentApproval: Approval? {
         guard safeIndex < totalCount else { return nil }
@@ -51,31 +50,23 @@ struct ApprovalDeck: View {
             if totalCount > 1 { headerBar }
             cardStack
         }
-        .onAppear { clampIndex() }
-        .onChange(of: companion.approvals.map(\.id)) { _, _ in clampIndex() }
         // A new front card always starts at home, whatever happened to the last one.
         .onChange(of: currentApproval?.id) { _, _ in
             if !deck.isAnimating { deck.finishDecision() }
         }
     }
 
-    private func clampIndex() {
-        if deck.currentIndex >= totalCount {
-            deck.currentIndex = max(0, totalCount - 1)
-        }
-    }
-
     private func cyclePrevious() {
-        guard !deck.isAnimating, deck.currentIndex > 0 else { return }
+        guard !deck.isAnimating, companion.approvalDeck.canSelectPrevious else { return }
         withAnimation(Self.settle) {
-            deck.currentIndex -= 1
+            companion.selectPreviousApproval()
         }
     }
 
     private func cycleNext() {
-        guard !deck.isAnimating, deck.currentIndex < totalCount - 1 else { return }
+        guard !deck.isAnimating, companion.approvalDeck.canSelectNext else { return }
         withAnimation(Self.settle) {
-            deck.currentIndex += 1
+            companion.selectNextApproval()
         }
     }
 
@@ -83,7 +74,7 @@ struct ApprovalDeck: View {
         HStack(alignment: .center, spacing: 8) {
             Label {
                 Text("Approval \(min(safeIndex + 1, totalCount)) of \(totalCount)")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(Paper.Typography.ledgerMeta)
                     .foregroundStyle(Paper.inkSecondary)
             } icon: {
                 Image(systemName: "doc.on.doc.fill")
@@ -94,31 +85,18 @@ struct ApprovalDeck: View {
 
             if totalCount > 1 {
                 HStack(spacing: 4) {
-                    Button {
-                        cyclePrevious()
-                    } label: {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 11, weight: .semibold))
-                            .frame(width: 22, height: 22)
-                            .background(Paper.ink.opacity(0.06), in: Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(deck.isAnimating || safeIndex == 0)
-                    .opacity(safeIndex == 0 ? 0.35 : 1.0)
-                    .help("View previous card in stack")
-
-                    Button {
-                        cycleNext()
-                    } label: {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 11, weight: .semibold))
-                            .frame(width: 22, height: 22)
-                            .background(Paper.ink.opacity(0.06), in: Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(deck.isAnimating || safeIndex >= totalCount - 1)
-                    .opacity(safeIndex >= totalCount - 1 ? 0.35 : 1.0)
-                    .help("View next card in stack")
+                    DeckArrowButton(
+                        symbol: "chevron.left",
+                        disabled: deck.isAnimating || safeIndex == 0,
+                        helpText: "View previous card in stack",
+                        action: cyclePrevious
+                    )
+                    DeckArrowButton(
+                        symbol: "chevron.right",
+                        disabled: deck.isAnimating || safeIndex >= totalCount - 1,
+                        helpText: "View next card in stack",
+                        action: cycleNext
+                    )
                 }
             }
 
@@ -155,7 +133,7 @@ struct ApprovalDeck: View {
                     .font(.system(size: 11))
                 Text(companion.approvingBatch ? "Approving…" :
                         failed.isEmpty ? "All (\(batch.items.count))" : "Retry (\(failed.count))")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(Paper.Typography.captionMedium)
             }
         }
         .buttonStyle(CardButton(kind: .secondary))
@@ -207,12 +185,13 @@ struct ApprovalDeck: View {
     }
 
     private func handleDecision(approval: Approval, approved: Bool) {
-        guard !deck.isAnimating else { return }
+        guard !deck.isAnimating, !companion.approvalDeck.isAnimating else { return }
         let flight = Duration.milliseconds(150)
         guard companion.decide(approval.id, approved: approved, after: reduceMotion ? nil : flight)
         else { return }
         guard !reduceMotion else { return }
         deck.isAnimating = true
+        companion.setApprovalAnimating(true)
         deck.activeDecision = approved ? .approve : .deny
 
         // A quiet fade where the card stands: no slide, no tilt, no stamp. The receipt line
@@ -224,8 +203,34 @@ struct ApprovalDeck: View {
         Task { @MainActor in
             try? await Task.sleep(for: flight)
             deck.finishDecision()
-            clampIndex()
+            companion.setApprovalAnimating(false)
         }
+    }
+}
+
+private struct DeckArrowButton: View {
+    let symbol: String
+    let disabled: Bool
+    let helpText: String
+    let action: () -> Void
+    @StateObject private var hovered = Flag()
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(hovered.on && !disabled ? Paper.inkPrimary : Paper.inkSecondary)
+                .frame(width: 22, height: 22)
+                .background(hovered.on && !disabled ? Paper.fillHover : Paper.fillSubtle, in: shape)
+                .overlay(shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5))
+        }
+        .buttonStyle(.plain)
+        .pointerStyle(disabled ? .default : .link)
+        .onHover { hovered.on = $0 }
+        .disabled(disabled)
+        .opacity(disabled ? 0.35 : 1.0)
+        .help(helpText)
     }
 }
 
@@ -236,7 +241,7 @@ private struct PendingBatch: Identifiable {
     let failed: [Approval]
 }
 
-/// A peek card that sits behind the front card, establishing depth.
+/// A peek card that sits behind the front card, establishing depth on elevated paper.
 struct PeekCard: View {
     let approval: Approval
     let offset: Int // 1 or 2
@@ -266,24 +271,27 @@ struct PeekCard: View {
                 Image(systemName: approval.symbol)
                     .font(.system(size: 11, weight: .medium))
                     .frame(width: 22, height: 22)
-                    .background(Paper.ink.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    .foregroundStyle(Paper.ink)
+                    .background(
+                        Paper.fillSubtle,
+                        in: RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous))
+                    .foregroundStyle(Paper.inkPrimary)
                 Text(approval.title)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(Paper.Typography.label)
                     .lineLimit(1)
-                    .foregroundStyle(Paper.ink)
+                    .foregroundStyle(Paper.inkPrimary)
                 Spacer()
             }
             Spacer(minLength: 0)
         }
         .padding(12)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Paper.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Paper.hairline, lineWidth: 1)
+        .surface(
+            RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous),
+            lift: 0.75,
+            fill: Paper.elevated,
+            border: Paper.borderStrong,
+            borderWidth: 0.5
         )
-        .shadow(color: .black.opacity(0.06), radius: 4, y: 2)
         // Shrinks toward its bottom edge, so that edge peeks out below the card in front.
         .scaleEffect(scale, anchor: .bottom)
         .offset(y: yOffset)
@@ -301,15 +309,15 @@ struct EmailBody: View {
         VStack(alignment: .leading, spacing: 10) {
             ForEach(EmailParagraph.parse(text)) { paragraph in
                 Text(verbatim: paragraph.text)
-                    .font(.system(size: 13))
+                    .font(Paper.Typography.callout)
                     .lineSpacing(3)
-                    .foregroundStyle(paragraph.quoted ? Paper.ink.opacity(0.7) : Paper.ink)
+                    .foregroundStyle(paragraph.quoted ? Paper.inkSecondary : Paper.inkPrimary)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.leading, paragraph.quoted ? 10 : 0)
                     .overlay(alignment: .leading) {
                         if paragraph.quoted {
-                            Rectangle().fill(Paper.hairline).frame(width: 2)
+                            Rectangle().fill(Paper.borderSubtle).frame(width: 2)
                         }
                     }
             }
@@ -326,7 +334,8 @@ struct EmailThreadPreview: View {
         VStack(alignment: .leading, spacing: 10) {
             if let subject = email.subject {
                 Text(verbatim: subject)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(Paper.Typography.label)
+                    .foregroundStyle(Paper.inkPrimary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if email.messages.count > 1 {
@@ -336,6 +345,7 @@ struct EmailThreadPreview: View {
                     }
                 }
                 .pickerStyle(.menu)
+                .pointerStyle(.link)
             }
             if !email.messages.isEmpty {
                 let message = email.messages[min(selection.message, email.messages.count - 1)]
@@ -346,17 +356,21 @@ struct EmailThreadPreview: View {
                     if !message.bcc.isEmpty { Text("Bcc: \(message.bcc.joined(separator: ", "))") }
                     if let date = message.sentAt { Text(date) }
                 }
-                .font(.caption)
+                .font(Paper.Typography.caption)
                 .foregroundStyle(Paper.inkSecondary)
                 .fixedSize(horizontal: false, vertical: true)
                 if let body = message.body {
                     EmailBody(text: body)
                 } else {
-                    Text("Email body unavailable").font(.callout).foregroundStyle(Paper.inkSecondary)
+                    Text("Email body unavailable")
+                        .font(Paper.Typography.callout)
+                        .foregroundStyle(Paper.inkSecondary)
                 }
             }
             if let reason = email.unavailableReason {
-                Text(reason).font(.callout).foregroundStyle(Paper.inkSecondary)
+                Text(reason)
+                    .font(Paper.Typography.callout)
+                    .foregroundStyle(Paper.inkSecondary)
             }
         }
     }

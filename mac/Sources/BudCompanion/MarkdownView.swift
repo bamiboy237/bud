@@ -45,10 +45,9 @@ private enum ParsedMarkdown {
     }
 }
 
-/// One type scale for replies, in SF Pro, built from a single body size: the bubble reads at
-/// 13 pt, the conversation window a step up. Headings, lists, tables, and code all derive
-/// from it, so nothing in a reply picks its own typeface or size. SF Mono is wider and taller
-/// than SF Pro at the same size, so code sits at about 0.86 of the body to look the same.
+/// One type scale for replies, built on bundled Inter Variable + IBM Plex Mono from a single
+/// body size: the bubble reads at 13 pt, the conversation window at 14 pt. Headings, lists,
+/// tables, and code all derive from it, so nothing in a reply picks its own typeface or size.
 struct ReplyType {
     var size: CGFloat = 13
     var lineSpacing: CGFloat = 3
@@ -58,17 +57,36 @@ struct ReplyType {
     /// The floating bubble: code wraps instead of scrolling sideways.
     var compact: Bool = true
 
-    var body: Font { .system(size: size) }
-    var title: Font { .system(size: size + 4.5, weight: .semibold) }
-    var heading: Font { .system(size: size + 2, weight: .semibold) }
-    var section: Font { .system(size: size + 0.5, weight: .semibold) }
-    var minor: Font { .system(size: size, weight: .medium) }
-    var marker: Font { .system(size: size - 0.5).monospacedDigit() }
-    var table: Font { .system(size: size - 1.5).monospacedDigit() }
-    var codeSize: CGFloat { (size * 0.86).rounded() }
-    var code: Font { .system(size: codeSize, design: .monospaced) }
+    var body: Font { Fonts.sans(size: size, weight: Fonts.OpticalWeight.regular) }
+    var title: Font {
+        Fonts.sans(size: size >= 14 ? 20 : size + 5.5, weight: Fonts.OpticalWeight.bold)
+    }
+    var heading: Font {
+        Fonts.sans(size: size >= 14 ? 16.5 : size + 2.5, weight: Fonts.OpticalWeight.semibold)
+    }
+    var section: Font {
+        Fonts.sans(size: size >= 14 ? 14.5 : size + 1, weight: Fonts.OpticalWeight.semibold)
+    }
+    var minor: Font { Fonts.sans(size: size, weight: Fonts.OpticalWeight.medium) }
+    var marker: Font {
+        Fonts.sans(size: size - 0.5, weight: Fonts.OpticalWeight.regular, tabularDigits: true)
+    }
+    var table: Font {
+        Fonts.sans(size: size - 1.5, weight: Fonts.OpticalWeight.regular, tabularDigits: true)
+    }
+    var codeSize: CGFloat { size >= 14 ? 12.5 : (size * 0.88).rounded() }
+    var code: Font { Fonts.mono(size: codeSize) }
     var codeLineSpacing: CGFloat { compact ? 2 : 2.5 }
-    var meta: Font { .system(size: max(10.5, size - 2.5), weight: .medium, design: .monospaced) }
+    var meta: Font { Paper.Typography.ledgerMeta }
+
+    func tracking(for headingLevel: Int) -> CGFloat {
+        switch headingLevel {
+        case 1: Paper.Typography.h1Tracking
+        case 2: Paper.Typography.h2Tracking
+        case 3: Paper.Typography.h3Tracking
+        default: 0
+        }
+    }
 }
 
 private struct ReplyTypeKey: EnvironmentKey {
@@ -84,7 +102,7 @@ extension EnvironmentValues {
 
 private enum Metrics {
     static let marker: CGFloat = 16
-    static let radius: CGFloat = 6
+    static let codeHeaderHeight: CGFloat = 26
 }
 
 private struct Blocks: View {
@@ -110,11 +128,15 @@ private struct Block: View {
         case let heading as Heading:
             // More room above than below, so a heading belongs to the text it introduces.
             VStack(alignment: .leading, spacing: 5) {
-                Prose(text: inline(heading, code: type.code), font: font(heading.level), spacing: 1.5)
+                Prose(
+                    text: inline(heading, code: type.code),
+                    font: font(heading.level),
+                    spacing: 1.5,
+                    tracking: type.tracking(for: heading.level))
                     .foregroundStyle(heading.level >= 4 ? Paper.inkSecondary : Paper.inkPrimary)
                 // Top-level headings carry a hairline, so a long reply reads in sections.
                 if heading.level <= 2 {
-                    Rectangle().fill(Paper.hairline).frame(height: 0.5)
+                    Rectangle().fill(Paper.borderSubtle).frame(height: 0.5)
                 }
             }
             .padding(.top, first ? 0 : heading.level <= 2 ? type.blockSpacing * 0.6 : 2)
@@ -128,7 +150,7 @@ private struct Block: View {
             CodeBlockView(code: code.code, language: code.language)
         case let quote as BlockQuote:
             HStack(alignment: .top, spacing: 10) {
-                RoundedRectangle(cornerRadius: 1.5).fill(Paper.inkRule).frame(width: 3)
+                RoundedRectangle(cornerRadius: 1.5).fill(Paper.borderStrong).frame(width: 3)
                 Blocks(blocks: Array(quote.children), spacing: type.itemSpacing + 2)
                     .foregroundStyle(Paper.inkSecondary)
                     .padding(.vertical, 1)
@@ -137,7 +159,7 @@ private struct Block: View {
         case let table as Markdown.Table:
             TableView(table: table)
         case is ThematicBreak:
-            Rectangle().fill(Paper.hairline).frame(height: 0.5).padding(.vertical, 4)
+            Rectangle().fill(Paper.borderSubtle).frame(height: 0.5).padding(.vertical, 4)
         default:
             // HTML and anything newer than this renderer: show the source rather than drop it.
             Prose(text: AttributedString(markup.format()))
@@ -154,18 +176,24 @@ private struct Block: View {
     }
 }
 
-/// Text in the reply typeface, wrapped and selectable, with inline code drawn as chips.
+/// Text in the reply typeface, wrapped and selectable, with inline code and citations drawn as chips.
 private struct Prose: View {
     let text: AttributedString
     var font: Font?
     var spacing: CGFloat?
+    var tracking: CGFloat = 0
     @Environment(\.replyType) private var type
 
     var body: some View {
         chipped(text)
             .font(font ?? type.body)
+            .tracking(tracking)
             .lineSpacing(spacing ?? type.lineSpacing)
-            .textRenderer(CodeChips(fill: Paper.inkPrimary.opacity(0.085)))
+            .textRenderer(InlinePillRenderer(
+                codeFill: Paper.codeChipFill,
+                codeBorder: Paper.codeChipBorder,
+                citationFill: Paper.citationFill,
+                citationBorder: Paper.citationBorder))
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -174,56 +202,108 @@ private struct Prose: View {
 
 private enum ChipMetrics {
     static let gap: CGFloat = 3
+    static let punctuationGap: CGFloat = 2
 }
 
-/// Marks a run that is inline code, so `CodeChips` can draw its chip.
+/// Marks a run that is inline code, so `InlinePillRenderer` can draw its chip.
 private enum CodeRun: AttributedStringKey {
     typealias Value = Bool
     static let name = "bud.codeRun"
 }
 
-private struct CodeChipAttribute: TextAttribute {}
+/// Marks a run that is a clickable source citation pill.
+private enum CitationRun: AttributedStringKey {
+    typealias Value = Bool
+    static let name = "bud.citationRun"
+}
 
-/// One Text from an attributed string, with each code run tagged for a chip.
+/// Marks a pill run whose trailing character abuts punctuation (`.,:;!?)`).
+private enum TightTrailingRun: AttributedStringKey {
+    typealias Value = Bool
+    static let name = "bud.tightTrailingRun"
+}
+
+private struct CodeChipAttribute: TextAttribute {}
+private struct CitationPillAttribute: TextAttribute {}
+private struct TightTrailingAttribute: TextAttribute {}
+
+/// One Text from an attributed string, with inline code and citations tagged for pills.
 private func chipped(_ text: AttributedString) -> SwiftUI.Text {
     var out = SwiftUI.Text(verbatim: "")
     for run in text.runs {
-        let piece = SwiftUI.Text(AttributedString(text[run.range]))
-        out = out + (run[CodeRun.self] == true ? piece.customAttribute(CodeChipAttribute()) : piece)
+        var piece = SwiftUI.Text(AttributedString(text[run.range]))
+        if run[TightTrailingRun.self] == true {
+            piece = piece.customAttribute(TightTrailingAttribute())
+        }
+        if run[CitationRun.self] == true {
+            out = out + piece.customAttribute(CitationPillAttribute())
+        } else if run[CodeRun.self] == true {
+            out = out + piece.customAttribute(CodeChipAttribute())
+        } else {
+            out = out + piece
+        }
     }
     return out
 }
 
-/// Draws a rounded chip behind inline code, like an editor's: a 4 pt corner and a faint ink
-/// fill, a little wider than the glyphs so the code does not touch its neighbours.
-private struct CodeChips: TextRenderer {
-    let fill: Color
+/// Draws rounded micro-pills behind inline code and clickable source citations.
+private struct InlinePillRenderer: TextRenderer {
+    let codeFill: Color
+    let codeBorder: Color
+    let citationFill: Color
+    let citationBorder: Color
 
     func draw(layout: SwiftUI.Text.Layout, in context: inout GraphicsContext) {
         for line in layout {
-            // One chip per stretch of code: neighbouring code runs (kerning splits the last
-            // character into its own run) share a single rounded rectangle.
-            var chips: [CGRect] = []
-            var current: CGRect?
-            for run in line {
-                if run[CodeChipAttribute.self] != nil {
-                    let bounds = run.typographicBounds.rect
-                    current = current.map { $0.union(bounds) } ?? bounds
-                } else if let done = current {
-                    chips.append(done)
-                    current = nil
-                }
-            }
-            if let done = current { chips.append(done) }
-            for var chip in chips {
-                // The stretch's bounds include the kerning after its last character.
-                chip.size.width -= ChipMetrics.gap
-                context.fill(
-                    RoundedRectangle(cornerRadius: 4, style: .continuous)
-                        .path(in: chip.insetBy(dx: -3, dy: -1)),
-                    with: .color(fill))
-            }
+            drawPills(in: line, context: &context, isCitation: false, fill: codeFill, border: codeBorder)
+            drawPills(
+                in: line, context: &context, isCitation: true,
+                fill: citationFill, border: citationBorder)
             for run in line { context.draw(run) }
+        }
+    }
+
+    private func drawPills(
+        in line: SwiftUI.Text.Layout.Line,
+        context: inout GraphicsContext,
+        isCitation: Bool,
+        fill: Color,
+        border: Color?
+    ) {
+        var pills: [(rect: CGRect, tightRight: Bool)] = []
+        var current: CGRect?
+        var tightRight = false
+        for run in line {
+            let matches = isCitation
+                ? run[CitationPillAttribute.self] != nil
+                : run[CodeChipAttribute.self] != nil
+            if matches {
+                let bounds = run.typographicBounds.rect
+                current = current.map { $0.union(bounds) } ?? bounds
+                tightRight = run[TightTrailingAttribute.self] != nil
+            } else if let done = current {
+                pills.append((done, tightRight))
+                current = nil
+                tightRight = false
+            }
+        }
+        if let done = current { pills.append((done, tightRight)) }
+        for item in pills {
+            let trailingGap = item.tightRight ? ChipMetrics.punctuationGap : ChipMetrics.gap
+            var pill = item.rect
+            // The stretch's bounds include the kerning after its last character.
+            pill.size.width = max(0, pill.size.width - trailingGap)
+            let padded = CGRect(
+                x: pill.minX - ChipMetrics.gap,
+                y: pill.minY - 1,
+                width: pill.width + ChipMetrics.gap + trailingGap,
+                height: pill.height + 2)
+            let path = RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous)
+                .path(in: padded)
+            context.fill(path, with: .color(fill))
+            if let border {
+                context.stroke(path, with: .color(border), lineWidth: 0.5)
+            }
         }
     }
 }
@@ -249,7 +329,7 @@ private struct ListBlock: View {
     }
 
     /// Wide enough for the longest number in the list ("12."), so every marker fits on one
-    /// line and the items stay aligned. Body digits are about 7.5 pt; the period about 4.
+    /// line and the items stay aligned.
     private var markerWidth: CGFloat {
         guard let start else { return Metrics.marker }
         let digits = String(start + max(items.count - 1, 0)).count
@@ -272,32 +352,76 @@ private struct ListBlock: View {
     }
 }
 
-/// A code block on recessed paper with a hairline edge. In the window, long lines scroll
-/// sideways so code keeps its shape; in the small bubble they wrap. Hovering shows the
-/// language and a copy button.
+/// A code block on recessed paper with a hairline edge and a persistent quiet 26pt header bar.
+/// In the window, long lines scroll sideways so code keeps its shape; in the bubble they wrap.
 private struct CodeBlockView: View {
     let code: String
     let language: String?
     @Environment(\.replyType) private var type
-    @StateObject private var hover = Flag()
+    @StateObject private var copyHovered = Flag()
     @StateObject private var copied = Flag()
 
     private var source: String { code.hasSuffix("\n") ? String(code.dropLast()) : code }
 
     var body: some View {
-        content
-            .padding(.horizontal, 10)
-            .padding(.vertical, 9)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            // Lighter than the page, like an editor pane set into the reply.
-            .background(Paper.elevated, in: shape)
-            .overlay(shape.strokeBorder(Paper.hairline, lineWidth: 0.5))
-            .overlay(alignment: .topTrailing) { toolbar }
-            .onHover { hover.on = $0 }
+        VStack(alignment: .leading, spacing: 0) {
+            headerBar
+            Rectangle().fill(Paper.borderSubtle).frame(height: 0.5)
+            content
+                .padding(.horizontal, 10)
+                .padding(.vertical, 9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(Paper.recessed, in: shape)
+        .clipShape(shape)
+        .overlay(shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5))
     }
 
     private var shape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: Metrics.radius, style: .continuous)
+        RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
+    }
+
+    private var headerBar: some View {
+        HStack(spacing: 8) {
+            if let language, !language.isEmpty {
+                Text(language.lowercased())
+                    .font(type.meta)
+                    .foregroundStyle(Paper.inkMuted)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(source, forType: .string)
+                copied.on = true
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(1.2))
+                    copied.on = false
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: copied.on ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 10, weight: .medium))
+                    if copied.on {
+                        Text("Copied")
+                            .font(type.meta)
+                    }
+                }
+                .foregroundStyle(copied.on || copyHovered.on ? Paper.inkPrimary : Paper.inkMuted)
+                .padding(.horizontal, 6)
+                .frame(height: 18)
+                .background(
+                    copyHovered.on ? Paper.fillHover : .clear,
+                    in: RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .pointerStyle(.link)
+            .onHover { copyHovered.on = $0 }
+            .help(copied.on ? "Copied" : "Copy code")
+            .accessibilityLabel("Copy code")
+        }
+        .padding(.horizontal, 10)
+        .frame(height: Metrics.codeHeaderHeight)
     }
 
     @ViewBuilder
@@ -315,52 +439,15 @@ private struct CodeBlockView: View {
             }
         }
     }
-
-    @ViewBuilder
-    private var toolbar: some View {
-        if hover.on || copied.on {
-            HStack(spacing: 6) {
-                if let language, !language.isEmpty {
-                    Text(language.lowercased())
-                        .font(type.meta)
-                        .foregroundStyle(Paper.inkMuted)
-                }
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(source, forType: .string)
-                    copied.on = true
-                    Task { @MainActor in
-                        try? await Task.sleep(for: .seconds(1.2))
-                        copied.on = false
-                    }
-                } label: {
-                    Image(systemName: copied.on ? "checkmark" : "doc.on.doc")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(Paper.inkSecondary)
-                        .frame(width: 20, height: 18)
-                        .background(Paper.elevated, in: RoundedRectangle(cornerRadius: 4))
-                        .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(Paper.hairline, lineWidth: 0.5))
-                }
-                .buttonStyle(.plain)
-                .help(copied.on ? "Copied" : "Copy code")
-                .accessibilityLabel("Copy code")
-            }
-            .padding(5)
-            .transition(.opacity)
-        }
-    }
 }
 
-/// A table in a hairline frame: a tinted header row, row dividers, padded cells, and the
+/// A table in a hairline frame: a recessed header row, row dividers, padded cells, and the
 /// column alignment the markdown asked for. Numbers use tabular digits, so columns line up.
 private struct TableView: View {
     let table: Markdown.Table
     @Environment(\.replyType) private var type
 
     var body: some View {
-        // As wide as its content, like an editor's table. A table too wide for the space
-        // scrolls sideways at its natural column widths, rather than squeezing every column
-        // to the same narrow width.
         ViewThatFits(in: .horizontal) {
             grid.fixedSize(horizontal: true, vertical: true)
             ScrollView(.horizontal) { grid.fixedSize(horizontal: true, vertical: true) }
@@ -372,23 +459,27 @@ private struct TableView: View {
             GridRow { cells(Array(table.head.children), header: true) }
                 .background(Paper.recessed)
             ForEach(Array(table.body.children.enumerated()), id: \.offset) { _, row in
-                Rectangle().fill(Paper.hairline).frame(height: 0.5).gridCellUnsizedAxes(.horizontal)
+                Rectangle().fill(Paper.borderSubtle).frame(height: 0.5).gridCellUnsizedAxes(.horizontal)
                 GridRow { cells(Array(row.children), header: false) }
             }
         }
         .font(type.table)
-        .clipShape(RoundedRectangle(cornerRadius: Metrics.radius, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: Metrics.radius, style: .continuous)
-                .strokeBorder(Paper.hairline, lineWidth: 0.5))
+            RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
+                .strokeBorder(Paper.borderSubtle, lineWidth: 0.5))
     }
 
     @ViewBuilder
     private func cells(_ cells: [any Markup], header: Bool) -> some View {
         ForEach(Array(cells.enumerated()), id: \.offset) { index, cell in
             let alignment = alignment(index)
-            chipped(inline(cell, code: .system(size: type.codeSize - 1, design: .monospaced)))
-                .textRenderer(CodeChips(fill: Paper.inkPrimary.opacity(0.085)))
+            chipped(inline(cell, code: Fonts.mono(size: max(10, type.codeSize - 1))))
+                .textRenderer(InlinePillRenderer(
+                    codeFill: Paper.codeChipFill,
+                    codeBorder: Paper.codeChipBorder,
+                    citationFill: Paper.citationFill,
+                    citationBorder: Paper.citationBorder))
                 .fontWeight(header ? .semibold : .regular)
                 .foregroundStyle(header ? Paper.inkSecondary : Paper.inkPrimary)
                 .multilineTextAlignment(alignment.text)
@@ -400,7 +491,7 @@ private struct TableView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: alignment.frame)
                 // A full grid, as in an editor: a hairline between columns too.
                 .overlay(alignment: .leading) {
-                    if index > 0 { Rectangle().fill(Paper.hairline).frame(width: 0.5) }
+                    if index > 0 { Rectangle().fill(Paper.borderSubtle).frame(width: 0.5) }
                 }
                 .gridColumnAlignment(alignment.horizontal)
         }
@@ -423,7 +514,14 @@ private func inline(
     _ markup: any Markup, intent: InlinePresentationIntent = [], code codeFont: Font? = nil
 ) -> AttributedString {
     var out = AttributedString()
-    for child in markup.children {
+    let children = Array(markup.children)
+    for (index, child) in children.enumerated() {
+        let nextStartsWithPunctuation: Bool = {
+            guard index + 1 < children.count, let nextText = children[index + 1] as? Markdown.Text,
+                  let first = nextText.string.first
+            else { return false }
+            return ".,:;!?)]".contains(first)
+        }()
         switch child {
         case let text as Markdown.Text:
             var run = AttributedString(text.string)
@@ -444,13 +542,16 @@ private func inline(
                 run.inlinePresentationIntent = intent.union(.code)
             }
             run[CodeRun.self] = true
-            // Extra kerning on either side keeps the chip off the words beside it. It is
-            // spacing, not characters, so copying the text copies only the code.
-            if let last = out.characters.indices.last {
+            if nextStartsWithPunctuation { run[TightTrailingRun.self] = true }
+            if let lastChar = out.characters.last, !lastChar.isWhitespace,
+               let last = out.characters.indices.last
+            {
                 out[last..<out.endIndex].kern = ChipMetrics.gap
             }
             if let last = run.characters.indices.last {
-                run[last..<run.endIndex].kern = ChipMetrics.gap
+                run[last..<run.endIndex].kern = nextStartsWithPunctuation
+                    ? ChipMetrics.punctuationGap
+                    : ChipMetrics.gap
             }
             out += run
         case let link as Markdown.Link:
@@ -458,8 +559,21 @@ private func inline(
             if let destination = link.destination, let url = URL(string: destination) {
                 run.link = url
                 if url.scheme == Citations.scheme {
-                    // A citation is metadata: small mono, in the accent, never underlined.
-                    run.font = .system(size: 11, weight: .medium, design: .monospaced)
+                    // Citations render as high-contrast 11pt mono micro-pills.
+                    run.font = Paper.Typography.ledgerMeta
+                    run.foregroundColor = Paper.citationInk
+                    run[CitationRun.self] = true
+                    if nextStartsWithPunctuation { run[TightTrailingRun.self] = true }
+                    if let lastChar = out.characters.last, !lastChar.isWhitespace,
+                       let last = out.characters.indices.last
+                    {
+                        out[last..<out.endIndex].kern = ChipMetrics.gap
+                    }
+                    if let last = run.characters.indices.last {
+                        run[last..<run.endIndex].kern = nextStartsWithPunctuation
+                            ? ChipMetrics.punctuationGap
+                            : ChipMetrics.gap
+                    }
                 } else {
                     run.underlineStyle = .single
                 }

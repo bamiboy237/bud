@@ -14,6 +14,8 @@ from uuid import uuid4
 from bud.core.events import RUN_END_EVENTS, Event, EventType
 from bud.core.projection import (
     AUTO_PAUSES,
+    PROMPTED,
+    TERMINAL_SETUP_STATUSES,
     Snapshot,
     decisions,
     message_batch,
@@ -24,6 +26,7 @@ from bud.core.projection import (
     queued_messages,
     runs,
     setup_status_version,
+    since_last_prompt,
     snapshot,
     undecided_approvals,
     unreported_job_news,
@@ -79,11 +82,43 @@ CREATE TABLE IF NOT EXISTS conversations (
 );
 CREATE INDEX IF NOT EXISTS conversations_by_session ON conversations (session_id);
 CREATE INDEX IF NOT EXISTS events_by_type_session ON events (type, session_id);
+CREATE TABLE IF NOT EXISTS setup_wakeups (
+    wakeup_key TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    setup_id TEXT NOT NULL,
+    capability TEXT NOT NULL,
+    label TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    status_seq INTEGER NOT NULL,
+    origin TEXT,
+    run_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS setup_wakeups_pending
+    ON setup_wakeups (session_id, run_id);
 """
 # Recovery replays one run, which needs its predecessor's snapshot; keep a spare.
 KEEP_CONVERSATIONS = 2
 CACHED_SESSIONS = 32
 FOLDED_SESSIONS = 128
+
+
+def _active_setup_info(events: list[Event], capability: str) -> tuple[str | None, dict | None]:
+    for event in reversed(events):
+        if event.type == "capability.setup" and event.data.get("capability") == capability:
+            setup_id = event.data.get("setup_id") or event.id
+            origin = event.data.get("origin")
+            return setup_id, origin if isinstance(origin, dict) else None
+    return None, None
+
+
+def _session_origin(events: list[Event]) -> dict | None:
+    for event in reversed(events):
+        if event.type in ("run.queued", "user.message", "message.queued"):
+            origin = event.data.get("origin")
+            if isinstance(origin, dict):
+                return origin
+    return None
 
 
 class EventLog:
@@ -147,7 +182,13 @@ class EventLog:
             return self._insert(db, session_id, type, data, once=True, key=key)
 
     def update_setup_status(
-        self, session_id: str, data: dict, expected_event: str | None, *, key: str
+        self,
+        session_id: str,
+        data: dict,
+        expected_event: str | None,
+        *,
+        key: str,
+        origin: dict | None = None,
     ) -> bool:
         """Publish a check only if the same pending setup state still exists."""
         with self._connect() as db:
@@ -161,8 +202,60 @@ class EventLog:
             if version is None or version != expected_event or current is None:
                 return False
             if (current.status, current.reason) != (data["status"], data.get("reason")):
-                self._insert(db, session_id, "capability.status", data, once=True, key=key)
+                setup_id, setup_origin = _active_setup_info(events, data["capability"])
+                payload = dict(data)
+                if setup_id is not None and "setup_id" not in payload:
+                    payload["setup_id"] = setup_id
+                inserted = self._insert(
+                    db, session_id, "capability.status", payload, once=True, key=key
+                )
+                if inserted is not None and payload.get("status") in TERMINAL_SETUP_STATUSES:
+                    effective_setup_id = str(payload.get("setup_id") or inserted.id)
+                    effective_origin = (
+                        origin if origin is not None else (setup_origin or _session_origin(events))
+                    )
+                    self._record_setup_wakeup(
+                        db,
+                        session_id=session_id,
+                        setup_id=effective_setup_id,
+                        capability=payload["capability"],
+                        label=str(payload.get("label") or current.label),
+                        outcome=str(payload["status"]),
+                        status_seq=inserted.seq,
+                        origin=effective_origin,
+                    )
             return True
+
+    @staticmethod
+    def _record_setup_wakeup(
+        db: sqlite3.Connection,
+        *,
+        session_id: str,
+        setup_id: str,
+        capability: str,
+        label: str,
+        outcome: str,
+        status_seq: int,
+        origin: dict | None,
+    ) -> None:
+        wakeup_key = f"{session_id}:{setup_id}:{outcome}"
+        db.execute(
+            """INSERT OR IGNORE INTO setup_wakeups (
+                wakeup_key, session_id, setup_id, capability, label, outcome,
+                status_seq, origin, run_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)""",
+            (
+                wakeup_key,
+                session_id,
+                setup_id,
+                capability,
+                label,
+                outcome,
+                status_seq,
+                json.dumps(origin) if origin is not None else None,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
 
     def answer_question(
         self, session_id: str, approval_id: str, text: str, origin: dict | None = None
@@ -616,6 +709,46 @@ class EventLog:
             self._insert(db, session_id, "run.queued", run, key=f"{run['run_id']}:queued")
             return True
 
+    def claim_steering_messages(self, session_id: str, run_id: str) -> list[dict[str, Any]]:
+        """Atomically claim queued owner messages for injection into an active run."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if self._stopped(db, run_id):
+                return []
+            events = self._read(db, session_id)
+            if queue_paused(events):
+                return []
+            states = runs(events)
+            if (
+                not states
+                or states[-1].run_id != run_id
+                or states[-1].status not in ("queued", "running")
+            ):
+                return []
+            pending = queued_messages(events)
+            if not pending:
+                return []
+            claimed: list[dict[str, Any]] = []
+            for item in pending:
+                payload = item.model_dump()
+                inserted = self._insert(
+                    db,
+                    session_id,
+                    "user.message",
+                    {**payload, "run_id": run_id, "steered": True},
+                    once=True,
+                )
+                if inserted is None:
+                    continue
+                self._insert(
+                    db,
+                    session_id,
+                    "message.dispatched",
+                    {"message_id": item.message_id, "run_id": run_id, "steered": True},
+                )
+                claimed.append(payload)
+            return claimed
+
     def dispatch_job_report(self, session_id: str, run: dict) -> bool:
         """Queue a turn that reports ended jobs, if they are still unreported and nothing waits."""
         with self._connect() as db:
@@ -634,6 +767,82 @@ class EventLog:
                 return False
             self._insert(db, session_id, "run.queued", run, key=f"{run['run_id']}:queued")
             return True
+
+    def pending_setup_wakeups(
+        self, session_id: str, events: list[Event] | None = None
+    ) -> list[dict[str, Any]]:
+        """Durable terminal setup outcomes not yet covered by a completed prompted turn."""
+        if events is None:
+            events = self.read(session_id)
+        lower, _ = since_last_prompt(events, {"run_id": None})
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT wakeup_key, setup_id, capability, label, outcome, status_seq, origin
+                   FROM setup_wakeups
+                   WHERE session_id = ? AND run_id IS NULL AND status_seq > ?
+                   ORDER BY status_seq""",
+                (session_id, lower),
+            ).fetchall()
+        return [
+            {
+                "wakeup_key": row[0],
+                "setup_id": row[1],
+                "capability": row[2],
+                "label": row[3],
+                "outcome": row[4],
+                "status_seq": row[5],
+                "origin": json.loads(row[6]) if row[6] is not None else None,
+            }
+            for row in rows
+        ]
+
+    def dispatch_setup_wakeup(self, session_id: str, run: dict) -> bool:
+        """Queue one wakeup turn for terminal setup outcomes if still pending and idle."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            events = self._read(db, session_id)
+            states = runs(events)
+            if (
+                queue_paused(events)
+                or queued_messages(events)
+                or (
+                    states
+                    and states[-1].status in ("queued", "running", "stopping", "awaiting_approval")
+                )
+            ):
+                return False
+            lower, _ = since_last_prompt(events, {"run_id": None})
+            rows = db.execute(
+                """SELECT origin FROM setup_wakeups
+                   WHERE session_id = ? AND run_id IS NULL AND status_seq > ?
+                   ORDER BY status_seq""",
+                (session_id, lower),
+            ).fetchall()
+            if not rows:
+                return False
+            if run.get("origin") is None:
+                origin = next(
+                    (json.loads(row[0]) for row in reversed(rows) if row[0] is not None),
+                    None,
+                )
+                if origin is None:
+                    origin = _session_origin(events)
+                if origin is not None:
+                    run = {**run, "origin": origin}
+            db.execute(
+                """UPDATE setup_wakeups SET run_id = ?
+                   WHERE session_id = ? AND run_id IS NULL AND status_seq > ?""",
+                (run["run_id"], session_id, lower),
+            )
+            self._insert(db, session_id, "run.queued", run, key=f"{run['run_id']}:queued")
+            return True
+
+    def setup_wakeup_sessions(self) -> list[str]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT DISTINCT session_id FROM setup_wakeups WHERE run_id IS NULL"
+            ).fetchall()
+        return [row[0] for row in rows]
 
     def queue_sessions(self) -> list[str]:
         with self._connect() as db:
@@ -856,6 +1065,19 @@ class EventLog:
                         ORDER BY rowid DESC LIMIT ?)""",
                     (session_id, session_id, KEEP_CONVERSATIONS),
                 )
+            if terminal is not None and kind in ("run.completed", "run.waiting"):
+                row = db.execute(
+                    """SELECT json_extract(data, '$.trigger'), seq FROM events
+                       WHERE session_id = ? AND type = 'run.started'
+                       AND json_extract(data, '$.run_id') = ?""",
+                    (session_id, run_id),
+                ).fetchone()
+                if row and row[0] in PROMPTED:
+                    db.execute(
+                        """UPDATE setup_wakeups SET run_id = ?
+                           WHERE session_id = ? AND run_id IS NULL AND status_seq < ?""",
+                        (run_id, session_id, row[1]),
+                    )
             if terminal is not None and kind == "run.waiting":
                 self._supersede_updates(db, session_id, run_id)
             if (

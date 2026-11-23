@@ -13,6 +13,11 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin/BudCompanion" "$app/Contents/MacOS/bud"
 cp "$here/Info.plist" "$app/Contents/Info.plist"
+if [[ -d "$here/Sources/BudCompanion/Resources/Fonts" ]]; then
+  mkdir -p "$app/Contents/Resources/Fonts"
+  cp "$here/Sources/BudCompanion/Resources/Fonts"/* "$app/Contents/Resources/Fonts/"
+  echo "fonts: bundled"
+fi
 # Bundled pets ship by default; local pets can replace a bundled pet with the same ID.
 pets=${BUD_PETS:-${here:h}/data/pets}
 pet_sheet() {

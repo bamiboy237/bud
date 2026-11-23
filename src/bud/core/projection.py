@@ -51,6 +51,9 @@ class QueuedMessage(BaseModel):
     origin: MessageOrigin | None = None
 
 
+TERMINAL_SETUP_STATUSES = frozenset({"connected", "cancelled", "rejected", "dismissed"})
+
+
 class PendingSetup(BaseModel):
     """One capability setup card, tracked until it connects or is replaced."""
 
@@ -61,6 +64,7 @@ class PendingSetup(BaseModel):
     url: str | None = None
     steps: list[str] = Field(default_factory=list)
     reason: str | None = None
+    setup_id: str | None = None
 
 
 class SavedArtifact(BaseModel):
@@ -311,7 +315,7 @@ def pending_setups(events: list[Event]) -> list[PendingSetup]:
                 update={"status": incoming.status, "reason": incoming.reason}
             )
         cards[incoming.capability] = incoming
-    return [card for card in cards.values() if card.status not in {"connected", "cancelled"}]
+    return [card for card in cards.values() if card.status not in TERMINAL_SETUP_STATUSES]
 
 
 def runs(events: list[Event], *, summaries: bool = False) -> list[RunView]:
@@ -380,14 +384,32 @@ def runs(events: list[Event], *, summaries: bool = False) -> list[RunView]:
     return list(states.values())
 
 
-def reply_text(messages: list[dict]) -> str:
+def _response_text(message: dict) -> str:
     return "".join(
         part.get("content", "")
-        for message in messages
-        if message.get("kind") == "response"
         for part in message.get("parts", [])
         # bud's self-check notes are for the model, not the owner.
         if part.get("part_kind") == "text" and part.get("content") not in spiral_notes(message)
+    )
+
+
+def reply_segments(messages: list[dict]) -> list[str]:
+    """Assistant text split at mid-run steered user messages, oldest segment first."""
+    segments: list[str] = [""]
+    for message in messages:
+        if message.get("kind") == "request" and (meta := message.get("metadata") or {}).get(
+            "bud_steer"
+        ):
+            count = meta.get("bud_steer_count", 1)
+            segments.extend([""] * (count if isinstance(count, int) and count > 0 else 1))
+        elif message.get("kind") == "response":
+            segments[-1] += _response_text(message)
+    return segments
+
+
+def reply_text(messages: list[dict]) -> str:
+    return "".join(
+        _response_text(message) for message in messages if message.get("kind") == "response"
     )
 
 
@@ -400,17 +422,34 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
     transcript: list[Turn] = []
     blocks: dict[str, str] = {}
     run_turns: dict[str, Turn] = {}
+    steered_slots: dict[str, list[Turn]] = {}
     for event in events:
         match event.type:
             case "user.message":
+                if event.data.get("steered") and (steered_run := event.data.get("run_id")):
+                    # Reserve a pre-steer assistant slot right before the steered message;
+                    # empty slots are pruned once the transcript finishes.
+                    slot = Turn(role="assistant", text="")
+                    steered_slots.setdefault(steered_run, []).append(slot)
+                    transcript.append(slot)
                 transcript.append(Turn(role="user", text=event.data["text"], seq=event.seq))
                 blocks = {}
             case "run.waiting" | "run.completed":
                 report = event.data.get("report")
-                text = report_text(report) if report else reply_text(event.data.get("messages", []))
-                if not text:
-                    continue
                 run_id = event.data["run_id"]
+                slots = steered_slots.get(run_id, [])
+                if report:
+                    text = report_text(report)
+                    if not text:
+                        continue
+                else:
+                    segments = reply_segments(event.data.get("messages", []))
+                    for slot, seg in zip(slots, segments[:-1], strict=False):
+                        slot.text = seg
+                        slot.seq = event.seq
+                    text = segments[-1] if len(segments) > len(slots) else ""
+                    if not text:
+                        continue
                 if run_id not in run_turns:
                     run_turns[run_id] = Turn(role="assistant", text="")
                     transcript.append(run_turns[run_id])
@@ -464,6 +503,8 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
     ):
         state = "paused"
     groups = request_groups(events)
+    reserved = {id(slot) for slots in steered_slots.values() for slot in slots}
+    transcript = [turn for turn in transcript if id(turn) not in reserved or turn.text]
     return Snapshot(
         session_id=session_id,
         last_seq=events[-1].seq if events else 0,
@@ -628,12 +669,20 @@ def _failure_note(
 
 # Job news bud reports without being asked. The owner cancelled the others themselves.
 JOB_NEWS = ("task.completed", "task.failed", "task.paused", "task.stalled")
-# Runs that start a turn in the conversation: the owner's message, or a job report.
-PROMPTED = ("message", "job")
+# Runs that start a turn in the conversation: the owner's message, a job report, or a setup wakeup.
+PROMPTED = ("message", "job", "setup")
 JOB_REPORT = (
     "[bud system note] A job you started has ended or looks stuck. Tell the owner, in a few "
     "sentences, what it delivered, why it stopped, or that it seems stuck and they can ask you "
     "to stop it. Do not start new work."
+)
+SETUP_WAKEUP = (
+    "[bud system note] Capability setup changed. Review the <setup_updates> below. "
+    "If a capability is now connected, continue the owner's previous request using it "
+    "(load a connected app's actions with find_app_actions; after browser setup, call "
+    "enable_browser). If a capability setup was cancelled or declined, briefly acknowledge "
+    "that it will not be connected and offer alternatives or wrap up without reopening "
+    "setup unless asked."
 )
 
 

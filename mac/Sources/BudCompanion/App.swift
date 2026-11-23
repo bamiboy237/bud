@@ -40,6 +40,9 @@ private struct MenuContent: View {
         voice
         Divider()
         Button("Reconnect") { companion.start() }
+        Button(companion.diagnosticsCopied ? "Diagnostics copied" : "Copy Diagnostics") {
+            companion.copyDiagnostics()
+        }
         SettingsLink { Text("Settings…") }
         Divider()
         Button("Quit bud") { NSApp.terminate(nil) }.keyboardShortcut("q")
@@ -86,6 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var petVisible = true
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Fonts.register()
         let companion = Companion.shared
         let panel = PetPanel(root: PetView(companion: companion) { [weak self] in self?.focusPanel() }) {
             companion.anchor = $0
