@@ -13,7 +13,8 @@ struct DesktopDeliverySelection: Identifiable {
 struct DesktopDeliveryInspector: View {
     let selection: DesktopDeliverySelection
     let close: () -> Void
-    @State private var file = ""
+    @State private var attachment: ChatAttachment?
+    @State private var preview: AttachmentSelection?
     @State private var url = ""
     @State private var desktop = ""
     @State private var desktopID = ""
@@ -39,8 +40,16 @@ struct DesktopDeliveryInspector: View {
                 VStack(alignment: .leading, spacing: 12) {
                     if !phase.isEmpty {
                         Text(summary).font(Paper.Typography.callout)
-                        LabeledContent("File", value: file)
-                        LabeledContent("Desktop", value: desktop)
+                        if let attachment {
+                            LabeledContent("File", value: attachment.name)
+                            Button("Preview selected file") {
+                                preview = AttachmentSelection(
+                                    file: attachment, session: selection.session,
+                                    connection: selection.connection)
+                            }
+                            .help("Preview attachment \(attachment.id)")
+                        }
+                        LabeledContent("Desktop", value: displayDesktop(desktop, id: desktopID))
                         Text(url).font(.caption).textSelection(.enabled)
                         if phase == "delivered" || phase == "uncertain" {
                             Text("Reference \(reference)").font(.caption).textSelection(.enabled)
@@ -54,9 +63,12 @@ struct DesktopDeliveryInspector: View {
                         if canChange || phase == "approved" {
                             if canChange, !desktopChoices.isEmpty {
                                 Picker("Run browser on", selection: $targetID) {
-                                    Text(desktop).tag("")
+                                    Text(displayDesktop(desktop, id: desktopID)).tag("")
                                     ForEach(desktopChoices.keys.sorted(), id: \.self) { id in
-                                        if id != desktopID { Text(desktopChoices[id] ?? id).tag(id) }
+                                        if id != desktopID {
+                                            Text(displayDesktop(desktopChoices[id] ?? "", id: id))
+                                                .tag(id)
+                                        }
                                     }
                                 }
                                 Button("Use selected desktop") {
@@ -83,6 +95,10 @@ struct DesktopDeliveryInspector: View {
         }
         .background(Paper.canvas)
         .inspectorColumnWidth(min: 270, ideal: 340, max: 480)
+        .sheet(item: $preview) { selected in
+            AttachmentInspector(selection: selected) { preview = nil }
+                .frame(minWidth: 460, minHeight: 420)
+        }
         .task {
             await loadDesktops()
             while !Task.isCancelled {
@@ -91,6 +107,10 @@ struct DesktopDeliveryInspector: View {
                 try? await Task.sleep(for: .seconds(2))
             }
         }
+    }
+
+    private func displayDesktop(_ name: String, id: String) -> String {
+        id.isEmpty ? name : "\(name) · \(id.prefix(8))"
     }
 
     private var canChange: Bool { ["queued", "sign_in", "ready"].contains(phase) }
@@ -124,7 +144,12 @@ struct DesktopDeliveryInspector: View {
             let status = try await selection.connection.send("GET", selection.path)
             guard version == loadVersion else { return }
             if let form = status["browser"] as? [String: String] { url = form["url"] ?? "" }
-            if let attachment = status["file"] as? [String: String] { file = attachment["name"] ?? "" }
+            if let file = status["file"] as? [String: String],
+               let id = file["id"], let name = file["name"] {
+                attachment = ChatAttachment(id: id, name: name)
+            } else {
+                attachment = nil
+            }
             if let steps = status["steps"] as? [[String: Any]], let step = steps.last {
                 phase = step["browser_state"] as? String ?? ""
                 desktop = step["desktop"] as? String ?? ""
@@ -139,6 +164,10 @@ struct DesktopDeliveryInspector: View {
     private func act(_ action: String, body: [String: String]? = nil) async {
         guard !working else { return }
         working = true
+        if action == "retarget" {
+            // Until the destination is reloaded, there is nothing current to approve.
+            phase = ""
+        }
         loadVersion += 1
         problem = nil
         do {
