@@ -46,8 +46,10 @@ struct DesktopDeliveryInspector: View {
                             Text("Reference \(reference)").font(.caption).textSelection(.enabled)
                         }
                         if phase == "ready" {
-                            Button("Approve submission") { Task { await act("approve") } }
-                                .disabled(working)
+                            Button("Approve submission") {
+                                Task { await act("approve", body: ["desktop": desktopID]) }
+                            }
+                                .disabled(working || desktopID.isEmpty)
                         }
                         if canChange || phase == "approved" {
                             if canChange, !desktopChoices.isEmpty {
