@@ -41,6 +41,7 @@ class Turn(BaseModel):
     sources: dict[str, dict] | None = None
     attachments: list[Attachment] = Field(default_factory=list)
     routine: RoutineCard | None = None
+    desktop_job_id: str | None = None
 
 
 class PendingApproval(BaseModel):
@@ -491,7 +492,14 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
                 )
             case "background.finished":
                 # A reminder or a background command, posted by the server: no model turn.
-                transcript.append(Turn(role="assistant", text=event.data["text"]))
+                transcript.append(
+                    Turn(
+                        role="assistant",
+                        text=event.data["text"],
+                        seq=event.seq,
+                        desktop_job_id=event.data.get("desktop_job_id"),
+                    )
+                )
             case (
                 "routine.created"
                 | "routine.completed"

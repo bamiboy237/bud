@@ -22,11 +22,17 @@ struct DesktopHandoffPicker: View {
     @State private var problem: String?
     @State private var dispatching = false
     @State private var queued = false
+    @State private var useBrowser = false
+    @State private var formURL = ""
+    @State private var fileID = ""
+    @State private var referenceID = ""
+    @State private var submitID = ""
+    @State private var receiptID = ""
     @State private var jobID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Verify on paired desktops").font(Paper.Typography.body)
+            Text("Send to paired desktops").font(Paper.Typography.body)
             if queued {
                 Label("Queued. Results will appear in this chat.", systemImage: "checkmark.circle")
             } else if let desktops {
@@ -43,7 +49,7 @@ struct DesktopHandoffPicker: View {
                             } else if chosen.count < 2 {
                                 chosen.append(desktop.id)
                             }
-                            jobID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+                            resetJob()
                         } label: {
                             HStack {
                                 Image(systemName: chosen.contains(desktop.id)
@@ -57,8 +63,23 @@ struct DesktopHandoffPicker: View {
                         .buttonStyle(.plain)
                         .disabled(dispatching)
                     }
-                    Button("Queue verification") { Task { await dispatch() } }
-                        .disabled(chosen.isEmpty || dispatching)
+                    DisclosureGroup("Deliver through a website", isExpanded: $useBrowser) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("The last desktop opens the form. You approve before it sends the file.")
+                                .font(.caption).foregroundStyle(Paper.inkSecondary)
+                            TextField("Form URL", text: $formURL)
+                            TextField("File input ID", text: $fileID)
+                            TextField("Reference field ID", text: $referenceID)
+                            TextField("Submit button ID", text: $submitID)
+                            TextField("Receipt element ID", text: $receiptID)
+                        }
+                        .padding(.top, 4)
+                    }
+                    .disabled(dispatching)
+                    Button(useBrowser ? "Queue browser delivery" : "Queue verification") {
+                        Task { await dispatch() }
+                    }
+                    .disabled(chosen.isEmpty || dispatching || (useBrowser && !hasForm))
                 }
             } else if problem == nil {
                 ProgressView().controlSize(.small)
@@ -67,6 +88,21 @@ struct DesktopHandoffPicker: View {
         }
         .frame(width: 280, alignment: .leading)
         .task { await load() }
+        .onChange(of: browserForm) { _, _ in resetJob() }
+        .onChange(of: useBrowser) { _, _ in resetJob() }
+    }
+
+    private var browserForm: [String: String] {
+        [
+            "url": formURL, "file_input": fileID, "reference_input": referenceID,
+            "submit_button": submitID, "receipt": receiptID,
+        ].mapValues { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+    }
+
+    private var hasForm: Bool { !browserForm.values.contains("") }
+
+    private func resetJob() {
+        jobID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
     }
 
     private func load() async {
@@ -85,9 +121,12 @@ struct DesktopHandoffPicker: View {
         problem = nil
         defer { dispatching = false }
         do {
+            var payload: [String: Any] = [
+                "job_id": jobID, "file": selection.file.fields, "desktops": chosen,
+            ]
+            if useBrowser { payload["browser"] = browserForm }
             _ = try await selection.connection.send(
-                "POST", "sessions/\(selection.session)/desktop-jobs",
-                json: ["job_id": jobID, "file": selection.file.fields, "desktops": chosen])
+                "POST", "sessions/\(selection.session)/desktop-jobs", json: payload)
             queued = true
         } catch {
             problem = "\(error)"
