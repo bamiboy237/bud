@@ -127,11 +127,34 @@ pub struct Snapshot {
 
 /// Reply text of a run-end event: every text part of every response message.
 pub fn reply_text(data: &Value) -> String {
+    reply_text_from(data, false)
+}
+
+/// Trailing reply text after the last mid-run steered user message, if any.
+pub fn trailing_reply_text(data: &Value) -> String {
+    reply_text_from(data, true)
+}
+
+fn reply_text_from(data: &Value, trailing_only: bool) -> String {
     let mut out = String::new();
     let Some(messages) = data.get("messages").and_then(Value::as_array) else {
         return out;
     };
-    for message in messages {
+    let start = if trailing_only {
+        messages
+            .iter()
+            .rposition(|m| {
+                m.get("kind").and_then(Value::as_str) == Some("request")
+                    && m.get("metadata")
+                        .and_then(|meta| meta.get("bud_steer"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            })
+            .map_or(0, |i| i + 1)
+    } else {
+        0
+    };
+    for message in &messages[start..] {
         if message.get("kind").and_then(Value::as_str) != Some("response") {
             continue;
         }

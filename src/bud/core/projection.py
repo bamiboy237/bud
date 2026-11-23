@@ -384,14 +384,32 @@ def runs(events: list[Event], *, summaries: bool = False) -> list[RunView]:
     return list(states.values())
 
 
-def reply_text(messages: list[dict]) -> str:
+def _response_text(message: dict) -> str:
     return "".join(
         part.get("content", "")
-        for message in messages
-        if message.get("kind") == "response"
         for part in message.get("parts", [])
         # bud's self-check notes are for the model, not the owner.
         if part.get("part_kind") == "text" and part.get("content") not in spiral_notes(message)
+    )
+
+
+def reply_segments(messages: list[dict]) -> list[str]:
+    """Assistant text split at mid-run steered user messages, oldest segment first."""
+    segments: list[str] = [""]
+    for message in messages:
+        if message.get("kind") == "request" and (meta := message.get("metadata") or {}).get(
+            "bud_steer"
+        ):
+            count = meta.get("bud_steer_count", 1)
+            segments.extend([""] * (count if isinstance(count, int) and count > 0 else 1))
+        elif message.get("kind") == "response":
+            segments[-1] += _response_text(message)
+    return segments
+
+
+def reply_text(messages: list[dict]) -> str:
+    return "".join(
+        _response_text(message) for message in messages if message.get("kind") == "response"
     )
 
 
@@ -404,17 +422,34 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
     transcript: list[Turn] = []
     blocks: dict[str, str] = {}
     run_turns: dict[str, Turn] = {}
+    steered_slots: dict[str, list[Turn]] = {}
     for event in events:
         match event.type:
             case "user.message":
+                if event.data.get("steered") and (steered_run := event.data.get("run_id")):
+                    # Reserve a pre-steer assistant slot right before the steered message;
+                    # empty slots are pruned once the transcript finishes.
+                    slot = Turn(role="assistant", text="")
+                    steered_slots.setdefault(steered_run, []).append(slot)
+                    transcript.append(slot)
                 transcript.append(Turn(role="user", text=event.data["text"], seq=event.seq))
                 blocks = {}
             case "run.waiting" | "run.completed":
                 report = event.data.get("report")
-                text = report_text(report) if report else reply_text(event.data.get("messages", []))
-                if not text:
-                    continue
                 run_id = event.data["run_id"]
+                slots = steered_slots.get(run_id, [])
+                if report:
+                    text = report_text(report)
+                    if not text:
+                        continue
+                else:
+                    segments = reply_segments(event.data.get("messages", []))
+                    for slot, seg in zip(slots, segments[:-1], strict=False):
+                        slot.text = seg
+                        slot.seq = event.seq
+                    text = segments[-1] if len(segments) > len(slots) else ""
+                    if not text:
+                        continue
                 if run_id not in run_turns:
                     run_turns[run_id] = Turn(role="assistant", text="")
                     transcript.append(run_turns[run_id])
@@ -468,6 +503,8 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
     ):
         state = "paused"
     groups = request_groups(events)
+    reserved = {id(slot) for slots in steered_slots.values() for slot in slots}
+    transcript = [turn for turn in transcript if id(turn) not in reserved or turn.text]
     return Snapshot(
         session_id=session_id,
         last_seq=events[-1].seq if events else 0,
