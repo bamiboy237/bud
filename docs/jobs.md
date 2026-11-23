@@ -118,3 +118,13 @@ inside the DBOS durable runner. Each routine persists its `schedule`, `timezone`
   `POST /routines/{id}/occurrences/{occurrence_id}/confirm-delivery`. Session
   snapshots include `routines` and pending routine approvals (`R<seq>-<letter>`),
   and expired approvals are automatically denied without execution.
+
+### Create and review routines in chat
+
+Ask Bud to schedule a recurring job, for example, “Give me an attention briefing
+every Monday at 9 a.m. America/Chicago.” Bud proposes an enabled skill, the work
+it will do, and the schedule and time zone. Approve that proposal to save the
+routine. Its results return to the conversation that created it.
+
+Ask “What routines are set up in this chat?” to see their schedules, next runs,
+and recent status.
