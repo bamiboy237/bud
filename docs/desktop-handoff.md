@@ -39,7 +39,7 @@ and `bud desktop revoke DESKTOP_ID` removes a worker’s access. All commands us
 
 ## Deliver a file through a browser on another desktop
 
-Configure a normal HTML form that uses a file input, a text reference field,
+Configure a multipart HTML form that uses a file input, a text reference field,
 and a submit button on a single form. The confirmation page must show the exact
 reference in one element. Bud uses the reference to check whether an earlier
 submit succeeded. For a synthetic test, use IDs like these.
