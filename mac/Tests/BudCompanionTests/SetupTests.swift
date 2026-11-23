@@ -47,6 +47,28 @@ struct SetupTests {
     }
 
     @Test
+    func automaticSetupWakeupPreservesThePreviousAssistantTurn() throws {
+        let companion = Companion()
+        companion.apply(snapshot: [
+            "last_seq": 1,
+            "transcript": [
+                ["role": "user", "text": "Check my email"],
+                ["role": "assistant", "text": "Connect Gmail to continue."],
+            ],
+        ])
+        let start = try #require(BudEvent(json:
+            #"{"seq":2,"type":"run.started","data":{"trigger":"setup","run_id":"wakeup"}}"#))
+        companion.handle(start)
+        #expect(companion.turns.map(\.text) == ["Check my email", "Connect Gmail to continue."])
+        #expect(companion.reply.isEmpty)
+        let finish = try #require(BudEvent(json:
+            #"{"seq":3,"type":"run.completed","data":{"messages":[{"kind":"response","parts":[{"part_kind":"text","content":"You have two new emails."}]}]}}"#))
+        companion.handle(finish)
+        #expect(companion.turns.map(\.text) == ["Check my email", "Connect Gmail to continue."])
+        #expect(companion.reply == "You have two new emails.")
+    }
+
+    @Test
     func aReminderShowsAsANoticeWithoutARun() throws {
         let companion = Companion()
         companion.apply(snapshot: ["last_seq": 1])

@@ -623,10 +623,6 @@ def _create_app(
     )
     log = EventLog(db_path)
     hub = Hub(log)
-    if setup_journal is not None:
-        # The setup toolset was built before the log and hub existed; one seam
-        # hands its journal over so every setup event is a journaled event.
-        setup_journal.bind(hub)
     background.bind(hub)
     runner = compose_runner(
         hub,
@@ -645,6 +641,10 @@ def _create_app(
         mode_holder=live_mode,
         runner_cls=Runner,
     )
+    if setup_journal is not None:
+        # The setup toolset was built before the log, hub, and runner existed; one seam
+        # hands its journal over so every setup event is journaled and wakes the runner.
+        setup_journal.bind(hub, on_wakeup=runner.wake_setup)
 
     routine_wake = asyncio.Event()
     runner.bind_routine_wake(routine_wake)
@@ -901,6 +901,7 @@ def _create_app(
                 {"capability": capability, "status": "cancelled"},
                 headers={"Cache-Control": "no-store"},
             )
+        version = setup_journal.status_version(session_id, capability)
         status = "cancelled"
         if capability == "browser":
             pairing.stop()  # the cancelled code stops working at once
@@ -914,7 +915,41 @@ def _create_app(
                     raise HTTPException(503, str(exc)) from None
                 status = "connected"
         data = {"capability": capability, "label": card.label, "status": status}
-        hub.publish(session_id, "capability.status", data)
+        if not setup_journal.update_status(
+            session_id,
+            data,
+            version,
+            key=f"owner-setup-cancel:{uuid4().hex}",
+        ):
+            current = setup_journal.pending(session_id).get(capability)
+            if current is not None:
+                return JSONResponse(
+                    {
+                        "capability": capability,
+                        "label": current.label,
+                        "status": current.status,
+                        **({"reason": current.reason} if current.reason else {}),
+                    },
+                    headers={"Cache-Control": "no-store"},
+                )
+            latest = next(
+                (
+                    event.data
+                    for event in reversed(log.read(session_id))
+                    if event.type == "capability.status"
+                    and event.data.get("capability") == capability
+                ),
+                None,
+            )
+            if latest is not None:
+                return JSONResponse(
+                    {
+                        "capability": capability,
+                        "label": latest.get("label", card.label),
+                        "status": latest.get("status", "cancelled"),
+                    },
+                    headers={"Cache-Control": "no-store"},
+                )
         return JSONResponse(data, headers={"Cache-Control": "no-store"})
 
     @app.get("/models")
