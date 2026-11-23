@@ -115,6 +115,31 @@ struct TypographyTests {
         }
     }
 
+    @Test
+    func ditherBackdropGeneratesCachedNonEmptyImagesInLightAndDark() throws {
+        for scheme in [ColorScheme.light, .dark] {
+            let image = try #require(
+                DitherBackdrop.cachedImage(for: CGSize(width: 520, height: 640), scheme: scheme))
+            #expect(image.width >= 520)
+            #expect(image.height >= 640)
+            // Subsequent call with the same quantized bucket returns the cached instance.
+            let cached = try #require(
+                DitherBackdrop.cachedImage(for: CGSize(width: 518, height: 636), scheme: scheme))
+            #expect(cached === image)
+
+            let provider = try #require(image.dataProvider)
+            let data = try #require(provider.data) as Data
+            let nonZeroBytes = data.reduce(into: 0) { count, byte in
+                if byte != 0 { count += 1 }
+            }
+            // The upper-left wave band has active dither pixels while the bottom-right stays open.
+            #expect(nonZeroBytes > 0)
+            #expect(nonZeroBytes < data.count / 2)
+        }
+        #expect(DitherBackdrop.waveField(u: 0.18, v: 0.22) > 0.35)
+        #expect(DitherBackdrop.waveField(u: 0.95, v: 0.95) < 0.05)
+    }
+
     private func alpha(_ color: Color, in appearance: NSAppearance) -> CGFloat {
         var resolved: CGFloat = 0
         appearance.performAsCurrentDrawingAppearance {

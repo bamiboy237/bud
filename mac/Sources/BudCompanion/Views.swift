@@ -542,6 +542,10 @@ private struct Bubble: View {
         .frame(width: compact ? nil : 332, alignment: .leading)
         .frame(minWidth: 132, alignment: .leading)
         .fixedSize(horizontal: compact, vertical: false)
+        .background(
+            DitherBackdrop()
+                .clipShape(BubbleShape(anchor: companion.anchor))
+        )
         .surface(BubbleShape(anchor: companion.anchor))
         .onHover { companion.bubbleHovered = $0 }
         // A cited date opens the conversation window at that message.

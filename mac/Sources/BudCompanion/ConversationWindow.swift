@@ -159,7 +159,13 @@ private struct ConversationView: View {
         }
         .ignoresSafeArea(.container, edges: .top)
         .foregroundStyle(Paper.inkPrimary)
-        .background(Paper.canvas)
+        .background {
+            ZStack {
+                Paper.canvas
+                DitherBackdrop()
+            }
+            .ignoresSafeArea()
+        }
         .environment(\.replyType, pageType)
         .environment(\.openURL, OpenURLAction { url in
             companion.openSource(url) ? .handled : .systemAction
@@ -202,7 +208,6 @@ private struct ConversationView: View {
         }
         .padding(.trailing, 10)
         .frame(height: Rhythm.headerHeight)
-        .background(Paper.canvas)
     }
 
     private var statusDotColor: Color {
