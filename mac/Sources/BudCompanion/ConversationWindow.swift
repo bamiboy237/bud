@@ -92,9 +92,16 @@ private struct ConversationView: View {
     let window: ConversationWindow
     @FocusState private var typing: Bool
     @StateObject private var scroll = ScrollState()
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// Lines longer than this are hard to read, however wide the window gets.
     private let column: CGFloat = 640
+
+    private var cardTransition: AnyTransition {
+        reduceMotion
+            ? .opacity
+            : .scale(scale: 0.96).combined(with: .opacity)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -295,16 +302,21 @@ private struct ConversationView: View {
             }
             if !companion.setups.isEmpty {
                 SetupDeck(companion: companion)
-                    .frame(maxWidth: 420, alignment: .leading)
+                    .frame(maxWidth: 460, alignment: .leading)
+                    .transition(cardTransition)
             }
             if !companion.approvals.isEmpty {
                 // The card is the surface; a second panel around it read as a card in a card.
                 ApprovalDeck(companion: companion)
-                    .frame(maxWidth: 420, alignment: .leading)
+                    .frame(maxWidth: 460, alignment: .leading)
+                    .transition(cardTransition)
             } else if let receipt = companion.receipt {
                 ReceiptLine(receipt: receipt)
+                    .transition(.opacity)
             }
         }
+        .animation(.spring(duration: 0.22, bounce: 0), value: companion.setups.map(\.id))
+        .animation(.spring(duration: 0.22, bounce: 0), value: companion.approvals.first?.id)
     }
 
     /// One field for everything: a grounded two-row composer with generous input space on top

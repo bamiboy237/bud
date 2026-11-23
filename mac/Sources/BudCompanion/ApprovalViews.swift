@@ -296,7 +296,9 @@ struct PeekCard: View {
         .surface(
             RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous),
             lift: 0.75,
-            fill: Paper.elevated
+            fill: Paper.elevated,
+            border: Paper.borderStrong,
+            borderWidth: 0.5
         )
         // Shrinks toward its bottom edge, so that edge peeks out below the card in front.
         .scaleEffect(scale, anchor: .bottom)

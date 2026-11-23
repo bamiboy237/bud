@@ -831,32 +831,49 @@ struct ApprovalCard: View {
     let approval: Approval
     let onDecide: (Bool) -> Void
     @StateObject private var layout = ApprovalLayout()
+    @Environment(\.replyType) private var replyType
+
+    private var inWindow: Bool {
+        !replyType.compact || companion.windowOpen
+    }
+
     private var busy: Bool {
         companion.deciding.contains(approval.id) || companion.approvingBatch || companion.link != .connected
     }
     private var detailLimit: CGFloat {
         // The browser caution is read in full before turning it on, never behind a scroll;
         // it is written short enough to fit the deck at this height.
+        if inWindow {
+            return approval.isQuestion ? 260 : 200
+        }
         let height: CGFloat = approval.isQuestion ? 190 : approval.tool == "enable_browser" ? 135 : 94
         let hasProblem = companion.approvalFailures[approval.id] != nil || companion.decisionProblem != nil
         return hasProblem ? max(80, height - 40) : height
     }
 
     var body: some View {
-        content
-        .padding(12)
+        let radius = inWindow ? Paper.radiusLG : Paper.radiusMD
+        Group {
+            if inWindow {
+                windowContent
+            } else {
+                compactContent.padding(12)
+            }
+        }
         .frame(maxWidth: .infinity, alignment: .leading)
         .surface(
-            RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous),
+            RoundedRectangle(cornerRadius: radius, style: .continuous),
             lift: 1,
-            fill: Paper.elevated
+            fill: Paper.elevated,
+            border: inWindow ? Paper.borderStrong : Paper.borderSubtle,
+            borderWidth: 0.5
         )
         .disabled(busy)
         .opacity(busy ? 0.55 : 1)
         .animation(.easeOut(duration: 0.12), value: busy)
     }
 
-    private var content: some View {
+    private var compactContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             heading
             if approval.isQuestion {
@@ -872,6 +889,58 @@ struct ApprovalCard: View {
                     .foregroundStyle(Paper.errorInk)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+
+    private var windowContent: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if approval.isQuestion {
+                QuestionCards(
+                    companion: companion,
+                    approval: approval,
+                    flow: companion.questionFlow(for: approval),
+                    listLimit: detailLimit,
+                    onDismiss: { onDecide(false) }
+                )
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    heading
+                    detail
+                    if let problem = companion.approvalFailures[approval.id] ?? companion.decisionProblem {
+                        Text(problem)
+                            .font(Paper.Typography.caption)
+                            .foregroundStyle(Paper.errorInk)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 12)
+
+                Rectangle().fill(Paper.hairline).frame(height: 0.5)
+
+                windowFooter
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+            }
+        }
+    }
+
+    private var windowFooter: some View {
+        HStack(spacing: 8) {
+            Button("Deny") { onDecide(false) }
+                .buttonStyle(CardButton(kind: .secondary))
+            if !Approval.yesOrNo.contains(approval.tool) {
+                Button("Change…") { companion.write(.revise(approval.id)) }
+                    .buttonStyle(CardButton(kind: .quiet))
+                    .help("Tell bud what to do differently")
+            }
+            Spacer(minLength: 4)
+            if approval.grantable { alwaysAllow }
+            Button(companion.approvalFailures[approval.id] == nil ? approval.verb : "Retry") {
+                onDecide(true)
+            }
+            .buttonStyle(CardButton(kind: .primary))
         }
     }
 

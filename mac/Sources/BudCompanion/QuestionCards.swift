@@ -113,11 +113,22 @@ struct QuestionCards: View {
     let approval: Approval
     @ObservedObject var flow: QuestionFlow
     let listLimit: CGFloat
+    var onDismiss: (() -> Void)? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.replyType) private var replyType
 
     private var answers: QuestionAnswers { flow.answers }
+    private var inWindow: Bool { !replyType.compact || companion.windowOpen }
 
     var body: some View {
+        if inWindow {
+            windowBody
+        } else {
+            compactBody
+        }
+    }
+
+    private var compactBody: some View {
         VStack(alignment: .leading, spacing: 10) {
             if answers.questions.count > 1 { navigation }
             ZStack(alignment: .topLeading) {
@@ -135,6 +146,77 @@ struct QuestionCards: View {
             }
             .clipped()
             .animation(.easeOut(duration: 0.25), value: answers.index)
+        }
+    }
+
+    private var windowBody: some View {
+        let canSend = !answers.picked.isEmpty || answers.typed != nil
+        return VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .center, spacing: 8) {
+                    Text(answers.questions.count > 1
+                        ? "Question \(answers.index + 1) of \(answers.questions.count)"
+                        : "Question")
+                        .font(Paper.Typography.captionMedium)
+                        .foregroundStyle(Paper.inkMuted)
+                    if let job = approval.job {
+                        Text("· \(job)")
+                            .font(Paper.Typography.caption)
+                            .foregroundStyle(Paper.inkMuted)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 4)
+                    if answers.questions.count > 1 {
+                        Button { flow.back() } label: { Image(systemName: "chevron.left") }
+                            .buttonStyle(IconButton(size: 22))
+                            .disabled(answers.isFirst)
+                            .opacity(answers.isFirst ? 0.35 : 1)
+                            .accessibilityLabel("Previous question")
+                            .help("Previous question")
+                    }
+                }
+
+                ZStack(alignment: .topLeading) {
+                    WindowQuestionPage(
+                        question: answers.current,
+                        picked: answers.picked,
+                        typed: answers.typed,
+                        listLimit: max(listLimit, 240),
+                        onSelect: { label in flow.answers.choose(label) },
+                        onSomethingElse: {
+                            flow.startTyping()
+                            companion.write(.answer(approval.id))
+                        }
+                    )
+                    .id(answers.index)
+                    .transition(transition)
+                }
+                .clipped()
+                .animation(.easeOut(duration: 0.25), value: answers.index)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 14)
+
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
+
+            HStack(spacing: 8) {
+                if let onDismiss {
+                    Button("Dismiss", action: onDismiss)
+                        .buttonStyle(CardButton(kind: .quiet))
+                }
+                Spacer(minLength: 8)
+                Button(answers.isLast ? "Submit" : "Next") {
+                    withTransaction(Transaction(animation: nil)) {
+                        flow.advance()
+                    }
+                }
+                .buttonStyle(CardButton(kind: .primary))
+                .disabled(!canSend)
+                .opacity(canSend ? 1 : 0.45)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
         }
     }
 
@@ -163,6 +245,208 @@ struct QuestionCards: View {
                 .accessibilityLabel("Question \(answers.index + 1) of \(answers.questions.count)")
             Spacer(minLength: 0)
         }
+    }
+}
+
+/// Structured question page for the full Conversation Window: bold question title, helper line,
+/// and rounded selectable option rows with left radio/check indicator and right numeric badge.
+private struct WindowQuestionPage: View {
+    let question: Question
+    let picked: [String]
+    let typed: String?
+    let listLimit: CGFloat
+    let onSelect: (String) -> Void
+    let onSomethingElse: () -> Void
+    @StateObject private var layout = ApprovalLayout()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(question.text)
+                    .font(Fonts.sans(size: 14.5, weight: Fonts.OpticalWeight.semibold))
+                    .foregroundStyle(Paper.inkPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(question.multiSelect ? "Select one or more answers" : "Select one answer")
+                    .font(Paper.Typography.caption)
+                    .foregroundStyle(Paper.inkMuted)
+            }
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(question.options.enumerated()), id: \.offset) { index, option in
+                        WindowOptionRow(
+                            option: option,
+                            index: index + 1,
+                            selected: picked.contains(option.label),
+                            multiSelect: question.multiSelect,
+                            action: {
+                                withTransaction(Transaction(animation: nil)) {
+                                    onSelect(option.label)
+                                }
+                            }
+                        )
+                        .modifier(Stagger(index: index))
+                    }
+                    WindowCustomAnswerRow(
+                        typed: typed,
+                        hasOptions: !question.options.isEmpty,
+                        action: onSomethingElse
+                    )
+                    .modifier(Stagger(index: question.options.count))
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { layout.height = $0 }
+            }
+            .frame(height: min(layout.height, listLimit))
+            .scrollBounceBehavior(.basedOnSize)
+        }
+    }
+}
+
+private struct WindowOptionRow: View {
+    let option: QuestionOption
+    let index: Int
+    let selected: Bool
+    let multiSelect: Bool
+    let action: () -> Void
+    @StateObject private var hovered = Flag()
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 8, style: .continuous)
+        Button(action: action) {
+            HStack(alignment: .center, spacing: 10) {
+                indicator
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(option.label)
+                        .font(Fonts.sans(
+                            size: 13,
+                            weight: selected ? Fonts.OpticalWeight.medium : Fonts.OpticalWeight.regular))
+                        .foregroundStyle(Paper.inkPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let description = option.description {
+                        Text(description)
+                            .font(Paper.Typography.caption)
+                            .foregroundStyle(Paper.inkSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Spacer(minLength: 6)
+                Text("\(index)")
+                    .font(Paper.Typography.ledgerMeta)
+                    .foregroundStyle(selected ? Paper.citationInk : Paper.inkMuted)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(
+                        selected ? Paper.citationFill : Paper.recessed,
+                        in: RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous)
+                            .strokeBorder(
+                                selected ? Paper.citationBorder : Paper.borderSubtle,
+                                lineWidth: 0.5))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                selected ? Paper.citationFill : hovered.on ? Paper.fillHover : Paper.fillSubtle,
+                in: shape
+            )
+            .overlay(
+                shape.strokeBorder(
+                    selected ? Paper.accent : Paper.borderSubtle,
+                    lineWidth: selected ? 1 : 0.5)
+            )
+            .contentShape(shape)
+        }
+        .buttonStyle(PressScaleOptionStyle())
+        .pointerStyle(.link)
+        .onHover { hovered.on = $0 }
+        .accessibilityLabel(option.description.map { "\(option.label), \($0)" } ?? option.label)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    @ViewBuilder
+    private var indicator: some View {
+        if multiSelect {
+            let box = RoundedRectangle(cornerRadius: 4, style: .continuous)
+            ZStack {
+                if selected {
+                    box.fill(Paper.accent)
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(Paper.canvas)
+                } else {
+                    box.strokeBorder(hovered.on ? Paper.inkSecondary : Paper.borderStrong, lineWidth: 1)
+                }
+            }
+            .frame(width: 15, height: 15)
+        } else {
+            ZStack {
+                Circle()
+                    .strokeBorder(
+                        selected ? Paper.accent : hovered.on ? Paper.inkSecondary : Paper.borderStrong,
+                        lineWidth: selected ? 1.5 : 1)
+                if selected {
+                    Circle()
+                        .fill(Paper.accent)
+                        .frame(width: 7, height: 7)
+                }
+            }
+            .frame(width: 15, height: 15)
+        }
+    }
+}
+
+private struct WindowCustomAnswerRow: View {
+    let typed: String?
+    let hasOptions: Bool
+    let action: () -> Void
+    @StateObject private var hovered = Flag()
+
+    var body: some View {
+        let hasCustom = typed != nil
+        let shape = RoundedRectangle(cornerRadius: 8, style: .continuous)
+        Button(action: action) {
+            HStack(alignment: .center, spacing: 10) {
+                Image(systemName: hasCustom ? "checkmark.circle.fill" : "pencil")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(hasCustom ? Paper.accent : Paper.inkMuted)
+                    .frame(width: 15, height: 15)
+                Text(typed ?? (hasOptions ? "Something else…" : "Answer in your own words…"))
+                    .font(Paper.Typography.callout)
+                    .foregroundStyle(hasCustom ? Paper.inkPrimary : Paper.inkSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 6)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                hasCustom ? Paper.citationFill : hovered.on ? Paper.fillHover : Paper.fillSubtle,
+                in: shape
+            )
+            .overlay(
+                shape.strokeBorder(
+                    hasCustom ? Paper.accent : Paper.borderSubtle,
+                    lineWidth: hasCustom ? 1 : 0.5)
+            )
+            .contentShape(shape)
+        }
+        .buttonStyle(PressScaleOptionStyle())
+        .pointerStyle(.link)
+        .onHover { hovered.on = $0 }
+        .accessibilityLabel(hasOptions ? "Something else" : "Answer in your own words")
+    }
+}
+
+private struct PressScaleOptionStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(!reduceMotion && configuration.isPressed ? 0.97 : 1.0)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }
 
