@@ -213,4 +213,8 @@ Hard rules live in code and hold in both modes: sending email, real Gmail and Ca
 
 The reviewer sees only the tool call, a description of its target looked up from Bud's own records, your request for this run, and your answers to Bud's questions in this turn. It never sees emails, web pages, or tool results, which is where prompt injection arrives. When you deny a call, Bud is told the reviewer's concern so it can try a safer way. If you approve a held call, an identical retry in the same session does not ask again.
 
-Auto mode sends the tool call and your request to OpenAI. Set `APPROVAL_REVIEW=false` to keep that off the API; auto mode then asks about every write, like strict. Each verdict, with its risk, authorization, and prompt version, is recorded in the `action.decided` event.
+Auto mode sends the tool call and your request to OpenAI. Set `APPROVAL_REVIEW=false` to keep
+review requests off that API. Bud then asks you about calls that would have gone to the
+reviewer. Auto mode still allows workspace creates and updates without asking. Use strict mode
+if you want those writes to ask for approval too. Each reviewer verdict, with its risk,
+authorization, and prompt version, is recorded in the `action.decided` event.
