@@ -54,6 +54,8 @@ from bud.core.log import StopRequested
 from bud.core.projection import (
     JOB_REPORT,
     PROMPTED,
+    SETUP_WAKEUP,
+    TERMINAL_SETUP_STATUSES,
     JobReport,
     RoutineBudget,
     RoutineDestination,
@@ -383,7 +385,9 @@ class Runner(DBOSConfiguredInstance):
             self.hub.publish(run["session_id"], "run.recovered", {"run_id": run["run_id"]})
             self._launch(run, recovering=True)
         for session_id in set(
-            self.hub.log.sessions_with_decisions() + self.hub.log.queue_sessions()
+            self.hub.log.sessions_with_decisions()
+            + self.hub.log.queue_sessions()
+            + self.hub.log.setup_wakeup_sessions()
         ):
             self._drain(session_id)
         if self.work_items is not None:
@@ -454,7 +458,7 @@ class Runner(DBOSConfiguredInstance):
             )
         owner_request = (
             None
-            if trigger == "job"
+            if trigger in ("job", "setup")
             else (
                 routine.owner_request
                 if routine is not None
@@ -580,6 +584,16 @@ class Runner(DBOSConfiguredInstance):
             self._on_loop(self._drain, session_id)
         return changed
 
+    def wake_setup(self, session_id: str) -> None:
+        """Schedule a drain for a capability setup outcome when the runner loop is active."""
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is None and (self._loop is None or self._loop.is_closed()):
+            return
+        self._on_loop(self._drain, session_id)
+
     def _drain(self, session_id: str) -> None:
         if self._closing or session_id in self._bursts or self._busy(session_id):
             return
@@ -596,6 +610,8 @@ class Runner(DBOSConfiguredInstance):
         if queue_paused(events):
             return
         if not pending:
+            if self._wake_setups(session_id, events):
+                return
             self._report_jobs(session_id, events)
             return
         run = self._inputs(
@@ -608,6 +624,32 @@ class Runner(DBOSConfiguredInstance):
         if self.hub.log.dispatch_message(session_id, pending[0].message_id, run):
             self.hub.wake(session_id)
             self._launch(run)
+
+    def _wake_setups(self, session_id: str, events: list[Event]) -> bool:
+        """Start a turn when a capability setup connected or was cancelled."""
+        wakeups = self.hub.log.pending_setup_wakeups(session_id, events)
+        if not wakeups:
+            return False
+        origin = next(
+            (wakeup["origin"] for wakeup in reversed(wakeups) if wakeup["origin"] is not None),
+            None,
+        )
+        if origin is None:
+            origin = next(
+                (
+                    event.data.get("origin")
+                    for event in reversed(events)
+                    if event.type in ("run.queued", "user.message", "message.queued")
+                    and isinstance(event.data.get("origin"), dict)
+                ),
+                None,
+            )
+        run = self._inputs(session_id, SETUP_WAKEUP, origin=origin, trigger="setup")
+        if self.hub.log.dispatch_setup_wakeup(session_id, run):
+            self.hub.wake(session_id)
+            self._launch(run)
+            return True
+        return False
 
     def _report_jobs(self, session_id: str, events: list[Event]) -> None:
         """Start a turn that tells the owner about jobs that ended or stalled since they last
@@ -2353,7 +2395,7 @@ def setup_updates_note(events: list[Event], run: dict) -> str:
     changes = {
         capability: status
         for capability, status in latest.items()
-        if status in {"connected", "cancelled"}
+        if status in TERMINAL_SETUP_STATUSES
     }
     if not changes:
         return ""
@@ -2361,9 +2403,8 @@ def setup_updates_note(events: list[Event], run: dict) -> str:
         "\n\n<setup_updates>Connection state from Bud, not a new request from the owner. "
         "Load a newly connected app's actions with find_app_actions; after browser setup, "
         "call enable_browser. The owner cancelled any setup "
-        "marked cancelled; do not reopen it unless they ask to connect that app again.\n"
-        + json.dumps(changes, ensure_ascii=False)
-        + "</setup_updates>"
+        "marked cancelled, rejected, or dismissed; do not reopen it unless they ask to "
+        "connect that app again.\n" + json.dumps(changes, ensure_ascii=False) + "</setup_updates>"
     )
 
 
