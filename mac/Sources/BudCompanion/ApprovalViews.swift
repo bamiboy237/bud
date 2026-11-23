@@ -11,7 +11,6 @@ enum DecisionDirection: Equatable {
 }
 
 final class DeckState: ObservableObject {
-    @Published var currentIndex: Int = 0
     @Published var flyOpacity: Double = 1.0
     @Published var activeDecision: DecisionDirection? = nil
     @Published var isAnimating: Bool = false
@@ -38,7 +37,7 @@ struct ApprovalDeck: View {
 
     private var totalCount: Int { companion.approvals.count }
     private var safeIndex: Int {
-        totalCount == 0 ? 0 : min(max(deck.currentIndex, 0), totalCount - 1)
+        totalCount == 0 ? 0 : min(companion.approvalDeck.safeIndex, totalCount - 1)
     }
     private var currentApproval: Approval? {
         guard safeIndex < totalCount else { return nil }
@@ -51,31 +50,23 @@ struct ApprovalDeck: View {
             if totalCount > 1 { headerBar }
             cardStack
         }
-        .onAppear { clampIndex() }
-        .onChange(of: companion.approvals.map(\.id)) { _, _ in clampIndex() }
         // A new front card always starts at home, whatever happened to the last one.
         .onChange(of: currentApproval?.id) { _, _ in
             if !deck.isAnimating { deck.finishDecision() }
         }
     }
 
-    private func clampIndex() {
-        if deck.currentIndex >= totalCount {
-            deck.currentIndex = max(0, totalCount - 1)
-        }
-    }
-
     private func cyclePrevious() {
-        guard !deck.isAnimating, deck.currentIndex > 0 else { return }
+        guard !deck.isAnimating, companion.approvalDeck.canSelectPrevious else { return }
         withAnimation(Self.settle) {
-            deck.currentIndex -= 1
+            companion.selectPreviousApproval()
         }
     }
 
     private func cycleNext() {
-        guard !deck.isAnimating, deck.currentIndex < totalCount - 1 else { return }
+        guard !deck.isAnimating, companion.approvalDeck.canSelectNext else { return }
         withAnimation(Self.settle) {
-            deck.currentIndex += 1
+            companion.selectNextApproval()
         }
     }
 
@@ -194,12 +185,13 @@ struct ApprovalDeck: View {
     }
 
     private func handleDecision(approval: Approval, approved: Bool) {
-        guard !deck.isAnimating else { return }
+        guard !deck.isAnimating, !companion.approvalDeck.isAnimating else { return }
         let flight = Duration.milliseconds(150)
         guard companion.decide(approval.id, approved: approved, after: reduceMotion ? nil : flight)
         else { return }
         guard !reduceMotion else { return }
         deck.isAnimating = true
+        companion.setApprovalAnimating(true)
         deck.activeDecision = approved ? .approve : .deny
 
         // A quiet fade where the card stands: no slide, no tilt, no stamp. The receipt line
@@ -211,7 +203,7 @@ struct ApprovalDeck: View {
         Task { @MainActor in
             try? await Task.sleep(for: flight)
             deck.finishDecision()
-            clampIndex()
+            companion.setApprovalAnimating(false)
         }
     }
 }
