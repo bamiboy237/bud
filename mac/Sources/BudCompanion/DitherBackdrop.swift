@@ -2,14 +2,15 @@ import AppKit
 import CoreGraphics
 import SwiftUI
 
-/// Subtle editorial pixel-matrix backdrop: an 8×8 Bayer ordered-dithering matrix applied to an
-/// organic sweeping wave luminance field, rendered into a cached ring of monochrome `CGImage`
-/// frames of crisp `2pt` square pixel dots. Drifts slowly like calm ocean waves over a seamless
-/// 15-second periodic loop with ~0% CPU after cache warmup, pauses automatically when the window
-/// or app is inactive or when Reduce Motion is enabled, and hides when Increase Contrast is on.
+/// Subtle editorial pixel-matrix backdrop: an 8×8 Bayer ordered-dithering matrix applied to a
+/// continuous, fluid 24fps traveling organic wave field, rendered directly into a compact cell-grid
+/// `CGImage` where each pixel draws as a crisp `3pt × 3pt` square dot (`.interpolation(.none)`).
+/// Pauses automatically when the window/app is inactive or Reduce Motion is enabled, and hides
+/// when Increase Contrast is on.
 struct DitherBackdrop: View {
-    static let frameCount = 24
-    static let loopDuration: TimeInterval = 15.0
+    static let cellPoints: CGFloat = 3
+    static let frameInterval: TimeInterval = 1.0 / 24.0
+    private static let epoch = Date(timeIntervalSinceReferenceDate: 0)
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.colorSchemeContrast) private var contrast
@@ -24,13 +25,13 @@ struct DitherBackdrop: View {
         GeometryReader { proxy in
             if contrast != .increased {
                 TimelineView(
-                    .animation(
-                        minimumInterval: Self.loopDuration / Double(Self.frameCount),
-                        paused: paused)
+                    .animation(minimumInterval: Self.frameInterval, paused: paused)
                 ) { context in
-                    let idx = paused ? 0 : Self.frameIndex(at: context.date)
-                    if let image = Self.cachedImage(
-                        for: proxy.size, scheme: colorScheme, frameIndex: idx)
+                    let time = paused ? 0 : context.date.timeIntervalSince(Self.epoch)
+                    if let image = Self.renderImage(
+                        for: proxy.size,
+                        scheme: colorScheme,
+                        time: time)
                     {
                         Image(decorative: image, scale: 1, orientation: .up)
                             .resizable()
@@ -42,18 +43,6 @@ struct DitherBackdrop: View {
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
-    }
-
-    static func frameIndex(at date: Date) -> Int {
-        let elapsed = date.timeIntervalSinceReferenceDate
-        let cycle = (elapsed / loopDuration).truncatingRemainder(dividingBy: 1.0)
-        let normalized = cycle < 0 ? cycle + 1.0 : cycle
-        return Int(normalized * Double(frameCount)) % frameCount
-    }
-
-    static func phase(forFrame frameIndex: Int) -> Double {
-        let wrapped = ((frameIndex % frameCount) + frameCount) % frameCount
-        return (2.0 * .pi * Double(wrapped)) / Double(frameCount)
     }
 
     /// Standard 8×8 Bayer ordered-dithering threshold matrix (`0..<64`).
@@ -68,57 +57,17 @@ struct DitherBackdrop: View {
         42, 26, 38, 22, 41, 25, 37, 21,
     ]
 
-    private final class Box {
-        let image: CGImage
-        init(_ image: CGImage) { self.image = image }
-    }
-
-    nonisolated(unsafe) private static let cache: NSCache<NSString, Box> = {
-        let cache = NSCache<NSString, Box>()
-        cache.countLimit = 128
-        return cache
-    }()
-
-    /// Returns a cached `CGImage` for the quantized surface size, appearance, and loop frame.
-    static func cachedImage(
+    /// Renders a compact `(cols × rows)` cell-grid `CGImage` for `size` where each pixel maps to
+    /// one crisp `3pt × 3pt` square dot when drawn with `.interpolation(.none)`.
+    static func renderImage(
         for size: CGSize,
         scheme: ColorScheme,
-        frameIndex: Int = 0
+        time: TimeInterval = 0
     ) -> CGImage? {
         guard size.width >= 16, size.height >= 16 else { return nil }
-        // Quantize to 32pt buckets so window resizing reuses buckets smoothly without churn.
-        let bucketW = max(32, Int((size.width / 32).rounded(.up)) * 32)
-        let bucketH = max(32, Int((size.height / 32).rounded(.up)) * 32)
+        let cols = max(1, Int(ceil(size.width / cellPoints)))
+        let rows = max(1, Int(ceil(size.height / cellPoints)))
         let isDark = scheme == .dark
-        let wrappedFrame = ((frameIndex % frameCount) + frameCount) % frameCount
-        let key = "\(bucketW)x\(bucketH)-\(isDark ? "dark" : "light")-f\(wrappedFrame)" as NSString
-        if let hit = cache.object(forKey: key) {
-            return hit.image
-        }
-        guard let rendered = renderImage(
-            widthPoints: bucketW,
-            heightPoints: bucketH,
-            isDark: isDark,
-            phase: phase(forFrame: wrappedFrame)
-        ) else {
-            return nil
-        }
-        cache.setObject(Box(rendered), forKey: key)
-        return rendered
-    }
-
-    /// Renders crisp `2pt × 2pt` dither dots into a premultiplied RGBA `CGImage`.
-    static func renderImage(
-        widthPoints: Int,
-        heightPoints: Int,
-        isDark: Bool,
-        phase: Double = 0
-    ) -> CGImage? {
-        let cellPt = 2
-        let cols = max(8, widthPoints / cellPt)
-        let rows = max(8, heightPoints / cellPt)
-        let pixelW = cols * cellPt
-        let pixelH = rows * cellPt
 
         // Premultiplied RGBA bytes for an active dot:
         // - Dark mode: #FFFFFF at ~6.6% alpha (17 / 255) over #18191D canvas
@@ -139,32 +88,25 @@ struct DitherBackdrop: View {
             dotB = UInt8((25 * Int(dotA)) / 255)
         }
 
-        var pixels = [UInt8](repeating: 0, count: pixelW * pixelH * 4)
+        var pixels = [UInt8](repeating: 0, count: cols * rows * 4)
         let invCols = 1.0 / Double(max(1, cols - 1))
         let invRows = 1.0 / Double(max(1, rows - 1))
 
         for cy in 0..<rows {
             let v = Double(cy) * invRows
             let bayerRowOffset = (cy & 7) * 8
+            let rowBase = cy * cols * 4
             for cx in 0..<cols {
                 let u = Double(cx) * invCols
-                let intensity = waveField(u: u, v: v, phase: phase)
+                let intensity = waveField(u: u, v: v, time: time)
                 let threshold = (bayer8x8[bayerRowOffset + (cx & 7)] + 0.5) / 64.0
                 guard intensity > threshold else { continue }
 
-                // Fill the 2pt × 2pt square dot.
-                let px0 = cx * cellPt
-                let py0 = cy * cellPt
-                for dy in 0..<cellPt {
-                    let rowBase = ((py0 + dy) * pixelW + px0) * 4
-                    for dx in 0..<cellPt {
-                        let idx = rowBase + dx * 4
-                        pixels[idx] = dotR
-                        pixels[idx + 1] = dotG
-                        pixels[idx + 2] = dotB
-                        pixels[idx + 3] = dotA
-                    }
-                }
+                let idx = rowBase + cx * 4
+                pixels[idx] = dotR
+                pixels[idx + 1] = dotG
+                pixels[idx + 2] = dotB
+                pixels[idx + 3] = dotA
             }
         }
 
@@ -173,11 +115,11 @@ struct DitherBackdrop: View {
         else { return nil }
 
         return CGImage(
-            width: pixelW,
-            height: pixelH,
+            width: cols,
+            height: rows,
             bitsPerComponent: 8,
             bitsPerPixel: 32,
-            bytesPerRow: pixelW * 4,
+            bytesPerRow: cols * 4,
             space: colorSpace,
             bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
             provider: provider,
@@ -187,27 +129,23 @@ struct DitherBackdrop: View {
         )
     }
 
-    /// Smooth organic wave luminance field in `0...0.82` with seamless `2π`-periodic `phase`:
-    /// strongest along a curved diagonal wave band sweeping from upper-left through center-left,
-    /// feathering smoothly into open canvas toward the right and bottom-right.
-    static func waveField(u: Double, v: Double, phase: Double = 0) -> Double {
-        let ridge1 = 0.24 + 0.16 * sin(v * .pi * 1.35 + 0.35 + phase) - 0.10 * v
-        let ridge2 = 0.46 + 0.14 * cos(v * .pi * 1.75 - 0.40 - phase) - 0.14 * v
-        let ripple =
-            0.055 * sin(u * 7.2 + v * 4.4 - phase)
-            + 0.04 * cos(u * 4.6 - v * 6.2 + phase)
+    /// Continuous traveling organic wave luminance field in `0...0.76`: 3 domain-warped wave
+    /// octaves drift across the viewport at a calm meditative pace (`~0.30 rad/s`), keeping
+    /// ~45–55% of the surface open solid canvas while soft halftone crests roll across.
+    static func waveField(u: Double, v: Double, time: Double = 0) -> Double {
+        let t = time * 0.30
+        let w1 = sin(u * 3.4 + v * 2.6 - t)
+        let w2 = cos(u * 2.8 - v * 3.6 + t * 0.82 + 0.7 * w1)
+        let w3 = sin((u + v) * 4.5 - t * 1.15 + 0.6 * w2)
 
-        let d1 = (u - ridge1 + ripple) / 0.26
-        let band1 = exp(-d1 * d1 * 1.35)
+        let dx = u - 0.52
+        let dy = v - 0.50
+        let edgeBias = min(0.22, (dx * dx + dy * dy) * 0.55)
 
-        let d2 = (u - ridge2 - ripple * 0.7) / 0.22
-        let band2 = 0.62 * exp(-d2 * d2 * 1.6)
-
-        let cornerCanopy = max(0, 1.0 - hypot(u * 1.15, v * 1.25))
-        let feather = pow(max(0, 1.0 - 0.56 * u - 0.32 * v), 1.25)
-
-        let raw = (0.72 * band1 + 0.48 * band2 + 0.36 * cornerCanopy) * feather
-        let contour = 0.88 + 0.12 * sin((u * 3.2 + v * 2.4 + band1 * 1.4) * .pi * 2.0 - phase)
-        return min(max(raw * contour, 0), 0.82)
+        let combined = 0.44 * w1 + 0.34 * w2 + 0.22 * w3 + edgeBias
+        let lifted = (combined - 0.04) * 0.82
+        guard lifted > 0 else { return 0 }
+        let clamped = min(lifted, 1.0)
+        return clamped * clamped * (3.0 - 2.0 * clamped) * 0.76
     }
 }

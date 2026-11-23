@@ -79,6 +79,12 @@ private enum Rhythm {
 
 private final class ScrollState: ObservableObject {
     @Published var atBottom = true
+    var jumpingUntil: Date = .distantPast
+
+    func jumpToBottom() {
+        jumpingUntil = Date.now.addingTimeInterval(0.35)
+        atBottom = true
+    }
 }
 
 private struct ConversationView: View {
@@ -120,24 +126,39 @@ private struct ConversationView: View {
                 .defaultScrollAnchor(.bottom)
                 .defaultScrollAnchor(.bottom, for: .sizeChanges)
                 .onScrollGeometryChange(for: Bool.self) { geometry in
-                    let scrollable = geometry.contentSize.height > geometry.containerSize.height + 64
+                    let scrollable = geometry.contentSize.height > geometry.containerSize.height + 80
                     let distanceFromBottom = geometry.contentSize.height - geometry.visibleRect.maxY
-                    return !scrollable || distanceFromBottom <= 96
+                    return !scrollable || distanceFromBottom <= 140
                 } action: { _, atBottom in
-                    scroll.atBottom = atBottom
+                    if Date.now < scroll.jumpingUntil {
+                        if !scroll.atBottom { scroll.atBottom = true }
+                    } else if scroll.atBottom != atBottom {
+                        scroll.atBottom = atBottom
+                    }
                 }
                 .overlay(alignment: .bottom) {
                     if !scroll.atBottom {
                         JumpButton {
-                            withAnimation(.spring(duration: 0.35, bounce: 0)) {
+                            scroll.jumpToBottom()
+                            withAnimation(.easeOut(duration: 0.14)) {
                                 proxy.scrollTo("end", anchor: .bottom)
                             }
                         }
-                        .padding(.bottom, 10)
-                        .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                        .padding(.bottom, 12)
+                        .frame(maxWidth: .infinity)
+                        .background(alignment: .bottom) {
+                            LinearGradient(
+                                colors: [Paper.canvas.opacity(0), Paper.canvas.opacity(0.92)],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                            .frame(height: 44)
+                            .allowsHitTesting(false)
+                        }
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
                     }
                 }
-                .animation(.easeOut(duration: 0.15), value: scroll.atBottom)
+                .animation(.easeOut(duration: 0.16), value: scroll.atBottom)
                 .onAppear {
                     // Replies finish laying out a moment after the first pass, which leaves the
                     // anchor short of the end; settle on the latest message once they have.
@@ -348,12 +369,14 @@ private struct ConversationView: View {
             .padding(.top, 12)
             .padding(.bottom, 6)
 
-            // Bottom utility strip: quiet keyboard hints on the left, send/stop action on the right.
+            // Bottom utility strip: minimal by default, with send/stop action on the right.
             HStack(alignment: .center, spacing: 8) {
-                Text(canCancel ? "↩ send · Esc cancel" : "↩ send · ⇧↩ newline")
-                    .font(Paper.Typography.ledgerMeta)
-                    .foregroundStyle(Paper.inkMuted)
-                    .lineLimit(1)
+                if canCancel && companion.replyingTo == nil {
+                    Text("Esc cancel")
+                        .font(Paper.Typography.ledgerMeta)
+                        .foregroundStyle(Paper.inkMuted)
+                        .lineLimit(1)
+                }
                 Spacer(minLength: 8)
                 if companion.running, !hasText {
                     RoundButton(symbol: "stop.fill", label: "Stop bud", action: companion.stop)
@@ -658,14 +681,15 @@ private struct JumpButton: View {
             }
             .foregroundStyle(hovered.on ? Paper.inkPrimary : Paper.inkSecondary)
             .padding(.horizontal, 12)
-            .frame(height: 26)
+            .padding(.vertical, 6)
             .surface(
                 Capsule(),
-                lift: 0.85,
+                lift: 1.0,
                 fill: hovered.on ? Paper.overlay : Paper.elevated,
                 border: Paper.borderStrong,
                 borderWidth: 0.5
             )
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .pointerStyle(.link)

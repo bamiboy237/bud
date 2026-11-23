@@ -116,42 +116,32 @@ struct TypographyTests {
     }
 
     @Test
-    func ditherBackdropGeneratesCachedNonEmptyImagesInLightAndDark() throws {
+    func ditherBackdropGeneratesTravelingWaveFramesInLightAndDark() throws {
+        let size = CGSize(width: 520, height: 640)
+        let expectedCols = Int(ceil(size.width / DitherBackdrop.cellPoints))
+        let expectedRows = Int(ceil(size.height / DitherBackdrop.cellPoints))
+
         for scheme in [ColorScheme.light, .dark] {
-            let image = try #require(
-                DitherBackdrop.cachedImage(for: CGSize(width: 520, height: 640), scheme: scheme))
-            #expect(image.width >= 520)
-            #expect(image.height >= 640)
-            // Subsequent call with the same quantized bucket returns the cached instance.
-            let cached = try #require(
-                DitherBackdrop.cachedImage(for: CGSize(width: 518, height: 636), scheme: scheme))
-            #expect(cached === image)
+            let frame0 = try #require(
+                DitherBackdrop.renderImage(for: size, scheme: scheme, time: 0))
+            #expect(frame0.width == expectedCols)
+            #expect(frame0.height == expectedRows)
 
-            let provider = try #require(image.dataProvider)
-            let data = try #require(provider.data) as Data
-            let nonZeroBytes = data.reduce(into: 0) { count, byte in
-                if byte != 0 { count += 1 }
+            let data0 = try #require(frame0.dataProvider?.data) as Data
+            let activeCells = stride(from: 3, to: data0.count, by: 4).reduce(into: 0) { count, idx in
+                if data0[idx] != 0 { count += 1 }
             }
-            // The upper-left wave band has active dither pixels while the bottom-right stays open.
-            #expect(nonZeroBytes > 0)
-            #expect(nonZeroBytes < data.count / 2)
+            let totalCells = expectedCols * expectedRows
+            // Traveling wave crests leave substantial open solid canvas while rendering visible halftone crests.
+            #expect(activeCells > totalCells / 12)
+            #expect(activeCells < (totalCells * 3) / 5)
 
-            // Distinct animation frames produce valid, distinct dithered wave patterns.
-            let shifted = try #require(
-                DitherBackdrop.cachedImage(
-                    for: CGSize(width: 520, height: 640), scheme: scheme, frameIndex: 6))
-            let shiftedData = try #require(shifted.dataProvider?.data) as Data
-            #expect(shiftedData != data)
+            // Distinct timestamps produce distinct traveling wave frames.
+            let frameLater = try #require(
+                DitherBackdrop.renderImage(for: size, scheme: scheme, time: 3.5))
+            let dataLater = try #require(frameLater.dataProvider?.data) as Data
+            #expect(dataLater != data0)
         }
-        #expect(DitherBackdrop.waveField(u: 0.18, v: 0.22) > 0.35)
-        #expect(DitherBackdrop.waveField(u: 0.95, v: 0.95) < 0.05)
-        // Seamless 2π periodic loop invariant.
-        #expect(
-            abs(
-                DitherBackdrop.waveField(u: 0.28, v: 0.42, phase: 0)
-                    - DitherBackdrop.waveField(u: 0.28, v: 0.42, phase: 2.0 * .pi)
-            ) < 1e-12
-        )
     }
 
     private func alpha(_ color: Color, in appearance: NSAppearance) -> CGFloat {
