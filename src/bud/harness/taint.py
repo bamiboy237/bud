@@ -89,6 +89,7 @@ _SELF_AUTHORED_TOOLS = frozenset(
         "update_task",
         "search_conversation_history",
         "run_command",
+        "run_local_command",
         "run_in_background",
     }
 )

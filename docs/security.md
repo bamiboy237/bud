@@ -85,9 +85,10 @@ add them.
 
 ## Shell commands
 
-On macOS, Bud runs shell commands in its workspace with `run_command`, and long ones with
-`run_in_background`, without asking. Each command runs under the macOS sandbox (Seatbelt)
-with these limits:
+On macOS, Bud uses `run_local_command` for work that needs no network, such as reading
+images with installed libraries or processing a spreadsheet. Use `run_command` when the task
+needs network access. Long commands use `run_in_background`. All three use the macOS sandbox
+(Seatbelt) with these limits:
 
 - It writes only inside the workspace and the system temp folder.
 - It cannot read your home folder, Bud's data folder, or the folder Bud runs from (which
@@ -100,7 +101,9 @@ with these limits:
   cancelled, its whole process group is stopped.
 - Python packages go into the workspace's own `.venv`.
 
-The sandbox blocks all network access except a local proxy that runs for each command.
+Local commands have no network access, even to a previously approved site. They do not
+ask for approval based on hostnames in the command. Network-capable commands keep the
+target check and can connect only through a local proxy.
 Package registries and code hosts (PyPI, npm, crates.io, GitHub, and others) pass. For any
 other site, the proxy asks the approval reviewer, with the command and your request. A site
 the reviewer allows is remembered until Bud restarts. A site it does not allow is blocked and

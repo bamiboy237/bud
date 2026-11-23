@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from functools import partial
+from pathlib import Path
 
 from pydantic_ai.exceptions import (
     ModelConnectionError,
@@ -14,13 +15,12 @@ from pydantic_ai.exceptions import (
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
-from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
+from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings, OpenAIResponsesModel
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.deepseek import DeepSeekProvider
 from pydantic_ai.providers.meta import MetaProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.openai_chatgpt import OpenAIChatGPTProvider
-from pydantic_ai.settings import ModelSettings
 
 from bud.config import Settings
 from bud.gateway.chatgpt import ChatGPTStore
@@ -72,7 +72,6 @@ def should_fall_back(exc: Exception, *, subscription: bool = False) -> bool:
 
 
 def provider_model_factory(settings: Settings, chatgpt: ChatGPTStore) -> ModelFactory:
-    model_settings = ModelSettings(timeout=REQUEST_TIMEOUT_SECONDS)
     providers = {}
 
     def build(spec: ModelSpec) -> Model | None:
@@ -118,7 +117,7 @@ def provider_model_factory(settings: Settings, chatgpt: ChatGPTStore) -> ModelFa
             "chat" if spec.provider in {"deepseek", "mistral"} else "responses"
         )
         model_type = OpenAIChatModel if protocol == "chat" else OpenAIResponsesModel
-        options = dict(model_settings)
+        options = OpenAIChatModelSettings(timeout=REQUEST_TIMEOUT_SECONDS)
         if spec.max_tokens is not None:
             options["max_tokens"] = spec.max_tokens
         if spec.reasoning_effort is not None:
@@ -129,14 +128,16 @@ def provider_model_factory(settings: Settings, chatgpt: ChatGPTStore) -> ModelFa
             )
         if spec.service_tier is not None:
             options["openai_service_tier"] = spec.service_tier
-        profile = None
-        if spec.supports_tools is not None or spec.context_window is not None:
-            profile = profile or {}
-            if spec.supports_tools is not None:
-                profile["supports_tools"] = spec.supports_tools
-            if spec.context_window is not None:
-                profile["context_window"] = spec.context_window
-        return model_type(spec.name, provider=providers[key], settings=options, profile=profile)
+        profile = OpenAIModelProfile()
+        if spec.supports_tools is not None:
+            profile["supports_tools"] = spec.supports_tools
+        if spec.supports_image_input is not None:
+            profile["supports_image_input"] = spec.supports_image_input
+        if spec.context_window is not None:
+            profile["context_window"] = spec.context_window
+        return model_type(
+            spec.name, provider=providers[key], settings=options, profile=profile or None
+        )
 
     return build
 
@@ -172,6 +173,7 @@ class Gateway:
         *,
         require_tools: bool = False,
         selected: str | None = None,
+        workspace: Path | None = None,
     ) -> Model:
         target = selected or self.selected_model
         if target:
@@ -192,7 +194,9 @@ class Gateway:
                     raise NoModelAvailable(
                         f"{spec.id} does not support tools. Select a tool-capable model."
                     )
-                chain.append(TrackedModel(model, spec, self.ledger, session_id))
+                chain.append(
+                    TrackedModel(model, spec, self.ledger, session_id, workspace=workspace)
+                )
                 if not self.fallback or target:
                     break
         if not chain:
