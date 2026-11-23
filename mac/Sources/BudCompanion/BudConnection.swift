@@ -46,11 +46,14 @@ enum ConnectionError: Error, CustomStringConvertible {
 
 /// An authenticated handle on one bud server.
 struct BudConnection: Sendable {
+    typealias Transport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+
     let base: URL
     let token: String
     /// The account scope from the handshake. Sent on every later request, so a server that
     /// switched accounts refuses old clients (409) instead of mixing approvals.
     var scope: String = ""
+    private let transport: Transport
 
     init(settings: BudSettings) throws {
         guard let base = URL(string: settings.url), Self.safeOrigin(base) else {
@@ -58,6 +61,19 @@ struct BudConnection: Sendable {
         }
         self.base = base
         self.token = try Self.ownerToken(home: settings.home)
+        self.transport = { try await budSession.data(for: $0) }
+    }
+
+    init(
+        base: URL,
+        token: String,
+        scope: String = "",
+        transport: @escaping Transport = { try await budSession.data(for: $0) }
+    ) {
+        self.base = base
+        self.token = token
+        self.scope = scope
+        self.transport = transport
     }
 
     /// Never send the owner secret over plaintext HTTP to another machine.
@@ -130,7 +146,7 @@ struct BudConnection: Sendable {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await budSession.data(for: request(method, path, json: json))
+            (data, response) = try await transport(request(method, path, json: json))
         } catch {
             throw ConnectionError.unreachable
         }

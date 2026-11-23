@@ -278,7 +278,13 @@ final class Companion {
     /// The newest stored event handled, so an older snapshot can't undo a newer event.
     @ObservationIgnored private var seenSeq = 0
     /// A message that failed to send, kept with its id so resending it can't run it twice.
-    @ObservationIgnored private var unsent: HeldMessage?
+    @ObservationIgnored private(set) var unsent: HeldMessage?
+    @ObservationIgnored private(set) var sendTask: Task<Void, Never>?
+
+    func connectForTesting(_ connection: BudConnection, session: String = "s1") {
+        self.connection = connection
+        self.session = session
+    }
     @ObservationIgnored private var blocks: [(id: String, text: String)] = []
     /// Model requests already streamed. A second text.reset for one means bud is replaying that
     /// step after a restart, so its partial text is dropped instead of shown twice.
@@ -762,7 +768,7 @@ final class Companion {
         let destination = session
         // A typed message waiting for its retry keeps its id; speech never clears it.
         if spoken == nil { unsent = nil }
-        Task {
+        sendTask = Task {
             do {
                 // Built here: a [String: Any] can't cross into the task under Swift 6 checking.
                 let body: [String: Any] = [
@@ -800,7 +806,7 @@ final class Companion {
             return
         }
         retryingHeldMessage = true
-        Task {
+        sendTask = Task {
             do {
                 _ = try await connection.send("POST", "sessions/\(held.session)/messages", json: [
                     "text": held.payload, "message_id": held.id, "origin": BudConnection.origin,

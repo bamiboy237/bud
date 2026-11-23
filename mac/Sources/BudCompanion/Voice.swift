@@ -20,6 +20,15 @@ enum VoiceState: Equatable {
     case failed(String)
 }
 
+protocol VoiceRecorder: AnyObject {
+    func start(level: @escaping @Sendable (Float) -> Void) throws
+    func stop() -> Clip
+}
+
+protocol VoiceTranscriber: Sendable {
+    func transcribe(_ clip: Clip) async throws -> String
+}
+
 /// Hold a key, talk, let go: your words go to bud as a message. Everything runs on this Mac.
 ///
 /// The microphone records while the key is down. On release, Parakeet (through FluidAudio)
@@ -39,34 +48,82 @@ final class Voice {
     /// The right ⌥ fallback needs Accessibility; the menu asks for it when this is true.
     private(set) var needsAccessibility = false
 
-    @ObservationIgnored private var transcriber: Transcriber?
-    @ObservationIgnored private let recorder = Recorder()
-    @ObservationIgnored private var talkKey: Hotkey?
+    @ObservationIgnored private var transcriber: (any VoiceTranscriber)?
+    @ObservationIgnored private let companion: Companion
+    @ObservationIgnored private let recorder: any VoiceRecorder
+    @ObservationIgnored private let registerHotkey:
+        @MainActor (Int, Int, @escaping () -> Void, @escaping () -> Void) -> (any HotkeyToken)?
+    @ObservationIgnored private let isDownloaded: () -> Bool
+    @ObservationIgnored private let requestMicAccess: () async -> Bool
+    @ObservationIgnored private let loadContacts: (Bool) async -> [String]
+    @ObservationIgnored private let loadTranscriber:
+        ([String], @escaping @Sendable (Double) -> Void) async throws -> any VoiceTranscriber
+    @ObservationIgnored private let rightOptionAllowed: @MainActor () -> Bool
+    @ObservationIgnored private let makeRightOptionHold:
+        @MainActor (@escaping () -> Void, @escaping () -> Void) -> RightOptionHold
+    @ObservationIgnored private let playSound: @MainActor (TalkSound) -> Void
+    @ObservationIgnored private var talkKey: (any HotkeyToken)?
     @ObservationIgnored private var optionHold: RightOptionHold?
-    @ObservationIgnored private var escapeKeys: [Hotkey] = []
+    @ObservationIgnored private var escapeKeys: [any HotkeyToken] = []
     /// What the field was for when this recording started: a message, or an answer.
     @ObservationIgnored private var destination: InputPurpose = .ask
+    @ObservationIgnored private(set) var setupTask: Task<Void, Never>?
+    @ObservationIgnored private(set) var transcriptionTask: Task<Void, Never>?
+
+    init(
+        companion: Companion = .shared,
+        recorder: any VoiceRecorder = Recorder(),
+        registerHotkey: @escaping @MainActor (
+            Int, Int, @escaping () -> Void, @escaping () -> Void
+        ) -> (any HotkeyToken)? = { Hotkey(key: $0, modifiers: $1, onPress: $2, onRelease: $3) },
+        isDownloaded: @escaping () -> Bool = { Transcriber.downloaded },
+        requestMicAccess: @escaping () async -> Bool = {
+            await AVCaptureDevice.requestAccess(for: .audio)
+        },
+        loadContacts: @escaping (Bool) async -> [String] = { await ContactNames.load(ask: $0) },
+        loadTranscriber: @escaping (
+            [String], @escaping @Sendable (Double) -> Void
+        ) async throws -> any VoiceTranscriber = {
+            try await Transcriber.load(names: $0, progress: $1)
+        },
+        rightOptionAllowed: @escaping @MainActor () -> Bool = { RightOptionHold.allowed },
+        makeRightOptionHold: @escaping @MainActor (
+            @escaping () -> Void, @escaping () -> Void
+        ) -> RightOptionHold = { RightOptionHold(onPress: $0, onRelease: $1) },
+        playSound: @escaping @MainActor (TalkSound) -> Void = { $0.play() }
+    ) {
+        self.companion = companion
+        self.recorder = recorder
+        self.registerHotkey = registerHotkey
+        self.isDownloaded = isDownloaded
+        self.requestMicAccess = requestMicAccess
+        self.loadContacts = loadContacts
+        self.loadTranscriber = loadTranscriber
+        self.rightOptionAllowed = rightOptionAllowed
+        self.makeRightOptionHold = makeRightOptionHold
+        self.playSound = playSound
+    }
 
     /// Takes the key, and loads the models if they were set up before.
     func start() {
-        talkKey = Hotkey(key: kVK_Space, modifiers: optionKey, onPress: press, onRelease: release)
+        talkKey = registerHotkey(kVK_Space, optionKey, press, release)
         if talkKey == nil {
             log.info("⌥ Space is taken; using the right Option key")
             keyName = "right ⌥"
-            needsAccessibility = !RightOptionHold.allowed
-            optionHold = RightOptionHold(onPress: press, onRelease: release)
+            needsAccessibility = !rightOptionAllowed()
+            optionHold = makeRightOptionHold(press, release)
         }
-        if Transcriber.downloaded { prepare(askForContacts: false) }
+        if isDownloaded() { prepare(askForContacts: false) }
     }
 
     /// "Set up voice…": asks for the microphone (and Contacts, for names), then downloads.
     func setUp() {
-        Task {
-            guard await AVCaptureDevice.requestAccess(for: .audio) else {
+        setupTask = Task {
+            guard await requestMicAccess() else {
                 state = .failed("Microphone access is off. Turn it on in System Settings, Privacy & Security, Microphone.")
                 return
             }
-            prepare(askForContacts: true)
+            await prepareAndWait(askForContacts: true)
         }
     }
 
@@ -75,54 +132,57 @@ final class Voice {
     func allowRightOption() {
         RightOptionHold.askForPermission()
         Task {
-            for _ in 0..<90 where !RightOptionHold.allowed {
+            for _ in 0..<90 where !rightOptionAllowed() {
                 try? await Task.sleep(for: .seconds(2))
             }
-            guard RightOptionHold.allowed else { return }
+            guard rightOptionAllowed() else { return }
             optionHold?.stop()
-            optionHold = RightOptionHold(onPress: press, onRelease: release)
+            optionHold = makeRightOptionHold(press, release)
             needsAccessibility = false
         }
     }
 
     /// At launch nothing is asked: Contacts are used only if you allowed them during setup.
     private func prepare(askForContacts: Bool) {
+        setupTask = Task { await prepareAndWait(askForContacts: askForContacts) }
+    }
+
+    private func prepareAndWait(askForContacts: Bool) async {
         if case .preparing = state { return }
         state = .preparing(0)
-        Task {
-            let names = await ContactNames.load(ask: askForContacts)
-            do {
-                transcriber = try await Transcriber.load(names: names) { fraction in
-                    // Updates arrive out of order across tasks; the bar only moves forward.
-                    Task { @MainActor in
-                        if case .preparing(let shown) = Voice.shared.state, fraction > shown {
-                            Voice.shared.state = .preparing(fraction)
-                        }
+        let names = await loadContacts(askForContacts)
+        do {
+            transcriber = try await loadTranscriber(names) { [weak self] fraction in
+                // Updates arrive out of order across tasks; the bar only moves forward.
+                Task { @MainActor in
+                    guard let self else { return }
+                    if case .preparing(let shown) = self.state, fraction > shown {
+                        self.state = .preparing(fraction)
                     }
                 }
-                state = .ready
-            } catch {
-                log.error("voice setup failed: \(error.localizedDescription, privacy: .public)")
-                state = .failed("Couldn't set up voice: \(error.localizedDescription)")
             }
+            state = .ready
+        } catch {
+            log.error("voice setup failed: \(error.localizedDescription, privacy: .public)")
+            state = .failed("Couldn't set up voice: \(error.localizedDescription)")
         }
     }
 
     // MARK: Talking
 
-    private func press() {
+    func press() {
         switch state {
         case .ready:
             // One held recording at a time: a second can't replace words not yet sent.
-            guard Companion.shared.unsentSpeech == nil else {
-                Companion.shared.nudge("Send or clear the words bud is holding first.")
+            guard companion.unsentSpeech == nil else {
+                companion.nudge("Send or clear the words bud is holding first.")
                 return
             }
             begin()
         case .off, .failed:
-            Companion.shared.nudge("Voice isn't set up yet. Choose Set up voice… in the menu bar.")
+            companion.nudge("Voice isn't set up yet. Choose Set up voice… in the menu bar.")
         case .preparing:
-            Companion.shared.nudge("Voice is still getting ready.")
+            companion.nudge("Voice is still getting ready.")
         case .listening, .transcribing:
             break  // A held key repeats; one press is one recording.
         }
@@ -130,27 +190,27 @@ final class Voice {
 
     private func begin() {
         do {
-            try recorder.start { level in
-                Task { @MainActor in Voice.shared.level = level }
+            try recorder.start { [weak self] level in
+                Task { @MainActor in self?.level = level }
             }
         } catch {
             log.error("mic failed: \(error.localizedDescription, privacy: .public)")
-            Companion.shared.nudge("bud couldn't use the microphone.")
+            companion.nudge("bud couldn't use the microphone.")
             return
         }
         state = .listening
-        destination = Companion.shared.inputPurpose
-        Companion.shared.hearing = true
-        TalkSound.start.play()
+        destination = companion.inputPurpose
+        companion.hearing = true
+        playSound(.start)
         // Esc drops the recording; taken only while listening, so it's never stolen otherwise.
         // Option is still held, so it arrives as ⌥ Esc; plain Esc covers a key let go early.
-        escapeKeys = [optionKey, 0].compactMap { Hotkey(key: kVK_Escape, modifiers: $0, onPress: cancel) }
+        escapeKeys = [optionKey, 0].compactMap { registerHotkey(kVK_Escape, $0, cancel, {}) }
     }
 
-    private func release() {
+    func release() {
         guard state == .listening else { return }
         let clip = finishListening()
-        TalkSound.stop.play()
+        playSound(.stop)
         // A tap, not a sentence: nothing to send.
         guard clip.seconds >= 0.3, let transcriber else {
             state = .ready
@@ -158,20 +218,20 @@ final class Voice {
         }
         state = .transcribing
         let destination = destination
-        Task {
+        transcriptionTask = Task {
             do {
                 let text = try await transcriber.transcribe(clip)
                 state = .ready
-                if !text.isEmpty { Companion.shared.say(text, meant: destination) }
+                if !text.isEmpty { companion.say(text, meant: destination) }
             } catch {
                 log.error("transcription failed: \(error.localizedDescription, privacy: .public)")
                 state = .ready
-                Companion.shared.nudge("bud didn't catch that. Try again?")
+                companion.nudge("bud didn't catch that. Try again?")
             }
         }
     }
 
-    private func cancel() {
+    func cancel() {
         guard state == .listening else { return }
         _ = finishListening()
         state = .ready
@@ -180,7 +240,7 @@ final class Voice {
     private func finishListening() -> Clip {
         escapeKeys.forEach { $0.unregister() }
         escapeKeys = []
-        Companion.shared.hearing = false
+        companion.hearing = false
         level = 0
         return recorder.stop()
     }
@@ -200,7 +260,7 @@ struct Clip: Sendable {
 
 /// The microphone. The tap runs on an audio thread, so samples land in a lock-guarded buffer
 /// and only a loudness number crosses back to the main thread.
-final class Recorder {
+final class Recorder: VoiceRecorder {
     private let engine = AVAudioEngine()
     private let sink = Sink()
 
@@ -254,7 +314,7 @@ final class Recorder {
 }
 
 /// Parakeet and the name boost, loaded once and used from one place at a time.
-actor Transcriber {
+actor Transcriber: VoiceTranscriber {
     private let asr: AsrManager
     private let boost: VocabularyBoostingSession?
 
