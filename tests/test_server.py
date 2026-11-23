@@ -730,18 +730,16 @@ def test_routine_and_task_survive_real_process_restart_and_paused_stays_paused(t
             f"/sessions/{session}/approvals/R1-A",
             json={"approved": True},
         ) == {"applied": True}
-        finished = server.wait(
-            lambda: (
-                r["latest_occurrence"]
-                if (r := server.request("GET", f"/routines/{active_routine['routine_id']}"))[
-                    "latest_occurrence"
-                ]["execution_status"]
-                == "completed"
-                else None
-            ),
-            "routine occurrence completes after restart",
-        )
-        assert finished["delivery_status"] == "confirmed"
+
+        def completed_and_delivered():
+            routine = server.request("GET", f"/routines/{active_routine['routine_id']}")
+            occurrence = routine["latest_occurrence"]
+            return (
+                occurrence["execution_status"] == "completed"
+                and occurrence["delivery_status"] == "confirmed"
+            )
+
+        server.wait(completed_and_delivered, "routine occurrence completes and confirms delivery")
         assert (server.data / "workspace" / FILENAME).read_text() == DRAFT
         assert (
             server.request("GET", f"/routines/{paused_routine['routine_id']}")["status"] == "paused"
