@@ -1327,8 +1327,6 @@ private struct InputField: View {
             }
             .padding(.vertical, 3)
 
-            KeybindChip("↩")
-                .padding(.bottom, 2)
             RoundButton(symbol: "arrow.up", label: "Send", size: 22, action: { companion.send() })
                 .opacity(hasText ? 1 : 0.35)
         }

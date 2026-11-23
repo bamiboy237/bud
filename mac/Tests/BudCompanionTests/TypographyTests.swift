@@ -135,9 +135,23 @@ struct TypographyTests {
             // The upper-left wave band has active dither pixels while the bottom-right stays open.
             #expect(nonZeroBytes > 0)
             #expect(nonZeroBytes < data.count / 2)
+
+            // Distinct animation frames produce valid, distinct dithered wave patterns.
+            let shifted = try #require(
+                DitherBackdrop.cachedImage(
+                    for: CGSize(width: 520, height: 640), scheme: scheme, frameIndex: 6))
+            let shiftedData = try #require(shifted.dataProvider?.data) as Data
+            #expect(shiftedData != data)
         }
         #expect(DitherBackdrop.waveField(u: 0.18, v: 0.22) > 0.35)
         #expect(DitherBackdrop.waveField(u: 0.95, v: 0.95) < 0.05)
+        // Seamless 2π periodic loop invariant.
+        #expect(
+            abs(
+                DitherBackdrop.waveField(u: 0.28, v: 0.42, phase: 0)
+                    - DitherBackdrop.waveField(u: 0.28, v: 0.42, phase: 2.0 * .pi)
+            ) < 1e-12
+        )
     }
 
     private func alpha(_ color: Color, in appearance: NSAppearance) -> CGFloat {
