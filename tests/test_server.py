@@ -732,14 +732,17 @@ def test_routine_and_task_survive_real_process_restart_and_paused_stays_paused(t
         ) == {"applied": True}
         finished = server.wait(
             lambda: (
-                r["latest_occurrence"]
-                if (r := server.request("GET", f"/routines/{active_routine['routine_id']}"))[
-                    "latest_occurrence"
-                ]["execution_status"]
+                occ_view
+                if (
+                    occ_view := server.request("GET", f"/routines/{active_routine['routine_id']}")[
+                        "latest_occurrence"
+                    ]
+                )["execution_status"]
                 == "completed"
+                and occ_view["delivery_status"] == "confirmed"
                 else None
             ),
-            "routine occurrence completes after restart",
+            "routine occurrence completes and confirms delivery after restart",
         )
         assert finished["delivery_status"] == "confirmed"
         assert (server.data / "workspace" / FILENAME).read_text() == DRAFT

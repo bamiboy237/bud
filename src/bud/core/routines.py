@@ -18,7 +18,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from croniter import croniter
 from pydantic import BaseModel
 
-from bud.core.events import Event
 from bud.core.hub import Hub
 from bud.core.log import _is_job_session
 from bud.core.projection import (
@@ -27,6 +26,7 @@ from bud.core.projection import (
     RoutineDestination,
     RoutineOccurrenceView,
     RoutineView,
+    parked_approvals,
     undecided_approvals,
 )
 from bud.skills import SkillStore, valid_name
@@ -1300,12 +1300,22 @@ class RoutineStore:
             self.hub.wake(wake_feed)
         return self.occurrence(occurrence_id)
 
-    def _references(self, routine: RoutineDefinition, events: list[Event]) -> dict[str, str]:
-        requested = [e for e in events if e.type == "approval.requested"]
-        return {
-            event.data["approval_id"]: f"R{routine.routine_seq}-{_letter(index)}"
-            for index, event in enumerate(requested, 1)
-        }
+    def _references(self, routine: RoutineDefinition) -> dict[str, str]:
+        """Assign unique R<seq>-<letter> labels across all occurrences of this routine."""
+        with self.log._connect() as db:
+            rows = db.execute(
+                "SELECT session_id FROM routine_occurrences WHERE routine_id = ? "
+                "ORDER BY triggered_at ASC, rowid ASC",
+                (routine.routine_id,),
+            ).fetchall()
+        refs: dict[str, str] = {}
+        index = 1
+        for (occ_session,) in rows:
+            for event in self.log.read(occ_session):
+                if event.type == "approval.requested":
+                    refs[event.data["approval_id"]] = f"R{routine.routine_seq}-{_letter(index)}"
+                    index += 1
+        return refs
 
     def resolve_approval(self, feed_id: str, reference: str) -> tuple[str, str] | None:
         match = re.fullmatch(r"R([1-9][0-9]*)-([A-Z]+)", reference.upper())
@@ -1313,13 +1323,31 @@ class RoutineStore:
         if match:
             seq = int(match[1])
             routines = [r for r in routines if r.routine_seq == seq]
+        fallback: tuple[str, str] | None = None
         for routine in routines:
+            refs = self._references(routine)
             for occ in self.occurrences(routine.routine_id, limit=20):
                 events = self.log.read(occ.session_id)
-                for approval_id, label in self._references(routine, events).items():
+                open_ids = {
+                    req["approval_id"]
+                    for req in [*undecided_approvals(events), *parked_approvals(events)]
+                }
+                for req in undecided_approvals(events) + parked_approvals(events):
+                    approval_id = req["approval_id"]
+                    label = refs.get(approval_id, "")
                     if reference == approval_id or reference.upper() == label:
                         return occ.session_id, approval_id
-        return None
+                if fallback is None:
+                    for event in events:
+                        if event.type != "approval.requested":
+                            continue
+                        approval_id = event.data["approval_id"]
+                        if approval_id in open_ids:
+                            continue
+                        label = refs.get(approval_id, "")
+                        if reference == approval_id or reference.upper() == label:
+                            fallback = (occ.session_id, approval_id)
+        return fallback
 
     def view(self, routine: RoutineDefinition) -> RoutineView:
         recent = self.occurrences(routine.routine_id, limit=10)
@@ -1327,12 +1355,12 @@ class RoutineStore:
             (occ for occ in recent if occ.execution_status in ACTIVE_OCCURRENCE_STATUSES), None
         )
         latest = recent[0] if recent else None
+        refs = self._references(routine)
         pending: list[PendingApproval] = []
         for occ in recent:
             if occ.execution_status != "awaiting_approval":
                 continue
             events = self.log.read(occ.session_id)
-            refs = self._references(routine, events)
             for req in undecided_approvals(events):
                 pending.append(
                     PendingApproval.model_validate(

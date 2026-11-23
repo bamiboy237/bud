@@ -1,4 +1,5 @@
-from datetime import UTC, datetime
+import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic_ai.messages import ModelResponse, ToolCallPart
@@ -582,3 +583,123 @@ async def test_tick_routines_isolates_failures_per_routine(tmp_path, monkeypatch
         assert (
             bud.runner.routines.occurrences(healthy.routine_id)[0].execution_status == "completed"
         )
+
+
+async def test_routine_budget_deadline_minutes_enforced(tmp_path):
+    async def slow_read() -> str:
+        await asyncio.sleep(0.5)
+        return "too late"
+
+    def model_fn(messages, info):
+        parts = [p for m in messages for p in m.parts]
+        if any(getattr(p, "tool_name", None) == "slow_read" for p in parts):
+            return reply("Done.")
+        return ModelResponse(parts=[ToolCallPart("slow_read", {}, tool_call_id="slow-1")])
+
+    clock = [datetime(2026, 11, 6, 12, 0, tzinfo=UTC)]
+    async with running_bud(
+        tmp_path,
+        model_fn,
+        jobs=True,
+        extra_tools=[slow_read],
+        extra_policy={"slow_read": "allow"},
+    ) as bud:
+        bud.runner.harness.clock = lambda: clock[0]
+        bud.log.append("owner", "session.created")
+
+        # 1. Wall-clock asyncio.timeout in _execute enforces deadline_minutes.
+        wall_routine = bud.runner.create_routine(
+            feed_id="owner",
+            title="Wall Deadline",
+            skill="attention-briefing",
+            prompt="Run slow read.",
+            cron="0 9 * * *",
+            budget=RoutineBudget(deadline_minutes=0.001),
+        )
+        occ_wall = bud.runner.run_routine_now(wall_routine.routine_id, trigger_id="wall-dl")
+        await bud.settle()
+        assert bud.runner.routines is not None
+        failed_wall = bud.runner.routines.occurrence(occ_wall.occurrence_id)
+        assert failed_wall.execution_status == "failed"
+        assert "deadline" in (failed_wall.error or "").lower()
+
+        # 2. Clock-based deadline check in tick_routines catches overdue running occurrences.
+        tick_routine = bud.runner.create_routine(
+            feed_id="owner",
+            title="Tick Deadline",
+            skill="attention-briefing",
+            prompt="Run long task.",
+            cron="0 9 * * *",
+            budget=RoutineBudget(deadline_minutes=5),
+        )
+        occ_tick, _ = bud.runner.routines.claim_manual_occurrence(
+            tick_routine.routine_id, now=clock[0], trigger_id="tick-dl"
+        )
+        assert occ_tick.run_id is not None
+        bud.log.append(
+            occ_tick.session_id, "run.queued", {"run_id": occ_tick.run_id, "trigger": "routine"}
+        )
+        bud.log.append(
+            occ_tick.session_id, "run.started", {"run_id": occ_tick.run_id, "trigger": "routine"}
+        )
+        bud.runner.routines.mark_queued(occ_tick.occurrence_id)
+        bud.runner.routines.sync_execution(occ_tick.session_id, "running")
+
+        clock[0] = clock[0] + timedelta(minutes=6)
+        bud.runner.tick_routines(clock[0])
+        failed_tick = bud.runner.routines.occurrence(occ_tick.occurrence_id)
+        assert failed_tick.execution_status == "failed"
+        assert "deadline" in (failed_tick.error or "").lower()
+        # Deadline timeout on an occurrence leaves the routine schedule active.
+        assert bud.runner.routines.get(tick_routine.routine_id).status == "active"
+
+
+async def test_cross_occurrence_routine_approval_references_do_not_collide(tmp_path):
+    def respond(messages, info):
+        parts = [p for m in messages for p in m.parts]
+        if any(getattr(p, "part_kind", None) == "tool-return" for p in parts):
+            return reply("Saved.")
+        if any("declined" in str(getattr(p, "content", "")).lower() for p in parts):
+            return reply("Cancelled.")
+        content = "First run" if "08:00" in str(parts[0].content) else "Second run"
+        return create_note(content, call_id=f"write-{len(parts)}")
+
+    clock = [datetime(2026, 11, 6, 7, 59, tzinfo=UTC)]
+    async with running_bud(tmp_path, respond, jobs=True) as bud:
+        bud.runner.harness.clock = lambda: clock[0]
+        bud.log.append("owner", "session.created")
+        bud.runner.create_routine(
+            feed_id="owner",
+            title="Queued Routine",
+            skill="attention-briefing",
+            prompt="Write note.",
+            cron="0 * * * *",
+            overlap_policy="queue",
+        )
+        assert bud.runner.routines is not None
+        clock[0] = datetime(2026, 11, 6, 8, 1, tzinfo=UTC)
+        occ1 = bud.runner.tick_routines()[0]
+        await bud.settle()
+
+        clock[0] = datetime(2026, 11, 6, 9, 1, tzinfo=UTC)
+        occ2 = bud.runner.tick_routines()[0]
+        await bud.settle()
+
+        snap = bud.runner.snapshot("owner")
+        refs = {a.occurrence_id: a.reference for a in snap.pending_approvals}
+        assert refs == {occ1.occurrence_id: "R1-A", occ2.occurrence_id: "R1-B"}
+
+        # Decide the newer occurrence (R1-B) first: older R1-A stays open and reachable.
+        assert bud.runner.decide("owner", "R1-B", False)
+        await bud.settle()
+        assert bud.runner.routines.occurrence(occ2.occurrence_id).execution_status == "completed"
+        assert (
+            bud.runner.routines.occurrence(occ1.occurrence_id).execution_status
+            == "awaiting_approval"
+        )
+        assert not (bud.root / "note.txt").exists()
+
+        assert bud.runner.decide("owner", "R1-A", True)
+        await bud.settle()
+        assert bud.runner.routines.occurrence(occ1.occurrence_id).execution_status == "completed"
+        assert (bud.root / "note.txt").exists()

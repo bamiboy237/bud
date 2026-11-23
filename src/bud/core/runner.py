@@ -656,6 +656,12 @@ class Runner(DBOSConfiguredInstance):
             if routine.status == "active" and routine.next_run_at is not None:
                 delta = (routine.next_run_at - now_utc).total_seconds()
                 soonest = min(soonest, max(0.05, delta))
+            if routine.budget.deadline_minutes is not None:
+                span = timedelta(minutes=routine.budget.deadline_minutes)
+                for occ in self.routines.active_occurrences(routine_id=routine.routine_id):
+                    if occ.execution_status in ("queued", "running"):
+                        delta = ((occ.triggered_at + span) - now_utc).total_seconds()
+                        soonest = min(soonest, max(0.05, delta))
         for session_id in self.routines.open_approval_sessions():
             for req in undecided_approvals(self.hub.log.read(session_id)):
                 raw = req.get("expires_at")
@@ -814,6 +820,14 @@ class Runner(DBOSConfiguredInstance):
         launched: list[RoutineOccurrence] = []
         for routine in self.routines.list_routines():
             try:
+                if routine.budget.deadline_minutes is not None:
+                    deadline = timedelta(minutes=routine.budget.deadline_minutes)
+                    for occ in self.routines.active_occurrences(routine_id=routine.routine_id):
+                        if (
+                            occ.execution_status in ("queued", "running")
+                            and now_utc - occ.triggered_at >= deadline
+                        ):
+                            self._enforce_routine_deadline(routine, occ, now_utc)
                 claimed = self.routines.claim_scheduled_occurrences(routine.routine_id, now_utc)
                 for occ in claimed:
                     self._dispatch_routine_occurrence(routine, occ)
@@ -821,6 +835,48 @@ class Runner(DBOSConfiguredInstance):
             except Exception:
                 logger.exception("Routine tick failed for routine %s", routine.routine_id)
         return launched
+
+    def _enforce_routine_deadline(
+        self, routine: RoutineDefinition, occ: RoutineOccurrence, now_utc: datetime
+    ) -> None:
+        assert self.routines is not None
+        reason = (
+            f"Routine occurrence exceeded deadline ({routine.budget.deadline_minutes} minutes)."
+        )
+        request = self.hub.log.request_stop(occ.session_id)
+        self.hub.wake(occ.session_id)
+        if request is not None:
+            run_id = request["run_id"]
+            if self.durable and self._loop is not None and not self._loop.is_closed():
+                self._loop.create_task(DBOS.cancel_workflow_async(run_id))
+            if occ.session_id in self.tasks:
+                self.tasks[occ.session_id].cancel()
+            executing = self._executing.get(run_id)
+            if executing is not None:
+                executing.cancel()
+            if run_id not in self._executing:
+                self.hub.log.acknowledge_stop(occ.session_id, run_id)
+        events = self.hub.log.read(occ.session_id)
+        cancel_ev = next((e for e in reversed(events) if e.type == "run.cancelled"), None)
+        uncertain = list(cancel_ev.data.get("uncertain_tools", [])) if cancel_ev is not None else []
+        if uncertain:
+            self._sync_routine_occurrence(occ.session_id)
+            return
+        self.routines.sync_execution(occ.session_id, "failed", error=reason, completed_at=now_utc)
+        self.hub.publish_once(
+            routine.destination.feed_id,
+            "routine.failed",
+            {
+                "routine_id": routine.routine_id,
+                "occurrence_id": occ.occurrence_id,
+                "title": routine.title,
+                "text": f"Routine {routine.routine_seq} ({routine.title}) failed: {reason}",
+                "origin": routine.destination.origin.model_dump(),
+            },
+            key=f"routine:occ:{occ.occurrence_id}:failed",
+        )
+        self.hub.wake(routine.feed_id)
+        self.hub.wake(routine.destination.feed_id)
 
     def _build_routine_prompt(self, routine: RoutineDefinition) -> str:
         """Build the occurrence prompt with fresh active scoped preferences (THE-152)."""
@@ -952,6 +1008,8 @@ class Runner(DBOSConfiguredInstance):
             self.hub.wake(routine.destination.feed_id)
             return
         if latest.status in ("failed", "cancelled"):
+            if occ.execution_status == "failed" and latest.status == "cancelled":
+                return
             self.routines.sync_execution(
                 session_id,
                 latest.status,
@@ -1844,61 +1902,73 @@ class Runner(DBOSConfiguredInstance):
             declined = parked_decisions_note(history_events, run)
             setups = setup_updates_note(history_events, run)
             surface = surface_note(run)
-            result = await self.agent.run(
-                (
-                    run["text"]
-                    + recalled["text"]
-                    + gap
-                    + still_open
-                    + jobs
-                    + declined
-                    + setups
-                    + surface
-                )
-                if run["text"]
-                else run["text"],
-                model=(
-                    # Durable runs resolve pre-registered keys; local runs take the instance.
-                    model_override
-                    if self.durable
-                    else self.gateway.model(
-                        self.tier,
-                        session_id=run["session_id"],
-                        require_tools=True,
-                        selected=model_override,
-                    )
-                    if model_override
-                    else None
-                ),
-                conversation=conversation,
-                message_history=history or None,
-                deferred_tool_results=RESULTS.validate_json(run["results"])
-                if run["results"]
-                else None,
-                run_id=run["run_id"],
-                conversation_id=run["session_id"] if conversation is None else None,
-                metadata={
-                    "bud_skills": run.get("skills", {}),
-                    "bud_session_id": run["session_id"],
-                    "bud_task_id": run.get("task_id"),
-                    "bud_routine_id": run.get("routine_id"),
-                    "bud_occurrence_id": run.get("occurrence_id"),
-                    "bud_budget_usd": max_usd,
-                    # What the job's result is checked against when it calls finish_job.
-                    "bud_brief": self._brief(run),
-                    "bud_origin": run.get("origin"),
-                    "bud_request": run.get("request"),
-                    "bud_revision_pending": bool(run.get("quiet")),
-                    "bud_inline_approval": run.get("task_id") is None
-                    and run.get("occurrence_id") is None
-                    and run["trigger"] == "approval",
-                },
-                # No step cap: SpiralGuard ends runaway loops unless profile/routine sets a limit.
-                usage_limits=_effective_usage_limits(self.harness.usage_limits(), budget),
-                # A job ends only by filing a typed report; chat ends in text.
-                output_type=self.job_output if run.get("task_id") is not None else None,
-                event_stream_handler=None if self.durable else self._stream,
+            deadline_minutes = budget.get("deadline_minutes") if isinstance(budget, dict) else None
+            deadline_cm = (
+                asyncio.timeout(deadline_minutes * 60)
+                if isinstance(deadline_minutes, (int, float))
+                else contextlib.nullcontext()
             )
+            try:
+                async with deadline_cm:
+                    result = await self.agent.run(
+                        (
+                            run["text"]
+                            + recalled["text"]
+                            + gap
+                            + still_open
+                            + jobs
+                            + declined
+                            + setups
+                            + surface
+                        )
+                        if run["text"]
+                        else run["text"],
+                        model=(
+                            # Durable runs resolve pre-registered keys; local runs take instance.
+                            model_override
+                            if self.durable
+                            else self.gateway.model(
+                                self.tier,
+                                session_id=run["session_id"],
+                                require_tools=True,
+                                selected=model_override,
+                            )
+                            if model_override
+                            else None
+                        ),
+                        conversation=conversation,
+                        message_history=history or None,
+                        deferred_tool_results=RESULTS.validate_json(run["results"])
+                        if run["results"]
+                        else None,
+                        run_id=run["run_id"],
+                        conversation_id=run["session_id"] if conversation is None else None,
+                        metadata={
+                            "bud_skills": run.get("skills", {}),
+                            "bud_session_id": run["session_id"],
+                            "bud_task_id": run.get("task_id"),
+                            "bud_routine_id": run.get("routine_id"),
+                            "bud_occurrence_id": run.get("occurrence_id"),
+                            "bud_budget_usd": max_usd,
+                            # What the job's result is checked against when it calls finish_job.
+                            "bud_brief": self._brief(run),
+                            "bud_origin": run.get("origin"),
+                            "bud_request": run.get("request"),
+                            "bud_revision_pending": bool(run.get("quiet")),
+                            "bud_inline_approval": run.get("task_id") is None
+                            and run.get("occurrence_id") is None
+                            and run["trigger"] == "approval",
+                        },
+                        # No step cap: SpiralGuard ends loops unless profile/routine sets a limit.
+                        usage_limits=_effective_usage_limits(self.harness.usage_limits(), budget),
+                        # A job ends only by filing a typed report; chat ends in text.
+                        output_type=self.job_output if run.get("task_id") is not None else None,
+                        event_stream_handler=None if self.durable else self._stream,
+                    )
+            except TimeoutError as exc:
+                raise BudgetExceededError(
+                    f"Routine occurrence exceeded deadline ({deadline_minutes} minutes)."
+                ) from exc
             data = {
                 "run_id": run["run_id"],
                 "messages": json.loads(result.new_messages_json()),
