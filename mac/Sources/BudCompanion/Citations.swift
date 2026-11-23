@@ -12,7 +12,7 @@ struct Source: Equatable {
     let label: String
 }
 
-enum SourceTarget: Equatable {
+enum SourceTarget: Hashable {
     case turn(session: String, seq: Int)
     case workspace(path: String)
 }
@@ -108,6 +108,11 @@ struct SourcePanel: Equatable {
 
     var loading: Bool { turns.isEmpty && document == nil && problem == nil }
 
+    var citedTurn: Turn? {
+        guard case .turn(_, let seq) = target else { return nil }
+        return turns.first { $0.seq == seq }
+    }
+
     init(target: SourceTarget, problem: String? = nil) {
         self.target = target
         self.problem = problem
@@ -131,10 +136,13 @@ struct SourcePanel: Equatable {
         self.init(target: .turn(session: session, seq: seq))
         date = formattedDate
         turns = (raw["turns"] as? [[String: Any]] ?? []).compactMap { turn in
-            guard let text = turn["text"] as? String, !text.isEmpty else { return nil }
+            let files = ChatAttachment.decode(turn["attachments"])
+            guard let text = turn["text"] as? String, !text.isEmpty || !files.isEmpty else {
+                return nil
+            }
             return Turn(
                 fromOwner: turn["role"] as? String == "user", text: text, seq: turn["seq"] as? Int,
-                sources: Citations.sources(turn["sources"]))
+                sources: Citations.sources(turn["sources"]), attachments: files)
         }
     }
 

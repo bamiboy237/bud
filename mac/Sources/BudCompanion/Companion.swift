@@ -204,6 +204,9 @@ final class Companion {
     private(set) var turns: [Turn] = []
     /// Where a source link pointed in this conversation; the window scrolls there.
     var focus: Focus?
+    private(set) var focusRequest = 0
+    private(set) var citedConversations: [SourcePanel] = []
+    var citedConversation: SourcePanel? { citedConversations.last }
     /// A cited message and its conversation, shown beside the chat.
     var sourcePanel: SourcePanel?
     var attachmentSelection: AttachmentSelection?
@@ -348,6 +351,7 @@ final class Companion {
 
     private func startConnection(resetBackoff: Bool) {
         attachmentSelection = nil
+        citedConversations = []
         setupMonitor?.cancel()
         setupMonitor = nil
         fastPollRemaining = 0
@@ -586,14 +590,21 @@ final class Companion {
 
     // MARK: Actions
 
-    /// Follows a source link into the side panel. Returns false for links that aren't sources.
+    /// Opens a cited message or a workspace file. Returns false for other links.
     func openSource(_ url: URL) -> Bool {
         guard let target = Citations.target(url) else { return false }
         ConversationWindow.shared.show()
         guard let connection else { return true }
         let mine = generation
         attachmentSelection = nil
-        sourcePanel = SourcePanel(target: target)
+        let requested = SourcePanel(target: target)
+        if let focus = chatFocus(for: requested) {
+            citedConversations.removeAll()
+            sourcePanel = nil
+            highlight(focus)
+            return true
+        }
+        sourcePanel = requested
         Task {
             let found: [String: Any]?
             let unavailable: String
@@ -608,8 +619,20 @@ final class Companion {
             }
             // Another link was followed, or the connection changed, while this one loaded.
             guard mine == generation, sourcePanel?.target == target else { return }
-            sourcePanel = found.flatMap(SourcePanel.init) ?? SourcePanel(
-                target: target, problem: unavailable)
+            guard let panel = found.flatMap(SourcePanel.init) else {
+                sourcePanel = SourcePanel(target: target, problem: unavailable)
+                return
+            }
+            if panel.citedTurn != nil {
+                sourcePanel = nil
+                if let index = citedConversations.firstIndex(where: { $0.target == panel.target }) {
+                    citedConversations.removeLast(citedConversations.count - index - 1)
+                } else {
+                    citedConversations.append(panel)
+                }
+            } else {
+                sourcePanel = panel
+            }
         }
         return true
     }
@@ -634,12 +657,12 @@ final class Companion {
         }
     }
 
-    func selection(for file: ChatAttachment) -> AttachmentSelection? {
-        connection.map { AttachmentSelection(file: file, session: session, connection: $0) }
+    func selection(for file: ChatAttachment, in sourceSession: String? = nil) -> AttachmentSelection? {
+        connection.map { AttachmentSelection(file: file, session: sourceSession ?? session, connection: $0) }
     }
 
-    func openAttachment(_ file: ChatAttachment) {
-        guard let selection = selection(for: file) else {
+    func openAttachment(_ file: ChatAttachment, in sourceSession: String? = nil) {
+        guard let selection = selection(for: file, in: sourceSession) else {
             nudge("Reconnect to Bud to open the attachment.")
             return
         }
@@ -655,9 +678,15 @@ final class Companion {
         return seq == replySeq ? .latest : nil
     }
 
-    /// Scrolls the chat to the message the side panel shows.
-    func scrollToSource(_ panel: SourcePanel) {
-        focus = chatFocus(for: panel)
+    private func highlight(_ target: Focus) {
+        focus = target
+        focusRequest += 1
+    }
+
+    func backFromCitation() {
+        _ = citedConversations.popLast()
+        sourcePanel = nil
+        attachmentSelection = nil
     }
 
     func receiveSetup(_ data: [String: Any], replacing: Bool = false) {
