@@ -6,7 +6,7 @@
 use crate::client::{Core, CoreError};
 use crate::mascot::{self, Mascot};
 use crate::protocol::{
-    plain_citations, reply_text, Event, ModelInfo, PendingApproval, PendingSetup, Snapshot,
+    plain_citations, trailing_reply_text, Event, ModelInfo, PendingApproval, PendingSetup, Snapshot,
 };
 use crate::sanitize::{self, Filter};
 use crate::sse::Feed;
@@ -918,6 +918,10 @@ impl App {
     }
 
     fn ev_user_message(&mut self, ev: &Event) {
+        self.finish_streaming();
+        if self.running() {
+            self.status = Status::Thinking;
+        }
         let id = ev.opt_str("message_id");
         let text = sanitize::clean(ev.str("text"));
         if let Some(id) = &id {
@@ -1280,7 +1284,7 @@ impl App {
     fn ev_run_end(&mut self, ev: &Event) {
         let run_id = ev.str("run_id").to_string();
         self.settle_tools(&HashSet::new(), false);
-        let full = sanitize::clean(&reply_text(&ev.data));
+        let full = sanitize::clean(&trailing_reply_text(&ev.data));
         self.reconcile_reply(&run_id, &full);
         self.finish_streaming();
         let elapsed = self.take_elapsed();
@@ -1309,8 +1313,12 @@ impl App {
 
     /// The stored reply is the truth: fill in or replace text the live stream lost.
     fn reconcile_reply(&mut self, run_id: &str, full: &str) {
-        let streamed: String = self
+        let segment_start = self
             .entries
+            .iter()
+            .rposition(|e| matches!(e, Entry::User(_)))
+            .map_or(0, |i| i + 1);
+        let streamed: String = self.entries[segment_start..]
             .iter()
             .filter_map(|e| match e {
                 Entry::Assistant(a) if a.run_id == run_id => {
@@ -1322,10 +1330,10 @@ impl App {
         if full.is_empty() || streamed == full {
             return;
         }
-        let last = self
-            .entries
+        let last = self.entries[segment_start..]
             .iter()
-            .rposition(|e| matches!(e, Entry::Assistant(a) if a.run_id == run_id));
+            .rposition(|e| matches!(e, Entry::Assistant(a) if a.run_id == run_id))
+            .map(|i| segment_start + i);
         if full.starts_with(&streamed) && last.is_some() {
             let tail = &full[streamed.len()..];
             if let Some(Entry::Assistant(a)) = last.map(|i| &mut self.entries[i]) {
@@ -1334,12 +1342,17 @@ impl App {
             }
             return;
         }
-        let first = self
-            .entries
+        let first = self.entries[segment_start..]
             .iter()
-            .position(|e| matches!(e, Entry::Assistant(a) if a.run_id == run_id));
-        self.entries
-            .retain(|e| !matches!(e, Entry::Assistant(a) if a.run_id == run_id));
+            .position(|e| matches!(e, Entry::Assistant(a) if a.run_id == run_id))
+            .map(|i| segment_start + i);
+        let mut idx = 0usize;
+        self.entries.retain(|e| {
+            let keep =
+                idx < segment_start || !matches!(e, Entry::Assistant(a) if a.run_id == run_id);
+            idx += 1;
+            keep
+        });
         let mut doc = MdDoc::new();
         doc.set(full);
         let entry = Entry::Assistant(Box::new(AssistantEntry {

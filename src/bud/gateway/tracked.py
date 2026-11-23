@@ -5,7 +5,7 @@ Ledger writes can fail without failing the request.
 """
 
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -48,12 +48,18 @@ class TrackedModel(WrapperModel):
     session_id: str | None
 
     def __init__(
-        self, wrapped: Model, spec: ModelSpec, ledger: Ledger, session_id: str | None = None
+        self,
+        wrapped: Model,
+        spec: ModelSpec,
+        ledger: Ledger,
+        session_id: str | None = None,
+        steer_signal: Callable[[str, str | None], Any] | None = None,
     ) -> None:
         super().__init__(wrapped)
         self.spec = spec
         self.ledger = ledger
         self.session_id = session_id
+        self.steer_signal = steer_signal
 
     async def request(
         self,
@@ -80,6 +86,42 @@ class TrackedModel(WrapperModel):
         run_context: RunContext[Any] | None = None,
     ) -> AsyncGenerator[StreamedResponse]:
         started = perf_counter()
+        signal = None
+        if self.steer_signal is not None:
+            sid = self.session_id or request_session.get() or ""
+            attr = request_attribution.get()
+            rid = (run_context.run_id if run_context is not None else None) or (
+                attr.run_id if attr else None
+            )
+            if sid:
+                signal = self.steer_signal(sid, rid)
+        if signal is not None:
+            from bud.harness.steering import in_steerable_stream, wrap_steerable_stream
+
+            if in_steerable_stream():
+                signal = None
+        if signal is not None:
+            from bud.harness.steering import wrap_steerable_stream
+
+            def open_inner():
+                return super(TrackedModel, self).request_stream(
+                    messages, model_settings, model_request_parameters, run_context
+                )
+
+            stream = wrap_steerable_stream(
+                open_inner,
+                model_request_parameters=model_request_parameters,
+                signal=signal,
+                fallback_model_name=self.model_name,
+            )
+            try:
+                stream.metadata = (stream.metadata or {}) | {"bud_model_id": self.spec.id}
+                yield stream
+            except BaseException as exc:
+                await self._record_failure(exc, started)
+                raise
+            await self._record_usage(stream.usage, started)
+            return
         try:
             async with super().request_stream(
                 messages, model_settings, model_request_parameters, run_context

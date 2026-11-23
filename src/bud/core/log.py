@@ -709,6 +709,46 @@ class EventLog:
             self._insert(db, session_id, "run.queued", run, key=f"{run['run_id']}:queued")
             return True
 
+    def claim_steering_messages(self, session_id: str, run_id: str) -> list[dict[str, Any]]:
+        """Atomically claim queued owner messages for injection into an active run."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if self._stopped(db, run_id):
+                return []
+            events = self._read(db, session_id)
+            if queue_paused(events):
+                return []
+            states = runs(events)
+            if (
+                not states
+                or states[-1].run_id != run_id
+                or states[-1].status not in ("queued", "running")
+            ):
+                return []
+            pending = queued_messages(events)
+            if not pending:
+                return []
+            claimed: list[dict[str, Any]] = []
+            for item in pending:
+                payload = item.model_dump()
+                inserted = self._insert(
+                    db,
+                    session_id,
+                    "user.message",
+                    {**payload, "run_id": run_id, "steered": True},
+                    once=True,
+                )
+                if inserted is None:
+                    continue
+                self._insert(
+                    db,
+                    session_id,
+                    "message.dispatched",
+                    {"message_id": item.message_id, "run_id": run_id, "steered": True},
+                )
+                claimed.append(payload)
+            return claimed
+
     def dispatch_job_report(self, session_id: str, run: dict) -> bool:
         """Queue a turn that reports ended jobs, if they are still unreported and nothing waits."""
         with self._connect() as db:
