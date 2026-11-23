@@ -63,9 +63,9 @@ final class ConversationWindow: NSObject, NSWindowDelegate {
     }
 }
 
-/// Replies in the window read at 14pt Inter with comfortable line spacing and 12.5pt IBM Plex Mono.
+/// Replies in the window read at 14pt Inter with relaxed line spacing and 12.5pt IBM Plex Mono.
 private let pageType = ReplyType(
-    size: 14, lineSpacing: 4.5, blockSpacing: 13, itemSpacing: 5.5, compact: false)
+    size: 14, lineSpacing: 5, blockSpacing: 14, itemSpacing: 6, compact: false)
 
 /// The rhythm that separates speakers without labels: a wide gap before each of your
 /// messages starts a new exchange, a shorter one joins bud's answer to your question.
@@ -73,7 +73,7 @@ private enum Rhythm {
     static let exchange: CGFloat = 52
     static let answer: CGFloat = 22
     /// The actions row under a reply: its spacing and height.
-    static let actions: CGFloat = 6 + 24
+    static let actions: CGFloat = 8 + 24
     static let headerHeight: CGFloat = 38
 }
 
@@ -93,10 +93,14 @@ private struct ConversationView: View {
     var body: some View {
         VStack(spacing: 0) {
             headerBar
-            Rectangle().fill(Paper.borderSubtle).frame(height: 0.5)
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
+                        if !companion.turns.isEmpty || !companion.shown.isEmpty || companion.running {
+                            SessionDateDivider(label: "Today")
+                                .padding(.bottom, 20)
+                        }
                         ForEach(Array(companion.turns.enumerated()), id: \.element.id) { index, turn in
                             TurnView(turn: turn, companion: companion, focused: companion.focus == .turn(turn.id))
                                 .padding(.top, index == 0 ? 0 : turn.fromOwner ? Rhythm.exchange - Rhythm.actions : Rhythm.answer)
@@ -108,7 +112,7 @@ private struct ConversationView: View {
                     .frame(maxWidth: column, alignment: .leading)
                     .padding(.horizontal, 32)
                     .padding(.top, 20)
-                    .padding(.bottom, 36)
+                    .padding(.bottom, 44)
                     .frame(maxWidth: .infinity)
                 }
                 // Opens at the latest message, and stays there as a reply streams in, unless
@@ -116,9 +120,9 @@ private struct ConversationView: View {
                 .defaultScrollAnchor(.bottom)
                 .defaultScrollAnchor(.bottom, for: .sizeChanges)
                 .onScrollGeometryChange(for: Bool.self) { geometry in
+                    let scrollable = geometry.contentSize.height > geometry.containerSize.height + 64
                     let distanceFromBottom = geometry.contentSize.height - geometry.visibleRect.maxY
-                    return geometry.contentSize.height <= geometry.containerSize.height + 24
-                        || distanceFromBottom <= 60
+                    return !scrollable || distanceFromBottom <= 96
                 } action: { _, atBottom in
                     scroll.atBottom = atBottom
                 }
@@ -282,14 +286,14 @@ private struct ConversationView: View {
         }
     }
 
-    /// One field for everything: a new message, a reply to something bud said, or your answer
-    /// when bud asked for one.
+    /// One field for everything: a grounded two-row composer with generous input space on top
+    /// and a quiet utility strip below.
     private var field: some View {
-        let hasText = !companion.draft.trimmingCharacters(in: .whitespaces).isEmpty
+        let hasText = !companion.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let canCancel = companion.replyingTo != nil || companion.inputPurpose != .ask
         let composerShape = RoundedRectangle(cornerRadius: Paper.radiusLG, style: .continuous)
 
-        return VStack(alignment: .leading, spacing: 8) {
+        return VStack(alignment: .leading, spacing: 0) {
             if let quote = companion.replyingTo {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "arrowshape.turn.up.left")
@@ -314,39 +318,43 @@ private struct ConversationView: View {
                     .buttonStyle(IconButton(size: 18))
                     .accessibilityLabel("Don't reply to this")
                 }
-                .transition(.opacity)
+                .padding(.horizontal, 14)
+                .padding(.top, 10)
+                .padding(.bottom, 8)
+                Rectangle().fill(Paper.hairline).frame(height: 0.5)
             }
-            HStack(alignment: .bottom, spacing: 8) {
-                ZStack(alignment: .leading) {
-                    if companion.draft.isEmpty {
-                        Text(companion.inputPurpose.prompt)
-                            .font(Paper.Typography.body)
-                            .foregroundStyle(Paper.placeholder)
-                            .lineLimit(1)
-                            .allowsHitTesting(false)
-                    }
-                    TextField("", text: $companion.draft, axis: .vertical)
-                        .textFieldStyle(.plain)
+
+            // Top row: multi-line text input with generous breathing room.
+            ZStack(alignment: .topLeading) {
+                if companion.draft.isEmpty {
+                    Text(companion.inputPurpose.prompt)
                         .font(Paper.Typography.body)
-                        .lineLimit(1...6)
-                        .focused($typing)
-                        .onSubmit { companion.send() }
-                        .onExitCommand {
-                            companion.inputPurpose = .ask
-                            companion.replyingTo = nil
-                        }
+                        .foregroundStyle(Paper.placeholder)
+                        .lineLimit(1)
+                        .allowsHitTesting(false)
                 }
-                .padding(.vertical, 4)
-                if canCancel && companion.replyingTo == nil {
-                    KeybindChip("Esc")
-                        .padding(.bottom, 3)
-                }
-                if hasText {
-                    KeybindChip("↩")
-                        .padding(.bottom, 3)
-                }
-                // Stop while bud works and the field is empty; typed text (an answer to a job's
-                // question, or a message to queue) turns it back into Send.
+                TextField("", text: $companion.draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(Paper.Typography.body)
+                    .lineLimit(1...6)
+                    .focused($typing)
+                    .onSubmit { companion.send() }
+                    .onExitCommand {
+                        companion.inputPurpose = .ask
+                        companion.replyingTo = nil
+                    }
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 12)
+            .padding(.bottom, 6)
+
+            // Bottom utility strip: quiet keyboard hints on the left, send/stop action on the right.
+            HStack(alignment: .center, spacing: 8) {
+                Text(canCancel ? "↩ send · Esc cancel" : "↩ send · ⇧↩ newline")
+                    .font(Paper.Typography.ledgerMeta)
+                    .foregroundStyle(Paper.inkMuted)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
                 if companion.running, !hasText {
                     RoundButton(symbol: "stop.fill", label: "Stop bud", action: companion.stop)
                 } else {
@@ -354,10 +362,11 @@ private struct ConversationView: View {
                         .opacity(hasText ? 1 : 0.35)
                 }
             }
+            .padding(.leading, 14)
+            .padding(.trailing, 8)
+            .padding(.bottom, 8)
+            .padding(.top, 2)
         }
-        .padding(.leading, 14)
-        .padding(.trailing, 8)
-        .padding(.vertical, 8)
         .surface(
             composerShape,
             lift: 1,
@@ -392,6 +401,24 @@ private struct ConversationView: View {
             .help("Back to the bubble")
             .accessibilityLabel("Collapse to the bubble")
         }
+    }
+}
+
+/// Subtle centered editorial date/session divider with 0.5pt hairline rules on either side.
+private struct SessionDateDivider: View {
+    let label: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
+            Text(label)
+                .font(Paper.Typography.ledgerMeta)
+                .foregroundStyle(Paper.inkMuted)
+                .fixedSize()
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -462,7 +489,7 @@ private struct Reply: View {
     @StateObject private var copied = Flag()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             MarkdownView(Citations.linked(text, sources: sources))
             if finished {
                 HStack(spacing: 2) {
@@ -616,19 +643,33 @@ private func elapsed(_ seconds: Int) -> String {
     return "\(minutes / 60)h \(String(format: "%02d", minutes % 60))m"
 }
 
-/// Back to the newest message, when you've scrolled up to read.
+/// Back to the newest message, when you've meaningfully scrolled up to read earlier turns.
 private struct JumpButton: View {
     let action: () -> Void
+    @StateObject private var hovered = Flag()
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: "arrow.down")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Paper.inkPrimary)
-                .frame(width: 30, height: 30)
-                .surface(Circle(), lift: 0.8, fill: Paper.elevated)
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.down")
+                    .font(.system(size: 10, weight: .semibold))
+                Text("Jump to latest")
+                    .font(Paper.Typography.captionMedium)
+            }
+            .foregroundStyle(hovered.on ? Paper.inkPrimary : Paper.inkSecondary)
+            .padding(.horizontal, 12)
+            .frame(height: 26)
+            .surface(
+                Capsule(),
+                lift: 0.85,
+                fill: hovered.on ? Paper.overlay : Paper.elevated,
+                border: Paper.borderStrong,
+                borderWidth: 0.5
+            )
         }
-        .buttonStyle(IconButton(size: 30, highlight: false))
+        .buttonStyle(.plain)
+        .pointerStyle(.link)
+        .onHover { hovered.on = $0 }
         .help("Jump to the latest")
         .accessibilityLabel("Jump to the latest message")
     }
@@ -724,6 +765,9 @@ private struct SourcePanelView: View {
         }
         .foregroundStyle(Paper.inkPrimary)
         .background(Paper.canvas)
+        .overlay(alignment: .leading) {
+            Rectangle().fill(Paper.hairline).frame(width: 0.5).ignoresSafeArea()
+        }
     }
 
     /// The cited reply and the message it answered.
