@@ -25,7 +25,7 @@ from pydantic_ai_harness.system_reminders import Reminder
 from bud.config import get_settings
 from bud.gateway.registry import Registry
 from bud.gateway.spend import build_spend_limits
-from bud.harness.actions import Action, GuardTools, Policy, RecordDecision
+from bud.harness.actions import Action, GuardTools, Policy, PriorDispatchCheck, RecordDecision
 from bud.harness.actions import _pinned as pinned_account
 from bud.harness.code import CODE_GUIDANCE, ReadOnlyCodeMode, build_code_mode
 from bud.harness.context import BackgroundCompaction
@@ -271,6 +271,7 @@ class Harness:
         loop_report: LoopReport | None = None,
         durability: AbstractCapability | None = None,
         capabilities: tuple[AbstractCapability[None], ...] = (),
+        prior_dispatch: PriorDispatchCheck | None = None,
     ) -> Agent[None, str | DeferredToolRequests]:
         harness_cfg = self.operating_profile.harness
         limits = self.operating_profile.limits
@@ -319,6 +320,7 @@ class Harness:
                     known=self.known,
                     facts=self._today,
                     grants=self.grants,
+                    prior_dispatch=prior_dispatch,
                 ),
                 self.output_limits,
                 *([self.code_mode] if self.code_mode is not None else []),

@@ -21,6 +21,8 @@ from bud.gateway.router import Gateway
 from bud.harness.actions import Action, Policy
 from bud.harness.agent import Harness
 from bud.harness.ask import ask_user
+from bud.harness.memory import build_memory
+from bud.harness.preferences import PreferenceStore
 from bud.harness.spiral import SpiralConfig
 from bud.workspace import READ_TOOLS, WRITE_TOOLS, build_tools, read_capabilities
 
@@ -67,8 +69,12 @@ async def running_bud(
     function: ResponseFunction,
     *,
     jobs: bool = False,
+    routines: bool | None = None,
+    preferences: bool = False,
     ask: bool = False,
     spiral: SpiralConfig | None = None,
+    extra_tools: list[Any] | None = None,
+    extra_policy: dict[str, Action] | None = None,
 ):
     directory = directory.resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -82,15 +88,25 @@ async def running_bud(
     gateway = Gateway(registry, Ledger(directory / "costs.db"), lambda _: model)
     policy: dict[str, Action] = dict.fromkeys(READ_TOOLS, "allow")
     policy.update(dict.fromkeys(WRITE_TOOLS, "ask"))
+    if extra_policy:
+        policy.update(extra_policy)
     tools: list[Any] = [tool.function for tool in build_tools(root, claims)]
     if ask:
         policy["ask_user"] = "ask"
         tools.append(ask_user)
+    if extra_tools:
+        tools.extend(extra_tools)
+    memory = build_memory(directory / "memory.db", namespace="owner") if preferences else None
+    pref_store = (
+        PreferenceStore(directory / "preferences.db", memory=memory) if preferences else None
+    )
     harness = Harness(
         FunctionToolset[None](tools),
         Policy(tools=policy),
         registry,
         "A synthetic workspace for behavior tests.",
+        memory=memory,
+        preferences=pref_store,
         state_dir=directory,
         result_path=log.path,
         read_tools=READ_TOOLS,
@@ -99,7 +115,7 @@ async def running_bud(
     harness.clock = lambda: datetime(2026, 11, 6, 12, tzinfo=UTC)
     if spiral is not None:
         harness.spiral = spiral
-    runner = Runner(Hub(log), gateway, harness, jobs=jobs, workspace=root)
+    runner = Runner(Hub(log), gateway, harness, jobs=jobs, routines=routines, workspace=root)
     try:
         yield RunningBud(runner, log, root, claims)
     finally:

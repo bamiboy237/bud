@@ -33,12 +33,14 @@ class ServerProcess:
         *,
         accounts: bool = False,
         hold_model: bool = False,
+        hold_external_exec: bool = False,
     ):
         self.root = root.resolve()
         self.data = self.root / "data"
         self.checkpoint = checkpoint
         self.accounts = accounts
         self.hold_model = hold_model
+        self.hold_external_exec = hold_external_exec
         self.process = None
         self.client = None
         self.last_snapshot = None
@@ -71,6 +73,8 @@ class ServerProcess:
                 env["BUD_TEST_ACCOUNTS"] = "1"
             if self.hold_model:
                 env["BUD_HOLD_MODEL"] = "1"
+            if self.hold_external_exec:
+                env["BUD_HOLD_EXTERNAL_EXEC"] = "1"
             command = [
                 sys.executable,
                 str(ROOT / "tests" / "server_process.py"),
@@ -211,8 +215,15 @@ def running(
     *,
     accounts: bool = False,
     hold_model: bool = False,
+    hold_external_exec: bool = False,
 ):
-    process = ServerProcess(root, checkpoint, accounts=accounts, hold_model=hold_model)
+    process = ServerProcess(
+        root,
+        checkpoint,
+        accounts=accounts,
+        hold_model=hold_model,
+        hold_external_exec=hold_external_exec,
+    )
     try:
         yield process.start()
     finally:
@@ -641,3 +652,197 @@ def test_sigterm_during_inflight_durable_run_stops_fast_and_recovers(tmp_path):
                 (run_id,),
             ).fetchone()
             assert row is not None and row[0] == "SUCCESS", (row, server.logs())
+
+
+def test_routine_and_task_survive_real_process_restart_and_paused_stays_paused(tmp_path):
+    strict_from_boot(tmp_path)
+    with running(tmp_path) as server:
+        session = server.request("POST", "/sessions", status=201)["session_id"]
+        active_routine = server.request(
+            "POST",
+            "/routines",
+            status=201,
+            json={
+                "feed_id": session,
+                "title": "Report Routine",
+                "skill": "attention-briefing",
+                "prompt": "Save note to report.md",
+                "cron": "0 9 * * *",
+                "timezone": "UTC",
+                "approval_expiry_seconds": 3600,
+            },
+        )
+        paused_routine = server.request(
+            "POST",
+            "/routines",
+            status=201,
+            json={
+                "feed_id": session,
+                "title": "Paused Routine",
+                "skill": "attention-briefing",
+                "prompt": "Briefing",
+                "cron": "* * * * *",
+                "timezone": "UTC",
+            },
+        )
+        server.request("POST", f"/routines/{paused_routine['routine_id']}/pause")
+        occ = server.request(
+            "POST",
+            f"/routines/{active_routine['routine_id']}/run-now",
+            status=202,
+            json={"trigger_id": "manual-restart-1"},
+        )
+        # Idempotent run-now with same trigger_id returns the same occurrence.
+        occ_dup = server.request(
+            "POST",
+            f"/routines/{active_routine['routine_id']}/run-now",
+            status=202,
+            json={"trigger_id": "manual-restart-1"},
+        )
+        assert occ["occurrence_id"] == occ_dup["occurrence_id"]
+
+        approval = server.wait(
+            lambda: next(
+                (
+                    a
+                    for a in server.snapshot(session)["pending_approvals"]
+                    if a.get("routine_id") == active_routine["routine_id"]
+                ),
+                None,
+            ),
+            "routine approval pending",
+        )
+        assert approval["reference"] == "R1-A"
+        assert approval["expires_at"] is not None
+        server.kill()
+
+    with running(tmp_path) as server:
+        snap = server.snapshot(session)
+        routines_by_id = {r["routine_id"]: r for r in snap["routines"]}
+        assert routines_by_id[active_routine["routine_id"]]["status"] == "active"
+        assert routines_by_id[paused_routine["routine_id"]]["status"] == "paused"
+        assert routines_by_id[paused_routine["routine_id"]]["recent_occurrences"] == []
+        assert any(a["approval_id"] == approval["approval_id"] for a in snap["pending_approvals"])
+
+        # Approve using the routine reference R1-A and verify completion + confirmed delivery.
+        assert server.request(
+            "POST",
+            f"/sessions/{session}/approvals/R1-A",
+            json={"approved": True},
+        ) == {"applied": True}
+        finished = server.wait(
+            lambda: (
+                r["latest_occurrence"]
+                if (r := server.request("GET", f"/routines/{active_routine['routine_id']}"))[
+                    "latest_occurrence"
+                ]["execution_status"]
+                == "completed"
+                else None
+            ),
+            "routine occurrence completes after restart",
+        )
+        assert finished["delivery_status"] == "confirmed"
+        assert (server.data / "workspace" / FILENAME).read_text() == DRAFT
+        assert (
+            server.request("GET", f"/routines/{paused_routine['routine_id']}")["status"] == "paused"
+        )
+
+        # Edit and resume controls over HTTP.
+        edited = server.request(
+            "PATCH",
+            f"/routines/{paused_routine['routine_id']}",
+            json={"cron": "30 10 * * *", "title": "Renamed Paused Routine"},
+        )
+        assert edited["revision"] == 2
+        assert edited["status"] == "paused"
+        resumed = server.request("POST", f"/routines/{paused_routine['routine_id']}/resume")
+        assert resumed["status"] == "active"
+
+
+def test_crash_during_external_tool_inspects_uncertain_side_effect_without_repeating(tmp_path):
+    with running(tmp_path, accounts=True, hold_external_exec=True) as server:
+        session = server.request("POST", "/sessions", status=201)["session_id"]
+        routine = server.request(
+            "POST",
+            "/routines",
+            status=201,
+            json={
+                "feed_id": session,
+                "title": "Slack Routine",
+                "skill": "attention-briefing",
+                "prompt": "Send hello on Slack",
+                "cron": "0 9 * * *",
+            },
+        )
+        occ = server.request(
+            "POST",
+            f"/routines/{routine['routine_id']}/run-now",
+            status=202,
+            json={"trigger_id": "slack-crash-1"},
+        )
+        approval = server.wait(
+            lambda: next(
+                (
+                    a
+                    for a in server.snapshot(session)["pending_approvals"]
+                    if a.get("routine_id") == routine["routine_id"]
+                ),
+                None,
+            ),
+            "Slack routine approval",
+        )
+        assert approval["tool"] == "SLACK_SEND_MESSAGE"
+        assert server.request(
+            "POST",
+            f"/sessions/{session}/approvals/{approval['approval_id']}",
+            json={"approved": True},
+        ) == {"applied": True}
+        marker = server.data / "checkpoint"
+        server.wait(
+            lambda: marker.exists() and marker.read_text() == "in_flight_external",
+            "in-flight external execution",
+        )
+        calls = server.data / "app-calls.jsonl"
+        executes_before = [
+            json.loads(line)
+            for line in calls.read_text().splitlines()
+            if json.loads(line).get("method") == "execute"
+        ]
+        assert len(executes_before) == 1
+        server.kill()
+
+    with running(tmp_path, accounts=True) as server:
+        reviewed = server.wait(
+            lambda: (
+                r
+                if (r := server.request("GET", f"/routines/{routine['routine_id']}"))[
+                    "latest_occurrence"
+                ]["execution_status"]
+                == "needs_review"
+                else None
+            ),
+            "uncertain side effect surfaced as needs_review",
+        )
+        assert reviewed["status"] == "paused"
+        assert reviewed["pause_reason"] == "uncertain"
+        assert reviewed["latest_occurrence"]["occurrence_id"] == occ["occurrence_id"]
+        assert reviewed["latest_occurrence"]["uncertain_tools"] == ["SLACK_SEND_MESSAGE"]
+
+        # Crucial invariant: external side effect was inspected, NOT repeated!
+        executes_after = [
+            json.loads(line)
+            for line in (server.data / "app-calls.jsonl").read_text().splitlines()
+            if json.loads(line).get("method") == "execute"
+        ]
+        assert len(executes_after) == 1
+
+        # Cannot resume or run-now until explicitly acknowledged.
+        server.request("POST", f"/routines/{routine['routine_id']}/resume", status=409)
+        server.request("POST", f"/routines/{routine['routine_id']}/run-now", status=409)
+        resumed = server.request(
+            "POST",
+            f"/routines/{routine['routine_id']}/resume",
+            json={"acknowledge_uncertain": True},
+        )
+        assert resumed["status"] == "active"
+        assert resumed["pause_reason"] is None

@@ -88,3 +88,33 @@ The job admission limit is four open jobs in the account or simulated-world
 scope. Reopening a finished job uses the same limit. Child jobs use the normal
 action tools. The conversation uses read and job-control tools. Job creation
 and updates are replay-safe. A correction retires approvals only in that job.
+
+## Scheduled routines
+
+Routines run an installed skill on a 5-field cron schedule and IANA timezone
+inside the DBOS durable runner. Each routine persists its `schedule`, `timezone`,
+`skill`, `prompt` (owner-authored request), `budget` (`max_usd`, `max_requests`,
+`max_tool_calls`, `max_tokens`, `deadline_minutes`), ownership (`feed_id`),
+`destination`, `missed_run_policy` (`run_once`, `skip`, or bounded `catch_up`),
+`overlap_policy`, `approval_expiry_seconds`, and `status` (`active` or `paused`).
+
+- **Deduplication and missed runs:** Each scheduled slot uses a unique
+  `dedup_key` (`sched:<routine_id>:<utc_slot>`), so repeated wakeups or restart
+  recovery create at most one occurrence. Paused routines stay paused across
+  restarts and never backfill skipped intervals on resume.
+- **Scoped preferences:** Each occurrence loads current active `skill:<name>`
+  and `global` preferences from `PreferenceStore` at launch (`routine prompt >
+  skill:<name> > global`), excluding forgotten preferences.
+- **Execution vs delivery claims:** Occurrence execution (`execution_status`) is
+  tracked separately from destination delivery (`delivery_status`,
+  `dispatch_claim_id`, `delivery_receipt`). Uncertain mid-tool crashes or
+  unconfirmed delivery claims pause the routine (`pause_reason="uncertain"`) and
+  move the occurrence to `needs_review` for inspection rather than repeating side
+  effects.
+- **Controls and API:** `POST /routines`, `GET /routines`, `GET /routines/{id}`,
+  `PATCH /routines/{id}` (edit, bumping `revision`), `POST /routines/{id}/run-now`,
+  `POST /routines/{id}/pause`, `POST /routines/{id}/resume`,
+  `POST /routines/{id}/stop`, and
+  `POST /routines/{id}/occurrences/{occurrence_id}/confirm-delivery`. Session
+  snapshots include `routines` and pending routine approvals (`R<seq>-<letter>`),
+  and expired approvals are automatically denied without execution.

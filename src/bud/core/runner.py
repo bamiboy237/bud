@@ -1,15 +1,16 @@
 """Agent runs with durable inputs, DBOS recovery, and application-owned approvals."""
 
 import asyncio
+import contextlib
 import json
 import logging
 from collections.abc import AsyncIterable
 from contextvars import Context, ContextVar
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from dbos import DBOS, DBOSConfiguredInstance, SetWorkflowID
@@ -24,6 +25,7 @@ from pydantic_ai import (
     ToolApproved,
     ToolDenied,
 )
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.durable_exec.dbos import DBOSDurability
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
@@ -41,8 +43,9 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
-from pydantic_ai.models import Model
+from pydantic_ai.models import Model, ModelRequestContext
 from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.usage import UsageLimits
 
 from bud.config import get_settings
 from bud.core.events import RUN_END_EVENTS, Event, EventType
@@ -52,6 +55,8 @@ from bud.core.projection import (
     JOB_REPORT,
     PROMPTED,
     JobReport,
+    RoutineBudget,
+    RoutineDestination,
     Snapshot,
     decisions,
     message_batch,
@@ -67,10 +72,21 @@ from bud.core.projection import (
     unreported_job_news,
     waiting_batch,
 )
+from bud.core.routines import (
+    DEFAULT_APPROVAL_EXPIRY_SECONDS,
+    MissedRunPolicy,
+    OverlapPolicy,
+    RoutineDefinition,
+    RoutineOccurrence,
+    RoutineStore,
+    routine_report_name,
+    save_routine_report,
+)
 from bud.core.runtime import replay_version
 from bud.core.tasks import CONTROL_TOOLS, FINISHED, TaskFlow, WorkItems, job_output
 from bud.gateway import Gateway
 from bud.gateway.errors import NEXT_STEP, error_summary, failure
+from bud.gateway.ledger import Ledger
 from bud.gateway.registry import Tier
 from bud.gateway.router import NoModelAvailable
 from bud.gateway.tracked import (
@@ -79,6 +95,7 @@ from bud.gateway.tracked import (
     request_attribution,
     request_session,
 )
+from bud.harness.actions import UncertainSideEffectError
 from bud.harness.agent import Harness
 from bud.harness.ask import AskAnswer, answer_from_text, ask_summary, questions_of, render_answers
 from bud.harness.learning import Learner
@@ -113,6 +130,56 @@ class RecoveryRefused(Exception):
     pass
 
 
+class ApprovalExpired(Exception):
+    def __init__(self, approval_id: str) -> None:
+        self.approval_id = approval_id
+        super().__init__(f"Approval {approval_id} has expired.")
+
+
+class BudgetExceededError(Exception):
+    pass
+
+
+@dataclass(kw_only=True)
+class RoutineBudgetGuard(AbstractCapability[None]):
+    """Stop a routine occurrence before calling the model once its USD cap is reached."""
+
+    ledger: Ledger
+    id: str | None = "bud_routine_budget"
+
+    async def before_model_request(
+        self, ctx: RunContext[None], request_context: ModelRequestContext
+    ) -> ModelRequestContext:
+        metadata = ctx.metadata or {}
+        max_usd = metadata.get("bud_budget_usd")
+        session_id = metadata.get("bud_session_id")
+        if isinstance(max_usd, (int, float)) and isinstance(session_id, str):
+            spent, _ = self.ledger.session_totals(session_id)
+            if spent >= max_usd:
+                raise BudgetExceededError(
+                    f"Routine occurrence reached its USD budget (${max_usd:.4f})."
+                )
+        return request_context
+
+
+def _min_limit(first: int | None, second: int | None) -> int | None:
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return min(first, second)
+
+
+def _effective_usage_limits(base: UsageLimits, budget: dict[str, Any] | None) -> UsageLimits:
+    if not isinstance(budget, dict):
+        return base
+    return UsageLimits(
+        request_limit=_min_limit(base.request_limit, budget.get("max_requests")),
+        tool_calls_limit=_min_limit(base.tool_calls_limit, budget.get("max_tool_calls")),
+        total_tokens_limit=_min_limit(base.total_tokens_limit, budget.get("max_tokens")),
+    )
+
+
 @DBOS.dbos_class(class_name="bud.runner")
 class Runner(DBOSConfiguredInstance):
     def __init__(
@@ -124,6 +191,7 @@ class Runner(DBOSConfiguredInstance):
         *,
         durable: bool = False,
         jobs: bool = False,
+        routines: bool | None = None,
         learner: Learner | None = None,
         recall: Recall | None = None,
         workspace: Path | None = None,
@@ -142,10 +210,18 @@ class Runner(DBOSConfiguredInstance):
         self._executing: dict[str, asyncio.Task] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._bursts: dict[str, asyncio.TimerHandle] = {}
+        self._routine_wake: asyncio.Event | None = None
         self._closing = False
         self._current: ContextVar[dict] = ContextVar("bud_run")
         self.session_models: dict[str, str] = {}
         self.work_items = WorkItems(hub, workspace) if jobs else None
+        enable_routines = jobs if routines is None else routines
+        self.routines = (
+            RoutineStore(hub, skills=harness.skills, workspace=workspace)
+            if enable_routines
+            else None
+        )
+        self.workspace = workspace
         # Checks each finished job's deliverable; without it, reports say "not checked".
         self.verifier = build_verifier() if jobs else None
         self.job_output = job_output(self.verifier)
@@ -197,32 +273,51 @@ class Runner(DBOSConfiguredInstance):
             else None
         )
         self.context = harness.build_context(self._record_context)
-        self.agent = harness.agent(
-            gateway.model(self.tier, require_tools=True, selected=self.profile.model.model_id),
-            self._record_decision,
-            context=self.context,
-            loop_report=self._loop_detected,
-            durability=durability,
-            capabilities=(
+        runner_capabilities: list[AbstractCapability[None]] = [
+            RoutineBudgetGuard(ledger=self.gateway.ledger)
+        ]
+        if self.work_items is not None:
+            runner_capabilities.append(
                 TaskFlow(
                     store=self.work_items,
                     policy=harness.policy,
                     kick=self._kick,
                     stop=self._stop_task,
                     withdraw=self._withdraw,
-                ),
+                )
             )
-            if self.work_items is not None
-            else (),
+        self.agent = harness.agent(
+            gateway.model(self.tier, require_tools=True, selected=self.profile.model.model_id),
+            self._record_decision,
+            context=self.context,
+            loop_report=self._loop_detected,
+            durability=durability,
+            capabilities=tuple(runner_capabilities),
+            prior_dispatch=self.hub.log.has_unreturned_decision,
         )
+
+    def _clock_utc(self) -> datetime:
+        now = self.harness.clock()
+        return now.astimezone(UTC) if now.tzinfo is not None else now.replace(tzinfo=UTC)
 
     def snapshot(self, session_id: str) -> Snapshot:
         state = self.hub.log.snapshot(session_id, self.hub.log.read(session_id))
-        if self.work_items is not None and self.work_items.for_session(session_id) is None:
-            state.tasks = self.work_items.views(session_id)
-            state.pending_approvals.extend(
-                approval for task in state.tasks for approval in task.pending_approvals
-            )
+        is_job = self.work_items is not None and self.work_items.for_session(session_id) is not None
+        is_occ = (
+            self.routines is not None
+            and self.routines.occurrence_for_session(session_id) is not None
+        )
+        if not is_job and not is_occ:
+            if self.work_items is not None:
+                state.tasks = self.work_items.views(session_id)
+                state.pending_approvals.extend(
+                    approval for task in state.tasks for approval in task.pending_approvals
+                )
+            if self.routines is not None:
+                state.routines = self.routines.views(session_id)
+                state.pending_approvals.extend(
+                    approval for routine in state.routines for approval in routine.pending_approvals
+                )
         policy = self.harness.policy
         for approval in state.pending_approvals:
             # The card offers a standing grant only where one is allowed and not already held.
@@ -245,13 +340,13 @@ class Runner(DBOSConfiguredInstance):
         )
 
     def _publish_task(self, session_id: str) -> None:
-        if self.work_items is None:
-            return
-        self.work_items.publish(session_id)
-        item = self.work_items.for_session(session_id)
-        if item is not None:
-            # A job that just ended may need bud to tell the owner; see _report_jobs.
-            self._kick(item.feed_id)
+        if self.work_items is not None:
+            self.work_items.publish(session_id)
+            item = self.work_items.for_session(session_id)
+            if item is not None:
+                # A job that just ended may need bud to tell the owner; see _report_jobs.
+                self._kick(item.feed_id)
+        self._sync_routine_occurrence(session_id)
 
     async def recover(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -286,6 +381,9 @@ class Runner(DBOSConfiguredInstance):
         if self.work_items is not None:
             for item in self.work_items.items():
                 self._publish_task(item.session_id)
+        if self.routines is not None:
+            self._reconcile_routines_on_recovery()
+            self.tick_routines()
 
     def _resolve_run_model(self, session_id: str) -> str:
         override = self.session_models.get(session_id)
@@ -328,6 +426,10 @@ class Runner(DBOSConfiguredInstance):
             last.data.get("conversation_saved") or last.data.get("conversation")
         )
         item = self.work_items.for_session(session_id) if self.work_items is not None else None
+        occ = (
+            self.routines.occurrence_for_session(session_id) if self.routines is not None else None
+        )
+        routine = self.routines.get(occ.routine_id) if (occ is not None and self.routines) else None
         skills = self.harness.skills.snapshot()
         if item is not None:
             skills = (
@@ -342,22 +444,42 @@ class Runner(DBOSConfiguredInstance):
                     skills,
                 )
             )
+        owner_request = (
+            None
+            if trigger == "job"
+            else (
+                routine.owner_request
+                if routine is not None
+                else (text if item is None else item.owner_request)
+            )
+        )
         # Inputs name the saved snapshot or a log position instead of copying history, so
         # each queued run stays small. Both references are immutable once written.
         return {
             "session_id": session_id,
-            "run_id": uuid4().hex,
+            "run_id": occ.run_id
+            if (occ is not None and occ.run_id and results is None)
+            else uuid4().hex,
             "text": text,
             # What the owner asked for, kept for the approval-triage model: the message text,
-            # or (set in _resume_if_ready) the original message of a resumed run. A job gets
-            # the owner's words that started or steered it, never its brief: bud writes the
-            # brief, possibly after reading untrusted mail.
-            "request": None if trigger == "job" else (text if item is None else item.owner_request),
+            # or (set in _resume_if_ready) the original message of a resumed run. A job or
+            # routine gets only the owner's own words, never briefs or tool outputs.
+            "request": owner_request,
             # The owner's clock when this run was queued (the simulated clock in sim mode).
             "clock": self.harness.clock().isoformat(),
             "trigger": trigger if results is None else "approval",
             "origin": origin,
             "task_id": item.task_id if item is not None else None,
+            "routine_id": routine.routine_id if routine is not None else None,
+            "occurrence_id": occ.occurrence_id if occ is not None else None,
+            "routine_revision": occ.routine_revision if occ is not None else None,
+            "approval_expiry_seconds": routine.approval_expiry_seconds
+            if routine is not None
+            else None,
+            "budget": routine.budget.model_dump(mode="json") if routine is not None else None,
+            "destination": (
+                routine.destination.model_dump(mode="json") if routine is not None else None
+            ),
             "conversation_run": last.data["run_id"] if saved and last is not None else None,
             "history_seq": None if saved else (events[-1].seq if events else 0),
             "results": RESULTS.dump_json(results).decode() if results is not None else None,
@@ -505,6 +627,488 @@ class Runner(DBOSConfiguredInstance):
         for feed_id in stalled:
             self._kick(feed_id)
 
+    # Routine orchestration and controls
+
+    def bind_routine_wake(self, event: asyncio.Event) -> None:
+        self._routine_wake = event
+
+    def wake_routines(self) -> None:
+        if self._routine_wake is None:
+            return
+        if self._loop is not None and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._routine_wake.set)
+        else:
+            self._routine_wake.set()
+
+    def next_routine_delay(
+        self, now: datetime | None = None, *, default_seconds: float = 30.0
+    ) -> float:
+        """How long to wait before the next scheduled routine or approval expiry check."""
+        if self.routines is None:
+            return default_seconds
+        now_utc = (
+            now.astimezone(UTC)
+            if now is not None and now.tzinfo is not None
+            else (now.replace(tzinfo=UTC) if now is not None else self._clock_utc())
+        )
+        soonest = default_seconds
+        for routine in self.routines.list_routines():
+            if routine.status == "active" and routine.next_run_at is not None:
+                delta = (routine.next_run_at - now_utc).total_seconds()
+                soonest = min(soonest, max(0.05, delta))
+        for session_id in self.routines.open_approval_sessions():
+            for req in undecided_approvals(self.hub.log.read(session_id)):
+                raw = req.get("expires_at")
+                if isinstance(raw, str):
+                    delta = (datetime.fromisoformat(raw).astimezone(UTC) - now_utc).total_seconds()
+                    soonest = min(soonest, max(0.05, delta))
+        return max(0.05, soonest)
+
+    def create_routine(
+        self,
+        *,
+        feed_id: str,
+        title: str,
+        skill: str,
+        prompt: str,
+        cron: str,
+        timezone: str = "UTC",
+        missed_run_policy: MissedRunPolicy = "run_once",
+        overlap_policy: OverlapPolicy = "skip",
+        approval_expiry_seconds: int | None = DEFAULT_APPROVAL_EXPIRY_SECONDS,
+        budget: RoutineBudget | None = None,
+        destination: RoutineDestination | None = None,
+        source_id: str | None = None,
+    ) -> RoutineDefinition:
+        assert self.routines is not None
+        routine = self.routines.create(
+            feed_id=feed_id,
+            title=title,
+            skill=skill,
+            prompt=prompt,
+            cron=cron,
+            timezone=timezone,
+            missed_run_policy=missed_run_policy,
+            overlap_policy=overlap_policy,
+            approval_expiry_seconds=approval_expiry_seconds,
+            budget=budget,
+            destination=destination,
+            source_id=source_id,
+            now=self._clock_utc(),
+        )
+        self.wake_routines()
+        return routine
+
+    def edit_routine(self, routine_id: str, **changes: Any) -> RoutineDefinition:
+        assert self.routines is not None
+        routine = self.routines.edit(routine_id, now=self._clock_utc(), **changes)
+        self.wake_routines()
+        return routine
+
+    def pause_routine(self, routine_id: str, *, reason: str = "owner") -> RoutineDefinition:
+        assert self.routines is not None
+        routine = self.routines.pause(routine_id, now=self._clock_utc(), reason=reason)
+        self.wake_routines()
+        return routine
+
+    def resume_routine(
+        self, routine_id: str, *, acknowledge_uncertain: bool = False
+    ) -> RoutineDefinition:
+        assert self.routines is not None
+        routine = self.routines.resume(
+            routine_id, now=self._clock_utc(), acknowledge_uncertain=acknowledge_uncertain
+        )
+        self.wake_routines()
+        return routine
+
+    def run_routine_now(
+        self, routine_id: str, *, trigger_id: str | None = None
+    ) -> RoutineOccurrence:
+        assert self.routines is not None
+        routine = self.routines.get(routine_id)
+        occ, created = self.routines.claim_manual_occurrence(
+            routine_id, now=self._clock_utc(), trigger_id=trigger_id
+        )
+        if created or occ.execution_status == "pending":
+            self._dispatch_routine_occurrence(routine, occ)
+        return self.routines.occurrence(occ.occurrence_id)
+
+    async def stop_routine(self, routine_id: str) -> dict[str, Any]:
+        assert self.routines is not None
+        routine = self.routines.get(routine_id)
+        stopped = False
+        has_uncertain = routine.pause_reason == "uncertain"
+        for occ in self.routines.active_occurrences(routine_id=routine_id):
+            result = await self.stop_session(occ.session_id)
+            stopped |= result["stop_requested"]
+            updated = self.routines.occurrence(occ.occurrence_id)
+            if updated.execution_status == "needs_review" or updated.uncertain_tools:
+                has_uncertain = True
+        self.routines.pause(
+            routine_id,
+            now=self._clock_utc(),
+            reason="uncertain" if has_uncertain else "stopped",
+        )
+        self.wake_routines()
+        return {
+            "stop_requested": stopped,
+            "status": "paused",
+            "pause_reason": "uncertain" if has_uncertain else "stopped",
+        }
+
+    def confirm_routine_delivery(
+        self, occurrence_id: str, *, receipt: str | None = None
+    ) -> RoutineOccurrence:
+        assert self.routines is not None
+        return self.routines.confirm_delivery(
+            occurrence_id, receipt=receipt, confirmed_at=self._clock_utc()
+        )
+
+    def mark_routine_delivery_uncertain(self, occurrence_id: str, reason: str) -> RoutineOccurrence:
+        assert self.routines is not None
+        return self.routines.mark_delivery_needs_review(occurrence_id, reason)
+
+    def expire_approvals(self, now: datetime | None = None) -> list[str]:
+        """Expire any open or parked approvals whose expires_at <= now."""
+        now_utc = (
+            now.astimezone(UTC)
+            if now is not None and now.tzinfo is not None
+            else (now.replace(tzinfo=UTC) if now is not None else self._clock_utc())
+        )
+        sessions = set(self.hub.log.sessions_with_requests())
+        if self.routines is not None:
+            sessions.update(self.routines.open_approval_sessions())
+        expired: list[str] = []
+        for session_id in sorted(sessions):
+            try:
+                events = self.hub.log.read(session_id)
+                open_requests = [*undecided_approvals(events), *parked_approvals(events)]
+                session_changed = False
+                for request in open_requests:
+                    raw = request.get("expires_at")
+                    if not isinstance(raw, str):
+                        continue
+                    if datetime.fromisoformat(raw).astimezone(UTC) <= now_utc:
+                        approval_id = request["approval_id"]
+                        if self.hub.log.expire_approval(session_id, approval_id):
+                            expired.append(approval_id)
+                            session_changed = True
+                if session_changed:
+                    self.hub.wake(session_id)
+                    with contextlib.suppress(RuntimeError):
+                        self._on_loop(self._resume_if_ready, session_id)
+            except Exception:
+                logger.exception("Approval expiry sweep failed for session %s", session_id)
+        return expired
+
+    def tick_routines(self, now: datetime | None = None) -> list[RoutineOccurrence]:
+        """Evaluate scheduled routines and approval expiries, isolated per routine."""
+        now_utc = (
+            now.astimezone(UTC)
+            if now is not None and now.tzinfo is not None
+            else (now.replace(tzinfo=UTC) if now is not None else self._clock_utc())
+        )
+        self.expire_approvals(now_utc)
+        if self.routines is None:
+            return []
+        launched: list[RoutineOccurrence] = []
+        for routine in self.routines.list_routines():
+            try:
+                claimed = self.routines.claim_scheduled_occurrences(routine.routine_id, now_utc)
+                for occ in claimed:
+                    self._dispatch_routine_occurrence(routine, occ)
+                    launched.append(self.routines.occurrence(occ.occurrence_id))
+            except Exception:
+                logger.exception("Routine tick failed for routine %s", routine.routine_id)
+        return launched
+
+    def _build_routine_prompt(self, routine: RoutineDefinition) -> str:
+        """Build the occurrence prompt with fresh active scoped preferences (THE-152)."""
+        skill_scope = f"skill:{routine.skill}"
+        skill_lines: list[str] = []
+        global_lines: list[str] = []
+        if self.harness.preferences is not None:
+            for rec in self.harness.preferences.list_preferences(skill_scope):
+                skill_lines.append(
+                    f"- [{rec.scope} | key: {rec.key} | rev {rec.revision}] {rec.value}"
+                )
+            for rec in self.harness.preferences.list_preferences("global"):
+                global_lines.append(
+                    f"- [{rec.scope} | key: {rec.key} | rev {rec.revision}] {rec.value}"
+                )
+        pref_sections: list[str] = []
+        if skill_lines:
+            pref_sections.append(f"Active {skill_scope} preferences:\n" + "\n".join(skill_lines))
+        if global_lines:
+            pref_sections.append("Active global preferences:\n" + "\n".join(global_lines))
+        pref_block = (
+            "\n\n<routine_preferences>\n"
+            "Apply active preferences in precedence order: routine instructions > "
+            f"{skill_scope} preferences > global preferences. Never restore cleared or "
+            "superseded preferences.\n"
+            + ("\n\n".join(pref_sections) if pref_sections else "No active saved preferences.")
+            + "\n</routine_preferences>"
+        )
+        return (
+            f'<routine id="{routine.routine_id}" skill="{routine.skill}" '
+            f'revision="{routine.revision}">\n'
+            f"Load and follow skill `{routine.skill}` with `load_capability`.\n"
+            f"Routine task: {routine.prompt}\n"
+            "</routine>" + pref_block
+        )
+
+    def _dispatch_routine_occurrence(
+        self, routine: RoutineDefinition, occ: RoutineOccurrence
+    ) -> None:
+        assert self.routines is not None
+        active_skills = self.harness.skills.snapshot()
+        if routine.skill not in active_skills:
+            reason = f"Skill {routine.skill!r} is not installed or enabled."
+            self.routines.sync_execution(occ.session_id, "failed", error=reason)
+            self.hub.publish_once(
+                routine.destination.feed_id,
+                "routine.failed",
+                {
+                    "routine_id": routine.routine_id,
+                    "occurrence_id": occ.occurrence_id,
+                    "title": routine.title,
+                    "text": f"Routine {routine.routine_seq} ({routine.title}) failed: {reason}",
+                    "origin": routine.destination.origin.model_dump(),
+                },
+                key=f"routine:occ:{occ.occurrence_id}:failed",
+            )
+            self.hub.wake(routine.destination.feed_id)
+            return
+        prompt_text = self._build_routine_prompt(routine)
+        run = self._inputs(
+            occ.session_id,
+            prompt_text,
+            origin=routine.destination.origin.model_dump(),
+            trigger="routine",
+        )
+        run["skills"] = {routine.skill: active_skills[routine.skill]}
+        run["request"] = routine.owner_request
+        run["routine_id"] = routine.routine_id
+        run["occurrence_id"] = occ.occurrence_id
+        run["routine_revision"] = occ.routine_revision
+        run["approval_expiry_seconds"] = routine.approval_expiry_seconds
+        run["budget"] = routine.budget.model_dump(mode="json")
+        run["destination"] = routine.destination.model_dump(mode="json")
+        self.hub.publish_once(occ.session_id, "run.queued", run, key=f"{run['run_id']}:queued")
+        self.routines.mark_queued(occ.occurrence_id)
+        self.hub.wake(occ.session_id)
+        self._on_loop(self._launch, run)
+
+    def _sync_routine_occurrence(self, session_id: str) -> None:
+        if self.routines is None:
+            return
+        occ = self.routines.occurrence_for_session(session_id)
+        if occ is None:
+            return
+        routine = self.routines.get(occ.routine_id)
+        events = self.hub.log.read(session_id)
+        states = runs(events)
+        if not states:
+            return
+        latest = states[-1]
+        if latest.status in ("queued", "running", "awaiting_approval"):
+            self.routines.sync_execution(session_id, latest.status)
+            self.hub.wake(routine.feed_id)
+            return
+        if latest.status == "needs_review":
+            cancel_ev = next(
+                (e for e in reversed(events) if e.type == "run.cancelled"),
+                None,
+            )
+            uncertain = (
+                list(cancel_ev.data.get("uncertain_tools", [])) if cancel_ev is not None else []
+            )
+            self.routines.sync_execution(
+                session_id,
+                "needs_review",
+                uncertain_tools=uncertain,
+                error=latest.reason,
+                completed_at=self._clock_utc(),
+            )
+            self.routines.pause(routine.routine_id, now=self._clock_utc(), reason="uncertain")
+            self.hub.publish_once(
+                routine.destination.feed_id,
+                "routine.needs_review",
+                {
+                    "routine_id": routine.routine_id,
+                    "occurrence_id": occ.occurrence_id,
+                    "title": routine.title,
+                    "uncertain_tools": uncertain,
+                    "text": (
+                        f"Routine {routine.routine_seq} ({routine.title}) paused for review: "
+                        f"inspect {', '.join(uncertain) or 'uncertain side effect'} "
+                        "before retrying."
+                    ),
+                    "origin": routine.destination.origin.model_dump(),
+                },
+                key=f"routine:occ:{occ.occurrence_id}:needs_review",
+            )
+            self.hub.wake(routine.feed_id)
+            self.hub.wake(routine.destination.feed_id)
+            return
+        if latest.status in ("failed", "cancelled"):
+            self.routines.sync_execution(
+                session_id,
+                latest.status,
+                error=latest.reason,
+                completed_at=self._clock_utc(),
+            )
+            ev_type: EventType = (
+                "routine.failed" if latest.status == "failed" else "routine.cancelled"
+            )
+            self.hub.publish_once(
+                routine.destination.feed_id,
+                ev_type,
+                {
+                    "routine_id": routine.routine_id,
+                    "occurrence_id": occ.occurrence_id,
+                    "title": routine.title,
+                    "text": (
+                        f"Routine {routine.routine_seq} ({routine.title}) "
+                        f"{latest.status}: {latest.reason or latest.status}"
+                    ),
+                    "origin": routine.destination.origin.model_dump(),
+                },
+                key=f"routine:occ:{occ.occurrence_id}:{latest.status}",
+            )
+            self.hub.wake(routine.feed_id)
+            self.hub.wake(routine.destination.feed_id)
+            return
+        if latest.status == "completed":
+            updated = self.routines.sync_execution(
+                session_id, "completed", completed_at=self._clock_utc()
+            )
+            end_event = next(
+                (e for e in reversed(events) if e.type == "run.completed"),
+                None,
+            )
+            if updated is not None and end_event is not None:
+                self._deliver_routine_occurrence(updated, routine, end_event)
+
+    def _deliver_routine_occurrence(
+        self, occ: RoutineOccurrence, routine: RoutineDefinition, end_event: Event
+    ) -> None:
+        if self.routines is None or occ.delivery_status != "pending":
+            return
+        claimed = self.routines.claim_delivery(occ.occurrence_id)
+        if claimed is None:
+            return
+        text = plain_citations(
+            reply_text(end_event.data.get("messages", [])), end_event.data.get("sources")
+        )
+        report_path: str | None = None
+        if routine.destination.save_report and self.workspace is not None and text.strip():
+            name = routine_report_name(routine, occ.occurrence_id, end_event.created_at)
+            try:
+                if save_routine_report(
+                    self.workspace,
+                    name,
+                    routine.title,
+                    routine.routine_seq,
+                    end_event.created_at,
+                    text,
+                ):
+                    report_path = str(self.workspace / name)
+            except OSError as exc:
+                logger.warning("Could not save routine %d report: %s", routine.routine_seq, exc)
+        dest_feed = routine.destination.feed_id
+        event = self.hub.publish_once(
+            dest_feed,
+            "routine.completed",
+            {
+                "routine_id": routine.routine_id,
+                "occurrence_id": occ.occurrence_id,
+                "title": routine.title,
+                "text": text,
+                "report_path": report_path,
+                "origin": routine.destination.origin.model_dump(),
+            },
+            key=f"routine:occ:{occ.occurrence_id}:delivery",
+        )
+        receipt = event.id if event is not None else None
+        if routine.destination.origin.channel == "imessage":
+            self.routines.mark_delivery_dispatched(
+                occ.occurrence_id, receipt=receipt, report_path=report_path
+            )
+        else:
+            self.routines.confirm_delivery(
+                occ.occurrence_id,
+                receipt=receipt,
+                report_path=report_path,
+                confirmed_at=self._clock_utc(),
+            )
+        self.hub.wake(routine.feed_id)
+        self.hub.wake(dest_feed)
+
+    def _reconcile_routines_on_recovery(self) -> None:
+        if self.routines is None:
+            return
+        for occ in self.routines.pending_dispatches():
+            try:
+                events = self.hub.log.read(occ.session_id)
+                routine = self.routines.get(occ.routine_id)
+                if any(
+                    e.type == "run.queued" and e.data.get("run_id") == occ.run_id for e in events
+                ):
+                    self.routines.mark_queued(occ.occurrence_id)
+                    self._sync_routine_occurrence(occ.session_id)
+                elif routine.pause_reason == "uncertain":
+                    self.routines.sync_execution(
+                        occ.session_id,
+                        "needs_review",
+                        error="Routine paused for uncertain side effect before dispatch.",
+                    )
+                else:
+                    self._dispatch_routine_occurrence(routine, occ)
+            except Exception:
+                logger.exception(
+                    "Failed reconciling pending routine dispatch %s", occ.occurrence_id
+                )
+        for occ in self.routines.unconfirmed_deliveries():
+            try:
+                routine = self.routines.get(occ.routine_id)
+                if occ.delivery_status == "pending":
+                    end_event = next(
+                        (
+                            e
+                            for e in reversed(self.hub.log.read(occ.session_id))
+                            if e.type == "run.completed"
+                        ),
+                        None,
+                    )
+                    if end_event is not None:
+                        self._deliver_routine_occurrence(occ, routine, end_event)
+                elif occ.delivery_status == "claimed":
+                    delivery_key = f"routine:occ:{occ.occurrence_id}:delivery"
+                    with self.hub.log._connect() as db:
+                        row = db.execute(
+                            "SELECT id FROM events WHERE session_id = ? AND event_key = ?",
+                            (routine.destination.feed_id, delivery_key),
+                        ).fetchone()
+                    if row is not None and routine.destination.origin.channel != "imessage":
+                        self.routines.confirm_delivery(
+                            occ.occurrence_id,
+                            receipt=row[0],
+                            confirmed_at=self._clock_utc(),
+                        )
+                    else:
+                        self.routines.mark_delivery_needs_review(
+                            occ.occurrence_id,
+                            "Delivery claim existed without confirmation on restart; "
+                            "inspect destination before retrying.",
+                        )
+            except Exception:
+                logger.exception("Failed reconciling routine delivery %s", occ.occurrence_id)
+        for routine in self.routines.list_routines():
+            for occ in self.routines.occurrences(routine.routine_id, limit=10):
+                if occ.execution_status in ("queued", "running", "awaiting_approval"):
+                    self._sync_routine_occurrence(occ.session_id)
+
     async def stop_session(self, session_id: str) -> dict:
         timer = self._bursts.pop(session_id, None)
         if timer is not None:
@@ -516,6 +1120,11 @@ class Runner(DBOSConfiguredInstance):
             for item in self.work_items.items(session_id):
                 if self.work_items.view(item).status not in FINISHED:
                     result = await self.stop_session(item.session_id)
+                    child_stopped |= result["stop_requested"]
+        if self.routines is not None:
+            for occ in self.routines.active_occurrences(feed_id=session_id):
+                if occ.session_id != session_id:
+                    result = await self.stop_routine(occ.routine_id)
                     child_stopped |= result["stop_requested"]
         await self.context.discard(session_id)
         if request is not None:
@@ -533,11 +1142,28 @@ class Runner(DBOSConfiguredInstance):
         self._publish_task(session_id)
         return {"stop_requested": request is not None or child_stopped, "queue_paused": True}
 
+    def _check_approval_expiry(
+        self, session_id: str, approval_id: str, request: dict, origin: dict | None = None
+    ) -> None:
+        expires_at = request.get("expires_at")
+        if not isinstance(expires_at, str):
+            return
+        if datetime.fromisoformat(expires_at).astimezone(UTC) <= self._clock_utc():
+            if self.hub.log.expire_approval(session_id, approval_id, origin=origin):
+                self.hub.wake(session_id)
+                if self._loop is not None and not self._loop.is_closed():
+                    self._on_loop(self._resume_if_ready, session_id)
+            raise ApprovalExpired(approval_id)
+
     def decide(
         self, session_id: str, approval_id: str, approved: bool, origin: dict | None = None
     ) -> bool:
         if self.work_items is not None:
             target = self.work_items.resolve(session_id, approval_id)
+            if target is not None:
+                return self.decide(target[0], target[1], approved, origin)
+        if self.routines is not None:
+            target = self.routines.resolve_approval(session_id, approval_id)
             if target is not None:
                 return self.decide(target[0], target[1], approved, origin)
         events = self.hub.log.read(session_id)
@@ -551,6 +1177,7 @@ class Runner(DBOSConfiguredInstance):
             )
         if request is None:
             raise UnknownApproval(approval_id)
+        self._check_approval_expiry(session_id, approval_id, request, origin)
         if request.get("tool") == "ask_user":
             # Questions carry information; a decision cannot. Send the answer instead.
             raise DecisionRejected(approval_id, expects_answer=True)
@@ -570,11 +1197,17 @@ class Runner(DBOSConfiguredInstance):
             target = self.work_items.resolve(session_id, approval_id)
             if target is not None:
                 return self.revise(target[0], target[1], text, message_id, origin)
+        if self.routines is not None:
+            target = self.routines.resolve_approval(session_id, approval_id)
+            if target is not None:
+                return self.revise(target[0], target[1], text, message_id, origin)
         self._validate_text(text)
         events = self.hub.log.read(session_id)
         request = next(
             (r for r in undecided_approvals(events) if r["approval_id"] == approval_id), None
         )
+        if request is not None:
+            self._check_approval_expiry(session_id, approval_id, request, origin)
         if request is not None and request.get("tool") == "ask_user":
             # A question is replaced by its answer, not by a correction.
             raise DecisionRejected(approval_id, expects_answer=True)
@@ -598,6 +1231,10 @@ class Runner(DBOSConfiguredInstance):
             target = self.work_items.resolve(session_id, approval_id)
             if target is not None:
                 return self.answer(target[0], target[1], text, origin, answers)
+        if self.routines is not None:
+            target = self.routines.resolve_approval(session_id, approval_id)
+            if target is not None:
+                return self.answer(target[0], target[1], text, origin, answers)
         if (text is None) == (answers is None):
             raise ValueError("Send either text or answers.")
         if text is not None:
@@ -609,6 +1246,7 @@ class Runner(DBOSConfiguredInstance):
         request = next((r for r in batch if r["approval_id"] == approval_id), None)
         if request is None:
             raise UnknownApproval(approval_id)
+        self._check_approval_expiry(session_id, approval_id, request, origin)
         if request.get("tool") != "ask_user":
             # Action approvals are approved or denied; answers must not grant them.
             raise DecisionRejected(approval_id, expects_answer=False)
@@ -731,6 +1369,12 @@ class Runner(DBOSConfiguredInstance):
             if event.type == "approval.denied"
             and (event.data.get("origin") or {}).get("client_id") == ACCOUNT_CHANGE
         }
+        expired_ids = {
+            event.data["approval_id"]
+            for event in events
+            if event.type == "approval.expired"
+            or (event.type == "approval.denied" and event.data.get("expired"))
+        }
         answers = {
             event.data["approval_id"]: event.data["text"]
             for event in events
@@ -757,7 +1401,7 @@ class Runner(DBOSConfiguredInstance):
                     if request["approval_id"] in revised
                     else ACCOUNT_CHANGED
                     if request["approval_id"] in rebound
-                    else _denial(request)
+                    else _denial(request, expired=request["approval_id"] in expired_ids)
                 )
                 for request in batch
             },
@@ -797,22 +1441,26 @@ class Runner(DBOSConfiguredInstance):
                 None,
             )
         run = self._inputs(session_id, None, results, origin=origin)
-        run["skills"] = next(
+        prev_queued = next(
             (
-                event.data.get("skills", {})
+                event.data
                 for event in reversed(events)
                 if event.type == "run.queued" and event.data["run_id"] == batch[0]["run_id"]
             ),
-            run["skills"],
+            {},
         )
-        run["request"] = next(
-            (
-                event.data.get("request")
-                for event in reversed(events)
-                if event.type == "run.queued" and event.data["run_id"] == batch[0]["run_id"]
-            ),
-            None,
-        )
+        run["skills"] = prev_queued.get("skills", run["skills"])
+        run["request"] = prev_queued.get("request")
+        for key in (
+            "routine_id",
+            "occurrence_id",
+            "routine_revision",
+            "approval_expiry_seconds",
+            "budget",
+            "destination",
+        ):
+            if key in prev_queued:
+                run[key] = prev_queued[key]
         run["quiet"] = any(request["approval_id"] in revised for request in batch) and not any(
             decided.get(request["approval_id"]) for request in batch
         )
@@ -891,6 +1539,11 @@ class Runner(DBOSConfiguredInstance):
         """The owner's words, bud's reply, and any denials for a finished turn."""
         if self.work_items is not None and self.work_items.for_session(session_id) is not None:
             return None  # a job's messages are briefs written by bud, not the owner's words
+        if (
+            self.routines is not None
+            and self.routines.occurrence_for_session(session_id) is not None
+        ):
+            return None  # routine occurrences run scheduled skill prompts, not chat turns
         events = self.hub.log.read(session_id)
         end = next(
             (
@@ -974,6 +1627,8 @@ class Runner(DBOSConfiguredInstance):
             return nothing
         if self.work_items is not None and self.work_items.for_session(run["session_id"]):
             return nothing  # a job brief is bud's own words
+        if self.routines is not None and self.routines.occurrence_for_session(run["session_id"]):
+            return nothing  # routine prompts resolve scoped preferences directly
         try:
             await self.recall.index_memory()
             hits = await self.recall.search(run["text"], exclude_turns=in_context)
@@ -1127,6 +1782,14 @@ class Runner(DBOSConfiguredInstance):
                     [],
                 )
                 return
+            budget = run.get("budget")
+            max_usd = budget.get("max_usd") if isinstance(budget, dict) else None
+            if isinstance(max_usd, (int, float)):
+                spent, _ = self.gateway.ledger.session_totals(run["session_id"])
+                if spent >= max_usd:
+                    raise BudgetExceededError(
+                        f"Routine occurrence reached its USD budget (${max_usd:.4f})."
+                    )
             await self._step("bud.started", self._started, run)
 
             conversation, history = self._history(run)
@@ -1218,16 +1881,20 @@ class Runner(DBOSConfiguredInstance):
                     "bud_skills": run.get("skills", {}),
                     "bud_session_id": run["session_id"],
                     "bud_task_id": run.get("task_id"),
+                    "bud_routine_id": run.get("routine_id"),
+                    "bud_occurrence_id": run.get("occurrence_id"),
+                    "bud_budget_usd": max_usd,
                     # What the job's result is checked against when it calls finish_job.
                     "bud_brief": self._brief(run),
                     "bud_origin": run.get("origin"),
                     "bud_request": run.get("request"),
                     "bud_revision_pending": bool(run.get("quiet")),
                     "bud_inline_approval": run.get("task_id") is None
+                    and run.get("occurrence_id") is None
                     and run["trigger"] == "approval",
                 },
-                # No step cap: SpiralGuard ends runaway loops unless the profile sets a limit.
-                usage_limits=self.harness.usage_limits(),
+                # No step cap: SpiralGuard ends runaway loops unless profile/routine sets a limit.
+                usage_limits=_effective_usage_limits(self.harness.usage_limits(), budget),
                 # A job ends only by filing a typed report; chat ends in text.
                 output_type=self.job_output if run.get("task_id") is not None else None,
                 event_stream_handler=None if self.durable else self._stream,
@@ -1285,6 +1952,8 @@ class Runner(DBOSConfiguredInstance):
                 data,
                 approvals,
             )
+        except UncertainSideEffectError as exc:
+            await self._step("bud.uncertain", self._finish_uncertain, run, exc.tool)
         except asyncio.CancelledError:
             if not self.durable and not self.hub.log.stop_requested(run["run_id"]):
                 self._finish(
@@ -1343,13 +2012,38 @@ class Runner(DBOSConfiguredInstance):
             },
             key=f"{run['run_id']}:started",
         )
+        if self.routines is not None and run.get("occurrence_id") is not None:
+            self.routines.sync_execution(run["session_id"], "running")
 
     def _finish(self, run: dict, type: EventType, data: dict, approvals: list[dict]) -> None:
+        expiry = run.get("approval_expiry_seconds")
+        if approvals and isinstance(expiry, int) and expiry > 0:
+            deadline = (self._clock_utc() + timedelta(seconds=expiry)).isoformat()
+            approvals = [
+                {**req, "expires_at": req.get("expires_at") or deadline} for req in approvals
+            ]
         self.hub.log.finish_run(run["session_id"], run["run_id"], type, data, approvals)
         if type == "run.completed":
             self._index_turn(run["session_id"], run["run_id"])
         self.hub.wake(run["session_id"])
         self._publish_task(run["session_id"])
+
+    def _finish_uncertain(self, run: dict, tool: str) -> None:
+        session_id = run["session_id"]
+        run_id = run["run_id"]
+        self.hub.publish_once(
+            session_id,
+            "run.cancelled",
+            {
+                "run_id": run_id,
+                "reason": (f"Interrupted during {tool}. Inspect its outcome before retrying."),
+                "uncertain_tools": [tool],
+            },
+            key=f"{run_id}:uncertain",
+        )
+        self.hub.log.pause_queue(session_id, "uncertain")
+        self.hub.wake(session_id)
+        self._publish_task(session_id)
 
     def _record_context(self, event: dict) -> None:
         session_id = event["session_id"]
@@ -1450,6 +2144,12 @@ NOTE_CHARS = 300
 def _failure(error: BaseException) -> dict[str, str]:
     if isinstance(error, RecoveryRefused):
         return {"reason": str(error), "kind": "recovery", "next": NEXT_STEP["recovery"]}
+    if isinstance(error, BudgetExceededError):
+        return {
+            "reason": str(error),
+            "kind": "budget",
+            "next": "Increase the routine budget or narrow its task before retrying.",
+        }
     return failure(error)
 
 
@@ -1723,8 +2423,13 @@ ACCOUNT_CHANGED = (
 )
 
 
-def _denial(request: dict) -> str:
+def _denial(request: dict, *, expired: bool = False) -> str:
     """What the agent hears when the owner denies a call. A held call carries its reason."""
+    if expired:
+        return (
+            "The approval request expired before the owner responded; nothing failed. "
+            "Do not execute or retry this action unless the owner asks."
+        )
     review = request.get("review")
     reason = review.get("reason") if isinstance(review, dict) else None
     if not isinstance(reason, str) or not reason:

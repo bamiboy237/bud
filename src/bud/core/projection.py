@@ -39,7 +39,10 @@ class PendingApproval(BaseModel):
     # True when the owner may grant this tool standing permission from the card.
     grantable: bool = False
     task_id: int | None = None
+    routine_id: str | None = None
+    occurrence_id: str | None = None
     reference: str | None = None
+    expires_at: str | None = None
 
 
 class QueuedMessage(BaseModel):
@@ -128,6 +131,68 @@ class TaskView(BaseModel):
     report: str | None = None
 
 
+class RoutineBudget(BaseModel, frozen=True):
+    max_usd: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    max_requests: int | None = Field(default=None, ge=1)
+    max_tool_calls: int | None = Field(default=None, ge=1)
+    max_tokens: int | None = Field(default=None, ge=1)
+    deadline_minutes: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+
+
+class RoutineDestination(BaseModel, frozen=True):
+    feed_id: str
+    origin: MessageOrigin = Field(default_factory=MessageOrigin)
+    save_report: bool = True
+
+
+class RoutineOccurrenceView(BaseModel):
+    occurrence_id: str
+    routine_id: str
+    routine_revision: int
+    feed_id: str
+    session_id: str
+    run_id: str | None = None
+    dedup_key: str
+    trigger_kind: Literal["scheduled", "missed", "manual"]
+    scheduled_for: str
+    triggered_at: str
+    execution_status: str
+    delivery_status: str
+    dispatch_claim_id: str | None = None
+    delivery_receipt: str | None = None
+    delivery_confirmed_at: str | None = None
+    report_path: str | None = None
+    uncertain_tools: list[str] = Field(default_factory=list)
+    error: str | None = None
+    completed_at: str | None = None
+
+
+class RoutineView(BaseModel):
+    routine_id: str
+    routine_seq: int
+    revision: int
+    feed_id: str
+    title: str
+    skill: str
+    prompt: str
+    cron: str
+    timezone: str
+    missed_run_policy: str
+    overlap_policy: str
+    approval_expiry_seconds: int | None = None
+    budget: RoutineBudget
+    destination: RoutineDestination
+    status: str
+    pause_reason: str | None = None
+    last_evaluated_at: str
+    next_run_at: str | None = None
+    last_run_at: str | None = None
+    active_occurrence: RoutineOccurrenceView | None = None
+    latest_occurrence: RoutineOccurrenceView | None = None
+    pending_approvals: list[PendingApproval] = Field(default_factory=list)
+    recent_occurrences: list[RoutineOccurrenceView] = Field(default_factory=list)
+
+
 class Snapshot(BaseModel):
     session_id: str
     last_seq: int
@@ -140,6 +205,7 @@ class Snapshot(BaseModel):
     queued_messages: list[QueuedMessage] = Field(default_factory=list)
     recent_runs: list[RunView] = Field(default_factory=list)
     tasks: list[TaskView] = Field(default_factory=list)
+    routines: list[RoutineView] = Field(default_factory=list)
 
 
 def queued_messages(events: list[Event]) -> list[QueuedMessage]:
@@ -362,6 +428,14 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
             case "background.finished":
                 # A reminder or a background command, posted by the server: no model turn.
                 transcript.append(Turn(role="assistant", text=event.data["text"]))
+            case (
+                "routine.completed"
+                | "routine.failed"
+                | "routine.cancelled"
+                | "routine.needs_review"
+            ):
+                if event.data.get("text"):
+                    transcript.append(Turn(role="assistant", text=event.data["text"]))
             case "text.reset" | "text.delta":
                 # Logs written before text became live-only stored each streamed piece.
                 run_id = event.data["run_id"]

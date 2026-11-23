@@ -44,8 +44,28 @@ from bud.core.events import Event, MessageOrigin
 from bud.core.hub import Hub
 from bud.core.log import EventLog, QueueFull
 from bud.core.profiles import Mode, ProfileStore, apply_mode, as_mode, mode_summary
-from bud.core.projection import Snapshot, parked_approvals, undecided_approvals
-from bud.core.runner import ACCOUNT_CHANGE, DecisionRejected, Runner, UnknownApproval
+from bud.core.projection import (
+    RoutineBudget,
+    RoutineDestination,
+    Snapshot,
+    parked_approvals,
+    undecided_approvals,
+)
+from bud.core.routines import (
+    DEFAULT_APPROVAL_EXPIRY_SECONDS,
+    MissedRunPolicy,
+    OverlapPolicy,
+    RoutineConflictError,
+    RoutineNotFoundError,
+    RoutineValidationError,
+)
+from bud.core.runner import (
+    ACCOUNT_CHANGE,
+    ApprovalExpired,
+    DecisionRejected,
+    Runner,
+    UnknownApproval,
+)
 from bud.core.setup import (
     SetupJournal,
     SetupRegistry,
@@ -143,6 +163,47 @@ class Answer(BaseModel):
 
 class ConnectRequest(BaseModel):
     resume: bool = False
+
+
+class NewRoutine(BaseModel):
+    feed_id: str = Field(min_length=1, max_length=128)
+    title: str = Field(min_length=1, max_length=120)
+    skill: str = Field(min_length=1, max_length=64)
+    prompt: str = Field(min_length=1, max_length=10_000)
+    cron: str = Field(min_length=1, max_length=120)
+    timezone: str = "UTC"
+    missed_run_policy: MissedRunPolicy = "run_once"
+    overlap_policy: OverlapPolicy = "skip"
+    approval_expiry_seconds: int | None = Field(default=DEFAULT_APPROVAL_EXPIRY_SECONDS, ge=1)
+    budget: RoutineBudget = Field(default_factory=RoutineBudget)
+    destination: RoutineDestination | None = None
+    source_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class EditRoutine(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=120)
+    skill: str | None = Field(default=None, min_length=1, max_length=64)
+    prompt: str | None = Field(default=None, min_length=1, max_length=10_000)
+    cron: str | None = Field(default=None, min_length=1, max_length=120)
+    timezone: str | None = None
+    missed_run_policy: MissedRunPolicy | None = None
+    overlap_policy: OverlapPolicy | None = None
+    approval_expiry_seconds: int | None = Field(default=None, ge=1)
+    clear_approval_expiry: bool = False
+    budget: RoutineBudget | None = None
+    destination: RoutineDestination | None = None
+
+
+class RunNowRequest(BaseModel):
+    trigger_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class ResumeRoutineRequest(BaseModel):
+    acknowledge_uncertain: bool = False
+
+
+class ConfirmDeliveryRequest(BaseModel):
+    receipt: str | None = Field(default=None, max_length=256)
 
 
 def sse_frame(event: Event) -> str:
@@ -575,19 +636,34 @@ def _create_app(
         runner_cls=Runner,
     )
 
+    routine_wake = asyncio.Event()
+    runner.bind_routine_wake(routine_wake)
+
     async def every_minute() -> None:
+        loop = asyncio.get_running_loop()
+        last_housekeeping = loop.time() - 60.0
         while True:
+            routine_wake.clear()
+            now_mono = loop.time()
+            if now_mono - last_housekeeping >= 60.0:
+                last_housekeeping = now_mono
+                try:
+                    deleted = await harness.results.prune()
+                    if deleted:
+                        logger.info("Removed %d expired temporary tool results", deleted)
+                except Exception:
+                    logger.exception("Temporary tool-result cleanup failed")
+                try:
+                    await asyncio.to_thread(runner.watch_jobs)
+                except Exception:
+                    logger.exception("Checking for stalled jobs failed")
             try:
-                deleted = await harness.results.prune()
-                if deleted:
-                    logger.info("Removed %d expired temporary tool results", deleted)
+                runner.tick_routines()
             except Exception:
-                logger.exception("Temporary tool-result cleanup failed")
-            try:
-                await asyncio.to_thread(runner.watch_jobs)
-            except Exception:
-                logger.exception("Checking for stalled jobs failed")
-            await asyncio.sleep(60)
+                logger.exception("Routine tick failed")
+            delay = min(runner.next_routine_delay(default_seconds=30.0), 30.0)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(routine_wake.wait(), timeout=delay)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -1013,7 +1089,7 @@ def _create_app(
             )
         except UnknownApproval:
             raise HTTPException(404, "unknown approval") from None
-        except DecisionRejected as exc:
+        except (DecisionRejected, ApprovalExpired) as exc:
             raise HTTPException(409, str(exc)) from None
         if applied and grant_tool is not None and grants.add(grant_tool):
             runner.harness.policy.grants = grants.tools
@@ -1047,7 +1123,7 @@ def _create_app(
             }
         except QueueFull as exc:
             raise HTTPException(429, str(exc)) from None
-        except DecisionRejected as exc:
+        except (DecisionRejected, ApprovalExpired) as exc:
             raise HTTPException(409, str(exc)) from None
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from None
@@ -1068,10 +1144,131 @@ def _create_app(
             }
         except UnknownApproval:
             raise HTTPException(404, "unknown approval") from None
-        except DecisionRejected as exc:
+        except (DecisionRejected, ApprovalExpired) as exc:
             raise HTTPException(409, str(exc)) from None
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
+
+    def _require_routines():
+        if runner.routines is None:
+            raise HTTPException(409, "Routines are disabled on this server.")
+        return runner.routines
+
+    @app.post("/routines", status_code=201)
+    def create_routine(body: NewRoutine) -> dict[str, Any]:
+        store = _require_routines()
+        require_current_binding()
+        try:
+            routine = runner.create_routine(
+                feed_id=body.feed_id,
+                title=body.title,
+                skill=body.skill,
+                prompt=body.prompt,
+                cron=body.cron,
+                timezone=body.timezone,
+                missed_run_policy=body.missed_run_policy,
+                overlap_policy=body.overlap_policy,
+                approval_expiry_seconds=body.approval_expiry_seconds,
+                budget=body.budget,
+                destination=body.destination,
+                source_id=body.source_id,
+            )
+        except RoutineValidationError as exc:
+            raise HTTPException(422, str(exc)) from None
+        except RoutineConflictError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return store.view(routine).model_dump()
+
+    @app.get("/routines")
+    def list_routines(feed_id: str | None = None) -> dict[str, list[dict[str, Any]]]:
+        store = _require_routines()
+        return {"routines": [view.model_dump() for view in store.views(feed_id)]}
+
+    @app.get("/routines/{routine_id}")
+    def get_routine(routine_id: str) -> dict[str, Any]:
+        store = _require_routines()
+        try:
+            routine = store.get(routine_id)
+        except RoutineNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        return store.view(routine).model_dump()
+
+    @app.patch("/routines/{routine_id}")
+    def edit_routine(routine_id: str, body: EditRoutine) -> dict[str, Any]:
+        store = _require_routines()
+        require_current_binding()
+        changes = body.model_dump(exclude_unset=True)
+        try:
+            routine = runner.edit_routine(routine_id, **changes)
+        except RoutineNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        except RoutineValidationError as exc:
+            raise HTTPException(422, str(exc)) from None
+        except RoutineConflictError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return store.view(routine).model_dump()
+
+    @app.post("/routines/{routine_id}/run-now", status_code=202)
+    def run_routine_now(routine_id: str, body: RunNowRequest | None = None) -> dict[str, Any]:
+        _require_routines()
+        require_current_binding()
+        try:
+            occ = runner.run_routine_now(routine_id, trigger_id=body.trigger_id if body else None)
+        except RoutineNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        except RoutineConflictError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return occ.to_view().model_dump()
+
+    @app.post("/routines/{routine_id}/pause")
+    def pause_routine(routine_id: str) -> dict[str, Any]:
+        store = _require_routines()
+        try:
+            routine = runner.pause_routine(routine_id)
+        except RoutineNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        return store.view(routine).model_dump()
+
+    @app.post("/routines/{routine_id}/resume")
+    def resume_routine(routine_id: str, body: ResumeRoutineRequest | None = None) -> dict[str, Any]:
+        store = _require_routines()
+        require_current_binding()
+        try:
+            routine = runner.resume_routine(
+                routine_id,
+                acknowledge_uncertain=bool(body and body.acknowledge_uncertain),
+            )
+        except RoutineNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        except RoutineConflictError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return store.view(routine).model_dump()
+
+    @app.post("/routines/{routine_id}/stop", status_code=202)
+    async def stop_routine(routine_id: str) -> dict[str, Any]:
+        _require_routines()
+        try:
+            return await runner.stop_routine(routine_id)
+        except RoutineNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+
+    @app.post("/routines/{routine_id}/occurrences/{occurrence_id}/confirm-delivery")
+    def confirm_routine_delivery(
+        routine_id: str,
+        occurrence_id: str,
+        body: ConfirmDeliveryRequest | None = None,
+    ) -> dict[str, Any]:
+        store = _require_routines()
+        try:
+            occ = store.occurrence(occurrence_id)
+            if occ.routine_id != routine_id:
+                raise HTTPException(404, "unknown occurrence for routine")
+            updated = runner.confirm_routine_delivery(
+                occurrence_id, receipt=body.receipt if body else None
+            )
+        except RoutineNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        return updated.to_view().model_dump()
 
     @app.get("/sessions/{session_id}/events")
     async def stream_events(

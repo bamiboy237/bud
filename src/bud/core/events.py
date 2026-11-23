@@ -38,6 +38,7 @@ EventType = Literal[
     "approval.granted",
     "approval.denied",
     "approval.parked",
+    "approval.expired",
     "question.answered",
     "run.waiting",
     "run.completed",
@@ -53,6 +54,16 @@ EventType = Literal[
     "task.cancelled",
     "task.stalled",
     "background.finished",
+    "routine.created",
+    "routine.updated",
+    "routine.paused",
+    "routine.resumed",
+    "routine.triggered",
+    "routine.completed",
+    "routine.failed",
+    "routine.cancelled",
+    "routine.needs_review",
+    "routine.delivery_confirmed",
 ]
 
 RUN_END_EVENTS = ("run.waiting", "run.completed", "run.failed", "run.cancelled")

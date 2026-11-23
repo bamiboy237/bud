@@ -17,6 +17,7 @@ from bud.core.projection import (
     Snapshot,
     decisions,
     message_batch,
+    parked_approvals,
     pause_reason,
     pending_setups,
     queue_paused,
@@ -28,17 +29,21 @@ from bud.core.projection import (
     unreported_job_news,
     waiting_batch,
 )
+from bud.harness.writes import consequential_tools, is_protected
 from bud.limits import MAX_QUEUED_MESSAGES
 
 
 def _is_job_session(db, session_id: str) -> bool:
-    try:
-        return (
-            db.execute("SELECT 1 FROM tasks WHERE session_id = ?", (session_id,)).fetchone()
-            is not None
-        )
-    except sqlite3.OperationalError:  # no jobs table yet: no jobs
-        return False
+    for table in ("tasks", "routine_occurrences"):
+        try:
+            if (
+                db.execute(f"SELECT 1 FROM {table} WHERE session_id = ?", (session_id,)).fetchone()
+                is not None
+            ):
+                return True
+        except sqlite3.OperationalError:  # table may not exist yet
+            continue
+    return False
 
 
 class QueueFull(Exception):
@@ -678,13 +683,20 @@ class EventLog:
             for e in events
             if e.type == "tool.result" and e.data["run_id"] == run_id
         }
+        consequential = consequential_tools()
         uncertain = [
             e.data["tool"]
             for e in events
             if e.type == "action.decided"
             and e.data["run_id"] == run_id
-            and e.data["outcome"] == "approved"
             and e.data["call_id"] not in returned
+            and (
+                e.data["outcome"] == "approved"
+                or (
+                    e.data["outcome"] in ("allowed", "auto-allow")
+                    and (e.data["tool"] in consequential or is_protected(str(e.data["tool"])))
+                )
+            )
         ]
         cancelled = self._insert(
             db,
@@ -707,6 +719,77 @@ class EventLog:
             self._insert(
                 db, session_id, "queue.paused", {"reason": "uncertain", "tools": uncertain}
             )
+
+    def has_unreturned_decision(self, session_id: str, run_id: str, call_id: str) -> str | None:
+        """Return the tool name if this call already recorded permission without a tool result."""
+        with self._connect() as db:
+            events = self._read(db, session_id)
+        if any(
+            e.type == "tool.result"
+            and e.data.get("run_id") == run_id
+            and e.data.get("call_id") == call_id
+            for e in events
+        ):
+            return None
+        for e in reversed(events):
+            if (
+                e.type == "action.decided"
+                and e.data.get("run_id") == run_id
+                and e.data.get("call_id") == call_id
+                and e.data.get("outcome") in ("approved", "allowed", "auto-allow")
+            ):
+                return str(e.data.get("tool"))
+        return None
+
+    def expire_approval(
+        self,
+        session_id: str,
+        approval_id: str,
+        *,
+        reason: str = "Approval expired.",
+        origin: dict | None = None,
+    ) -> bool:
+        """Atomically expire and deny an open approval request."""
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            events = self._read(db, session_id)
+            if approval_id in decisions(events):
+                return False
+            request = next(
+                (
+                    item
+                    for item in [*waiting_batch(events), *parked_approvals(events)]
+                    if item["approval_id"] == approval_id
+                ),
+                None,
+            )
+            if request is None:
+                return False
+            self._insert(
+                db,
+                session_id,
+                "approval.expired",
+                {
+                    "approval_id": approval_id,
+                    "tool": request.get("tool"),
+                    "expires_at": request.get("expires_at"),
+                },
+                once=True,
+                key=f"expired:{approval_id}",
+            )
+            denied = self._insert(
+                db,
+                session_id,
+                "approval.denied",
+                {
+                    "approval_id": approval_id,
+                    "reason": reason,
+                    "expired": True,
+                    "origin": origin,
+                },
+                once=True,
+            )
+            return denied is not None
 
     def record_action(self, session_id: str, run_id: str, decision: dict) -> None:
         # Permission and Stop serialize on the same database transaction.
