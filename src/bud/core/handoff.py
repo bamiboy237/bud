@@ -206,6 +206,40 @@ class DesktopHandoffs:
                 "file": details.file.model_dump(),
             }
 
+        @router.post("/sessions/{session}/desktop-jobs/{job_id}/browser/retarget")
+        def retarget(session: Id, job_id: Id, body: BrowserTarget):
+            with self.transaction() as db:
+                found = db.execute(
+                    """SELECT b.step, b.phase, s.desktop FROM handoff_browser b
+                       JOIN handoff_steps s ON s.id = b.step
+                       JOIN handoff_jobs j ON j.id = s.job
+                       WHERE j.id = ? AND j.session = ?""",
+                    (job_id, session),
+                ).fetchone()
+                if found is None:
+                    raise HTTPException(404, "Unknown browser job.")
+                if found["phase"] not in ("queued", "sign_in", "ready"):
+                    raise HTTPException(409, "The submission has already been approved.")
+                if (
+                    db.execute(
+                        "SELECT id FROM handoff_desktops WHERE id = ? AND revoked = 0",
+                        (body.desktop,),
+                    ).fetchone()
+                    is None
+                ):
+                    raise HTTPException(422, "The selected desktop is unavailable.")
+                if found["desktop"] != body.desktop:
+                    db.execute(
+                        "UPDATE handoff_steps SET desktop = ? WHERE id = ?",
+                        (body.desktop, found["step"]),
+                    )
+                    db.execute(
+                        "UPDATE handoff_browser SET phase = 'queued' WHERE step = ?",
+                        (found["step"],),
+                    )
+                    return {"state": "queued"}
+                return {"state": found["phase"]}
+
         @router.post("/sessions/{session}/desktop-jobs/{job_id}/browser/{decision}")
         def decide_browser(
             session: Id, job_id: Id, decision: Literal["approve", "cancel", "verify"]
@@ -240,40 +274,6 @@ class DesktopHandoffs:
                     "UPDATE handoff_browser SET phase = ? WHERE step = ?", (target, found["step"])
                 )
             return {"state": target}
-
-        @router.post("/sessions/{session}/desktop-jobs/{job_id}/browser/retarget")
-        def retarget(session: Id, job_id: Id, body: BrowserTarget):
-            with self.transaction() as db:
-                found = db.execute(
-                    """SELECT b.step, b.phase, s.desktop FROM handoff_browser b
-                       JOIN handoff_steps s ON s.id = b.step
-                       JOIN handoff_jobs j ON j.id = s.job
-                       WHERE j.id = ? AND j.session = ?""",
-                    (job_id, session),
-                ).fetchone()
-                if found is None:
-                    raise HTTPException(404, "Unknown browser job.")
-                if found["phase"] not in ("queued", "sign_in", "ready"):
-                    raise HTTPException(409, "The submission has already been approved.")
-                if (
-                    db.execute(
-                        "SELECT id FROM handoff_desktops WHERE id = ? AND revoked = 0",
-                        (body.desktop,),
-                    ).fetchone()
-                    is None
-                ):
-                    raise HTTPException(422, "The selected desktop is unavailable.")
-                if found["desktop"] != body.desktop:
-                    db.execute(
-                        "UPDATE handoff_steps SET desktop = ? WHERE id = ?",
-                        (body.desktop, found["step"]),
-                    )
-                    db.execute(
-                        "UPDATE handoff_browser SET phase = 'queued' WHERE step = ?",
-                        (found["step"],),
-                    )
-                    return {"state": "queued"}
-                return {"state": found["phase"]}
 
         @router.get(WORKER_PATH)
         def next_step(request: Request, browser: bool = False):
