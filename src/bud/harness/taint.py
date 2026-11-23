@@ -444,6 +444,15 @@ def _content(part: Any) -> str:
     return content if isinstance(content, str) else _dump(content)
 
 
+def owner_prompt(part: UserPromptPart) -> str | None:
+    """The owner's text in one prompt, or None for a system note."""
+    text, _ = _prompt_split(part)
+    if text.lstrip().startswith(SYSTEM_NOTE):
+        return None
+    added = ADDED.search(text)
+    return text[: added.start()].rstrip() if added else text
+
+
 def owner_text(messages: list[ModelMessage]) -> str:
     """The owner's own messages in this conversation, without the context Bud added."""
     parts = []
@@ -451,11 +460,8 @@ def owner_text(messages: list[ModelMessage]) -> str:
         if not isinstance(message, ModelRequest):
             continue
         for part in message.parts:
-            if isinstance(part, UserPromptPart):
-                text = _prompt_split(part)[0]
-                if not text.lstrip().startswith(SYSTEM_NOTE):
-                    start = ADDED.search(text)
-                    parts.append(text[: start.start()] if start else text)
+            if isinstance(part, UserPromptPart) and (text := owner_prompt(part)) is not None:
+                parts.append(text)
     return "\n".join(parts)
 
 
