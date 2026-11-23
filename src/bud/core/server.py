@@ -18,7 +18,7 @@ from typing import Annotated, Any, TextIO
 from uuid import uuid4
 
 from dbos import DBOS
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
 from pydantic_ai import ModelRetry
@@ -45,6 +45,7 @@ from bud.core.hub import Hub
 from bud.core.log import EventLog, QueueFull
 from bud.core.profiles import Mode, ProfileStore, apply_mode, as_mode, mode_summary
 from bud.core.projection import (
+    Attachment,
     RoutineBudget,
     RoutineDestination,
     Snapshot,
@@ -101,6 +102,7 @@ from bud.web import GUIDANCE as WEB_GUIDANCE
 from bud.web import READ_TOOLS as WEB_READ_TOOLS
 from bud.web import build_tools as build_web_tools
 from bud.workspace import (
+    ATTACHMENT_BYTES,
     DOCUMENT_TOOL,
     LOCAL_GUIDANCE,
     LOCAL_TOOLS,
@@ -109,7 +111,10 @@ from bud.workspace import (
     local_blocked,
     local_refusal,
     local_tools,
+    preview_document,
+    read_workspace_bytes,
     read_workspace_text,
+    save_attachment,
 )
 from bud.workspace import GUIDANCE as WORKSPACE_GUIDANCE
 from bud.workspace import READ_TOOLS as WORKSPACE_READ_TOOLS
@@ -132,7 +137,8 @@ class ModeRequest(BaseModel):
 
 
 class NewMessage(BaseModel):
-    text: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+    text: str = Field(max_length=MAX_MESSAGE_CHARS)
+    attachments: list[Attachment] = Field(default_factory=list, max_length=5)
     origin: MessageOrigin = Field(default_factory=MessageOrigin)
     message_id: str | None = Field(
         default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$"
@@ -1066,6 +1072,51 @@ def _create_app(
             "conversation": runner.snapshot(item.session_id).model_dump(),
         }
 
+    @app.put("/sessions/{session_id}/attachments/{attachment_id}", status_code=204)
+    async def upload_attachment(session_id: str, attachment_id: str, name: str, request: Request):
+        require_session(session_id)
+        require_current_binding()
+        try:
+            attachment = Attachment(id=attachment_id, name=name)
+        except ValueError as exc:
+            raise HTTPException(422, "Invalid attachment ID or filename.") from exc
+        content = bytearray()
+        async for chunk in request.stream():
+            if len(content) + len(chunk) > ATTACHMENT_BYTES:
+                raise HTTPException(413, "Attachments are limited to 25 MiB each.")
+            content.extend(chunk)
+        try:
+            await asyncio.to_thread(
+                save_attachment, workspace, attachment.path(session_id), bytes(content)
+            )
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return Response(status_code=204)
+
+    @app.get("/sessions/{session_id}/attachments/{attachment_id}")
+    def get_attachment(session_id: str, attachment_id: str, name: str, preview: bool = False):
+        require_session(session_id)
+        try:
+            attachment = Attachment(id=attachment_id, name=name)
+        except ValueError as exc:
+            raise HTTPException(404, "Unknown attachment.") from exc
+        data = read_workspace_bytes(workspace, attachment.path(session_id), limit=ATTACHMENT_BYTES)
+        if data is None:
+            raise HTTPException(404, "Unknown attachment.")
+        if preview:
+            converted = preview_document(data, name)
+            if not converted["ok"]:
+                raise HTTPException(422, converted["error"])
+            return JSONResponse(converted)
+        return Response(
+            data,
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     # Routes that write to the log are plain `def`, so FastAPI runs them on its thread pool and
     # a slow write never stalls the event loop that serves every stream. The runner hands
     # anything that launches work back to the loop itself (Runner._on_loop).
@@ -1073,12 +1124,18 @@ def _create_app(
     def post_message(session_id: str, message: NewMessage) -> dict[str, bool]:
         require_session(session_id)
         require_current_binding()
+        if any(
+            read_workspace_bytes(workspace, file.path(session_id), limit=ATTACHMENT_BYTES) is None
+            for file in message.attachments
+        ):
+            raise HTTPException(422, "An attachment is unavailable in this conversation.")
         try:
             event = runner.start(
                 session_id,
                 message.text,
                 message.message_id or uuid4().hex,
                 message.origin.model_dump(),
+                attachments=message.attachments,
             )
         except QueueFull as exc:
             raise HTTPException(429, str(exc)) from None

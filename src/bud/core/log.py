@@ -16,6 +16,7 @@ from bud.core.projection import (
     AUTO_PAUSES,
     PROMPTED,
     TERMINAL_SETUP_STATUSES,
+    Attachment,
     Snapshot,
     decisions,
     message_batch,
@@ -507,11 +508,19 @@ class EventLog:
             return session_id
 
     def accept_message(
-        self, session_id: str, text: str, message_id: str, origin: dict | None = None
+        self,
+        session_id: str,
+        text: str,
+        message_id: str,
+        origin: dict | None = None,
+        *,
+        attachments: list[Attachment] | None = None,
     ) -> Event | None:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            event = self._accept_message(db, session_id, text, message_id, origin)
+            event = self._accept_message(
+                db, session_id, text, message_id, origin, attachments=attachments
+            )
             if event is not None:
                 self._supersede(db, session_id, message_id, origin)
                 reason = pause_reason(self._read(db, session_id))
@@ -586,7 +595,9 @@ class EventLog:
         origin: dict | None,
         *,
         source_run: str | None = None,
+        attachments: list[Attachment] | None = None,
     ) -> Event | None:
+        files = [attachment.model_dump() for attachment in attachments or []]
         previous = db.execute(
             """SELECT data FROM events WHERE session_id = ?
                    AND type IN ('message.queued', 'user.message')
@@ -595,7 +606,11 @@ class EventLog:
         ).fetchone()
         if previous:
             data = json.loads(previous[0])
-            if data["text"] != text or data.get("origin") != origin:
+            if (
+                data["text"] != text
+                or data.get("origin") != origin
+                or data.get("attachments", []) != files
+            ):
                 raise ValueError("Message ID already used with different content or origin")
             return None
         if len(queued_messages(self._read(db, session_id))) >= MAX_QUEUED_MESSAGES:
@@ -609,6 +624,7 @@ class EventLog:
                 "text": text,
                 "origin": origin,
                 **({"source_run": source_run} if source_run else {}),
+                **({"attachments": files} if files else {}),
             },
         )
 
@@ -730,6 +746,10 @@ class EventLog:
                 return []
             claimed: list[dict[str, Any]] = []
             for item in pending:
+                # File messages start their own turn so the runner supplies the
+                # attachment context. Keep later messages behind them in order.
+                if item.attachments:
+                    break
                 payload = item.model_dump()
                 inserted = self._insert(
                     db,

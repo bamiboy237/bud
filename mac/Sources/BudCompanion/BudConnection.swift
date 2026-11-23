@@ -151,20 +151,44 @@ struct BudConnection: Sendable {
         _ method: String, _ path: String, json: [String: Any]? = nil,
         queryItems: [URLQueryItem] = []
     ) async throws -> [String: Any] {
+        let data = try await checkedData(request(method, path, json: json, queryItems: queryItems))
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+    }
+
+    func getBytes(_ path: String, queryItems: [URLQueryItem]) async throws -> Data {
+        try await checkedData(request("GET", path, queryItems: queryItems))
+    }
+
+    func postMessage(
+        _ text: String, id: String, session: String, attachments: [DraftAttachment]
+    ) async throws {
+        for file in attachments {
+            let reference = file.reference
+            var upload = request("PUT", reference.path(in: session), queryItems: reference.query)
+            upload.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+            upload.timeoutInterval = 60
+            upload.httpBody = file.data
+            _ = try await checkedData(upload)
+        }
+        var body: [String: Any] = ["text": text, "message_id": id, "origin": Self.origin]
+        if !attachments.isEmpty { body["attachments"] = attachments.map { $0.reference.fields } }
+        _ = try await send("POST", "sessions/\(session)/messages", json: body)
+    }
+
+    private func checkedData(_ request: URLRequest) async throws -> Data {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await transport(
-                request(method, path, json: json, queryItems: queryItems))
+            (data, response) = try await transport(request)
         } catch {
             throw ConnectionError.unreachable
         }
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-        let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
         guard (200..<300).contains(code) else {
-            throw ConnectionError.http(code, body["detail"].map { "\($0)" } ?? "request failed")
+            let detail = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            throw ConnectionError.http(code, detail?["detail"].map { "\($0)" } ?? "request failed")
         }
-        return body
+        return data
     }
 
     /// Who sent a message: routing metadata the server records, not a permission.

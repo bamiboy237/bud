@@ -128,11 +128,14 @@ def _directory(path: Path):
 
 
 @contextmanager
-def _parent(root: Path, parts: list[str]):
+def _parent(root: Path, parts: list[str], *, create: bool = False):
     with _directory(root) as root_fd:
         fd = os.dup(root_fd)
         try:
             for part in parts:
+                if create:
+                    with suppress(FileExistsError):
+                        os.mkdir(part, 0o700, dir_fd=fd)
                 new = os.open(part, _DIR_FLAGS, dir_fd=fd)
                 os.close(fd)
                 fd = new
@@ -250,6 +253,8 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool[None]]:
             ):
                 raise _Refused("An approved call with an approval_id is required.")
             parts = _parts(path)
+            if parts[0] == "attachments":
+                raise _Refused("Save a working copy outside the attachments folder.")
             data = content.encode("utf-8")
             if len(data) > _MAX_BYTES or "\x00" in content:
                 raise _Refused("Content must be UTF-8 text of at most 128 KiB.")
@@ -425,6 +430,45 @@ def read_workspace_text(root: Path, path: str) -> tuple[str, os.stat_result] | N
         return None
 
 
+ATTACHMENT_BYTES = _DOCUMENT_BYTES
+
+
+def save_attachment(root: Path, path: str, data: bytes) -> None:
+    """Save an explicitly uploaded file atomically, allowing identical retries."""
+    if len(data) > ATTACHMENT_BYTES:
+        raise ValueError("This attachment is too large.")
+    try:
+        parts = _parts(path)
+        with _parent(root, parts[:-1], create=True) as fd:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                existing, _ = _read_bytes(fd, parts[-1], ATTACHMENT_BYTES)
+            except FileNotFoundError:
+                temporary = ".upload-" + uuid.uuid4().hex
+                temp_fd = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=fd,
+                )
+                try:
+                    with os.fdopen(temp_fd, "wb") as stream:
+                        stream.write(data)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.link(
+                        temporary, parts[-1], src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False
+                    )
+                finally:
+                    os.unlink(temporary, dir_fd=fd)
+                os.fsync(fd)
+            else:
+                if existing != data:
+                    raise ValueError("This attachment ID already has different contents.")
+    except (_Refused, OSError) as exc:
+        raise ValueError("This attachment could not be saved.") from exc
+
+
 def read_workspace_bytes(root: Path, path: str, limit: int = _DOCUMENT_BYTES) -> bytes | None:
     """A visible workspace file's bytes, read without following links, or None when the path
     is hidden, credential-like, a link, a special file, or too large."""
@@ -435,6 +479,23 @@ def read_workspace_bytes(root: Path, path: str, limit: int = _DOCUMENT_BYTES) ->
         return data
     except (_Refused, OSError, ValueError):
         return None
+
+
+def attachment_preview(data: bytes, name: str) -> str:
+    try:
+        return anydoc.to_markdown_bytes(
+            data, "csv" if name.lower().endswith(".csv") else None, ocr="reject"
+        )
+    except anydoc.NeedsOcrError:
+        raise _Refused("The document has scanned pages, which Bud cannot read.") from None
+    except anydoc.EncryptedError:
+        raise _Refused("The document is password-protected.") from None
+    except anydoc.ConvertError as exc:
+        raise _Refused(f"Could not read the document: {exc}") from None
+
+
+def preview_document(data: bytes, name: str) -> dict[str, Any]:
+    return _safe(lambda: {"ok": True, "markdown": attachment_preview(data, name)})
 
 
 def document_tool(root: Path) -> Tool[None]:
@@ -453,17 +514,7 @@ def document_tool(root: Path) -> Tool[None]:
             parts = _parts(path)
             with _parent(root, parts[:-1]) as fd:
                 data, _ = _read_bytes(fd, parts[-1], _DOCUMENT_BYTES)
-            # CSV has no file signature, so it is named; other formats are detected.
-            kind = "csv" if path.lower().endswith(".csv") else None
-            try:
-                markdown = anydoc.to_markdown_bytes(data, kind, ocr="reject")
-            except anydoc.NeedsOcrError:
-                raise _Refused("The document has scanned pages, which Bud cannot read.") from None
-            except anydoc.EncryptedError:
-                raise _Refused("The document is password-protected.") from None
-            except anydoc.ConvertError as exc:
-                raise _Refused(f"Could not read the document: {exc}") from None
-            return {"ok": True, "path": path, "markdown": markdown}
+            return {"ok": True, "path": path, "markdown": attachment_preview(data, path)}
 
         return _safe(convert)
 

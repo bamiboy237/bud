@@ -16,6 +16,14 @@ from bud.harness.email_preview import EmailPreview
 from bud.limits import MAX_MESSAGE_CHARS
 
 
+class Attachment(BaseModel):
+    id: str = Field(pattern=r"^[a-f0-9]{32}$")
+    name: str = Field(min_length=1, max_length=200, pattern=r"^[^/\\]+$")
+
+    def path(self, session_id: str) -> str:
+        return f"attachments/{session_id}/{self.id}/{self.name}"
+
+
 class Turn(BaseModel):
     role: str
     text: str
@@ -24,6 +32,7 @@ class Turn(BaseModel):
     seq: int | None = None
     # What the reply's [S1]-style tags cite: session_id, seq, date, and a display label.
     sources: dict[str, dict] | None = None
+    attachments: list[Attachment] = Field(default_factory=list)
 
 
 class PendingApproval(BaseModel):
@@ -49,6 +58,7 @@ class QueuedMessage(BaseModel):
     message_id: str
     text: str
     origin: MessageOrigin | None = None
+    attachments: list[Attachment] = Field(default_factory=list)
 
 
 TERMINAL_SETUP_STATUSES = frozenset({"connected", "cancelled", "rejected", "dismissed"})
@@ -432,7 +442,14 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
                     slot = Turn(role="assistant", text="")
                     steered_slots.setdefault(steered_run, []).append(slot)
                     transcript.append(slot)
-                transcript.append(Turn(role="user", text=event.data["text"], seq=event.seq))
+                transcript.append(
+                    Turn(
+                        role="user",
+                        text=event.data["text"],
+                        seq=event.seq,
+                        attachments=event.data.get("attachments", []),
+                    )
+                )
                 blocks = {}
             case "run.waiting" | "run.completed":
                 report = event.data.get("report")
