@@ -193,17 +193,17 @@ def local_routes(view: BrowserView) -> APIRouter:
                         str(copy),
                         timeout=30,
                     )
-                # A site's file-input handler may have already sent it. Inspect before clicking.
-                if await _inspect_existing(view, path, tab, body) == "ready":
-                    await view._command(
-                        path,
-                        "click",
-                        "--tab",
-                        tab,
-                        "--selector",
-                        f"#{body.form.submit_button}",
-                        timeout=18,
-                    )
+                    # A site's file-input handler may have already sent it. Inspect before clicking.
+                    if await _inspect_existing(view, path, tab, body) == "ready":
+                        await view._command(
+                            path,
+                            "click",
+                            "--tab",
+                            tab,
+                            "--selector",
+                            f"#{body.form.submit_button}",
+                            timeout=18,
+                        )
             except (OSError, RuntimeError, TimeoutError):
                 pass
             state = await _inspect_existing(view, path, tab, body)
