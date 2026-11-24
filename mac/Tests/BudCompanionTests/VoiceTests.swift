@@ -396,12 +396,17 @@ struct VoiceTests {
     }
 
     @Test
-    func spokenAnswerRoutesToActiveQuestionFieldInsteadOfSending() async {
+    func spokenAnswerRoutesToActiveQuestionFieldInsteadOfSending() async throws {
         let transport = StubTransport()
         let companion = Companion()
         companion.connectForTesting(transport.makeConnection())
-        companion.write(.answer("approval-1"))
-        companion.draft = "existing"
+        let approval = try #require(Approval([
+            "approval_id": "approval-1", "tool": "ask_user", "args": ["question": "With whom?"],
+        ], jobs: [:]))
+        let flow = companion.questionFlow(for: approval)
+        flow.answers.type("existing", at: 0)
+        companion.focusQuestion(approval.id, position: 0, focused: true)
+        companion.draft = "separate message"
 
         let env = makeVoice(companion: companion, isDownloaded: true)
         await env.transcriber.setResult(.success("with Priya"))
@@ -412,17 +417,22 @@ struct VoiceTests {
         env.voice.release()
         await env.voice.transcriptionTask?.value
 
-        #expect(companion.inputPurpose == .answer("approval-1"))
-        #expect(companion.draft == "existing with Priya")
-        #expect(companion.inputOpen)
+        #expect(companion.inputPurpose == .ask)
+        #expect(companion.draft == "separate message")
+        #expect(flow.answers.typed(at: 0) == "existing with Priya")
         #expect(transport.requests.isEmpty)
     }
 
     @Test
-    func spokenTextIsHeldIfInputPurposeChangesWhileSpeaking() async {
+    func spokenTextIsHeldIfTheAnswerFieldLosesFocusWhileSpeaking() async throws {
         let transport = StubTransport()
         let companion = Companion()
         companion.connectForTesting(transport.makeConnection())
+        let approval = try #require(Approval([
+            "approval_id": "approval-2", "tool": "ask_user", "args": ["question": "Which room?"],
+        ], jobs: [:]))
+        _ = companion.questionFlow(for: approval)
+        companion.focusQuestion(approval.id, position: 0, focused: true)
 
         let env = makeVoice(companion: companion, isDownloaded: true)
         await env.transcriber.setResult(.success("book the room"))
@@ -430,8 +440,7 @@ struct VoiceTests {
         await env.voice.setupTask?.value
 
         env.voice.press()
-        // A question arrives while the user is holding the talk key.
-        companion.write(.answer("approval-2"))
+        companion.focusQuestion(approval.id, position: 0, focused: false)
         env.voice.release()
         await env.voice.transcriptionTask?.value
 

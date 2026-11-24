@@ -9,13 +9,16 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from pydantic_ai.exceptions import ApprovalRequired
+from pydantic_ai.toolsets import FunctionToolset
 
 from bud import shell
 from bud.config import Settings
 from bud.core.server import allow_file_tools, private_folders
-from bud.harness.actions import Policy
+from bud.harness.actions import ActionGateway, Policy
 from bud.harness.review import ReviewResult, ToolReviewer, Verdict
 from bud.shell import NetworkGrants, Proxy, build_tools, judge_site, run
+from tests.test_taint import call, ctx
 
 macos = pytest.mark.skipif(not shell.available(), reason="needs the macOS sandbox")
 
@@ -114,6 +117,29 @@ async def test_the_network_goes_through_the_proxy_and_its_judge(workspace):
     # Without the proxy the sandbox has no network at all.
     assert "hello" not in direct["stdout"]
     assert direct["exit_code"] != 0
+
+
+@macos
+async def test_local_compute_does_not_ask_and_cannot_use_a_granted_site(workspace, tmp_path):
+    grants = NetworkGrants(tmp_path / "network-grants.json")
+    grants.add("127.0.0.1")
+    policy = Policy(tools={})
+    allow_file_tools(policy)
+    tools = build_tools(workspace, grants, lambda: None)
+    gate = ActionGateway(FunctionToolset(tools), policy=policy, record=lambda decision: None)
+    server, port = await serve_once(b"network access")
+    context = ctx("Read my screenshot", "The examples used CommandLine.arguments and 127.0.0.1.")
+    command = f"printf '%s\\n' CommandLine.arguments; curl -sS -m 2 http://127.0.0.1:{port}/"
+    try:
+        with pytest.raises(ApprovalRequired):
+            await call(gate, "run_command", {"command": command}, context)
+        result = await call(gate, "run_local_command", {"command": command}, context)
+    finally:
+        server.close()
+
+    assert result["stdout"] == "CommandLine.arguments\n"
+    assert result["exit_code"] != 0
+    assert "blocked_sites" not in result
 
 
 async def test_registries_pass_and_each_other_site_is_judged_once():

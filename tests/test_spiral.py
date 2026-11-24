@@ -3,10 +3,19 @@
 import json
 from itertools import count
 
+import pytest
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+from bud.gateway.attachments import attachment_prompt
 from bud.harness.spiral import (
     NUDGE,
     SpiralConfig,
@@ -93,14 +102,15 @@ class NoProgress:
     """A judge that always answers that the run is stuck."""
 
     def __init__(self) -> None:
-        self.asked = 0
+        self.requests: list[str] = []
 
     async def progress_probability(self, request: str, log: str, total_steps: int) -> float:
-        self.asked += 1
+        self.requests.append(request)
         return 0.0
 
 
-async def test_the_progress_judge_climbs_the_same_ladder():
+@pytest.mark.parametrize("attached", [False, True])
+async def test_the_progress_judge_climbs_the_same_ladder(attached):
     # Results always change, so only the judge can see the run is stuck.
     reports: list[dict] = []
     judge = NoProgress()
@@ -108,11 +118,18 @@ async def test_the_progress_judge_climbs_the_same_ladder():
     pages = [f"page {i}" for i in range(50)]
     agent, calls = scripted(pages, config, reports, judge=judge)
 
-    result = await agent.run("Find the invoice.")
+    request = "Find the invoice."
+    prompt = attachment_prompt(
+        request,
+        ["attachments/owner/id/invoice.png"] if attached else [],
+        "\n\n<recalled>An unrelated old task.</recalled>",
+    )
+    history = [ModelRequest(parts=[UserPromptPart("An earlier unrelated request.")])]
+    result = await agent.run(prompt, message_history=history)
 
     assert result.output == HANDOFF_TEXT
     assert len(calls) == 4
-    assert judge.asked == 2
+    assert judge.requests == [request, request]
     assert [n["kind"] for n in nudges(result.all_messages())] == ["no_progress"]
     assert [r["kind"] for r in reports] == ["no_progress"]
     assert reports[0]["confidence"] == 1.0

@@ -66,7 +66,7 @@ final class Voice {
     @ObservationIgnored private var optionHold: RightOptionHold?
     @ObservationIgnored private var escapeKeys: [any HotkeyToken] = []
     /// What the field was for when this recording started: a message, or an answer.
-    @ObservationIgnored private var destination: InputPurpose = .ask
+    @ObservationIgnored private var destination: SpeechDestination = .ask
     @ObservationIgnored private(set) var setupTask: Task<Void, Never>?
     @ObservationIgnored private(set) var transcriptionTask: Task<Void, Never>?
 
@@ -199,7 +199,7 @@ final class Voice {
             return
         }
         state = .listening
-        destination = companion.inputPurpose
+        destination = companion.speechDestination
         companion.hearing = true
         playSound(.start)
         // Esc drops the recording; taken only while listening, so it's never stolen otherwise.

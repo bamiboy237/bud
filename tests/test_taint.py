@@ -757,6 +757,7 @@ async def test_self_authored_sources_cannot_vouch_for_a_navigation_link():
         ModelRequest(parts=[UserPromptPart(f"hi\n\n<job_updates>Job 1: {link}</job_updates>")]),
         ModelRequest(parts=[ToolReturnPart("inspect_task", link, tool_call_id="t1")]),
         ModelRequest(parts=[ToolReturnPart("read_file", f"notes: {link}", tool_call_id="r2")]),
+        ModelRequest(parts=[ToolReturnPart("run_local_command", link, tool_call_id="s1")]),
         ModelRequest(
             parts=[UserPromptPart(["check", TextContent(link, metadata={"origin": "memory"})])]
         ),
