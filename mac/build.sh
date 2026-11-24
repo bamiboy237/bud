@@ -6,13 +6,16 @@ set -euo pipefail
 here=${0:A:h}
 app=$here/build/bud.app
 
-swift build -c release --package-path "$here"
-bin=$(swift build -c release --package-path "$here" --show-bin-path)
+# Swift Build resolves package bundles in Contents/Resources, even on Swift 6.2 and 6.3.
+swift build --build-system swiftbuild -c release --package-path "$here"
+bin=$(swift build --build-system swiftbuild -c release --package-path "$here" --show-bin-path)
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin/BudCompanion" "$app/Contents/MacOS/bud"
 cp "$here/Info.plist" "$app/Contents/Info.plist"
+cp -R "$bin/SwiftMath_SwiftMath.bundle" "$app/Contents/Resources/"
+cp "$here/.build/checkouts/SwiftMath/LICENSE" "$app/Contents/Resources/SwiftMath-LICENSE"
 if [[ -d "$here/Sources/BudCompanion/Resources/Fonts" ]]; then
   mkdir -p "$app/Contents/Resources/Fonts"
   cp "$here/Sources/BudCompanion/Resources/Fonts"/* "$app/Contents/Resources/Fonts/"

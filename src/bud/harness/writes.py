@@ -83,13 +83,12 @@ def consequential_tools() -> frozenset[str]:
     prefix (is_protected). A private note or memory is not here: its text has no target."""
     from bud.browser import STEPS as BROWSER_STEPS
     from bud.core.background import STARTS as BACKGROUND_STARTS
-    from bud.shell import NETWORK_TOOL, SHELL_TOOLS
+    from bud.shell import NETWORK_COMMAND, NETWORK_TOOL
     from bud.world.tools import WRITE_TOOLS as WORLD_WRITE_TOOLS
 
     return (
         PROTECTED
-        | SHELL_TOOLS
-        | {NETWORK_TOOL}
+        | {NETWORK_COMMAND, NETWORK_TOOL}
         | BROWSER_STEPS
         | BACKGROUND_STARTS
         | WORLD_WRITE_TOOLS

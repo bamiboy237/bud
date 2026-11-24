@@ -99,7 +99,7 @@ private struct ConversationView: View {
     @Bindable var companion: Companion
     let window: ConversationWindow
     @FocusState private var typing: Bool
-    @State private var restoreTyping = false
+    @StateObject private var restoreTyping = Flag()
     @StateObject private var scroll = ScrollState()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -112,7 +112,8 @@ private struct ConversationView: View {
             : .scale(scale: 0.96).combined(with: .opacity)
     }
 
-    @State private var pickingAttachments = false
+    @StateObject private var pickingAttachments = Flag()
+    @StateObject private var droppingAttachments = Flag()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -198,6 +199,8 @@ private struct ConversationView: View {
             }
             field
         }
+        .contentShape(Rectangle())
+        .dropAttachments(into: companion, isTargeted: $droppingAttachments.on)
         .accessibilityHidden(companion.citedConversation != nil)
         .allowsHitTesting(companion.citedConversation == nil)
         .overlay {
@@ -220,41 +223,35 @@ private struct ConversationView: View {
             companion.openSource(url) ? .handled : .systemAction
         })
         .inspector(isPresented: Binding(
-            get: {
-                companion.sourcePanel != nil || companion.attachmentSelection != nil
-                    || companion.routineSelection != nil || companion.browserSelection != nil
-            },
-            set: {
-                if !$0 {
-                    companion.sourcePanel = nil
-                    companion.attachmentSelection = nil
-                    companion.routineSelection = nil
-                    companion.browserSelection = nil
-                }
-            }
+            get: { companion.inspector != nil },
+            set: { if !$0 { companion.closeInspector() } }
         )) {
-            if let selection = companion.attachmentSelection {
-                AttachmentInspector(selection: selection) { companion.attachmentSelection = nil }
+            switch companion.inspector {
+            case .attachment(let selection):
+                AttachmentInspector(selection: selection, close: companion.closeInspector)
                     .id(selection.id)
-            } else if let selection = companion.routineSelection {
-                RoutineInspector(selection: selection) { companion.routineSelection = nil }
+            case .routine(let selection):
+                RoutineInspector(selection: selection, close: companion.closeInspector)
                     .id(selection.id)
-            } else if let selection = companion.browserSelection {
-                BrowserInspector(selection: selection) { companion.browserSelection = nil }
+            case .browser(let selection):
+                BrowserInspector(selection: selection, close: companion.closeInspector)
                     .id(selection.id)
-            } else if let panel = companion.sourcePanel {
+            case .source(let panel, let request):
                 SourcePanelView(panel: panel, companion: companion)
+                    .id(request)
                     .inspectorColumnWidth(min: 240, ideal: 300, max: 420)
+            case nil:
+                EmptyView()
             }
         }
         .onAppear { typing = true }
         .onChange(of: companion.citedConversation != nil) { _, reading in
             if reading {
-                restoreTyping = typing
+                restoreTyping.on = typing
                 typing = false
-            } else if restoreTyping {
+            } else if restoreTyping.on {
                 typing = true
-                restoreTyping = false
+                restoreTyping.on = false
             }
         }
         .onChange(of: companion.inputPurpose) { _, purpose in
@@ -281,22 +278,41 @@ private struct ConversationView: View {
             }
             .padding(.leading, 76)
             Spacer(minLength: 8)
-            Button { companion.openRoutines() } label: {
-                Image(systemName: "clock.arrow.circlepath")
-            }
-            .buttonStyle(IconButton(size: 24))
-            .help("Routines")
-            .accessibilityLabel("Routines")
-            Button { companion.openBrowserView() } label: {
-                Image(systemName: "macwindow")
-            }
-            .buttonStyle(IconButton(size: 24))
-            .help("Browser")
-            .accessibilityLabel("Browser")
+            overviewMenu
             pin
         }
         .padding(.trailing, 10)
         .frame(height: Rhythm.headerHeight)
+    }
+
+    private var overviewMenu: some View {
+        Menu {
+            Button(action: companion.openBrowserView) {
+                Label("Browser", systemImage: browserOpen ? "checkmark" : "macwindow")
+            }
+            Divider()
+            Button { companion.openRoutines() } label: {
+                Label("Routines", systemImage: routinesOpen ? "checkmark" : "clock.arrow.circlepath")
+            }
+        } label: {
+            Text("Overview")
+                .font(Paper.Typography.label)
+                .foregroundStyle(companion.inspector == nil ? Paper.inkSecondary : Paper.inkPrimary)
+        }
+        .menuStyle(.borderlessButton)
+        .menuOrder(.fixed)
+        .fixedSize()
+        .pointerStyle(.link)
+    }
+
+    private var routinesOpen: Bool {
+        if case .routine = companion.inspector { return true }
+        return false
+    }
+
+    private var browserOpen: Bool {
+        if case .browser = companion.inspector { return true }
+        return false
     }
 
     private var statusDotColor: Color {
@@ -396,6 +412,8 @@ private struct ConversationView: View {
         let hasText = !companion.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let canSend = hasText || (companion.inputPurpose == .ask && !companion.draftAttachments.isEmpty)
         let canCancel = companion.replyingTo != nil || companion.inputPurpose != .ask
+        let dropTargeted = droppingAttachments.on && companion.canAddAttachments
+        let highlighted = typing || dropTargeted
         let composerShape = RoundedRectangle(cornerRadius: Paper.radiusLG, style: .continuous)
 
         return VStack(alignment: .leading, spacing: 0) {
@@ -430,24 +448,9 @@ private struct ConversationView: View {
             }
 
             if companion.inputPurpose == .ask, !companion.draftAttachments.isEmpty {
-                ScrollView(.horizontal) {
-                    HStack(spacing: 8) {
-                        ForEach(companion.draftAttachments) { file in
-                            HStack(spacing: 3) {
-                                AttachmentChip(name: file.reference.name)
-                                Button {
-                                    companion.draftAttachments.removeAll { $0.id == file.id }
-                                } label: {
-                                    Image(systemName: "xmark")
-                                }
-                                .buttonStyle(IconButton(size: 20))
-                                .accessibilityLabel("Remove \(file.reference.name)")
-                            }
-                        }
-                    }
-                }
-                .padding(.horizontal, 14)
-                .padding(.top, 8)
+                DraftAttachmentChips(files: companion.draftAttachments, remove: companion.removeAttachment)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 8)
             }
 
             // Top row: multi-line text input with generous breathing room.
@@ -459,12 +462,9 @@ private struct ConversationView: View {
                         .lineLimit(1)
                         .allowsHitTesting(false)
                 }
-                TextField("", text: $companion.draft, axis: .vertical)
-                    .textFieldStyle(.plain)
+                ChatInput(title: "", text: $companion.draft, focus: $typing, submit: { companion.send() })
                     .font(Paper.Typography.body)
                     .lineLimit(1...6)
-                    .focused($typing)
-                    .onSubmit { companion.send() }
                     .onExitCommand {
                         companion.inputPurpose = .ask
                         companion.replyingTo = nil
@@ -477,13 +477,13 @@ private struct ConversationView: View {
             // Bottom utility strip: minimal by default, with send/stop action on the right.
             HStack(alignment: .center, spacing: 8) {
                 if companion.inputPurpose == .ask {
-                    Button { pickingAttachments = true } label: {
+                    Button { pickingAttachments.on = true } label: {
                         Image(systemName: "paperclip")
                     }
                     .buttonStyle(IconButton(size: 26))
                     .help("Attach files")
                     .accessibilityLabel("Attach files")
-                    .disabled(companion.readingAttachments || companion.draftAttachments.count >= 5)
+                    .disabled(!companion.canAddAttachments)
                     if companion.readingAttachments || companion.uploadingAttachments {
                         ProgressView().controlSize(.small)
                             .accessibilityLabel(companion.readingAttachments ? "Reading files" : "Uploading files")
@@ -511,19 +511,13 @@ private struct ConversationView: View {
         .surface(
             composerShape,
             lift: 1,
-            fill: Paper.elevated,
-            border: typing ? Paper.accent : Paper.borderSubtle,
-            borderWidth: typing ? 1 : 0.5
+            fill: dropTargeted ? Paper.overlay : Paper.elevated,
+            border: highlighted ? Paper.accent : Paper.borderSubtle,
+            borderWidth: dropTargeted ? 2 : highlighted ? 1 : 0.5
         )
-        .fileImporter(isPresented: $pickingAttachments, allowedContentTypes: [.item],
+        .fileImporter(isPresented: $pickingAttachments.on, allowedContentTypes: [.item],
                       allowsMultipleSelection: true) { result in
             if case .success(let urls) = result { companion.addAttachments(urls) }
-        }
-        .dropDestination(for: URL.self) { urls, _ in
-            let files = urls.filter(\.isFileURL)
-            guard companion.inputPurpose == .ask, !files.isEmpty else { return false }
-            companion.addAttachments(files)
-            return true
         }
         .animation(.easeOut(duration: 0.15), value: typing)
         .animation(.easeOut(duration: 0.15), value: companion.replyingTo)
@@ -875,7 +869,7 @@ private struct SourcePanelView: View {
                         .tracking(Paper.Typography.h3Tracking)
                 }
                 Spacer()
-                Button { companion.sourcePanel = nil } label: {
+                Button(action: companion.closeInspector) {
                     Image(systemName: "xmark").font(.system(size: 10, weight: .semibold))
                 }
                 .buttonStyle(IconButton(size: 24))
