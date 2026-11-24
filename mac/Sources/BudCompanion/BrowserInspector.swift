@@ -78,6 +78,7 @@ struct BrowserInspector: View {
                         } else if !state.sending {
                             Text("Finish private input in Chrome before resuming.")
                             Button("Resume Bud") { Task { await send("resume") } }
+                                .buttonStyle(CardButton(kind: .primary))
                         }
                     }
                 } else if state.enabled == false {
@@ -97,7 +98,9 @@ struct BrowserInspector: View {
                         Button("Take over privately") {
                             Task { await send("takeover", body: ["tab": state.tabID]) }
                         }
+                        .buttonStyle(CardButton(kind: .secondary))
                         .disabled(state.sending || state.tabID.isEmpty)
+                        .opacity(state.sending ? 0.55 : 1)
                         if let screenshot = state.screenshot {
                             Image(nsImage: screenshot)
                                 .resizable().scaledToFit()

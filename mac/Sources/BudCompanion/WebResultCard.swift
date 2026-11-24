@@ -31,9 +31,8 @@ struct WebLinkCard: View {
             }
             .padding(10)
             .frame(maxWidth: 420, alignment: .leading)
-            .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusMD))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PaperHit(shape: RoundedRectangle(cornerRadius: Paper.radiusMD), fill: Paper.elevated))
     }
 }
 
@@ -68,9 +67,8 @@ struct WebImageCard: View {
                     }
                 }
                 .padding(10)
-                .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusMD))
             }
-            .buttonStyle(.plain)
+            .buttonStyle(PaperHit(shape: RoundedRectangle(cornerRadius: Paper.radiusMD), fill: Paper.elevated))
             .help("Load image")
         }
     }
