@@ -2,6 +2,14 @@
 
 ## Standalone install & updates
 
+Install or update safely on macOS with one command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bamiboy237/bud/master/scripts/install.sh | bash
+```
+
+Flags: `--version <tag>`, `--home <dir>`, `--app-dir <dir>`, `--no-app`, `--no-service`, `--no-modify-path`. The installer downloads over HTTPS only, verifies `SHA256SUMS.txt` before extracting, avoids `sudo`, and delegates activation to Bud's non-destructive updater with automatic backup and rollback.
+
 Bud separates immutable releases from user state under `~/.bud/` (override with `BUD_HOME` or `--home`):
 
 | Path | Contents |

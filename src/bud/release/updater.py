@@ -94,6 +94,8 @@ def _find_uv() -> str:
         shutil.which("uv"),
         str(Path.home() / ".local" / "bin" / "uv"),
         str(Path.home() / ".cargo" / "bin" / "uv"),
+        "/opt/homebrew/bin/uv",
+        "/usr/local/bin/uv",
     ]
     for candidate in candidates:
         if candidate and os.access(candidate, os.X_OK):
@@ -403,6 +405,46 @@ def _sign_app_if_needed(
         raise UpdateError(f"Failed to sign Bud.app: {stderr.strip()}")
 
 
+def _read_bundle_version(bundle_dir: Path) -> str:
+    manifest_path = bundle_dir / "manifest.json"
+    if not manifest_path.is_file():
+        raise UpdateError(f"Missing manifest.json in {bundle_dir}.")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    version = str(manifest.get("version") or "").strip()
+    if not version:
+        raise UpdateError("Release manifest is missing version.")
+    parse_version(version)
+    return version
+
+
+def _populate_release_assets(
+    bundle_dir: Path,
+    release_dir: Path,
+    *,
+    sign_identity: str = DEFAULT_SIGN_IDENTITY,
+    runner: CommandRunner | None = None,
+) -> Path:
+    shutil.copy2(bundle_dir / "manifest.json", release_dir / "manifest.json")
+    bin_dir = release_dir / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
+    venv_bud = release_dir / "venv" / "bin" / "bud"
+    bud_link = bin_dir / "bud"
+    if venv_bud.exists() and not bud_link.exists() and not bud_link.is_symlink():
+        os.symlink(Path("..") / "venv" / "bin" / "bud", bud_link)
+
+    bundle_tui = bundle_dir / "bin" / "bud-tui"
+    if bundle_tui.is_file():
+        shutil.copy2(bundle_tui, bin_dir / "bud-tui")
+        (bin_dir / "bud-tui").chmod(0o755)
+
+    bundle_app = bundle_dir / "Bud.app"
+    if bundle_app.is_dir():
+        installed_app = release_dir / "Bud.app"
+        shutil.copytree(bundle_app, installed_app, symlinks=True)
+        _sign_app_if_needed(installed_app, sign_identity=sign_identity, runner=runner)
+    return bin_dir
+
+
 def install_release_dir(
     bundle_dir: Path,
     bud_home: Path,
@@ -412,14 +454,7 @@ def install_release_dir(
     runner: CommandRunner | None = None,
 ) -> tuple[str, Path]:
     """Install a staged/extracted bundle into an isolated folder under ``bud_home/releases``."""
-    manifest_path = bundle_dir / "manifest.json"
-    if not manifest_path.is_file():
-        raise UpdateError(f"Missing manifest.json in {bundle_dir}.")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    version = str(manifest.get("version") or "").strip()
-    if not version:
-        raise UpdateError("Release manifest is missing version.")
-    parse_version(version)
+    version = _read_bundle_version(bundle_dir)
 
     wheel_dir = bundle_dir / "wheel"
     wheels = sorted(wheel_dir.glob("bud-*.whl")) if wheel_dir.is_dir() else []
@@ -436,39 +471,98 @@ def install_release_dir(
 
     run = runner or (lambda cmd: _default_runner(cmd))
     try:
-        shutil.copy2(manifest_path, final_dir / "manifest.json")
-        bin_dir = final_dir / "bin"
-        bin_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
         if install_deps:
             uv = _find_uv()
             venv_dir = final_dir / "venv"
-            code, _, stderr = run([uv, "venv", "--python", sys.executable, str(venv_dir)])
+            code, _, stderr = run(
+                [
+                    uv,
+                    "venv",
+                    "--no-project",
+                    "--no-config",
+                    "--python",
+                    sys.executable,
+                    str(venv_dir),
+                ]
+            )
             if code != 0:
                 raise UpdateError(f"Failed to create release venv: {stderr.strip()}")
             constraints = wheel_dir / "constraints.txt"
-            pip_cmd = [uv, "pip", "install", "--python", str(venv_dir / "bin" / "python")]
+            pip_cmd = [
+                uv,
+                "pip",
+                "install",
+                "--no-config",
+                "--python",
+                str(venv_dir / "bin" / "python"),
+            ]
             if constraints.is_file():
                 pip_cmd.extend(["--constraint", str(constraints)])
             pip_cmd.append(str(wheels[0]))
             code, _, stderr = run(pip_cmd)
             if code != 0:
                 raise UpdateError(f"Failed to install bud wheel into venv: {stderr.strip()}")
-            os.symlink(Path("..") / "venv" / "bin" / "bud", bin_dir / "bud")
-
-        bundle_tui = bundle_dir / "bin" / "bud-tui"
-        if bundle_tui.is_file():
-            shutil.copy2(bundle_tui, bin_dir / "bud-tui")
-            (bin_dir / "bud-tui").chmod(0o755)
-
-        bundle_app = bundle_dir / "Bud.app"
-        if bundle_app.is_dir():
-            installed_app = final_dir / "Bud.app"
-            shutil.copytree(bundle_app, installed_app, symlinks=True)
-            _sign_app_if_needed(installed_app, sign_identity=sign_identity, runner=runner)
+        _populate_release_assets(
+            bundle_dir,
+            final_dir,
+            sign_identity=sign_identity,
+            runner=runner,
+        )
     except Exception:
         shutil.rmtree(final_dir, ignore_errors=True)
         raise
     return version, final_dir
+
+
+def activate_staged_release(
+    bundle_dir: Path,
+    release_dir: Path,
+    bud_home: Path,
+    *,
+    app_install_dir: Path = DEFAULT_APP_DIR,
+    install_app: bool = True,
+    manage_service: bool = True,
+    port: int = PORT,
+    force: bool = False,
+    sign_identity: str = DEFAULT_SIGN_IDENTITY,
+    service: ServiceManager | None = None,
+    fetcher: RuntimeFetcher | None = None,
+    runner: CommandRunner | None = None,
+    health_timeout: float = 20.0,
+) -> UpdateResult:
+    """Populate a pre-built release venv dir with bundle assets and activate it atomically."""
+    home = bud_home.expanduser().resolve()
+    target_release = release_dir.expanduser().resolve()
+    current_link = home / "releases" / "current"
+
+    try:
+        version = _read_bundle_version(bundle_dir)
+        _populate_release_assets(
+            bundle_dir,
+            target_release,
+            sign_identity=sign_identity,
+            runner=runner,
+        )
+        return apply_update(
+            version,
+            target_release,
+            home,
+            app_install_dir=app_install_dir,
+            install_app=install_app,
+            manage_service=manage_service,
+            port=port,
+            force=force,
+            service=service,
+            fetcher=fetcher,
+            health_timeout=health_timeout,
+        )
+    except Exception:
+        current_points_here = False
+        with suppress(OSError):
+            current_points_here = current_link.exists() and current_link.resolve() == target_release
+        if not current_points_here:
+            shutil.rmtree(target_release, ignore_errors=True)
+        raise
 
 
 def _atomic_symlink(link_path: Path, target: Path | str) -> None:
@@ -677,12 +771,15 @@ def apply_update(
                 home / "bin" / "bud-tui", Path("..") / "releases" / "current" / "bin" / "bud-tui"
             )
 
+        data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        (home / "workspace").mkdir(parents=True, exist_ok=True, mode=0o700)
+
         if install_app:
             app_swapped = _swap_app_bundle(new_release_dir / "Bud.app", target_app, stash_app)
 
         if manage_service:
-            svc.install(bud_bin, port=port, start=True)
             url, token = _healthcheck_credentials(home, port=port)
+            svc.install(bud_bin, port=port, start=True)
             svc.wait_healthy(
                 url,
                 token,

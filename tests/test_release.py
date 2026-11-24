@@ -7,6 +7,8 @@ import io
 import json
 import plistlib
 import sqlite3
+import subprocess
+import sys
 import tarfile
 from contextlib import closing
 from pathlib import Path
@@ -26,6 +28,7 @@ from bud.release.backup import (
 from bud.release.service import LAUNCH_AGENT_LABEL, ServiceManager, render_launchd_plist
 from bud.release.updater import (
     ReleaseInfo,
+    activate_staged_release,
     apply_update,
     download_and_verify_release,
     fetch_github_release,
@@ -417,3 +420,178 @@ def test_sign_app_if_needed_resigns_adhoc_with_local_cert_when_available(tmp_pat
 
     updater._sign_app_if_needed(app, runner=signed_run)
     assert not any(c[:2] == ["codesign", "--force"] for c in recorded)
+
+
+def _stage_bundle_and_venv(
+    root: Path,
+    bud_home: Path,
+    *,
+    version: str,
+    app_marker: str,
+) -> tuple[Path, Path]:
+    bundle = root / f"staged-bundle-{version}"
+    (bundle / "Bud.app" / "Contents" / "MacOS").mkdir(parents=True, exist_ok=True)
+    (bundle / "Bud.app" / "Contents" / "MacOS" / "bud").write_text(app_marker, encoding="utf-8")
+    (bundle / "manifest.json").write_text(
+        json.dumps({"version": version, "arch": "arm64"}), encoding="utf-8"
+    )
+    release_dir = bud_home / "releases" / f"v{version}-staged"
+    (release_dir / "venv" / "bin").mkdir(parents=True, exist_ok=True)
+    bud_exec = release_dir / "venv" / "bin" / "bud"
+    bud_exec.write_text(f"#!/bin/sh\necho bud {version}\n", encoding="utf-8")
+    bud_exec.chmod(0o755)
+    return bundle, release_dir
+
+
+def test_activate_staged_release_installs_upgrades_and_cleans_up_on_failure(tmp_path):
+    bud_home = tmp_path / "staged-bud-home"
+    app_dir = tmp_path / "Applications"
+
+    svc = ServiceManager(
+        bud_home,
+        plist_path=tmp_path / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist",
+        runner=lambda _cmd: (0, "", ""),
+        uid=501,
+    )
+
+    bundle1, rel1 = _stage_bundle_and_venv(tmp_path, bud_home, version="0.1.0", app_marker="app-v1")
+    res1 = activate_staged_release(
+        bundle1,
+        rel1,
+        bud_home,
+        app_install_dir=app_dir,
+        service=svc,
+        fetcher=lambda _u, _t: {"version": "0.1.0"},
+        runner=lambda _cmd: (0, "", ""),
+    )
+    assert res1.previous_version is None
+    assert res1.new_version == "0.1.0"
+    assert (bud_home / "bin" / "bud").exists()
+    assert (bud_home / "data" / "auth" / "owner.token").is_file()
+    assert (bud_home / "workspace").is_dir()
+    assert (app_dir / "Bud.app" / "Contents" / "MacOS" / "bud").read_text() == "app-v1"
+
+    _write_wal_db(bud_home / "data" / "bud.db", "important-user-data")
+    bundle2, rel2 = _stage_bundle_and_venv(tmp_path, bud_home, version="0.2.0", app_marker="app-v2")
+    res2 = activate_staged_release(
+        bundle2,
+        rel2,
+        bud_home,
+        app_install_dir=app_dir,
+        service=svc,
+        fetcher=lambda _u, _t: {"version": "0.2.0"},
+        runner=lambda _cmd: (0, "", ""),
+    )
+    assert res2.previous_version == "0.1.0"
+    assert res2.new_version == "0.2.0"
+    assert _read_note(bud_home / "data" / "bud.db") == "important-user-data"
+    manifest = verify_backup(res2.backup_dir)
+    assert "bud.db" in manifest["files"]
+    assert (app_dir / "Bud.app" / "Contents" / "MacOS" / "bud").read_text() == "app-v2"
+
+    bundle3, rel3 = _stage_bundle_and_venv(tmp_path, bud_home, version="0.3.0", app_marker="app-v3")
+
+    def fail_v3(_u: str, _t: str) -> dict[str, str]:
+        if (bud_home / "releases" / "current").resolve() == rel3.resolve():
+            raise ConnectionError("v3 failed healthcheck")
+        return {"version": "0.2.0"}
+
+    with pytest.raises(UpdateRollbackError) as exc_info:
+        activate_staged_release(
+            bundle3,
+            rel3,
+            bud_home,
+            app_install_dir=app_dir,
+            service=svc,
+            fetcher=fail_v3,
+            runner=lambda _cmd: (0, "", ""),
+            health_timeout=0.5,
+        )
+    assert exc_info.value.rollback_ok is True
+    assert not rel3.exists()
+    assert (bud_home / "releases" / "current").resolve() == rel2.resolve()
+
+
+def test_install_script_syntax_help_and_fail_closed_security(tmp_path):
+    repo_root = Path(__file__).resolve().parent.parent
+    script = repo_root / "scripts" / "install.sh"
+    assert script.is_file()
+
+    syntax = subprocess.run(
+        ["bash", "-n", str(script)], capture_output=True, text=True, check=False
+    )
+    assert syntax.returncode == 0, syntax.stderr
+
+    help_proc = subprocess.run(
+        ["bash", str(script), "--help"], capture_output=True, text=True, check=False
+    )
+    assert help_proc.returncode == 0, help_proc.stderr
+    assert "--archive" in help_proc.stdout
+    assert "--checksums" in help_proc.stdout
+    assert "--home" in help_proc.stdout
+
+    if sys.platform != "darwin":
+        return
+
+    untouched_home = tmp_path / "untouched-home"
+
+    # Tampered tarball must fail SHA-256 verification before modifying home.
+    tampered_archive = tmp_path / "bud-0.1.0-darwin-arm64.tar.gz"
+    tampered_archive.write_bytes(b"not-a-valid-tarball")
+    sums_bad = tmp_path / "SHA256SUMS.bad.txt"
+    sums_bad.write_text(f"{'0' * 64}  bud-0.1.0-darwin-arm64.tar.gz\n", encoding="utf-8")
+
+    bad_proc = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--archive",
+            str(tampered_archive),
+            "--checksums",
+            str(sums_bad),
+            "--home",
+            str(untouched_home),
+            "--no-app",
+            "--no-service",
+            "--no-modify-path",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert bad_proc.returncode != 0
+    assert "checksum mismatch" in bad_proc.stderr.lower(), bad_proc.stderr
+    assert not untouched_home.exists()
+
+    # Symlink member inside verified tarball must be rejected before modifying home.
+    symlink_archive = tmp_path / "bud-0.1.0-darwin-symlink.tar.gz"
+    with tarfile.open(symlink_archive, "w:gz") as tar:
+        sym = tarfile.TarInfo("link")
+        sym.type = tarfile.SYMTYPE
+        sym.linkname = "/etc/passwd"
+        tar.addfile(sym)
+    sym_digest = hashlib.sha256(symlink_archive.read_bytes()).hexdigest()
+    sums_sym = tmp_path / "SHA256SUMS.sym.txt"
+    sums_sym.write_text(f"{sym_digest}  {symlink_archive.name}\n", encoding="utf-8")
+
+    sym_proc = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--archive",
+            str(symlink_archive),
+            "--checksums",
+            str(sums_sym),
+            "--home",
+            str(untouched_home),
+            "--no-app",
+            "--no-service",
+            "--no-modify-path",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert sym_proc.returncode != 0
+    assert "unsafe member" in sym_proc.stderr.lower(), sym_proc.stderr
+    assert not untouched_home.exists()

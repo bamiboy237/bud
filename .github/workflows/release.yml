@@ -82,6 +82,15 @@ jobs:
           print("smoke-installed", version, installed)
           PY
           "$RUNNER_TEMP"/smoke-home/releases/*/bin/bud --version
+          archive=$(ls dist/bud-*.tar.gz | head -n 1)
+          bash scripts/install.sh \
+            --archive "$archive" \
+            --checksums dist/SHA256SUMS.txt \
+            --home "$RUNNER_TEMP/installer-smoke" \
+            --no-app \
+            --no-service \
+            --no-modify-path
+          "$RUNNER_TEMP/installer-smoke/bin/bud" --version
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

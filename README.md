@@ -2,31 +2,34 @@
 
 Local-first personal AI teammate. Connects to Gmail, Google Calendar, web search, local files, Chrome, and iMessage. Reads run automatically; risky writes wait for your approval.
 
-## Daily-driver install (macOS)
+## Install (macOS)
 
-Requires `uv` and Python 3.12+ (plus Apple Command Line Tools when building from source):
+Install standalone daily-driver Bud (no repo clone needed):
 
 ```sh
-git clone https://github.com/bamiboy237/bud.git
-cd bud
-uv sync --locked
-uv run bud login chatgpt
-uv run bud install --from-repo . --migrate-from .
+curl -fsSL https://raw.githubusercontent.com/bamiboy237/bud/master/scripts/install.sh | bash
+bud login chatgpt
 ```
 
-This installs Bud into `~/.bud/`, builds `/Applications/Bud.app`, starts the `app.bud.server` LaunchAgent on `127.0.0.1:8420`, and keeps your history separate from any repo checkout:
+This verifies SHA-256 checksums, installs `uv` and Python 3.14 if needed, sets up `~/.bud/`, `/Applications/Bud.app`, and the `app.bud.server` LaunchAgent on `127.0.0.1:8420`, and keeps user state separate from releases:
 
 - `~/.bud/config.env`: API keys and settings.
 - `~/.bud/data/`: chats, memory, routines, connections, spend ledger, and `auth/owner.token`.
 - `~/.bud/workspace/`: Bud's working notes, reports, and chat attachments.
 - `~/.bud/backups/`: automatic verified SQLite snapshots taken before every update.
 
-Update later from GitHub Releases (or **Check for Updates...** in the menu bar) or from local `master` without touching your data:
+Re-running the installer or `bud update` (or **Check for Updates...** in the menu bar) backs up data first and never wipes history:
 
 ```sh
 bud update                   # pull latest verified GitHub release, back up data, swap, restart
 bud update --from-repo .     # build and install straight from a local checkout
 bud rollback                 # restore latest verified backup if an update ever misbehaves
+```
+
+Or install straight from a source checkout (requires `uv`, Python 3.12+, and Apple Command Line Tools):
+
+```sh
+git clone https://github.com/bamiboy237/bud.git && cd bud && uv sync --locked && uv run bud install --from-repo . --migrate-from .
 ```
 
 ## Development workflow
