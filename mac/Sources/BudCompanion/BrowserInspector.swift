@@ -106,6 +106,11 @@ struct BrowserInspector: View {
                                 .buttonStyle(CardButton(kind: .primary))
                         }
                     }
+                } else if state.sending {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ProgressView().controlSize(.small)
+                        Text("Wait for Private input before entering private information.")
+                    }
                 } else if state.enabled == false {
                     Text("Connect and enable Browse from chat to view its tabs.")
                 } else if state.connected == false {
@@ -232,7 +237,6 @@ struct BrowserInspector: View {
         state.sending = true
         clearPreview()
         state.problem = nil
-        if action == "takeover" { state.privateInput = true }
         do {
             let stateResponse = try await selection.connection.send("POST", "browser/view/\(action)", json: body)
             state.privateInput = stateResponse["private"] as? Bool == true

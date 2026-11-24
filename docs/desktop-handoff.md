@@ -36,3 +36,50 @@ For terminal testing, `bud desktop primary` prints the chat ID.
    queues the same operation. `bud desktop status CHAT_ID JOB_ID` shows progress,
 and `bud desktop revoke DESKTOP_ID` removes a worker’s access. All commands use
 `--url` before the action when the server differs from the default.
+
+## Deliver a file through a browser on another desktop
+
+Configure a multipart HTML form that uses a file input, a text reference field,
+and a submit button on a single form. Use a trusted site with a standard form
+that sends the file only when you submit, not when you select it. The
+confirmation page must show the exact reference in one element. Bud uses the
+reference to check whether an earlier submit succeeded. For a synthetic test,
+use IDs like these.
+
+~~~json
+{
+  "url": "https://portal.example.test/deliver",
+  "file_input": "invoice-file",
+  "reference_input": "reference",
+  "submit_button": "submit-form",
+  "receipt": "receipt-number"
+}
+~~~
+
+Start a Browse-enabled Bud server on the browser desktop and pair one browser
+with its relay. A delivery waits if the relay has no browser or more than one
+connected browser. Run the worker there with its paired-device token and
+`bud desktop --url "$COORDINATOR" run --browser-local http://127.0.0.1:8420`.
+The worker uses the local server's owner credential for loopback requests only.
+The coordinator can reach only the paired-worker endpoints, and it gets no
+browser login data.
+
+Dispatch a sent attachment with
+`bud desktop --url "$COORDINATOR" dispatch CHAT FILE_ID FILE_NAME DESKTOP_ID --form form.json`.
+With two desktop IDs, the first verifies the file and the second opens the form.
+Bud reports readiness in the originating chat. If the site requires sign-in,
+complete it on the destination browser and click **Continue**. Then approve the
+file and destination with
+`bud desktop --url "$COORDINATOR" browser CHAT JOB_ID approve --desktop DESKTOP_ID`.
+
+While approval is still pending, Bud can wait for the destination or the owner
+can change it with `bud desktop retarget CHAT JOB_ID DESKTOP_ID`. The new
+desktop opens the configured URL with its own browser session. If a site saved
+a draft at that URL it can show up there. Any typing held just in the old tab
+stays on the old machine.
+
+If the connection drops after approval is consumed, Bud looks for the matching
+receipt in the existing tab. When it cannot confirm an outcome, the job shows
+**Uncertain**. `bud desktop browser CHAT JOB_ID verify` checks again without
+submitting. Standard forms are the supported target. Test a site with a
+synthetic file and a safe draft workflow before using its real submission page.

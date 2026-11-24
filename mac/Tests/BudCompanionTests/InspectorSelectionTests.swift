@@ -23,6 +23,11 @@ struct InspectorSelectionTests {
         #expect(!companion.toggleInspector(.source(source, request: UUID())))
         companion.openBrowserView()
         #expect(companion.inspector?.target == .browser)
+        companion.openDesktopDelivery("delivery")
+        #expect(companion.inspector?.target == .delivery(session: "chat", job: "delivery"))
+        companion.openDesktopDelivery("delivery")
+        #expect(companion.inspector == nil)
+        companion.openBrowserView()
         companion.openBrowserView()
         #expect(companion.inspector == nil)
     }

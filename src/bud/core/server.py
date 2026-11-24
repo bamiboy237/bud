@@ -40,6 +40,7 @@ from bud.core.background import GUIDANCE as BACKGROUND_GUIDANCE
 from bud.core.background import STARTS as BACKGROUND_STARTS
 from bud.core.background import TOOLS as BACKGROUND_TOOLS
 from bud.core.background import Background
+from bud.core.browser_delivery import local_routes
 from bud.core.browser_view import BrowserView
 from bud.core.composition import compose_runner, compose_world_harness
 from bud.core.events import Event, MessageOrigin
@@ -788,6 +789,7 @@ def _create_app(
     app = FastAPI(title="bud core", lifespan=lifespan)
     if browser_view is not None:
         app.include_router(browser_view.routes())
+        app.include_router(local_routes(browser_view))
     handoffs = DesktopHandoffs(db_path.with_suffix(".handoff.db"), workspace, hub)
     app.include_router(handoffs.routes())
     app.add_middleware(
