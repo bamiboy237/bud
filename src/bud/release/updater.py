@@ -426,21 +426,22 @@ def install_release_dir(
     if install_deps and not wheels:
         raise UpdateError(f"No bud wheel found under {wheel_dir}.")
 
-    releases_root = bud_home.expanduser() / "releases"
+    releases_root = bud_home.expanduser().resolve() / "releases"
     releases_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+    # Venv console scripts embed their exact creation path in shebangs, so create directly at the
+    # unique final_dir instead of creating in a temp name and renaming afterward.
     final_dir = releases_root / f"v{version}-{stamp}-{uuid4().hex[:6]}"
-    staging_dir = releases_root / f".install-{uuid4().hex}"
-    staging_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    final_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
 
     run = runner or (lambda cmd: _default_runner(cmd))
     try:
-        shutil.copy2(manifest_path, staging_dir / "manifest.json")
-        bin_dir = staging_dir / "bin"
+        shutil.copy2(manifest_path, final_dir / "manifest.json")
+        bin_dir = final_dir / "bin"
         bin_dir.mkdir(parents=True, exist_ok=True, mode=0o755)
         if install_deps:
             uv = _find_uv()
-            venv_dir = staging_dir / "venv"
+            venv_dir = final_dir / "venv"
             code, _, stderr = run([uv, "venv", "--python", sys.executable, str(venv_dir)])
             if code != 0:
                 raise UpdateError(f"Failed to create release venv: {stderr.strip()}")
@@ -461,13 +462,11 @@ def install_release_dir(
 
         bundle_app = bundle_dir / "Bud.app"
         if bundle_app.is_dir():
-            installed_app = staging_dir / "Bud.app"
+            installed_app = final_dir / "Bud.app"
             shutil.copytree(bundle_app, installed_app, symlinks=True)
             _sign_app_if_needed(installed_app, sign_identity=sign_identity, runner=runner)
-
-        os.replace(staging_dir, final_dir)
     except Exception:
-        shutil.rmtree(staging_dir, ignore_errors=True)
+        shutil.rmtree(final_dir, ignore_errors=True)
         raise
     return version, final_dir
 
