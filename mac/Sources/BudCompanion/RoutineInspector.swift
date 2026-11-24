@@ -364,8 +364,12 @@ struct RoutineInspector: View {
     private func scheduleSummary(_ schedule: RoutineSchedule, timezone: String) -> some View {
         frequencySection {
             LabeledContent("Repeat", value: schedule.frequency.rawValue)
-            if schedule.frequency != .custom {
-                Divider()
+            Divider()
+            if schedule.frequency == .custom {
+                LabeledContent("Cron expression") {
+                    Text(schedule.cron).monospaced().textSelection(.enabled)
+                }
+            } else {
                 LabeledContent("Time", value: schedule.time.formatted(
                     Date.FormatStyle(date: .omitted, time: .shortened, timeZone: .gmt)))
                 if schedule.frequency == .weekly {
