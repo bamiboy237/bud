@@ -9,14 +9,42 @@ struct DesktopDeliverySelection: Identifiable {
     var path: String { "sessions/\(session)/desktop-jobs/\(jobID)" }
 }
 
+struct DesktopDeliveryStatus {
+    let file: ChatAttachment
+    let url: String
+    let desktop: String
+    let desktopID: String
+    let reference: String
+    let phase: String
+    let revoked: Bool
+
+    init?(_ payload: [String: Any]) {
+        guard let form = payload["browser"] as? [String: String], let url = form["url"],
+              let attachment = payload["file"] as? [String: String],
+              let fileID = attachment["id"], let filename = attachment["name"],
+              let step = (payload["steps"] as? [[String: Any]])?.last,
+              let desktop = step["desktop"] as? String, let desktopID = step["desktop_id"] as? String,
+              let reference = step["id"] as? String, let phase = step["browser_state"] as? String,
+              let revoked = step["revoked"] as? Bool,
+              !url.isEmpty, !fileID.isEmpty, !filename.isEmpty, !desktopID.isEmpty
+        else { return nil }
+        file = ChatAttachment(id: fileID, name: filename)
+        self.url = url
+        self.desktop = desktop
+        self.desktopID = desktopID
+        self.reference = reference
+        self.phase = phase
+        self.revoked = revoked
+    }
+
+    var canApprove: Bool { phase == "ready" && !revoked }
+    var canChange: Bool { ["queued", "sign_in", "ready"].contains(phase) }
+}
+
 @MainActor
 private final class DesktopDeliveryState: ObservableObject {
-    @Published var file = ""
-    @Published var url = ""
-    @Published var desktop = ""
-    @Published var desktopID = ""
-    @Published var reference = ""
-    @Published var phase = ""
+    @Published var status: DesktopDeliveryStatus?
+    @Published var preview: AttachmentSelection?
     @Published var problem: String?
     @Published var working = false
     @Published var desktopChoices: [String: String] = [:]
@@ -42,28 +70,32 @@ struct DesktopDeliveryInspector: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    if !state.phase.isEmpty {
-                        Text(summary).font(Paper.Typography.callout)
-                        LabeledContent("File", value: state.file)
-                        LabeledContent("Desktop", value: state.desktop)
-                        Text(state.url).font(.caption).textSelection(.enabled)
-                        if state.phase == "delivered" || state.phase == "uncertain" {
-                            Text("Reference \(state.reference)").font(.caption).textSelection(.enabled)
+                    if let status = state.status {
+                        Text(summary(status)).font(Paper.Typography.callout)
+                        LabeledContent("File", value: status.file.name)
+                        Button("Preview selected file") {
+                            state.preview = AttachmentSelection(
+                                file: status.file, session: selection.session,
+                                connection: selection.connection)
                         }
-                        if state.phase == "ready" {
+                        LabeledContent("Desktop", value: desktopLabel(status.desktop, id: status.desktopID))
+                        Text(status.url).font(.caption).textSelection(.enabled)
+                        if status.phase == "delivered" || status.phase == "uncertain" {
+                            Text("Reference \(status.reference)").font(.caption).textSelection(.enabled)
+                        }
+                        if status.canApprove {
                             Button("Approve submission") {
-                                let desktopID = state.desktopID
-                                Task { await act("approve", body: ["desktop": desktopID]) }
+                                Task { await act("approve", body: ["desktop": status.desktopID]) }
                             }
-                            .disabled(state.working || state.desktopID.isEmpty)
+                            .disabled(state.working)
                         }
-                        if canChange || state.phase == "approved" {
-                            if canChange, !state.desktopChoices.isEmpty {
+                        if status.canChange || status.phase == "approved" {
+                            if status.canChange, !state.desktopChoices.isEmpty {
                                 Picker("Run browser on", selection: $state.targetID) {
-                                    Text(state.desktop).tag("")
+                                    Text(desktopLabel(status.desktop, id: status.desktopID)).tag("")
                                     ForEach(state.desktopChoices.keys.sorted(), id: \.self) { id in
-                                        if id != state.desktopID {
-                                            Text(state.desktopChoices[id] ?? id).tag(id)
+                                        if let name = state.desktopChoices[id], id != status.desktopID {
+                                            Text(desktopLabel(name, id: id)).tag(id)
                                         }
                                     }
                                 }
@@ -76,7 +108,7 @@ struct DesktopDeliveryInspector: View {
                             Button("Cancel delivery") { Task { await act("cancel") } }
                                 .disabled(state.working)
                         }
-                        if state.phase == "uncertain" {
+                        if status.phase == "uncertain" {
                             Button("Check for receipt") { Task { await act("verify") } }
                                 .disabled(state.working)
                         }
@@ -92,23 +124,29 @@ struct DesktopDeliveryInspector: View {
         }
         .background(Paper.canvas)
         .inspectorColumnWidth(min: 270, ideal: 340, max: 480)
+        .sheet(item: $state.preview) { selected in
+            AttachmentInspector(selection: selected, close: { state.preview = nil })
+                .frame(minWidth: 460, minHeight: 420)
+        }
         .task {
             await loadDesktops()
             while !Task.isCancelled {
                 await load()
-                if state.phase == "delivered" || state.phase == "cancelled" { break }
+                if state.status?.phase == "delivered" || state.status?.phase == "cancelled" { break }
                 try? await Task.sleep(for: .seconds(2))
             }
         }
     }
 
-    private var canChange: Bool { ["queued", "sign_in", "ready"].contains(state.phase) }
+    private func desktopLabel(_ name: String, id: String) -> String {
+        "\(name) · \(id.prefix(8))"
+    }
 
-    private var summary: String {
-        switch state.phase {
-        case "queued": "Waiting for \(state.desktop)"
-        case "sign_in": "Finish private sign-in on \(state.desktop), then choose Continue in the browser."
-        case "ready": "Review the file and site before approving."
+    private func summary(_ status: DesktopDeliveryStatus) -> String {
+        switch status.phase {
+        case "queued": "Waiting for \(status.desktop)"
+        case "sign_in": "Finish private sign-in on \(status.desktop), then choose Continue in the browser."
+        case "ready": status.revoked ? "Choose another desktop." : "Review the file and site before approving."
         case "approved", "sending": "Waiting for the browser receipt"
         case "delivered": "Receipt confirmed"
         case "uncertain": "Bud couldn’t confirm submission. You can check again for a receipt."
@@ -131,21 +169,17 @@ struct DesktopDeliveryInspector: View {
         let version = state.loadVersion
         do {
             let status = try await selection.connection.send("GET", selection.path)
-            guard version == state.loadVersion else { return }
-            if let form = status["browser"] as? [String: String] {
-                state.url = form["url"] ?? ""
+            guard version == state.loadVersion, !Task.isCancelled else { return }
+            let next = DesktopDeliveryStatus(status)
+            if state.status?.desktopID != next?.desktopID {
+                state.targetID = ""
             }
-            if let attachment = status["file"] as? [String: String] {
-                state.file = attachment["name"] ?? ""
-            }
-            if let steps = status["steps"] as? [[String: Any]], let step = steps.last {
-                state.phase = step["browser_state"] as? String ?? ""
-                state.desktop = step["desktop"] as? String ?? ""
-                state.desktopID = step["desktop_id"] as? String ?? ""
-                state.reference = step["id"] as? String ?? ""
-            }
+            state.status = next
+            state.problem = next == nil ? "Couldn’t load the delivery details." : nil
         } catch {
-            if version == state.loadVersion { state.problem = "\(error)" }
+            guard version == state.loadVersion, !Task.isCancelled else { return }
+            state.status = nil
+            state.problem = "\(error)"
         }
     }
 
@@ -153,12 +187,17 @@ struct DesktopDeliveryInspector: View {
         guard !state.working else { return }
         state.working = true
         state.loadVersion += 1
+        state.status = nil
         state.problem = nil
         do {
             _ = try await selection.connection.send(
                 "POST", "\(selection.path)/browser/\(action)", json: body)
             state.targetID = ""
-        } catch { state.problem = "\(error)" }
+        } catch {
+            state.problem = "\(error)"
+            state.working = false
+            return
+        }
         state.working = false
         await load()
     }
