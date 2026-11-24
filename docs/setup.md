@@ -40,7 +40,8 @@ Create a local signing certificate named `bud companion (local)` in Keychain Acc
 
 ## Models & connected accounts
 
-- **Models:** run `bud login chatgpt`, or set `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `MUSE_API_KEY`, `MISTRAL_API_KEY` in `~/.bud/config.env` or `.env`. Web search (`search_web` / `read_webpage`) uses `EXA_API_KEY`.
+- **In `Bud.app`:** launches a guided onboarding window on first run for ChatGPT sign-in and API keys, and applies edits in **Settings...** (`Cmd+,`) live with zero restart.
+- **In the CLI:** run `bud login chatgpt`, or set `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `MUSE_API_KEY`, `MISTRAL_API_KEY` in `~/.bud/config.env` or `.env`. Web search (`search_web` / `read_webpage`) uses `EXA_API_KEY`.
 - **Gmail & Calendar (Composio):** set `COMPOSIO_API_KEY`, then run `bud connect gmail` / `bud connect calendar` or trigger `setup_capability` in chat. New connections hot-reload on the next message. Switching or disconnecting an account automatically denies any pending approvals scoped to the old account.
 
 ## iMessage (Photon v2)

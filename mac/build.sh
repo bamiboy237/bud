@@ -38,6 +38,7 @@ if (( dev )); then
   /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Bud Dev" "$app/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable bud-dev" "$app/Contents/Info.plist"
 fi
+cp "$here/Resources/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 cp -R "$bin/SwiftMath_SwiftMath.bundle" "$app/Contents/Resources/"
 cp "$here/.build/checkouts/SwiftMath/LICENSE" "$app/Contents/Resources/SwiftMath-LICENSE"
 if [[ -d "$here/Sources/BudCompanion/Resources/Fonts" ]]; then

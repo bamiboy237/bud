@@ -43,8 +43,9 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
-from pydantic_ai.models import Model, ModelRequestContext
+from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters
 from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 
 from bud.config import get_settings
@@ -106,6 +107,7 @@ from bud.harness.ask import AskAnswer, answer_from_text, ask_summary, questions_
 from bud.harness.learning import Learner
 from bud.harness.operating_profile import OperatingProfile
 from bud.harness.recall import CITATION, Recall, plain_citations, recalled_so_far, render
+from bud.harness.review import ToolReviewer
 from bud.harness.spiral import paused_in
 from bud.harness.steering import SteeringCapability, SteerSignal
 from bud.harness.verify import build_verifier
@@ -120,6 +122,29 @@ SHUTDOWN_WAIT_SECONDS = 5
 
 class UnknownApproval(Exception):
     pass
+
+
+class _UnconfiguredModel(Model):
+    """Placeholder bound when the server starts in onboarding mode with no model configured."""
+
+    @property
+    def model_name(self) -> str:
+        return "unconfigured"
+
+    @property
+    def system(self) -> str:
+        return "bud"
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        raise NoModelAvailable(
+            "No model is configured yet. Open Bud Settings to sign in with ChatGPT "
+            "or add an API key."
+        )
 
 
 class DecisionRejected(Exception):
@@ -210,6 +235,7 @@ class Runner(DBOSConfiguredInstance):
         recall: Recall | None = None,
         workspace: Path | None = None,
         operating_profile: OperatingProfile | None = None,
+        allow_unconfigured: bool = False,
     ) -> None:
         self.hub = hub
         self.gateway = gateway
@@ -219,6 +245,8 @@ class Runner(DBOSConfiguredInstance):
             raise ValueError("Runner operating_profile must match harness.operating_profile")
         self.tier: Tier = tier or self.profile.model.tier
         self.durable = durable
+        self._jobs = jobs
+        self._allow_unconfigured = allow_unconfigured
         self.tasks: dict[str, asyncio.Task] = {}
         self._monitors: set[asyncio.Task] = set()
         self._executing: dict[str, asyncio.Task] = {}
@@ -252,38 +280,10 @@ class Runner(DBOSConfiguredInstance):
             harness.policy.tools.update({CREATE_ROUTINE: "ask", LIST_ROUTINES: "allow"})
             harness.policy.no_grants |= {CREATE_ROUTINE}
         self.version = replay_version()
-        self.fingerprint = sha256(
-            (
-                self.profile.digest
-                + harness.prompt_version
-                + gateway.registry.model_dump_json()
-                + json.dumps(harness.policy.tools, sort_keys=True)
-                + str(gateway.selected_model)
-                + str(gateway.fallback)
-                + str(jobs)
-                + self.tier
-                + str(harness.results.retention.total_seconds())
-            ).encode()
-        ).hexdigest()
+        self.fingerprint = self._compute_fingerprint()
         if durable:
             super().__init__("core")
-        # A Model instance cannot cross the DBOS step boundary, so durable runners
-        # register every buildable registry model up front — ledger-tracked, like
-        # the agent's default — and agent.run() receives the registered key, not an
-        # instance. Built only for durable runners: building also acquires the
-        # cross-process ChatGPT lock, which non-durable runners must not take.
-        runtime_models: dict[str, Model] = {}
-        if durable:
-            for spec in self.gateway.registry.models:
-                built = self.gateway.build_model(spec)
-                if built is not None:
-                    runtime_models[spec.id] = TrackedModel(
-                        built,
-                        spec,
-                        self.gateway.ledger,
-                        steer_signal=self._steer_signal,
-                        workspace=workspace,
-                    )
+        default_model, runtime_models = self._build_models()
         self.runtime_model_ids = frozenset(runtime_models)
         durability = (
             DBOSDurability(
@@ -298,9 +298,8 @@ class Runner(DBOSConfiguredInstance):
             else None
         )
         self.context = harness.build_context(self._record_context)
-        runner_capabilities: list[AbstractCapability[None]] = [
-            RoutineBudgetGuard(ledger=self.gateway.ledger)
-        ]
+        self._budget_guard = RoutineBudgetGuard(ledger=self.gateway.ledger)
+        runner_capabilities: list[AbstractCapability[None]] = [self._budget_guard]
         if self.work_items is not None:
             runner_capabilities.append(
                 TaskFlow(
@@ -313,10 +312,6 @@ class Runner(DBOSConfiguredInstance):
             )
         if self.routines is not None:
             runner_capabilities.append(RoutineChat(store=self.routines, create=self.create_routine))
-        default_model = gateway.model(
-            self.tier, require_tools=True, selected=self.profile.model.model_id, workspace=workspace
-        )
-        self._attach_steer_signal(default_model)
         steering = SteeringCapability(
             claim=self._claim_steer,
             get_signal=self._steer_signal,
@@ -333,6 +328,100 @@ class Runner(DBOSConfiguredInstance):
             prior_dispatch=self.hub.log.has_unreturned_decision,
             steering=steering,
         )
+        self._durability = self._find_durability(self.agent._root_capability) if durable else None
+
+    def _compute_fingerprint(self) -> str:
+        return sha256(
+            (
+                self.profile.digest
+                + self.harness.prompt_version
+                + self.gateway.registry.model_dump_json()
+                + json.dumps(self.harness.policy.tools, sort_keys=True)
+                + str(self.gateway.selected_model)
+                + str(self.gateway.fallback)
+                + str(self._jobs)
+                + self.tier
+                + str(self.harness.results.retention.total_seconds())
+            ).encode()
+        ).hexdigest()
+
+    def _build_models(self) -> tuple[Model, dict[str, Model]]:
+        # A Model instance cannot cross the DBOS step boundary, so durable runners
+        # register every buildable registry model up front — ledger-tracked, like
+        # the agent's default — and agent.run() receives the registered key, not an
+        # instance. Built only for durable runners: building also acquires the
+        # cross-process ChatGPT lock, which non-durable runners must not take.
+        runtime_models: dict[str, Model] = {}
+        if self.durable:
+            for spec in self.gateway.registry.models:
+                built = self.gateway.build_model(spec)
+                if built is not None:
+                    runtime_models[spec.id] = TrackedModel(
+                        built,
+                        spec,
+                        self.gateway.ledger,
+                        steer_signal=self._steer_signal,
+                        workspace=self.workspace,
+                    )
+        try:
+            default_model = self.gateway.model(
+                self.tier,
+                require_tools=True,
+                selected=self.profile.model.model_id,
+                workspace=self.workspace,
+            )
+        except NoModelAvailable:
+            if not self._allow_unconfigured:
+                raise
+            return _UnconfiguredModel(), runtime_models
+        self._attach_steer_signal(default_model)
+        return default_model, runtime_models
+
+    @staticmethod
+    def _find_durability(capability: Any) -> DBOSDurability | None:
+        if isinstance(capability, DBOSDurability):
+            return capability
+        for child in getattr(capability, "capabilities", ()):
+            found = Runner._find_durability(child)
+            if found is not None:
+                return found
+        return None
+
+    @property
+    def is_configured(self) -> bool:
+        """True once at least one usable model is configured for default runs."""
+        return not isinstance(self.agent.model, _UnconfiguredModel)
+
+    @property
+    def active_model_id(self) -> str | None:
+        """Primary model ID that new runs use, or None when unconfigured."""
+        return self._resolve_run_model("") if self.is_configured else None
+
+    def reload_gateway(
+        self,
+        gateway: Gateway,
+        *,
+        reviewer: ToolReviewer | None = None,
+    ) -> None:
+        """Hot-swap the gateway, DBOS model table, default model, and reviewer live."""
+        self.gateway = gateway
+        self._budget_guard.ledger = gateway.ledger
+        self.harness.registry = gateway.registry
+        self.harness.set_reviewer(reviewer)
+        if self.learner is not None:
+            self.learner.model = lambda session_id: gateway.model(
+                self.profile.model.tier,
+                f"{session_id}:learn",
+                require_tools=True,
+                selected=self.profile.model.model_id,
+            )
+        default_model, runtime_models = self._build_models()
+        self.runtime_model_ids = frozenset(runtime_models)
+        self.agent.model = default_model
+        if self._durability is not None:
+            self._durability._extra_models = dict(runtime_models)
+            self._durability._models_by_id = {"default": default_model, **runtime_models}
+        self.fingerprint = self._compute_fingerprint()
 
     def _clock_utc(self) -> datetime:
         now = self.harness.clock()
@@ -434,6 +523,8 @@ class Runner(DBOSConfiguredInstance):
         if self.gateway.selected_model:
             return self.gateway.selected_model
         model = self.agent.model
+        if isinstance(model, _UnconfiguredModel):
+            return "unconfigured"
         if isinstance(model, TrackedModel):
             return model.spec.id
         if isinstance(model, FallbackModel):
@@ -2047,6 +2138,11 @@ class Runner(DBOSConfiguredInstance):
                 else contextlib.nullcontext()
             )
             try:
+                if model_override is None and isinstance(self.agent.model, _UnconfiguredModel):
+                    raise NoModelAvailable(
+                        "No model is configured yet. Open Bud Settings to sign in with ChatGPT "
+                        "or add an API key."
+                    )
                 async with deadline_cm:
                     result = await self.agent.run(
                         prompt,

@@ -1458,27 +1458,234 @@ private struct InputField: View {
 final class SettingsDraft {
     static let shared = SettingsDraft()
     var settings = BudSettings.load()
+    var savedFeedback: String? = nil
 }
 
-/// Settings: where bud runs, and the folder its token lives in.
-struct SettingsView: View {
-    @Bindable var draft = SettingsDraft.shared
+@MainActor @Observable
+final class SettingsTabState {
+    static let shared = SettingsTabState()
 
-    var body: some View {
-        Form {
-            TextField("bud URL", text: $draft.settings.url)
-            TextField("bud folder", text: $draft.settings.home, prompt: Text("/path/to/bud"))
-            Text("The folder that holds bud's .env and data. The owner token is read from there.")
-                .font(Paper.Typography.callout)
-                .foregroundStyle(Paper.inkSecondary)
-            Button("Save and reconnect") {
-                draft.settings.save()
-                Companion.shared.start()
+    enum Tab: String, CaseIterable, Identifiable {
+        case models = "Models"
+        case integrations = "Integrations"
+        case connection = "Connection"
+
+        var id: String { rawValue }
+
+        var symbol: String {
+            switch self {
+            case .models: "sparkles"
+            case .integrations: "key"
+            case .connection: "link"
             }
         }
-        .formStyle(.grouped)
-        .frame(width: 460)
-        .onAppear { draft.settings = BudSettings.load() }
+    }
+
+    var selected: Tab = .models
+}
+
+/// Settings: model sign-in, optional integration keys, and server connection details.
+struct SettingsView: View {
+    @Bindable var tab = SettingsTabState.shared
+    @Bindable var store = OnboardingStore.shared
+    @Bindable var draft = SettingsDraft.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var contentTransitionAnimation: Animation {
+        reduceMotion ? .easeOut(duration: 0.14) : .easeOut(duration: 0.18)
+    }
+
+    private var bannerKey: String {
+        store.error ?? store.feedback ?? draft.savedFeedback ?? ""
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            PaperSegmentedTabs(selected: $tab.selected)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    settingsBanner
+                    Group {
+                        switch tab.selected {
+                        case .models:
+                            ModelSetupPanel(store: store)
+                        case .integrations:
+                            IntegrationKeysPanel(store: store)
+                        case .connection:
+                            PaperConnectionPanel(draft: draft)
+                        }
+                    }
+                    .id(tab.selected)
+                    .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.99)))
+                }
+                .padding(20)
+            }
+            .animation(contentTransitionAnimation, value: tab.selected)
+            .animation(.easeOut(duration: 0.18), value: bannerKey)
+        }
+        .frame(width: 540, height: 520)
+        .background(Paper.canvas)
+        .onAppear {
+            draft.settings = BudSettings.load()
+            draft.savedFeedback = nil
+            Task { await store.refresh() }
+        }
+    }
+
+    @ViewBuilder
+    private var settingsBanner: some View {
+        if tab.selected == .connection {
+            if let ok = draft.savedFeedback, !ok.isEmpty {
+                StatusStrip(text: ok, isError: false) { draft.savedFeedback = nil }
+            }
+        } else if let err = store.error, !err.isEmpty {
+            StatusStrip(text: err, isError: true) { store.clearBanner() }
+        } else if let ok = store.feedback, !ok.isEmpty {
+            StatusStrip(text: ok, isError: false) { store.clearBanner() }
+        }
+    }
+}
+
+private struct PaperSegmentedTabs: View {
+    @Binding var selected: SettingsTabState.Tab
+    @Namespace private var tabNamespace
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        let trackShape = RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous)
+        HStack(spacing: 3) {
+            ForEach(SettingsTabState.Tab.allCases) { item in
+                TabButton(
+                    item: item,
+                    active: selected == item,
+                    namespace: tabNamespace
+                ) {
+                    withAnimation(reduceMotion ? nil : .spring(duration: 0.26, bounce: 0)) {
+                        selected = item
+                    }
+                }
+            }
+        }
+        .padding(3)
+        .background(Paper.recessed, in: trackShape)
+        .overlay(trackShape.strokeBorder(Paper.hairline, lineWidth: 0.5))
+    }
+
+    private struct TabButton: View {
+        let item: SettingsTabState.Tab
+        let active: Bool
+        let namespace: Namespace.ID
+        let action: () -> Void
+        @StateObject private var hover = Flag()
+        @Environment(\.colorScheme) private var scheme
+
+        var body: some View {
+            let pillShape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
+            Button(action: action) {
+                HStack(spacing: 5) {
+                    Image(systemName: item.symbol)
+                        .font(.system(size: 11, weight: .medium))
+                    Text(item.rawValue)
+                        .font(Paper.Typography.label)
+                }
+                .foregroundStyle(active ? Paper.inkPrimary : (hover.on ? Paper.inkPrimary : Paper.inkSecondary))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+                .background {
+                    if active {
+                        pillShape
+                            .fill(Paper.elevated)
+                            .overlay(pillShape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5))
+                            .shadow(
+                                color: .black.opacity(scheme == .dark ? 0.26 : 0.06),
+                                radius: 2,
+                                y: 1
+                            )
+                            .matchedGeometryEffect(id: "settings-tab", in: namespace)
+                    } else if hover.on {
+                        pillShape.fill(Paper.fillSubtle)
+                    }
+                }
+                .contentShape(pillShape)
+            }
+            .buttonStyle(TabPressStyle())
+            .pointerStyle(.link)
+            .onHover { hover.on = $0 }
+        }
+    }
+
+    private struct TabPressStyle: ButtonStyle {
+        func makeBody(configuration: Configuration) -> some View {
+            configuration.label.modifier(PaperPress(pressed: configuration.isPressed))
+        }
+    }
+}
+
+private struct PaperConnectionPanel: View {
+    @Bindable var draft: SettingsDraft
+    @FocusState private var urlFocused: Bool
+    @FocusState private var folderFocused: Bool
+
+    var body: some View {
+        let cardShape = RoundedRectangle(cornerRadius: Paper.radiusLG, style: .continuous)
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Connection")
+                    .font(Paper.Typography.h2)
+                    .tracking(Paper.Typography.h2Tracking)
+                    .foregroundStyle(Paper.inkPrimary)
+                Text("Local server address and bud data folder.")
+                    .font(Paper.Typography.callout)
+                    .foregroundStyle(Paper.inkSecondary)
+            }
+
+            VStack(spacing: 0) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("bud URL")
+                        .font(Paper.Typography.label)
+                        .foregroundStyle(Paper.inkPrimary)
+                    PaperFieldBox(focused: urlFocused) {
+                        TextField("http://127.0.0.1:8420", text: $draft.settings.url)
+                            .focused($urlFocused)
+                    }
+                }
+                .padding(14)
+
+                Rectangle().fill(Paper.hairline).frame(height: 0.5)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("bud folder")
+                        .font(Paper.Typography.label)
+                        .foregroundStyle(Paper.inkPrimary)
+                    PaperFieldBox(focused: folderFocused) {
+                        TextField("/path/to/bud", text: $draft.settings.home)
+                            .focused($folderFocused)
+                    }
+                    Text("Holds bud's config.env, data, and owner token.")
+                        .font(Paper.Typography.caption)
+                        .foregroundStyle(Paper.inkMuted)
+                }
+                .padding(14)
+            }
+            .surface(cardShape, lift: 1, fill: Paper.elevated, border: Paper.borderStrong, borderWidth: 0.5)
+
+            HStack(spacing: 10) {
+                Button("Run Setup Assistant…") { OnboardingWindow.shared.show() }
+                    .buttonStyle(CardButton(kind: .secondary))
+                Spacer(minLength: 8)
+                Button("Save and reconnect") {
+                    draft.settings.save()
+                    draft.savedFeedback = "Saved connection settings. Reconnecting..."
+                    Companion.shared.start()
+                }
+                .buttonStyle(CardButton(kind: .primary))
+            }
+        }
     }
 }
 

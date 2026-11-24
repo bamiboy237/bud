@@ -35,7 +35,7 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 from pydantic import BaseModel, Field
@@ -49,6 +49,9 @@ from pydantic_ai.messages import (
 )
 
 from bud.harness.ask import ask_summary
+
+if TYPE_CHECKING:
+    from bud.config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -656,16 +659,15 @@ class SessionGrants:
 Describer = Callable[[dict[str, Any]], str | None | Awaitable[str | None]]
 
 
-def build_reviewer() -> ToolReviewer | None:
+def build_reviewer(settings: "Settings | None" = None) -> ToolReviewer | None:
     """None unless the owner left review on and an OpenAI key exists.
 
     Without a reviewer, auto mode asks about every write, exactly like strict.
     """
     from bud.config import get_settings
 
-    settings = get_settings()
-    if not settings.approval_review or settings.openai_api_key is None:
+    resolved = settings if settings is not None else get_settings()
+    api_key = resolved.openai_api_key.get_secret_value().strip() if resolved.openai_api_key else ""
+    if not resolved.approval_review or not api_key:
         return None
-    return ToolReviewer(
-        settings.openai_api_key.get_secret_value(), model=settings.approval_review_model
-    )
+    return ToolReviewer(api_key, model=resolved.approval_review_model)

@@ -732,6 +732,10 @@ esac
 
 if [ -n "$PREV_VER" ]; then
   echo "  bud chat"
+elif [ "$APP_UPDATED" = "1" ]; then
+  echo "Open Bud.app to sign in with ChatGPT or add API keys:"
+  echo "  open \"$APP_DIR/Bud.app\""
+  echo "Or from your terminal: bud login chatgpt && bud chat"
 else
   echo "  bud login chatgpt"
   echo "  bud chat"

@@ -27,6 +27,9 @@ private struct MenuContent: View {
 
     var body: some View {
         Text(status)
+        if companion.needsOnboarding {
+            Button("Set up bud…") { OnboardingWindow.shared.show() }
+        }
         Divider()
         Button("Ask bud…") { delegate.ask() }
             .keyboardShortcut("k")

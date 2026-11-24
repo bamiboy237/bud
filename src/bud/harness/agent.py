@@ -164,6 +164,7 @@ class Harness:
         # Set by the composition root (bud serve, evals); auto mode then lets it review each
         # write. None means nothing is ever reviewed and auto mode asks like strict.
         self.reviewer: ToolReviewer | None = None
+        self._guards: list[GuardTools] = []
         # What each write's ids point to, rendered from the store: the reviewer's only view
         # of a target that is not spelled out in the call's own arguments.
         self.describers: dict[str, Describer] = {}
@@ -197,8 +198,14 @@ class Harness:
         # One daily cap for the whole install, so it lives in the data directory, not in
         # this account's session folder.
         self.spend = build_spend_limits(
-            settings.data_dir / "spend.db", registry, settings.daily_spend_usd
+            settings.data_dir / "spend.db", lambda: self.registry, settings.daily_spend_usd
         )
+
+    def set_reviewer(self, reviewer: ToolReviewer | None) -> None:
+        """Update the approval reviewer across the harness and all bound tool guards."""
+        self.reviewer = reviewer
+        for guard in self._guards:
+            guard.reviewer = reviewer
 
     def swap_tools(self, toolset: AbstractToolset[None]) -> None:
         """Replace the tools the next run sees; the running step keeps the ones it started with."""
@@ -296,6 +303,21 @@ class Harness:
             if harness_cfg.long_run_reminder_every is not None
             else []
         )
+        guard = GuardTools(
+            policy=self.policy,
+            record=record,
+            reviewer=self.reviewer,
+            describers=self.describers,
+            notifies_others=self.notifies_others,
+            harmless=self.harmless,
+            refuses=self.refuses,
+            stamp=lambda: self.stamp(),
+            known=self.known,
+            facts=self._today,
+            grants=self.grants,
+            prior_dispatch=prior_dispatch,
+        )
+        self._guards.append(guard)
         return Agent(
             model,
             name="bud",
@@ -309,20 +331,7 @@ class Harness:
             end_strategy=limits.end_strategy,
             capabilities=[
                 *([RepairToolArguments()] if harness_cfg.repair_tool_arguments else []),
-                GuardTools(
-                    policy=self.policy,
-                    record=record,
-                    reviewer=self.reviewer,
-                    describers=self.describers,
-                    notifies_others=self.notifies_others,
-                    harmless=self.harmless,
-                    refuses=self.refuses,
-                    stamp=lambda: self.stamp(),
-                    known=self.known,
-                    facts=self._today,
-                    grants=self.grants,
-                    prior_dispatch=prior_dispatch,
-                ),
+                guard,
                 self.output_limits,
                 *([self.code_mode] if self.code_mode is not None else []),
                 *([steering] if steering is not None else []),

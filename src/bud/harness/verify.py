@@ -141,9 +141,8 @@ def build_verifier() -> JobVerifier | None:
     from bud.config import get_settings
 
     settings = get_settings()
-    if settings.openai_api_key is None:
+    api_key = settings.openai_api_key.get_secret_value().strip() if settings.openai_api_key else ""
+    if not api_key:
         return None
     # The same small model auto mode's reviewer uses for its Decisions calls.
-    return JobVerifier(
-        settings.openai_api_key.get_secret_value(), model=settings.approval_review_model
-    )
+    return JobVerifier(api_key, model=settings.approval_review_model)

@@ -184,12 +184,16 @@ struct BudConnection: Sendable {
         return request
     }
 
+    func send(_ urlRequest: URLRequest) async throws -> [String: Any] {
+        let data = try await checkedData(urlRequest)
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+    }
+
     func send(
         _ method: String, _ path: String, json: [String: Any]? = nil,
         queryItems: [URLQueryItem] = []
     ) async throws -> [String: Any] {
-        let data = try await checkedData(request(method, path, json: json, queryItems: queryItems))
-        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        try await send(request(method, path, json: json, queryItems: queryItems))
     }
 
     func getBytes(_ path: String, queryItems: [URLQueryItem]) async throws -> Data {

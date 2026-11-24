@@ -110,16 +110,17 @@ def compose_runner(
     include_history_search: bool = True,
     mode_holder: dict[str, Mode] | None = None,
     runner_cls: Callable[..., Runner] = Runner,
+    allow_unconfigured: bool = False,
 ) -> Any:
     """Apply approval mode, memory/recall, and build the Runner + Agent via one path."""
-    harness.reviewer = reviewer
+    harness.set_reviewer(reviewer)
     if grants is not None:
         harness.policy.grants = grants
     has_reviewer = harness.reviewer is not None
     apply_mode(harness.policy, approval_mode, reviewer=has_reviewer)
     live_mode = mode_holder if mode_holder is not None else {"mode": approval_mode}
     harness.live_instructions.append(
-        lambda: mode_guidance(live_mode["mode"], reviewer=has_reviewer)
+        lambda: mode_guidance(live_mode["mode"], reviewer=harness.reviewer is not None)
     )
     if include_history_search:
         harness.capabilities.append(
@@ -146,14 +147,14 @@ def compose_runner(
         memory=harness.memory,
         workspace=workspace,
     )
-    return runner_cls(
-        hub,
-        gateway,
-        harness,
-        durable=durable,
-        jobs=jobs,
-        learner=learner,
-        recall=recall,
-        workspace=workspace,
-        operating_profile=profile,
-    )
+    kwargs: dict[str, Any] = {
+        "durable": durable,
+        "jobs": jobs,
+        "learner": learner,
+        "recall": recall,
+        "workspace": workspace,
+        "operating_profile": profile,
+    }
+    if allow_unconfigured:
+        kwargs["allow_unconfigured"] = True
+    return runner_cls(hub, gateway, harness, **kwargs)

@@ -140,9 +140,10 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 
 def embedder(settings: Settings) -> Embedder | None:
     """OpenAI embeddings with bud's own key; without a key, recall is keyword-only."""
-    if settings.openai_api_key is None:
+    api_key = settings.openai_api_key.get_secret_value().strip() if settings.openai_api_key else ""
+    if not api_key:
         return None
-    provider = OpenAIProvider(api_key=settings.openai_api_key.get_secret_value())
+    provider = OpenAIProvider(api_key=api_key)
     return Embedder(OpenAIEmbeddingModel(EMBEDDING_MODEL, provider=provider))
 
 

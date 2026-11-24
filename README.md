@@ -8,10 +8,10 @@ Install standalone daily-driver Bud (no repo clone needed):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/bamiboy237/bud/master/scripts/install.sh | bash
-bud login chatgpt
+open /Applications/Bud.app
 ```
 
-This verifies SHA-256 checksums, installs `uv` and Python 3.14 if needed, sets up `~/.bud/`, `/Applications/Bud.app`, and the `app.bud.server` LaunchAgent on `127.0.0.1:8420`, and keeps user state separate from releases:
+`Bud.app` opens a first-run setup window to sign in with ChatGPT or add API keys, and you can update keys anytime in **Settings...** (`Cmd+,`) with instant hot-reload (no restart). The installer verifies SHA-256 checksums, installs `uv` and Python 3.14 if needed, sets up `~/.bud/`, `/Applications/Bud.app`, and the `app.bud.server` LaunchAgent on `127.0.0.1:8420`, and keeps user state separate from releases:
 
 - `~/.bud/config.env`: API keys and settings.
 - `~/.bud/data/`: chats, memory, routines, connections, spend ledger, and `auth/owner.token`.
