@@ -40,9 +40,11 @@ and `bud desktop revoke DESKTOP_ID` removes a worker’s access. All commands us
 ## Deliver a file through a browser on another desktop
 
 Configure a multipart HTML form that uses a file input, a text reference field,
-and a submit button on a single form. The confirmation page must show the exact
-reference in one element. Bud uses the reference to check whether an earlier
-submit succeeded. For a synthetic test, use IDs like these.
+and a submit button on a single form. Use a trusted site with a standard form
+that sends the file only when you submit, not when you select it. The
+confirmation page must show the exact reference in one element. Bud uses the
+reference to check whether an earlier submit succeeded. For a synthetic test,
+use IDs like these.
 
 ~~~json
 {
@@ -54,8 +56,9 @@ submit succeeded. For a synthetic test, use IDs like these.
 }
 ~~~
 
-Start a Browse-enabled Bud server on the browser desktop and pair Chrome with
-it. Run the worker there with its paired-device token and
+Start a Browse-enabled Bud server on the browser desktop and pair one browser
+with its relay. A delivery waits if the relay has no browser or more than one
+connected browser. Run the worker there with its paired-device token and
 `bud desktop --url "$COORDINATOR" run --browser-local http://127.0.0.1:8420`.
 The worker uses the local server's owner credential for loopback requests only.
 The coordinator can reach only the paired-worker endpoints, and it gets no
