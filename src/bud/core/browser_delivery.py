@@ -90,14 +90,18 @@ return {state: await page.evaluate(({form, reference}) => {
     if (!(upload instanceof HTMLInputElement) || upload.type !== "file" ||
         !(number instanceof HTMLInputElement) || number.type !== "text" ||
         !(submit instanceof HTMLButtonElement) || submit.type !== "submit" ||
-        !upload.form || number.form !== upload.form || submit.form !== upload.form ||
-        (submit.getAttribute("formmethod") || upload.form.method).toLowerCase() !== "post" ||
-        (submit.getAttribute("formenctype") || upload.form.enctype).toLowerCase()
-            !== "multipart/form-data" ||
-        !["", "_self"].includes(submit.getAttribute("formtarget") || upload.form.target) ||
-        new URL(submit.getAttribute("formaction") || upload.form.action, location.href).origin
-            !== location.origin)
-        return "other_page";
+        !upload.form || number.form !== upload.form || submit.form !== upload.form)
+        return "invalid_form";
+    const action = submit.hasAttribute("formaction") ? submit.formAction : upload.form.action;
+    const method = submit.hasAttribute("formmethod") ? submit.formMethod : upload.form.method;
+    const encoding = submit.hasAttribute("formenctype") ? submit.formEnctype : upload.form.enctype;
+    const target = submit.getAttribute("formtarget") || upload.form.target ||
+        document.querySelector("base[target]")?.target || "";
+    if (!upload.name || !number.name || upload.name === number.name ||
+        [upload, number, submit].some(element => element.matches(":disabled")) ||
+        method !== "post" || encoding !== "multipart/form-data" ||
+        !["", "_self"].includes(target) || new URL(action).origin !== location.origin)
+        return "invalid_form";
     return "ready";
 }, ARGS)};
 """
@@ -111,7 +115,7 @@ async def _inspect(view: BrowserView, path: Path, tab: str, body: LocalBrowserSt
     for line in reversed(raw.decode("utf-8", "replace").splitlines()):
         with suppress(ValueError, AttributeError, TypeError):
             value = json.loads(line).get("state")
-            if value in ("ready", "sign_in", "delivered", "other_page"):
+            if value in ("ready", "sign_in", "delivered", "other_page", "invalid_form"):
                 return value
     return "unavailable"
 
