@@ -37,7 +37,7 @@ STACK = ROOT / "data" / "tmp" / "dev-stack"
 STATE = STACK / "state.json"
 DATA = STACK / "data"
 SHOTS = STACK / "shots"
-APP = ROOT / "mac" / "build" / "bud.app" / "Contents" / "MacOS" / "bud"
+APP = ROOT / "mac" / "build" / "bud-dev.app" / "Contents" / "MacOS" / "bud-dev"
 NO_PHOTON = {
     "PHOTON_API_KEY": "",
     "PHOTON_PROJECT_ID": "",
@@ -47,11 +47,10 @@ NO_PHOTON = {
 
 
 def live_data_dir() -> Path:
-    """The live server's data folder, read the way the server reads it.
-
-    Managed checkouts link `.env` to the main checkout, where the live server runs, so a
-    relative DATA_DIR is resolved from there.
-    """
+    """The live server's data folder, checking ~/.bud/data first, then the repo checkout."""
+    installed = Path.home() / ".bud" / "data"
+    if (installed / "composio" / "connections.db").is_file():
+        return installed
     main_checkout = (ROOT / ".env").resolve().parent
     data_dir = Settings(_env_file=main_checkout / ".env").data_dir.expanduser()
     return data_dir if data_dir.is_absolute() else main_checkout / data_dir
@@ -104,10 +103,15 @@ def up(simulate: bool, app: bool) -> None:
     if not simulate:
         snapshot_bindings(DATA / "composio")
     if app:
-        subprocess.run([str(ROOT / "mac" / "build.sh")], cwd=ROOT, check=True)
+        subprocess.run([str(ROOT / "mac" / "build.sh"), "--dev"], cwd=ROOT, check=True)
 
     port = free_port()
-    server = launch_server(DATA, port, simulate=simulate, env=NO_PHOTON)
+    server_env = {
+        **NO_PHOTON,
+        "BUD_BROWSE_HOME": str(DATA / "browse"),
+        "BUD_BROWSE_PORT": str(free_port()),
+    }
+    server = launch_server(DATA, port, simulate=simulate, env=server_env)
     state = {"port": port, "server_pid": server, "mode": "simulate" if simulate else "real"}
     save(state)
     print(f"up: {state['mode']} server on http://127.0.0.1:{port}, data {DATA}")

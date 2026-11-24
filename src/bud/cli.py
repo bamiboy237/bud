@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import os
 import webbrowser
 
 import httpx
@@ -14,7 +15,7 @@ from pydantic_settings.exceptions import SettingsError
 
 from bud import __version__
 from bud.composio.binding import ConnectionError
-from bud.config import HOST, LOCAL_URL, PORT, get_settings
+from bud.config import LOCAL_URL, get_settings
 from bud.core import handoff_client
 from bud.core.auth import OwnerAuthError
 from bud.core.client import chat
@@ -24,6 +25,8 @@ from bud.gateway.chatgpt import ChatGPTError, ChatGPTStore, login, refresh_model
 from bud.gateway.errors import error_summary
 from bud.gateway.registry import ModelConfigurationError, Tier, load_registry
 from bud.photon_config import PhotonSetupError
+from bud.release import ReleaseError
+from bud.release import commands as release_commands
 from bud.tracing import TracingSetupError
 from bud.world.store import World
 
@@ -264,11 +267,15 @@ def _main(argv: list[str] | None = None) -> None:
         "--profile",
         help="operating profile name or JSON path (defaults to the active profile)",
     )
+    serve_parser.add_argument("--host", help="bind host (defaults to BUD_HOST or 127.0.0.1)")
+    serve_parser.add_argument("--port", type=int, help="bind port (defaults to BUD_PORT or 8420)")
+    serve_parser.add_argument("--home", help="Bud home folder (defaults to checkout or ~/.bud)")
     chat_parser = commands.add_parser("chat", help="open or attach to a session")
     chat_parser.add_argument("session", nargs="?", help="session id to attach to")
     chat_parser.add_argument("--new", action="store_true", help="start a separate conversation")
     chat_parser.add_argument("--url", default=LOCAL_URL)
     handoff_client.arguments(commands)
+    release_commands.add_parsers(commands)
     args = parser.parse_args(argv)
     if args.command == "ask":
         asyncio.run(ask(args.prompt, args.tier, args.model))
@@ -301,7 +308,12 @@ def _main(argv: list[str] | None = None) -> None:
         from bud.harness.operating_profile import OperatingProfileStore, resolve_operating_profile
         from bud.tracing import tracing
 
+        if args.home:
+            os.environ["BUD_HOME"] = args.home
+            get_settings.cache_clear()
         settings = get_settings()
+        host = args.host or settings.host
+        port = args.port if args.port is not None else settings.port
         profile = (
             resolve_operating_profile(
                 args.profile,
@@ -311,19 +323,21 @@ def _main(argv: list[str] | None = None) -> None:
             else None
         )
         mode = "simulated tools" if args.simulate else "real accounts"
-        print(f"Starting bud with {mode} at {LOCAL_URL}.", flush=True)
+        print(f"Starting bud with {mode} at http://{host}:{port}.", flush=True)
         with tracing(settings):
             app = create_app(simulate=args.simulate, model_id=args.model, operating_profile=profile)
             # Event streams never end on their own; without a limit, one connected client (TUI,
             # Mac app) keeps a stopped server alive forever, holding bud.lock.
             # Clients resume by seq.
-            uvicorn.run(app, host=HOST, port=PORT, timeout_graceful_shutdown=SHUTDOWN_SECONDS)
+            uvicorn.run(app, host=host, port=port, timeout_graceful_shutdown=SHUTDOWN_SECONDS)
     elif args.command == "desktop":
         handoff_client.main(args)
     elif args.command == "chat":
         if args.new and args.session:
             parser.error("Use either a session ID or --new, not both.")
         asyncio.run(chat(args.url, args.session, new=args.new))
+    elif release_commands.handle_command(args):
+        return
     else:
         parser.print_help()
 
@@ -343,6 +357,7 @@ def main(argv: list[str] | None = None) -> None:
         PhotonSetupError,
         ModelConfigurationError,
         TracingSetupError,
+        ReleaseError,
     ) as exc:
         raise SystemExit(str(exc)) from None
     except httpx.HTTPStatusError as exc:

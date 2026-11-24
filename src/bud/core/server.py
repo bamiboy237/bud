@@ -8,6 +8,7 @@ import contextlib
 import fcntl
 import hashlib
 import logging
+import os
 import re
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -24,7 +25,7 @@ from pydantic import BaseModel, Field, SecretStr
 from pydantic_ai import ModelRetry
 from pydantic_ai.toolsets import AbstractToolset, CombinedToolset, FunctionToolset
 
-from bud import browser
+from bud import __version__, browser
 from bud.apps import CHANGES as APP_CHANGES
 from bud.apps import GUIDANCE as APP_GUIDANCE
 from bud.apps import OPEN_IN_APP, quiet_open
@@ -46,6 +47,14 @@ from bud.core.events import Event, MessageOrigin
 from bud.core.handoff import DesktopHandoffs
 from bud.core.hub import Hub
 from bud.core.log import EventLog, QueueFull
+from bud.core.onboarding import (
+    ChatGPTLoginManager,
+    OnboardingError,
+    onboarding_snapshot,
+    reload_settings,
+    resolve_config_env_path,
+    write_env_updates,
+)
 from bud.core.profiles import Mode, ProfileStore, apply_mode, as_mode, mode_summary
 from bud.core.projection import (
     Attachment,
@@ -79,7 +88,8 @@ from bud.core.setup import (
     setup_registry,
 )
 from bud.core.workspace_home import display_path, workspace_home
-from bud.gateway import build_gateway
+from bud.gateway import NoModelAvailable, build_gateway
+from bud.gateway.chatgpt import ChatGPTError
 from bud.harness.actions import Policy, load_policy
 from bud.harness.agent import Harness
 from bud.harness.ask import MAX_QUESTIONS, AskAnswer
@@ -137,6 +147,10 @@ def _noop() -> None:
 
 class ModeRequest(BaseModel):
     mode: str
+
+
+class OnboardingKeysRequest(BaseModel):
+    keys: dict[str, str | None] = Field(default_factory=dict)
 
 
 class NewMessage(BaseModel):
@@ -309,7 +323,23 @@ ACCOUNT_TOOL = re.compile(r"[A-Z][A-Z0-9]*_[A-Z0-9_]+")
 
 def private_folders(settings: Settings) -> list[Path]:
     """Folders a shell command must never read: Bud's data and the folder holding its .env."""
-    return [settings.data_dir, Path.cwd()]
+    folders: list[Path] = [settings.data_dir]
+    home = Path.home().resolve()
+    cwd = Path.cwd()
+    cwd_resolved = cwd.resolve()
+    if cwd_resolved != home and not home.is_relative_to(cwd_resolved):
+        folders.append(cwd)
+    bud_home = os.environ.get("BUD_HOME", "").strip()
+    if bud_home:
+        candidate = Path(bud_home).expanduser()
+        candidate_resolved = candidate.resolve()
+        if (
+            candidate_resolved != home
+            and not home.is_relative_to(candidate_resolved)
+            and candidate_resolved not in {path.resolve() for path in folders}
+        ):
+            folders.append(candidate)
+    return folders
 
 
 def file_guidance() -> str:
@@ -393,12 +423,22 @@ def _create_app(
     account_scope: str | None = None
     # Bud's own Browse relay, and a `browse pair` waiting for the extension; the pairing
     # stops when the server stops.
-    relay = browser.Relay(browser.RELAY_HOME)
+    browse_home = (
+        settings.browse_home.expanduser()
+        if settings.browse_home is not None
+        else browser.RELAY_HOME
+    )
+    relay = browser.Relay(browse_home, port=settings.browse_port)
     pairing = browser.Pairing(relay)
     browser_view: BrowserView | None = None
 
     # Set by the account branch: reloads the tool list after a new app connects.
     refresh_tools: Callable[[], None] = _noop
+    refresh_lock = Lock()
+    loaded: dict[str, Any] = {}
+    account_toolset: (
+        Callable[[AccountBinding | None, Path | None], CombinedToolset[None]] | None
+    ) = None
 
     # The approval mode applies to the harness policy after composition (the
     # Harness unions memory/skill rules in), one seam for every tool class.
@@ -466,12 +506,11 @@ def _create_app(
             browser.allow_tools(tools_policy)
             setup.register("browser", browser.setup_entry(pairing))
         setup_journal = SetupJournal()
-        loaded: dict[str, Any] = {
+        loaded = {
             "binding": binding,
             "accounts": frozenset(accounts),
             "browse": browser.executable() if browsing else None,
         }
-        refresh_lock = Lock()
 
         def browser_toolsets(browse: Path | None) -> list[AbstractToolset[None]]:
             if browse is None:
@@ -481,7 +520,7 @@ def _create_app(
                 FunctionToolset(browser.control_tools(consent, relay, view=browser_view)),
             ]
 
-        def account_toolset(
+        def _account_toolset(
             binding: AccountBinding | None, browse: Path | None
         ) -> CombinedToolset[None]:
             return CombinedToolset(
@@ -500,6 +539,8 @@ def _create_app(
                 ]
             )
 
+        account_toolset = _account_toolset
+
         def refresh_account_tools() -> None:
             """Swap in the account tools after any change, in the same chat: a new app, a
             reconnect, or a removal. The next message sees them; no restart is needed."""
@@ -514,7 +555,7 @@ def _create_app(
                     return
                 # Build first and adopt last: if anything fails, nothing changed, and the next
                 # request tries again. Old tools keep refusing to dispatch meanwhile.
-                replacement = account_toolset(binding, browse)
+                replacement = _account_toolset(binding, browse)
                 connections.adopt(binding)
                 harness.swap_tools(replacement)
                 previous = loaded["binding"]
@@ -527,7 +568,7 @@ def _create_app(
         memory_path = session_dir / "memory.db"
         memory = build_memory(memory_path, namespace="owner")
         harness = Harness(
-            account_toolset(binding, loaded["browse"]),
+            _account_toolset(binding, loaded["browse"]),
             tools_policy,
             gateway.registry,
             PROFILE + "\nComposio is your library of app integrations. Use discover_tools to check "
@@ -616,17 +657,28 @@ def _create_app(
     harness.refuses.update(
         dict.fromkeys(LOCAL_TOOLS, lambda tool_args: local_refusal(tool_args, outside))
     )
-    reviewer = build_reviewer()
+    reviewer = build_reviewer(settings)
     has_reviewer = reviewer is not None
     # Standing permissions the owner granted from an approval card. The policy reads them on
     # every call, so a new grant or a revoke applies without a restart.
     grants = Grants(settings.data_dir / "grants.json")
     live_mode: dict[str, Mode] = {"mode": approval_mode}
-    gateway.model(
-        active_profile.model.tier,
-        require_tools=True,
-        selected=active_profile.model.model_id,
-    )
+    allow_unconfigured = not simulate and model_id is None
+    if not allow_unconfigured:
+        gateway.model(
+            active_profile.model.tier,
+            require_tools=True,
+            selected=active_profile.model.model_id,
+        )
+    else:
+        try:
+            gateway.model(
+                active_profile.model.tier,
+                require_tools=True,
+                selected=active_profile.model.model_id,
+            )
+        except NoModelAvailable:
+            logger.info("No model configured yet; starting server in onboarding mode.")
     log = EventLog(db_path)
     hub = Hub(log)
     background.bind(hub)
@@ -646,6 +698,38 @@ def _create_app(
         include_history_search=True,
         mode_holder=live_mode,
         runner_cls=Runner,
+        allow_unconfigured=allow_unconfigured,
+    )
+    config_env_path = resolve_config_env_path(settings)
+
+    def reload_runtime_config(*, cleared_keys: set[str] | None = None) -> None:
+        nonlocal settings, gateway, has_reviewer, config_env_path
+        with refresh_lock:
+            new_settings = reload_settings(settings, config_env_path, cleared_keys=cleared_keys)
+            gateway.close()
+            new_gateway = build_gateway(
+                new_settings,
+                providers={"openai-chatgpt", "openai", "meta", "mistral", "deepseek"}
+                if not simulate
+                else None,
+                model_id=model_id,
+            )
+            new_reviewer = build_reviewer(new_settings)
+            settings = new_settings
+            gateway = new_gateway
+            has_reviewer = new_reviewer is not None
+            config_env_path = resolve_config_env_path(new_settings)
+            runner.reload_gateway(new_gateway, reviewer=new_reviewer)
+            apply_mode(harness.policy, live_mode["mode"], reviewer=has_reviewer)
+            if connections is not None and account_toolset is not None:
+                connections.settings = new_settings
+                current_binding = connections.binding or connections.stored()
+                harness.swap_tools(account_toolset(current_binding, loaded.get("browse")))
+
+    chatgpt_login = ChatGPTLoginManager(
+        settings.data_dir,
+        on_before_auth=lambda: gateway.close(),
+        on_complete=reload_runtime_config,
     )
     if setup_journal is not None:
         # The setup toolset was built before the log, hub, and runner existed; one seam
@@ -741,6 +825,7 @@ def _create_app(
         finally:
             try:
                 try:
+                    await chatgpt_login.shutdown()
                     # Stop accepting/sending messages before stopping core work.
                     await services.aclose()
                 finally:
@@ -765,6 +850,8 @@ def _create_app(
         else hashlib.sha256(str(db_path.resolve()).encode()).hexdigest()
     )
     app = FastAPI(title="bud core", lifespan=lifespan)
+    app.state.chatgpt_login = chatgpt_login
+    app.state.reload_runtime_config = reload_runtime_config
     if browser_view is not None:
         app.include_router(browser_view.routes())
         app.include_router(local_routes(browser_view))
@@ -786,10 +873,14 @@ def _create_app(
     @app.get("/runtime")
     def runtime() -> JSONResponse:
         """Authenticated transport handshake; no keys or account identifiers."""
+        has_model = runner.is_configured
         return JSONResponse(
             {
+                "version": __version__,
                 "mode": "simulate" if simulate else "accounts",
                 "scope": scope_id,
+                "has_model": has_model,
+                "needs_onboarding": not simulate and not has_model,
                 "restart_required": connections is not None and connections.restart_required(),
                 "messaging": messaging_state["status"],
                 "approval_mode": profile_store.load(),
@@ -797,6 +888,59 @@ def _create_app(
             },
             headers={"Cache-Control": "no-store"},
         )
+
+    def _onboarding_payload() -> JSONResponse:
+        manager: ChatGPTLoginManager = app.state.chatgpt_login
+        return JSONResponse(
+            onboarding_snapshot(
+                settings,
+                gateway,
+                manager,
+                has_model=runner.is_configured,
+                simulate=simulate,
+                active_model=runner.active_model_id,
+            ),
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/onboarding")
+    def get_onboarding() -> JSONResponse:
+        return _onboarding_payload()
+
+    @app.post("/onboarding/keys")
+    def update_onboarding_keys(body: OnboardingKeysRequest) -> JSONResponse:
+        if not body.keys:
+            return _onboarding_payload()
+        try:
+            cleared = write_env_updates(config_env_path, body.keys)
+            reload_runtime_config(cleared_keys=cleared)
+        except OnboardingError as exc:
+            raise HTTPException(422, str(exc)) from None
+        return _onboarding_payload()
+
+    @app.post("/onboarding/chatgpt/start")
+    async def start_chatgpt_onboarding() -> JSONResponse:
+        manager: ChatGPTLoginManager = app.state.chatgpt_login
+        try:
+            await manager.start()
+        except (ChatGPTError, OnboardingError) as exc:
+            raise HTTPException(503, str(exc)) from None
+        return _onboarding_payload()
+
+    @app.post("/onboarding/chatgpt/cancel")
+    async def cancel_chatgpt_onboarding() -> JSONResponse:
+        manager: ChatGPTLoginManager = app.state.chatgpt_login
+        await manager.cancel()
+        return _onboarding_payload()
+
+    @app.post("/onboarding/chatgpt/logout")
+    async def logout_chatgpt_onboarding() -> JSONResponse:
+        manager: ChatGPTLoginManager = app.state.chatgpt_login
+        try:
+            await manager.logout()
+        except (ChatGPTError, OnboardingError) as exc:
+            raise HTTPException(503, str(exc)) from None
+        return _onboarding_payload()
 
     @app.post("/mode")
     def switch_mode(body: ModeRequest) -> JSONResponse:

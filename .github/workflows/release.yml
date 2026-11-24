@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: Optional tag name for a dry-run build (e.g. v0.1.0)
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release-macos:
+    runs-on: macos-26
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          python-version: "3.14"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: tui
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: mac/.build
+          key: ${{ runner.os }}-swiftpm-${{ hashFiles('mac/Package.resolved', 'mac/Package.swift') }}
+          restore-keys: |
+            ${{ runner.os }}-swiftpm-
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: mac/build/browse-*.tgz
+          key: ${{ runner.os }}-browse-${{ hashFiles('mac/build.sh') }}
+      - run: uv sync --locked
+
+      - name: Build release bundle
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME:-}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.version_tag }}" ]]; then
+            tag="${{ inputs.version_tag }}"
+          fi
+          mkdir -p "$RUNNER_TEMP/staging" dist
+          uv run python - "$PWD" "$RUNNER_TEMP/staging/bundle" <<'PY'
+          import sys
+          from pathlib import Path
+          from bud.release.updater import build_local_release
+
+          build_local_release(
+              Path(sys.argv[1]),
+              Path(sys.argv[2]),
+              build_app=True,
+              build_tui=True,
+          )
+          PY
+          version=$(uv run python -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' "$RUNNER_TEMP/staging/bundle/manifest.json")
+          if [[ "$tag" == v* && "$version" != "${tag#v}" ]]; then
+            echo "Release tag $tag does not match pyproject.toml version $version" >&2
+            exit 1
+          fi
+          arch=$(uname -m)
+          bundle_name="bud-${version}-darwin-${arch}"
+          mv "$RUNNER_TEMP/staging/bundle" "$RUNNER_TEMP/staging/${bundle_name}"
+          tar -C "$RUNNER_TEMP/staging" -czf "dist/${bundle_name}.tar.gz" "${bundle_name}"
+          (cd dist && shasum -a 256 "${bundle_name}.tar.gz" > SHA256SUMS.txt)
+          ls -la dist
+
+      - name: Verify release archive installs cleanly
+        run: |
+          set -euo pipefail
+          (cd dist && shasum -a 256 -c SHA256SUMS.txt)
+          mkdir -p "$RUNNER_TEMP/smoke-extract" "$RUNNER_TEMP/smoke-home"
+          uv run python - "$PWD/dist" "$RUNNER_TEMP/smoke-extract" "$RUNNER_TEMP/smoke-home" <<'PY'
+          import sys
+          from pathlib import Path
+          from bud.release.updater import install_release_dir, safe_extract_tar, verify_sha256_sums
+
+          dist = Path(sys.argv[1])
+          archive = next(dist.glob("bud-*.tar.gz"))
+          verify_sha256_sums(archive, (dist / "SHA256SUMS.txt").read_text(encoding="utf-8"))
+          bundle = safe_extract_tar(archive, Path(sys.argv[2]))
+          version, installed = install_release_dir(bundle, Path(sys.argv[3]))
+          assert (installed / "bin" / "bud").exists()
+          assert (installed / "Bud.app").is_dir()
+          print("smoke-installed", version, installed)
+          PY
+          "$RUNNER_TEMP"/smoke-home/releases/*/bin/bud --version
+          archive=$(ls dist/bud-*.tar.gz | head -n 1)
+          bash scripts/install.sh \
+            --archive "$archive" \
+            --checksums dist/SHA256SUMS.txt \
+            --home "$RUNNER_TEMP/installer-smoke" \
+            --no-app \
+            --no-service \
+            --no-modify-path
+          "$RUNNER_TEMP/installer-smoke/bin/bud" --version
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bud-release-macos
+          path: dist/*
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/bud-*.tar.gz dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/bud-*.tar.gz dist/SHA256SUMS.txt \
+              --title "Bud $GITHUB_REF_NAME" \
+              --generate-notes
+          fi

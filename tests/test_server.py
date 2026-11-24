@@ -501,6 +501,7 @@ def test_api_authentication_and_validation(tmp_path):
         )
         assert response.status_code == 401
         runtime = server.request("GET", "/runtime")
+        assert runtime["version"]
         assert runtime["mode"] == "simulate"
         assert runtime["messaging"] == "disabled_in_simulation"
         assert server.client.get("/runtime").headers["cache-control"] == "no-store"

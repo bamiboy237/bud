@@ -1,128 +1,81 @@
 # bud
 
-> A personal AI teammate you run yourself. Fast, durable, and safe.
+Local-first personal AI teammate. Connects to Gmail, Google Calendar, web search, local files, Chrome, and iMessage. Reads run automatically; risky writes wait for your approval.
 
-Bud is an open-source, local-first personal AI assistant. It connects to Gmail,
-Google Calendar, web search, and a private local workspace. You approve each
-proposed write before it runs.
+## Install (macOS)
 
----
+Install standalone daily-driver Bud (no repo clone needed):
 
-## Highlights
-
-* **Crash recovery:** DBOS and SQLite retain execution state across restarts.
-* **Write approvals:** Reads run automatically. In `strict` mode every change pauses for your exact approval; in `auto` mode a reviewer runs the safe, requested ones and asks you about the rest. Sends and real-account writes always ask.
-* **Connected tools:** Gmail and Google Calendar use Composio; public web research uses Exa.
-* **Progressive skills:** Bud loads task instructions when it needs them.
-* **Simulation mode:** Experiment with synthetic accounts and files using your model access.
-* **Independent jobs:** Keep chatting while jobs work or wait for approval.
-
----
-
-## Quickstart
-
-### 1. Install
-
-Requires [uv](https://docs.astral.sh/uv/) and Python >= 3.12:
-
-```bash
-git clone https://github.com/bamiboy237/bud.git
-cd bud
-uv sync
+```sh
+curl -fsSL https://raw.githubusercontent.com/bamiboy237/bud/master/scripts/install.sh | bash
+open /Applications/Bud.app
 ```
 
-The terminal client is a Rust program. Build it once with [Rust](https://rustup.rs):
+`Bud.app` opens a first-run setup window to sign in with ChatGPT or add API keys, and you can update keys anytime in **Settings...** (`Cmd+,`) with instant hot-reload (no restart). The installer verifies SHA-256 checksums, installs `uv` and Python 3.14 if needed, sets up `~/.bud/`, `/Applications/Bud.app`, and the `app.bud.server` LaunchAgent on `127.0.0.1:8420`, and keeps user state separate from releases:
 
-```bash
-cargo build --release --manifest-path tui/Cargo.toml
+- `~/.bud/config.env`: API keys and settings.
+- `~/.bud/data/`: chats, memory, routines, connections, spend ledger, and `auth/owner.token`.
+- `~/.bud/workspace/`: Bud's working notes, reports, and chat attachments.
+- `~/.bud/backups/`: automatic verified SQLite snapshots taken before every update.
+
+Re-running the installer or `bud update` (or **Check for Updates...** in the menu bar) backs up data first and never wipes history:
+
+```sh
+bud update                   # pull latest verified GitHub release, back up data, swap, restart
+bud update --from-repo .     # build and install straight from a local checkout
+bud rollback                 # restore latest verified backup if an update ever misbehaves
 ```
 
-Without it, `bud chat` falls back to a plain streaming client.
+Or install straight from a source checkout (requires `uv`, Python 3.12+, and Apple Command Line Tools):
 
-### 2. Connect a model
-
-Sign in with your ChatGPT subscription:
-
-```bash
-uv run bud login chatgpt
+```sh
+git clone https://github.com/bamiboy237/bud.git && cd bud && uv sync --locked && uv run bud install --from-repo . --migrate-from .
 ```
 
-Or set `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, or `MUSE_API_KEY` privately in your
-environment or ignored `.env` file. Simulation also needs model access.
+## Development workflow
 
-### 3. Start chatting
+Daily-driver Bud (port `8420`, `app.bud.companion`, `~/.bud/`) stays isolated from development builds:
 
-Start the server and interactive terminal client in separate terminals:
+```sh
+scripts/dev-stack up              # isolated Bud Dev (app.bud.companion.dev), free port, temp data/workspace
+scripts/dev-stack up --simulate   # simulated inbox and calendar
+scripts/dev-stack down            # stop dev stack and delete temp state
+```
 
-```bash
-# Terminal 1: Use synthetic accounts and files
+Or run the simulated CLI stack in two terminals:
+
+```sh
 uv run bud serve --simulate
-
-# Terminal 2: Resume the primary conversation
 uv run bud chat
 ```
 
-Or ask a one-off question directly:
-
-```bash
-uv run bud ask "What are the core principles of event sourcing?"
-```
-
-### macOS companion
-
-Requires macOS 15 or later and Swift 6.2 or later. With the server running,
-build and launch the desktop companion:
-
-```bash
-./mac/build.sh --run
-```
-
-The build includes Bud's animated dog from `mac/Resources/pets/dog`.
-No separate artwork download is needed.
-
-Folders under `data/pets` override bundled pets with the same name.
-Set `BUD_PETS` to use another local pet folder.
-
-### Jobs and approvals
-
-Quick questions stay in the chat. Longer work runs as a separate job with its
-own history and approvals. Ask another question while a job waits, or name the
-job to revise it.
-
-Each proposal shows exact `/approve <reference>` and `/deny <reference>`
-commands. A correction replaces the affected job's proposal with a fresh
-reference. `/status` shows jobs and pending proposals. `/stop` stops the
-conversation and its open jobs.
-
-See [Jobs in the conversation](docs/jobs.md) for an example and API details.
-
----
+Optional Rust terminal UI (`cargo build --release --manifest-path tui/Cargo.toml`): without it, `bud chat` uses the Python client.
 
 ## CLI reference
 
-| Command | Description |
+| Command | Purpose |
 | :--- | :--- |
-| `bud serve` | Start the persistent Bud server |
-| `bud serve --simulate` | Start with synthetic accounts and files |
-| `bud chat` | Open the interactive terminal conversation |
+| `bud install` | Install standalone runtime, `Bud.app`, and LaunchAgent under `~/.bud/` |
+| `bud update` | Back up data, install latest GitHub release (or `--from-repo`), health-check, or roll back |
+| `bud rollback` | Restore `~/.bud/data/` from a verified backup and restart |
+| `bud service <action>` | Run `install`, `start`, `stop`, `restart`, `status`, `uninstall`, or `logs` |
+| `bud backup <action>` | Run `create`, `list`, or `restore` on `~/.bud/backups/` |
+| `bud serve [--simulate]` | Start the Bud HTTP/SSE core server (`--host`, `--port`, `--home`) |
+| `bud chat` | Open or resume the interactive terminal client (`--new`, `--url`) |
 | `bud ask "<prompt>"` | Send one prompt through the model gateway |
-| `bud models` | List available models |
-| `bud costs` | Inspect subscription token usage and metered API spend |
-| `bud eval` | Run evaluations against the simulated world |
-| `bud connect <app>` | Connect Gmail or Calendar through Composio |
+| `bud login chatgpt` / `logout` | Sign in or clear local ChatGPT OAuth credentials |
+| `bud models` / `bud costs` | List configured models or print daily token spend |
+| `bud connect <app>` / `connections` | Link `gmail` or `calendar` via Composio, or check status |
+| `bud grants [list\|revoke <tool>]` | List or revoke standing tool permissions |
+| `bud desktop ...` | Pair and control remote/local desktop verification workers |
+| `bud eval` | Run the offline-world model eval suite (spends real tokens) |
 
----
+## Docs
 
-## Guides
-
-* [Architecture and durability](docs/architecture.md)
-* [Jobs in the conversation](docs/jobs.md)
-* [Connect real accounts](docs/accounts.md)
-* [iMessage through Photon v2](docs/photon.md)
-* [Skills and tool extensibility](docs/skills.md)
-* [Security and approvals](docs/security.md)
-
----
+- [Setup, accounts, updates, and integrations](docs/setup.md)
+- [Architecture, jobs, routines, and skills](docs/architecture.md)
+- [Security and approval boundaries](docs/security.md)
+- [Testing and CI](docs/testing.md)
 
 ## License
 

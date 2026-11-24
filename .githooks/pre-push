@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+if ! command -v uv >/dev/null 2>&1; then
+  echo "pre-push: uv not on PATH, skipping fast local checks" >&2
+  exit 0
+fi
+
+uv run ruff check src tests
+uv run ruff format --check src tests
+uv run ty check

@@ -16,7 +16,7 @@ from pydantic_ai.messages import ModelResponse
 from pydantic_ai_harness import SpendLimits
 from pydantic_ai_harness.spend import Budget, SpendEntry, Spent
 
-from bud.gateway.registry import Registry
+from bud.gateway.registry import ModelSpec, Registry
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS spend (
@@ -113,7 +113,9 @@ class SqliteSpendStore:
         return totals
 
 
-def build_spend_limits(path: Path, registry: Registry, daily_usd: Decimal) -> SpendLimits | None:
+def build_spend_limits(
+    path: Path, registry: Registry | Callable[[], Registry], daily_usd: Decimal
+) -> SpendLimits | None:
     """A daily USD cap over every model response, priced from bud's model registry.
 
     None when the cap is zero (off). A response from a model the registry has no price
@@ -121,12 +123,23 @@ def build_spend_limits(path: Path, registry: Registry, daily_usd: Decimal) -> Sp
     """
     if daily_usd <= 0:
         return None
-    specs = {spec.id: spec for spec in registry.models}
+    if isinstance(registry, Registry):
+        static_specs: dict[str, ModelSpec] | None = {spec.id: spec for spec in registry.models}
+        getter: Callable[[], Registry] | None = None
+    else:
+        static_specs = None
+        getter = registry
 
     def price(response: ModelResponse) -> Decimal | None:
         # Gateway metadata identifies the route, including custom endpoints with the same name.
         route = (response.metadata or {}).get("bud_model_id")
-        spec = specs.get(route) if isinstance(route, str) else None
+        if not isinstance(route, str):
+            return None
+        if static_specs is not None:
+            spec = static_specs.get(route)
+        else:
+            assert getter is not None
+            spec = next((item for item in getter().models if item.id == route), None)
         cost = spec.cost(response.usage) if spec is not None else None
         return Decimal(str(cost)) if cost is not None else None
 

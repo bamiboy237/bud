@@ -320,6 +320,10 @@ final class Companion {
 
     /// Pure connection lifecycle state machine with monotonic attempt fencing and exponential backoff.
     private(set) var connectionMachine = ConnectionMachine()
+    /// Server package version reported by `/runtime`.
+    private(set) var serverVersion: String?
+    /// True when the server started without any configured model.
+    var needsOnboarding = false
     /// Brief confirmation flag for the menu bar when diagnostics are copied.
     private(set) var diagnosticsCopied = false
     @ObservationIgnored private var diagnosticsClearTask: Task<Void, Never>?
@@ -341,6 +345,14 @@ final class Companion {
     func connectForTesting(_ connection: BudConnection, session: String = "s1") {
         self.connection = connection
         self.session = session
+    }
+
+    func sendOnboardingRequest(
+        _ method: String, _ path: String, json: [String: Any]? = nil
+    ) async throws -> [String: Any] {
+        let active = try connection ?? BudConnection(settings: BudSettings.load())
+        let req = active.request(method, path, json: json)
+        return try await active.send(req)
     }
     @ObservationIgnored private var blocks: [(id: String, text: String)] = []
     /// Model requests already streamed. A second text.reset for one means bud is replaying that
@@ -396,6 +408,7 @@ final class Companion {
         setupProblems = [:]
         activeTasks = []
         connection = nil
+        serverVersion = nil
         let effects = connectionMachine.reduce(.start(resetBackoff: resetBackoff))
         link = connectionMachine.link
         applyConnectionEffects(effects)
@@ -415,6 +428,8 @@ final class Companion {
                         var connection = try BudConnection(settings: BudSettings.load())
                         let runtime = try await connection.send("GET", "runtime")
                         connection.scope = runtime["scope"] as? String ?? ""
+                        let runtimeVersion = runtime["version"] as? String
+                        let needsSetup = (runtime["needs_onboarding"] as? Bool) ?? false
                         let primary = try await connection.send("POST", "sessions/primary", json: [:])
                         guard let session = primary["session_id"] as? String else {
                             throw ConnectionError.http(0, "no session returned")
@@ -423,9 +438,14 @@ final class Companion {
                         let nextEffects = connectionMachine.reduce(.handshakeSucceeded(attempt: mine))
                         guard !nextEffects.isEmpty else { return }
                         self.connection = connection
+                        self.serverVersion = runtimeVersion
+                        self.needsOnboarding = needsSetup
                         self.session = session
                         seenSeq = 0
                         apply(snapshot: snapshot)
+                        if needsSetup {
+                            OnboardingWindow.shared.showIfNeeded()
+                        }
                         let startSeq = snapshot["last_seq"] as? Int ?? 0
                         for next in nextEffects {
                             if case .startStream(let attempt) = next {
@@ -1416,7 +1436,8 @@ final class Companion {
             voiceKey: voice.keyName,
             needsAccessibility: voice.needsAccessibility,
             recentNotices: notices.map(\.text),
-            recentErrors: errors
+            recentErrors: errors,
+            serverVersion: serverVersion
         )
     }
 

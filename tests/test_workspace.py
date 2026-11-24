@@ -319,3 +319,21 @@ async def test_the_agent_reads_workspace_files_through_code_mode(tmp_path):
     assert [r["tool"] for r in results] == ["run_code"]
     assert results[0]["outcome"] == "success"
     assert "Cedar first draft" in results[0]["result"]
+
+
+async def test_create_auto_creates_missing_parent_folders_and_update_requires_existing_parent(
+    workspace,
+):
+    root, tools = workspace
+    created = tools["workspace_create"](approved("sub-1"), "notes/2026/review.md", "Nested note")
+    assert result_of(created)["ok"] is True
+    assert (root / "notes" / "2026" / "review.md").read_text() == "Nested note"
+    assert oct((root / "notes").stat().st_mode & 0o777) == "0o700"
+    assert oct((root / "notes" / "2026").stat().st_mode & 0o777) == "0o700"
+
+    revision = content_hash(await Reader(root).read("notes/2026/review.md"))
+    missing_update = tools["workspace_update"](
+        approved("sub-2"), "missing/folder/review.md", "Nope", revision
+    )
+    assert result_of(missing_update)["ok"] is False
+    assert not (root / "missing").exists()
