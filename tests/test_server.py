@@ -762,11 +762,16 @@ def test_sigterm_during_inflight_durable_run_stops_fast_and_recovers(tmp_path):
         assert state["transcript"][-1]["text"] == "Offline reply."
         assert len(server.events("run.completed")) == 1
         with sqlite3.connect(server.data / "runtime.db") as db:
-            row = db.execute(
-                "SELECT status FROM workflow_status WHERE workflow_uuid = ?",
-                (run_id,),
-            ).fetchone()
-            assert row is not None and row[0] == "SUCCESS", (row, server.logs())
+            # The reply is visible before DBOS records the workflow's final status.
+            server.wait(
+                lambda: (
+                    db.execute(
+                        "SELECT status FROM workflow_status WHERE workflow_uuid = ?", (run_id,)
+                    ).fetchone()
+                    == ("SUCCESS",)
+                ),
+                "DBOS records the recovered workflow as successful",
+            )
 
 
 def test_routine_and_task_survive_real_process_restart_and_paused_stays_paused(tmp_path):

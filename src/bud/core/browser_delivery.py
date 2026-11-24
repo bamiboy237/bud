@@ -5,6 +5,7 @@ import base64
 import binascii
 import hashlib
 import json
+import os
 from contextlib import suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -137,10 +138,17 @@ def local_routes(view: BrowserView) -> APIRouter:
                 state = await _inspect_existing(view, path, tab, body)
                 return {"state": "delivered" if state == "delivered" else "uncertain"}
             if body.action == "prepare":
+                try:
+                    browsers = (await view._inventory(path))["browsers"]
+                except HTTPException:
+                    return {"state": "unavailable"}
+                if len(browsers) != 1:
+                    return {"state": "unavailable"}
                 # Reopening this ID keeps the existing tab and its unsaved form.
                 params = {
                     "action": "new",
                     "id": tab,
+                    "browser": browsers[0]["id"],
                     "url": body.form.url,
                     "keepOpen": True,
                     "allowedOrigins": [body.form.origin],
@@ -169,42 +177,40 @@ def local_routes(view: BrowserView) -> APIRouter:
             if state != "ready":
                 return {"state": "delivered" if state == "delivered" else "uncertain"}
             try:
-                with TemporaryDirectory(prefix="bud-delivery-") as folder:
+                # Browse includes /tmp on Unix, even if Bud and the relay use different TMPDIRs.
+                with TemporaryDirectory(
+                    dir="/tmp" if os.name == "posix" else None, prefix="bud-delivery-"
+                ) as folder:
                     copy = Path(folder) / body.file.name
                     if copy.parent != Path(folder) or body.file.name in {".", ".."}:
                         raise HTTPException(422, "Invalid file name.")
                     copy.write_bytes(data)
-                    await view._command(
+                    await view._tab_command(
                         path,
                         "fill",
-                        "--tab",
                         tab,
-                        "--selector",
-                        f"#{body.form.reference_input}",
-                        "--value",
-                        body.step,
+                        selector=f"#{body.form.reference_input}",
+                        value=body.step,
                         timeout=12,
                     )
-                    await view._command(
+                    state = await _inspect_existing(view, path, tab, body)
+                    if state != "ready":
+                        return {"state": "delivered" if state == "delivered" else "uncertain"}
+                    await view._tab_command(
                         path,
                         "upload",
-                        "--tab",
                         tab,
-                        "--selector",
-                        f"#{body.form.file_input}",
-                        "--files",
-                        str(copy),
+                        selector=f"#{body.form.file_input}",
+                        files=str(copy),
                         timeout=30,
                     )
-                    # A site's file-input handler may have already sent it. Inspect before clicking.
+                    # Do not click if the form changed or a receipt already appeared.
                     if await _inspect_existing(view, path, tab, body) == "ready":
-                        await view._command(
+                        await view._tab_command(
                             path,
                             "click",
-                            "--tab",
                             tab,
-                            "--selector",
-                            f"#{body.form.submit_button}",
+                            selector=f"#{body.form.submit_button}",
                             timeout=18,
                         )
             except (OSError, RuntimeError, TimeoutError):

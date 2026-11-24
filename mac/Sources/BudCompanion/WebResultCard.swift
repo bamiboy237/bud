@@ -31,19 +31,18 @@ struct WebLinkCard: View {
             }
             .padding(10)
             .frame(maxWidth: 420, alignment: .leading)
-            .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusMD))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PaperHit(shape: RoundedRectangle(cornerRadius: Paper.radiusMD), fill: Paper.elevated))
     }
 }
 
 struct WebImageCard: View {
     let url: URL
     let title: String
-    @State private var requested = false
+    @StateObject private var requested = Flag()
 
     var body: some View {
-        if requested {
+        if requested.on {
             AsyncImage(url: url) { phase in
                 switch phase {
                 case .success(let image):
@@ -58,7 +57,7 @@ struct WebImageCard: View {
                 }
             }
         } else {
-            Button { requested = true } label: {
+            Button { requested.on = true } label: {
                 HStack(spacing: 9) {
                     Image(systemName: "photo").foregroundStyle(Paper.accent)
                     VStack(alignment: .leading, spacing: 4) {
@@ -68,9 +67,8 @@ struct WebImageCard: View {
                     }
                 }
                 .padding(10)
-                .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusMD))
             }
-            .buttonStyle(.plain)
+            .buttonStyle(PaperHit(shape: RoundedRectangle(cornerRadius: Paper.radiusMD), fill: Paper.elevated))
             .help("Load image")
         }
     }

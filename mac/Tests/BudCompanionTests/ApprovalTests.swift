@@ -313,19 +313,19 @@ struct ApprovalTests {
         companion.apply(snapshot: [
             "last_seq": 1,
             "pending_approvals": [
-                ["approval_id": "a", "tool": "ask_user", "args": [:], "run_id": "run"]
+                ["approval_id": "a", "tool": "send_email", "args": [:], "run_id": "run"]
             ],
         ])
         companion.draft = "unfinished message"
-        companion.write(.answer("a"))
-        companion.draft = "unfinished answer"
+        companion.write(.revise("a"))
+        companion.draft = "unfinished revision"
         companion.write(.ask)
         #expect(companion.draft == "unfinished message")
-        companion.write(.answer("a"))
-        #expect(companion.draft == "unfinished answer")
+        companion.write(.revise("a"))
+        #expect(companion.draft == "unfinished revision")
         companion.apply(snapshot: ["last_seq": 2, "pending_approvals": []])
         #expect(companion.inputPurpose == .ask)
-        #expect(companion.draft == "unfinished message\n\nunfinished answer")
+        #expect(companion.draft == "unfinished message\n\nunfinished revision")
     }
 }
 

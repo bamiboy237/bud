@@ -1,12 +1,18 @@
 """Cross-worker browser jobs hold approvals across restart and never reissue a submit."""
 
 import base64
+import hashlib
 import json
 import sys
+from pathlib import Path
 
 import httpx
 import pytest
+from fastapi import FastAPI
 
+from bud.browser import Consent, Relay
+from bud.core.browser_delivery import local_routes
+from bud.core.browser_view import BrowserView
 from bud.core.handoff import WORKER_PATH
 from bud.core.handoff_client import work_once
 from tests.test_server import running
@@ -18,6 +24,106 @@ FORM = {
     "submit_button": "submit-form",
     "receipt": "receipt-number",
 }
+
+
+@pytest.mark.parametrize("browser_count", [0, 1, 2])
+async def test_prepare_requires_one_browser(tmp_path, monkeypatch, browser_count):
+    consent = Consent(tmp_path / "consent")
+    consent.set(True)
+    view = BrowserView(tmp_path / "private", consent, Relay(tmp_path), lambda: Path("browse"))
+    opened = []
+
+    async def command(_, action, *args, timeout):
+        if action == "status":
+            browsers = [
+                {"id": f"browser-{index}", "connected": True} for index in range(browser_count)
+            ]
+            return json.dumps(
+                {"extension": {"connected": bool(browsers), "browsers": browsers}, "tabs": []}
+            ).encode()
+        if action == "tabs":
+            assert args[0] == "--json"
+            opened.append(json.loads(args[1])["browser"])
+            return b"{}"
+        assert action == "execute"
+        return b'{"state":"ready"}'
+
+    monkeypatch.setattr(view, "_command", command)
+    app = FastAPI()
+    app.include_router(local_routes(view))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/browser/desktop-delivery",
+            json={"step": "d" * 32, "form": FORM, "action": "prepare"},
+        )
+    assert response.json() == {"state": "ready" if browser_count == 1 else "unavailable"}
+    assert opened == (["browser-0"] if browser_count == 1 else [])
+
+
+@pytest.mark.parametrize(
+    ("states", "actions", "outcome"),
+    [
+        (["ready", "ready", "ready", "delivered"], ["fill", "upload", "click"], "delivered"),
+        (["ready", "ready", "delivered", "delivered"], ["fill", "upload"], "delivered"),
+        (["ready", "other_page"], ["fill"], "uncertain"),
+    ],
+)
+async def test_local_submit_uses_browse_json_and_rechecks_form(
+    tmp_path, monkeypatch, states, actions, outcome
+):
+    consent = Consent(tmp_path / "consent")
+    consent.set(True)
+    view = BrowserView(tmp_path / "private", consent, Relay(tmp_path), lambda: Path("browse"))
+    step = "d" * 32
+    content = b"synthetic document"
+    attachment = {"id": "a" * 32, "name": "test invoice.txt"}
+    observed = []
+    copies = []
+    inspections = iter(states)
+
+    async def command(_, action, *args, timeout):
+        if action == "execute":
+            return b"tab: 7\n" + json.dumps({"state": next(inspections)}).encode()
+        flag, encoded = args
+        assert flag == "--json"
+        payload = json.loads(encoded)
+        assert payload.pop("tab") == f"delivery-{step}"
+        if action == "upload":
+            copy = Path(payload.pop("files"))
+            assert copy.name == attachment["name"]
+            assert copy.read_bytes() == content
+            copies.append(copy)
+        expected = {
+            "fill": {"selector": "#reference", "value": step},
+            "upload": {"selector": "#invoice-file"},
+            "click": {"selector": "#submit-form"},
+        }
+        assert payload == expected[action]
+        observed.append(action)
+        return b"{}"
+
+    monkeypatch.setattr(view, "_command", command)
+    app = FastAPI()
+    app.include_router(local_routes(view))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/browser/desktop-delivery",
+            json={
+                "step": step,
+                "form": FORM,
+                "action": "submit",
+                "file": attachment,
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "data": base64.b64encode(content).decode(),
+            },
+        )
+    assert response.json() == {"state": outcome}
+    assert observed == actions
+    assert all(not copy.exists() for copy in copies)
 
 
 @pytest.mark.parametrize("cut", ["before_submit", "after_submit"])

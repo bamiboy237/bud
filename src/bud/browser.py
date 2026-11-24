@@ -326,12 +326,35 @@ class BrowseTools(AbstractToolset[None]):
                 tools = await connection.get_tools(ctx)
                 if name not in tools:
                     return f"{name} is not available right now, so nothing was done."
-                return await connection.call_tool(name, tool_args, ctx, tools[name])
+                result = await connection.call_tool(name, tool_args, ctx, tools[name])
+                if self.view is not None:
+                    tab = _tool_tab(name, tool_args, result)
+                    if tab is not None:
+                        self.view.active_tab = tab
+                return result
         except ToolFailed:
             raise  # Browse's own error message, which the model sees and can act on
         except Exception as exc:
             logger.warning("browse mcp failed during %s: %s", name, type(exc).__name__)
             return "Browse could not be reached, so nothing was done. Call browser_status."
+
+
+def _tool_tab(name: str, args: dict[str, Any], result: Any) -> str | None:
+    opens_tab = name == "browser_navigate" or (name == TABS and args.get("action") == "new")
+    if not opens_tab and name not in TOOLS - {TABS, "browser_status"}:
+        return None
+    tab = args.get("tab")
+    if opens_tab:
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except ValueError:
+                result = None
+        if isinstance(result, dict):
+            tab = result.get("tab") or tab
+    if type(tab) is int or isinstance(tab, str):
+        return str(tab) if re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", str(tab)) else None
+    return None
 
 
 def toolset(

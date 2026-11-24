@@ -8,6 +8,7 @@ import re
 from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Response
@@ -39,6 +40,7 @@ class BrowserView:
         if not marker.exists():
             self.ready.set()
         self.handoff: asyncio.Task[None] | None = None
+        self.active_tab: str | None = None
 
     @property
     def private(self) -> bool:
@@ -76,22 +78,84 @@ class BrowserView:
             raise RuntimeError("Browse could not perform the requested action.")
         return out
 
+    async def _tab_command(
+        self,
+        path: Path,
+        action: str,
+        tab: str,
+        *,
+        timeout: float,
+        output: Path | None = None,
+        **arguments: Any,
+    ) -> bytes:
+        payload = json.dumps({"tab": int(tab) if tab.isdecimal() else tab, **arguments})
+        args = ("--output", str(output)) if output is not None else ()
+        return await self._command(path, action, "--json", payload, *args, timeout=timeout)
+
+    async def _inventory(self, path: Path) -> dict[str, Any]:
+        offline = {"connected": False, "browsers": [], "tabs": []}
+        try:
+            status = json.loads(await self._command(path, "status", "--json", timeout=5))
+            match status:
+                case {"relay": {"running": False}}:
+                    return offline
+                case {
+                    "extension": {"connected": bool(connected)} as extension,
+                    "tabs": list(items),
+                }:
+                    sources = extension.get("browsers", [])
+                    if not isinstance(sources, list):
+                        raise ValueError("Invalid Browse browser list.")
+                case _:
+                    raise ValueError("Invalid Browse status.")
+        except (OSError, ValueError, RuntimeError, TimeoutError):
+            raise HTTPException(
+                502, "Couldn’t load Browse tabs. Check the Browse connection."
+            ) from None
+
+        if not connected:
+            return offline
+
+        browsers = []
+        for source in sources:
+            if not isinstance(source, dict) or source.get("connected") is not True:
+                continue
+            identity = source.get("id")
+            if isinstance(identity, str) and identity:
+                browsers.append({"id": identity, "name": str(source.get("name") or identity)[:160]})
+        tabs = []
+        active = None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            tab_id = str(item.get("tab", item.get("id", "")))
+            if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", tab_id):
+                continue
+            if self.active_tab is not None and self.active_tab in (tab_id, item.get("id")):
+                active = tab_id
+            try:
+                host = urlsplit(str(item.get("url", ""))).hostname
+            except ValueError:
+                host = None
+            source_id = item.get("browser")
+            tabs.append(
+                {
+                    "id": tab_id,
+                    "title": str(item.get("title") or "Browser tab")[:160],
+                    "host": host or "",
+                    "browser": source_id if isinstance(source_id, str) else None,
+                }
+            )
+        return {"connected": True, "browsers": browsers, "tabs": tabs, "active_tab": active}
+
     async def request_handoff(self, path: Path, tab: str, message: str) -> dict[str, str]:
         """Run while holding lock. Return only the upstream outcome enum to the model."""
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", tab):
             return {"outcome": "unavailable"}
         self.enter()
         try:
-            raw = await self._command(
-                path,
-                "handoff",
-                "--tab",
-                tab,
-                "--message",
-                message,
-                "--timeoutSeconds",
-                "600",
-                timeout=610,
+            raw = await self._tab_command(
+                path, "handoff", tab, timeout=610, message=message, timeoutSeconds=600
             )
             outcome = json.loads(raw)["outcome"]
         except (OSError, RuntimeError, TimeoutError, KeyError, ValueError, TypeError):
@@ -132,22 +196,7 @@ class BrowserView:
                 path = self.locate()
                 if not self.consent.on() or path is None:
                     return {"private": False, "enabled": False, "tabs": []}
-                tabs = []
-                for item in await browser._tabs(path, self.relay):
-                    tab_id = str(item.get("tab", item.get("id", "")))
-                    if re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", tab_id):
-                        try:
-                            host = urlsplit(str(item.get("url", ""))).hostname
-                        except ValueError:
-                            host = None
-                        tabs.append(
-                            {
-                                "id": tab_id,
-                                "title": str(item.get("title") or "Browser tab")[:160],
-                                "host": host or "",
-                            }
-                        )
-                return {"private": False, "enabled": True, "tabs": tabs}
+                return {"private": False, "enabled": True, **await self._inventory(path)}
 
         @router.get("/browser/view/{tab}/image")
         async def image(tab: str):
@@ -163,18 +212,14 @@ class BrowserView:
                 try:
                     with TemporaryDirectory(dir=self.relay.home) as folder:
                         output = Path(folder) / "preview.jpg"
-                        await self._command(
+                        await self._tab_command(
                             path,
                             "screenshot",
-                            "--tab",
                             tab,
-                            "--format",
-                            "jpeg",
-                            "--quality",
-                            "55",
-                            "--output",
-                            str(output),
                             timeout=10,
+                            output=output,
+                            format="jpeg",
+                            quality=55,
                         )
                         with output.open("rb") as stream:
                             data = stream.read(8 * 1024 * 1024 + 1)

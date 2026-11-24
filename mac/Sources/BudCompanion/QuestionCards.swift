@@ -27,7 +27,9 @@ struct QuestionAnswers: Equatable {
     var isLast: Bool { index == questions.count - 1 }
     var current: Question { questions[index] }
     var picked: [String] { given[index]?.selected ?? [] }
-    var typed: String? { given[index]?.custom }
+    var canAdvance: Bool { completedAnswer(at: index) != nil }
+
+    func typed(at position: Int) -> String? { given[position]?.custom }
 
     mutating func choose(_ label: String) {
         if !current.multiSelect {
@@ -45,9 +47,7 @@ struct QuestionAnswers: Equatable {
     }
 
     mutating func type(_ text: String, at position: Int) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, questions.indices.contains(position) else { return }
-        given[position] = QuestionAnswer(header: questions[position].header, selected: [], custom: trimmed)
+        given[position] = QuestionAnswer(header: questions[position].header, selected: [], custom: text)
     }
 
     mutating func show(_ position: Int) {
@@ -58,18 +58,24 @@ struct QuestionAnswers: Equatable {
     var completedAnswers: [QuestionAnswer]? {
         var all: [QuestionAnswer] = []
         for position in questions.indices {
-            guard let answer = given[position] else { return nil }
+            guard let answer = completedAnswer(at: position) else { return nil }
             all.append(answer)
         }
         return all
+    }
+
+    private func completedAnswer(at position: Int) -> QuestionAnswer? {
+        guard let answer = given[position] else { return nil }
+        guard let custom = answer.custom else { return answer }
+        let trimmed = custom.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return QuestionAnswer(header: answer.header, selected: [], custom: trimmed)
     }
 }
 
 @MainActor
 final class QuestionFlow: ObservableObject {
     @Published var answers: QuestionAnswers
-    @Published var forward = true
-    private(set) var typingAt = 0
     private let submit: ([QuestionAnswer]) -> Void
 
     init(questions: [Question], submit: @escaping ([QuestionAnswer]) -> Void) {
@@ -78,34 +84,15 @@ final class QuestionFlow: ObservableObject {
     }
 
     func advance() {
+        guard answers.canAdvance else { return }
         if answers.isLast {
-            sendIfComplete()
+            if let all = answers.completedAnswers { submit(all) }
         } else {
-            move(to: answers.index + 1)
+            answers.show(answers.index + 1)
         }
     }
 
-    func back() { move(to: answers.index - 1) }
-    func startTyping() { typingAt = answers.index }
-
-    func answerTyped(_ text: String) {
-        answers.type(text, at: typingAt)
-        if typingAt < answers.questions.count - 1 {
-            move(to: typingAt + 1)
-        } else {
-            sendIfComplete()
-        }
-    }
-
-    private func move(to position: Int) {
-        guard answers.questions.indices.contains(position) else { return }
-        forward = position > answers.index
-        answers.show(position)
-    }
-
-    private func sendIfComplete() {
-        if let all = answers.completedAnswers { submit(all) }
-    }
+    func back() { answers.show(answers.index - 1) }
 }
 
 struct QuestionCards: View {
@@ -113,7 +100,6 @@ struct QuestionCards: View {
     let approval: Approval
     @ObservedObject var flow: QuestionFlow
     let listLimit: CGFloat
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.replyType) private var replyType
 
     private var answers: QuestionAnswers { flow.answers }
@@ -130,27 +116,19 @@ struct QuestionCards: View {
     private var compactBody: some View {
         VStack(alignment: .leading, spacing: 10) {
             if answers.questions.count > 1 { navigation }
-            ZStack(alignment: .topLeading) {
-                QuestionPage(
-                    question: answers.current, picked: answers.picked, typed: answers.typed,
-                    isLast: answers.isLast, listLimit: listLimit, onPick: pick,
-                    onNext: { flow.advance() },
-                    onSomethingElse: {
-                        flow.startTyping()
-                        companion.write(.answer(approval.id))
-                    }
-                )
-                .id(answers.index)
-                .transition(transition)
-            }
-            .clipped()
-            .animation(.easeOut(duration: 0.25), value: answers.index)
+            QuestionPage(
+                question: answers.current, picked: answers.picked, canSend: answers.canAdvance,
+                showsFooter: answers.current.multiSelect || answers.current.options.isEmpty
+                    || answers.typed(at: answers.index) != nil || answers.canAdvance,
+                customAnswer: inlineAnswer, isLast: answers.isLast, listLimit: listLimit,
+                onPick: pick, onNext: flow.advance
+            )
+            .id(answers.index)
         }
     }
 
     private var windowBody: some View {
-        let canSend = !answers.picked.isEmpty || answers.typed != nil
-        return VStack(alignment: .leading, spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .center, spacing: 8) {
                     Text(answers.questions.count > 1
@@ -175,23 +153,11 @@ struct QuestionCards: View {
                     }
                 }
 
-                ZStack(alignment: .topLeading) {
-                    WindowQuestionPage(
-                        question: answers.current,
-                        picked: answers.picked,
-                        typed: answers.typed,
-                        listLimit: max(listLimit, 240),
-                        onSelect: { label in flow.answers.choose(label) },
-                        onSomethingElse: {
-                            flow.startTyping()
-                            companion.write(.answer(approval.id))
-                        }
-                    )
-                    .id(answers.index)
-                    .transition(transition)
-                }
-                .clipped()
-                .animation(.easeOut(duration: 0.25), value: answers.index)
+                WindowQuestionPage(
+                    question: answers.current, picked: answers.picked, customAnswer: inlineAnswer,
+                    listLimit: max(listLimit, 240), onSelect: { flow.answers.choose($0) }
+                )
+                .id(answers.index)
 
                 if let problem = companion.approvalFailures[approval.id] ?? companion.decisionProblem {
                     Text(problem)
@@ -212,14 +178,10 @@ struct QuestionCards: View {
                         .buttonStyle(CardButton(kind: .quiet))
                 }
                 Spacer(minLength: 8)
-                Button(answers.isLast ? "Submit" : "Next") {
-                    withTransaction(Transaction(animation: nil)) {
-                        flow.advance()
-                    }
-                }
-                .buttonStyle(CardButton(kind: .primary))
-                .disabled(!canSend)
-                .opacity(canSend ? 1 : 0.45)
+                Button(answers.isLast ? "Submit" : "Next", action: flow.advance)
+                    .buttonStyle(CardButton(kind: .primary))
+                    .disabled(!answers.canAdvance)
+                    .opacity(answers.canAdvance ? 1 : 0.45)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
@@ -231,11 +193,17 @@ struct QuestionCards: View {
         if !answers.current.multiSelect { flow.advance() }
     }
 
-    private var transition: AnyTransition {
-        if reduceMotion { return .opacity }
-        return .asymmetric(
-            insertion: .move(edge: flow.forward ? .trailing : .leading),
-            removal: .move(edge: flow.forward ? .leading : .trailing))
+    private var inlineAnswer: some View {
+        let position = answers.index
+        return InlineCustomAnswer(
+            text: Binding(
+                get: { flow.answers.typed(at: position) },
+                set: { flow.answers.type($0 ?? "", at: position) }
+            ),
+            hasOptions: !answers.current.options.isEmpty,
+            onSubmit: flow.advance,
+            onFocus: { companion.focusQuestion(approval.id, position: position, focused: $0) }
+        )
     }
 
     private var navigation: some View {
@@ -256,13 +224,12 @@ struct QuestionCards: View {
 
 /// Structured question page for the full Conversation Window: bold question title, helper line,
 /// and rounded selectable option rows with left radio/check indicator and right numeric badge.
-private struct WindowQuestionPage: View {
+private struct WindowQuestionPage<CustomAnswer: View>: View {
     let question: Question
     let picked: [String]
-    let typed: String?
+    let customAnswer: CustomAnswer
     let listLimit: CGFloat
     let onSelect: (String) -> Void
-    let onSomethingElse: () -> Void
     @StateObject private var layout = ApprovalLayout()
 
     var body: some View {
@@ -272,9 +239,11 @@ private struct WindowQuestionPage: View {
                     .font(Fonts.sans(size: 14.5, weight: Fonts.OpticalWeight.semibold))
                     .foregroundStyle(Paper.inkPrimary)
                     .fixedSize(horizontal: false, vertical: true)
-                Text(question.multiSelect ? "Select one or more answers" : "Select one answer")
-                    .font(Paper.Typography.caption)
-                    .foregroundStyle(Paper.inkMuted)
+                if !question.options.isEmpty {
+                    Text(question.multiSelect ? "Select one or more answers" : "Select one answer")
+                        .font(Paper.Typography.caption)
+                        .foregroundStyle(Paper.inkMuted)
+                }
             }
 
             ScrollView {
@@ -285,20 +254,10 @@ private struct WindowQuestionPage: View {
                             index: index + 1,
                             selected: picked.contains(option.label),
                             multiSelect: question.multiSelect,
-                            action: {
-                                withTransaction(Transaction(animation: nil)) {
-                                    onSelect(option.label)
-                                }
-                            }
+                            action: { onSelect(option.label) }
                         )
-                        .modifier(Stagger(index: index))
                     }
-                    WindowCustomAnswerRow(
-                        typed: typed,
-                        hasOptions: !question.options.isEmpty,
-                        action: onSomethingElse
-                    )
-                    .modifier(Stagger(index: question.options.count))
+                    customAnswer
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { layout.height = $0 }
@@ -315,7 +274,6 @@ private struct WindowOptionRow: View {
     let selected: Bool
     let multiSelect: Bool
     let action: () -> Void
-    @StateObject private var hovered = Flag()
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -355,7 +313,7 @@ private struct WindowOptionRow: View {
             .padding(.vertical, 9)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
-                selected ? Paper.citationFill : hovered.on ? Paper.fillHover : Paper.fillSubtle,
+                selected ? Paper.citationFill : Paper.fillSubtle,
                 in: shape
             )
             .overlay(
@@ -365,9 +323,7 @@ private struct WindowOptionRow: View {
             )
             .contentShape(shape)
         }
-        .buttonStyle(PressScaleOptionStyle())
-        .pointerStyle(.link)
-        .onHover { hovered.on = $0 }
+        .buttonStyle(PaperHit(shape: shape))
         .accessibilityLabel(option.description.map { "\(option.label), \($0)" } ?? option.label)
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
@@ -383,7 +339,7 @@ private struct WindowOptionRow: View {
                         .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(Paper.canvas)
                 } else {
-                    box.strokeBorder(hovered.on ? Paper.inkSecondary : Paper.borderStrong, lineWidth: 1)
+                    box.strokeBorder(Paper.borderStrong, lineWidth: 1)
                 }
             }
             .frame(width: 15, height: 15)
@@ -391,7 +347,7 @@ private struct WindowOptionRow: View {
             ZStack {
                 Circle()
                     .strokeBorder(
-                        selected ? Paper.accent : hovered.on ? Paper.inkSecondary : Paper.borderStrong,
+                        selected ? Paper.accent : Paper.borderStrong,
                         lineWidth: selected ? 1.5 : 1)
                 if selected {
                     Circle()
@@ -404,70 +360,76 @@ private struct WindowOptionRow: View {
     }
 }
 
-private struct WindowCustomAnswerRow: View {
-    let typed: String?
+private struct InlineCustomAnswer: View {
+    @Binding var text: String?
     let hasOptions: Bool
-    let action: () -> Void
-    @StateObject private var hovered = Flag()
+    let onSubmit: () -> Void
+    let onFocus: (Bool) -> Void
+    @Environment(\.replyType) private var replyType
+    @FocusState private var focused: Bool
 
     var body: some View {
-        let hasCustom = typed != nil
-        let shape = RoundedRectangle(cornerRadius: 8, style: .continuous)
-        Button(action: action) {
-            HStack(alignment: .center, spacing: 10) {
-                Image(systemName: hasCustom ? "checkmark.circle.fill" : "pencil")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(hasCustom ? Paper.accent : Paper.inkMuted)
-                    .frame(width: 15, height: 15)
-                Text(typed ?? (hasOptions ? "Something else…" : "Answer in your own words…"))
-                    .font(Paper.Typography.callout)
-                    .foregroundStyle(hasCustom ? Paper.inkPrimary : Paper.inkSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 6)
+        content
+            .onChange(of: focused) { _, active in onFocus(active) }
+            .onDisappear { onFocus(false) }
+    }
+
+    @ViewBuilder private var content: some View {
+        let shape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
+        if text != nil || !hasOptions {
+            row {
+                ChatInput(
+                    title: "Your answer",
+                    text: Binding(get: { text ?? "" }, set: { text = $0 }),
+                    focus: $focused, submit: onSubmit
+                )
+                .lineLimit(1...4)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                hasCustom ? Paper.citationFill : hovered.on ? Paper.fillHover : Paper.fillSubtle,
-                in: shape
-            )
-            .overlay(
-                shape.strokeBorder(
-                    hasCustom ? Paper.accent : Paper.borderSubtle,
-                    lineWidth: hasCustom ? 1 : 0.5)
-            )
-            .contentShape(shape)
+            .background(Paper.fillSubtle, in: shape)
+            .overlay { shape.strokeBorder(focused ? Paper.borderFocus : Paper.borderSubtle, lineWidth: 1) }
+        } else {
+            Button {
+                if replyType.compact { PetPanel.current?.makeKey() }
+                text = ""
+                focused = true
+            } label: {
+                row {
+                    Text("Something else…").foregroundStyle(Paper.inkSecondary)
+                    Spacer(minLength: 0)
+                }
+            }
+            .buttonStyle(PaperHit(shape: shape, fill: Paper.fillSubtle))
+            .accessibilityLabel("Something else")
         }
-        .buttonStyle(PressScaleOptionStyle())
-        .pointerStyle(.link)
-        .onHover { hovered.on = $0 }
-        .accessibilityLabel(hasOptions ? "Something else" : "Answer in your own words")
+    }
+
+    private func row(@ViewBuilder content: () -> some View) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "pencil")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(Paper.inkSecondary)
+                .frame(width: 15)
+                .accessibilityHidden(true)
+            content()
+        }
+        .font(Paper.Typography.callout)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
-private struct PressScaleOptionStyle: ButtonStyle {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .scaleEffect(!reduceMotion && configuration.isPressed ? 0.97 : 1.0)
-            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
-    }
-}
-
-private struct QuestionPage: View {
+private struct QuestionPage<CustomAnswer: View>: View {
     let question: Question
     let picked: [String]
-    let typed: String?
+    let canSend: Bool
+    let showsFooter: Bool
+    let customAnswer: CustomAnswer
     let isLast: Bool
     let listLimit: CGFloat
     let onPick: (String) -> Void
     let onNext: () -> Void
-    let onSomethingElse: () -> Void
     @StateObject private var layout = ApprovalLayout()
-
-    private var canSend: Bool { !picked.isEmpty || typed != nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -477,17 +439,13 @@ private struct QuestionPage: View {
                         .font(Paper.Typography.callout)
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.bottom, 4)
-                    ForEach(Array(question.options.enumerated()), id: \.offset) { index, option in
+                    ForEach(Array(question.options.enumerated()), id: \.offset) { _, option in
                         Button { onPick(option.label) } label: { optionRow(option) }
                             .buttonStyle(ChoiceRow())
                             .accessibilityLabel(option.description.map { "\(option.label), \($0)" } ?? option.label)
                             .accessibilityAddTraits(picked.contains(option.label) ? .isSelected : [])
-                            .modifier(Stagger(index: index))
                     }
-                    Button(action: onSomethingElse) { answerRow }
-                        .buttonStyle(ChoiceRow())
-                        .accessibilityLabel(question.options.isEmpty ? "Answer in your own words" : "Something else")
-                        .modifier(Stagger(index: question.options.count))
+                    customAnswer
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { layout.height = $0 }
@@ -495,7 +453,7 @@ private struct QuestionPage: View {
             }
             .frame(height: min(layout.height, listLimit))
             .scrollBounceBehavior(.basedOnSize)
-            if question.multiSelect || canSend {
+            if showsFooter {
                 HStack(spacing: 0) {
                     Spacer(minLength: 0)
                     Button(isLast ? "Send" : "Next", action: onNext)
@@ -525,17 +483,6 @@ private struct QuestionPage: View {
             }
             Spacer(minLength: 0)
             RowSymbol(name: symbol)
-        }
-        .font(Paper.Typography.callout)
-    }
-
-    private var answerRow: some View {
-        HStack(spacing: 8) {
-            Text(typed ?? (question.options.isEmpty ? "Answer…" : "Something else…"))
-                .foregroundStyle(typed == nil ? Paper.inkSecondary : Paper.inkPrimary)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-            RowSymbol(name: typed == nil ? "pencil" : "checkmark")
         }
         .font(Paper.Typography.callout)
     }
