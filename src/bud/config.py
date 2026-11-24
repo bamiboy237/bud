@@ -2,6 +2,8 @@
 The gateway and the core server read API keys and the data directory through `get_settings()`.
 """
 
+import os
+from collections.abc import Mapping
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
@@ -12,6 +14,44 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 HOST = "127.0.0.1"
 PORT = 8420
 LOCAL_URL = f"http://{HOST}:{PORT}"
+
+
+def default_bud_home() -> Path:
+    """Default home folder for an installed daily-driver Bud (`~/.bud`)."""
+    return Path.home() / ".bud"
+
+
+def resolve_runtime_paths(
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[Path | None, Path, Path | None]:
+    """Resolve ``(env_file, default_data_dir, default_workspace_dir)`` for the current process.
+
+    Precedence preserves developer checkouts while enabling standalone `~/.bud` installs:
+    1. Explicit `BUD_HOME` env var -> `<BUD_HOME>/config.env` (or `.env`), `<BUD_HOME>/data`, and
+       `<BUD_HOME>/workspace`.
+    2. Current working directory containing `.env` or `data/` -> legacy repo-checkout defaults.
+    3. Installed `~/.bud` containing `config.env` or `data/` -> standalone home defaults.
+    4. Fallback -> `.env`, `Path("data")`, `None`.
+    """
+    current = (cwd or Path.cwd()).expanduser()
+    environ = env if env is not None else os.environ
+    bud_home = environ.get("BUD_HOME", "").strip()
+    if bud_home:
+        home = Path(bud_home).expanduser()
+        env_file: Path | None = None
+        if (home / "config.env").is_file():
+            env_file = home / "config.env"
+        elif (home / ".env").is_file():
+            env_file = home / ".env"
+        return env_file, home / "data", home / "workspace"
+    if (current / ".env").is_file() or (current / "data").is_dir():
+        return current / ".env", Path("data"), None
+    home = default_bud_home()
+    if (home / "config.env").is_file() or (home / "data").is_dir():
+        env_file = home / "config.env" if (home / "config.env").is_file() else None
+        return env_file, home / "data", home / "workspace"
+    return Path(".env"), Path("data"), None
 
 
 class Settings(BaseSettings):
@@ -32,6 +72,11 @@ class Settings(BaseSettings):
     data_dir: Path = Path("data")
     # Bud's own folder for files it reads and writes. Unset means ~/.bud/workspace.
     workspace_dir: Path | None = None
+    # Server bind host and port, and isolated Chrome relay overrides.
+    host: str = Field(default=HOST, validation_alias="BUD_HOST")
+    port: int = Field(default=PORT, ge=1, le=65535, validation_alias="BUD_PORT")
+    browse_home: Path | None = Field(default=None, validation_alias="BUD_BROWSE_HOME")
+    browse_port: int = Field(default=19989, ge=1, le=65535, validation_alias="BUD_BROWSE_PORT")
     # Drive the owner's Chrome through OpenCode Browse when it is installed.
     browser_tools: bool = True
     models_file: Path | None = None
@@ -82,4 +127,19 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    env_file, default_data_dir, default_workspace_dir = resolve_runtime_paths()
+    settings = Settings(_env_file=env_file) if env_file is not None else Settings(_env_file=None)
+    updates: dict[str, object] = {}
+    bud_home = os.environ.get("BUD_HOME", "").strip()
+    home_root = Path(bud_home).expanduser() if bud_home else default_data_dir.parent
+    if "data_dir" not in settings.model_fields_set and default_data_dir != settings.data_dir:
+        updates["data_dir"] = default_data_dir
+    elif (
+        default_data_dir.is_absolute()
+        and not settings.data_dir.is_absolute()
+        and not os.environ.get("DATA_DIR", "").strip()
+    ):
+        updates["data_dir"] = home_root / settings.data_dir
+    if "workspace_dir" not in settings.model_fields_set and default_workspace_dir is not None:
+        updates["workspace_dir"] = default_workspace_dir
+    return settings.model_copy(update=updates) if updates else settings

@@ -23,6 +23,7 @@ struct BudCompanionApp: App {
 private struct MenuContent: View {
     let delegate: AppDelegate
     @Bindable var companion = Companion.shared
+    @Bindable var updater = AppUpdater.shared
 
     var body: some View {
         Text(status)
@@ -43,9 +44,32 @@ private struct MenuContent: View {
         Button(companion.diagnosticsCopied ? "Diagnostics copied" : "Copy Diagnostics") {
             companion.copyDiagnostics()
         }
+        if !AppUpdater.isDevBuild() {
+            updates
+        }
         SettingsLink { Text("Settings…") }
         Divider()
         Button("Quit bud") { NSApp.terminate(nil) }.keyboardShortcut("q")
+    }
+
+    @ViewBuilder private var updates: some View {
+        switch updater.state {
+        case .idle:
+            Button("Check for Updates…") { Task { await updater.checkForUpdates() } }
+        case .checking:
+            Text("Checking for updates…")
+        case .upToDate(let current):
+            Button("Up to date (v\(current)). Check again") {
+                Task { await updater.checkForUpdates() }
+            }
+        case .available(let version, _):
+            Button("Update to v\(version) & Restart") { updater.installUpdate() }
+        case .updating(let version):
+            Text("Updating to v\(version)… Bud will restart")
+        case .error(let message):
+            Text(message)
+            Button("Check for Updates…") { Task { await updater.checkForUpdates() } }
+        }
     }
 
     /// Hold-to-talk: set it up, watch it download, then a reminder of the key.
@@ -70,14 +94,15 @@ private struct MenuContent: View {
     }
 
     private var status: String {
+        let prefix = AppUpdater.isDevBuild() ? "bud [dev]" : "bud"
         switch companion.link {
-        case .connecting: "Connecting…"
-        case .problem(let detail): detail
+        case .connecting: return AppUpdater.isDevBuild() ? "Connecting [dev]…" : "Connecting…"
+        case .problem(let detail): return detail
         case .connected:
             if let first = companion.lastFirstText {
-                "bud: \(companion.status.label). First text in \(first.formatted(.units(allowed: [.seconds], fractionalPart: .show(length: 1))))."
+                return "\(prefix): \(companion.status.label). First text in \(first.formatted(.units(allowed: [.seconds], fractionalPart: .show(length: 1))))."
             } else {
-                "bud: \(companion.status.label)"
+                return "\(prefix): \(companion.status.label)"
             }
         }
     }

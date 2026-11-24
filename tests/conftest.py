@@ -24,6 +24,8 @@ def isolated_environment(tmp_path, monkeypatch):
     # Never the developer's real browser.
     monkeypatch.setenv("BROWSER_TOOLS", "false")
     monkeypatch.delenv("BUD_DAILY_USD", raising=False)
+    for var in ("BUD_HOME", "BUD_HOST", "BUD_PORT", "BUD_BROWSE_HOME", "BUD_BROWSE_PORT"):
+        monkeypatch.delenv(var, raising=False)
     get_settings.cache_clear()
     with offline_requests():
         yield

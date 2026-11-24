@@ -303,7 +303,7 @@ def build_tools(root: Path, dispatch_path: Path) -> list[Tool[None]]:
                         raise _Refused("Incomplete dispatch claim; inspect claim storage.")
                     os.fsync(ledger)
                     os.fsync(ledger_parent)
-                    with _parent(root, parts[:-1]) as fd:
+                    with _parent(root, parts[:-1], create=expected_revision is None) as fd:
                         previous = None
                         if expected_revision is not None:
                             old, previous = _read(fd, parts[-1])

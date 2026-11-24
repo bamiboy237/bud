@@ -24,6 +24,7 @@ struct DiagnosticsSnapshot: Equatable, Sendable {
     var needsAccessibility: Bool
     var recentNotices: [String]
     var recentErrors: [String]
+    var serverVersion: String? = nil
 }
 
 /// Formats and sanitizes diagnostic snapshots so credentials, tokens, URL query strings,
@@ -82,6 +83,11 @@ enum DiagnosticsFormatter {
             "macOS: \(snapshot.macOSVersion)",
             "Connection: \(snapshot.connectionPhase) (attempt #\(snapshot.connectionAttempt), backoff #\(snapshot.backoffAttempt))",
             "Server: \(cleanEndpoint)",
+        ]
+        if let serverVersion = snapshot.serverVersion, !serverVersion.isEmpty {
+            lines.append("Server version: \(redact(serverVersion, knownSecrets: knownSecrets))")
+        }
+        lines += [
             "Session: \(session)",
             "Pet: \(snapshot.petStatus) (running: \(snapshot.running ? "yes" : "no"))",
             "Pending: approvals=\(snapshot.pendingApprovalsCount), setups=\(snapshot.pendingSetupsCount), tasks=\(snapshot.activeTasksCount) (stalled=\(snapshot.stalledTasksCount))",

@@ -1,10 +1,28 @@
 #!/bin/zsh
-# Build the bud desktop companion into mac/build/bud.app. Needs only Apple's Command Line Tools.
-#   ./mac/build.sh          build
+# Build the bud desktop companion into mac/build/bud.app (or bud-dev.app with --dev).
+# Needs only Apple's Command Line Tools.
+#   ./mac/build.sh          build prod app
+#   ./mac/build.sh --dev    build isolated dev app (app.bud.companion.dev)
 #   ./mac/build.sh --run    build, then run it against the bud checkout this script lives in
 set -euo pipefail
 here=${0:A:h}
-app=$here/build/bud.app
+dev=0
+run=0
+for arg in "$@"; do
+  case "$arg" in
+    --dev) dev=1 ;;
+    --run) run=1 ;;
+    *) echo "Unknown flag: $arg" >&2; exit 2 ;;
+  esac
+done
+
+if (( dev )); then
+  app=$here/build/bud-dev.app
+  exec_name=bud-dev
+else
+  app=$here/build/bud.app
+  exec_name=bud
+fi
 
 # Swift Build resolves package bundles in Contents/Resources, even on Swift 6.2 and 6.3.
 swift build --build-system swiftbuild -c release --package-path "$here"
@@ -12,8 +30,14 @@ bin=$(swift build --build-system swiftbuild -c release --package-path "$here" --
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$bin/BudCompanion" "$app/Contents/MacOS/bud"
+cp "$bin/BudCompanion" "$app/Contents/MacOS/$exec_name"
 cp "$here/Info.plist" "$app/Contents/Info.plist"
+if (( dev )); then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier app.bud.companion.dev" "$app/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleName bud-dev" "$app/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Bud Dev" "$app/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable bud-dev" "$app/Contents/Info.plist"
+fi
 cp -R "$bin/SwiftMath_SwiftMath.bundle" "$app/Contents/Resources/"
 cp "$here/.build/checkouts/SwiftMath/LICENSE" "$app/Contents/Resources/SwiftMath-LICENSE"
 if [[ -d "$here/Sources/BudCompanion/Resources/Fonts" ]]; then
@@ -119,7 +143,7 @@ else
 fi
 echo "built $app"
 
-if [[ ${1:-} == --run ]]; then
-  pkill -x bud 2>/dev/null || true
-  BUD_HOME=${BUD_HOME:-${here:h}} exec "$app/Contents/MacOS/bud"
+if (( run )); then
+  pkill -x "$exec_name" 2>/dev/null || true
+  BUD_HOME=${BUD_HOME:-${here:h}} exec "$app/Contents/MacOS/$exec_name"
 fi

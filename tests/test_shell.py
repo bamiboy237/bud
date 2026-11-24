@@ -390,6 +390,21 @@ def test_shell_commands_cannot_read_bud_data_or_the_folder_it_runs_from(tmp_path
     assert private_folders(settings) == [tmp_path / "data", Path.cwd()]
 
 
+def test_private_folders_omits_home_cwd_and_protects_bud_home(tmp_path, monkeypatch):
+    fake_home = tmp_path / "owner"
+    fake_home.mkdir()
+    bud_home = tmp_path / "bud-runtime"
+    bud_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.chdir(fake_home)
+    monkeypatch.setenv("BUD_HOME", str(bud_home))
+    settings = Settings(data_dir=bud_home / "data")
+    folders = private_folders(settings)
+    assert settings.data_dir in folders
+    assert fake_home not in folders
+    assert bud_home in folders
+
+
 @macos
 async def test_a_background_command_reaches_only_allowed_sites(workspace, tmp_path):
     """build_background takes no reviewer: a site the owner allowed works, and any other site

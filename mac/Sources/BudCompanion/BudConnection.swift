@@ -84,17 +84,54 @@ struct BudConnection: Sendable {
             && plain && url.user() == nil && url.query() == nil
     }
 
-    static func ownerToken(home: String) throws -> String {
-        let env = ProcessInfo.processInfo.environment
-        let homeURL = URL(filePath: home.isEmpty ? FileManager.default.currentDirectoryPath : home)
-        let dotenv = Self.dotenv(homeURL.appending(path: ".env"))
-        if let token = env["OWNER_TOKEN"] ?? dotenv["OWNER_TOKEN"], !token.isEmpty {
+    static func resolvedHomeURL(
+        home: String,
+        currentDirectory: URL = URL(filePath: FileManager.default.currentDirectoryPath),
+        userHome: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> URL {
+        let files = FileManager.default
+        if !home.isEmpty {
+            let expanded = if home == "~" {
+                userHome.path()
+            } else if home.hasPrefix("~/") {
+                userHome.appending(path: String(home.dropFirst(2))).path()
+            } else {
+                home
+            }
+            return URL(filePath: expanded)
+        }
+        if files.fileExists(atPath: currentDirectory.appending(path: ".env").path())
+            || files.fileExists(atPath: currentDirectory.appending(path: "data/auth/owner.token").path())
+        {
+            return currentDirectory
+        }
+        let installed = userHome.appending(path: ".bud")
+        if files.fileExists(atPath: installed.appending(path: "config.env").path())
+            || files.fileExists(atPath: installed.appending(path: "data/auth/owner.token").path())
+        {
+            return installed
+        }
+        return currentDirectory
+    }
+
+    static func ownerToken(
+        home: String,
+        currentDirectory: URL = URL(filePath: FileManager.default.currentDirectoryPath),
+        userHome: URL = FileManager.default.homeDirectoryForCurrentUser,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> String {
+        let homeURL = resolvedHomeURL(
+            home: home, currentDirectory: currentDirectory, userHome: userHome)
+        let configValues = Self.dotenv(homeURL.appending(path: "config.env"))
+        let envValues = Self.dotenv(homeURL.appending(path: ".env"))
+        let dotenv = envValues.merging(configValues) { _, configValue in configValue }
+        if let token = environment["OWNER_TOKEN"] ?? dotenv["OWNER_TOKEN"], !token.isEmpty {
             guard valid(token) else {
                 throw ConnectionError.noToken("OWNER_TOKEN must be a 43 to 256 character base64url secret.")
             }
             return token
         }
-        let dataDir = env["DATA_DIR"] ?? dotenv["DATA_DIR"] ?? "data"
+        let dataDir = environment["DATA_DIR"] ?? dotenv["DATA_DIR"] ?? "data"
         let dataURL = dataDir.hasPrefix("/") ? URL(filePath: dataDir) : homeURL.appending(path: dataDir)
         let path = dataURL.appending(path: "auth/owner.token")
         guard let raw = try? String(contentsOf: path, encoding: .utf8) else {

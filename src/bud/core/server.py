@@ -8,6 +8,7 @@ import contextlib
 import fcntl
 import hashlib
 import logging
+import os
 import re
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -24,7 +25,7 @@ from pydantic import BaseModel, Field, SecretStr
 from pydantic_ai import ModelRetry
 from pydantic_ai.toolsets import AbstractToolset, CombinedToolset, FunctionToolset
 
-from bud import browser
+from bud import __version__, browser
 from bud.apps import CHANGES as APP_CHANGES
 from bud.apps import GUIDANCE as APP_GUIDANCE
 from bud.apps import OPEN_IN_APP, quiet_open
@@ -308,7 +309,23 @@ ACCOUNT_TOOL = re.compile(r"[A-Z][A-Z0-9]*_[A-Z0-9_]+")
 
 def private_folders(settings: Settings) -> list[Path]:
     """Folders a shell command must never read: Bud's data and the folder holding its .env."""
-    return [settings.data_dir, Path.cwd()]
+    folders: list[Path] = [settings.data_dir]
+    home = Path.home().resolve()
+    cwd = Path.cwd()
+    cwd_resolved = cwd.resolve()
+    if cwd_resolved != home and not home.is_relative_to(cwd_resolved):
+        folders.append(cwd)
+    bud_home = os.environ.get("BUD_HOME", "").strip()
+    if bud_home:
+        candidate = Path(bud_home).expanduser()
+        candidate_resolved = candidate.resolve()
+        if (
+            candidate_resolved != home
+            and not home.is_relative_to(candidate_resolved)
+            and candidate_resolved not in {path.resolve() for path in folders}
+        ):
+            folders.append(candidate)
+    return folders
 
 
 def file_guidance() -> str:
@@ -392,7 +409,12 @@ def _create_app(
     account_scope: str | None = None
     # Bud's own Browse relay, and a `browse pair` waiting for the extension; the pairing
     # stops when the server stops.
-    relay = browser.Relay(browser.RELAY_HOME)
+    browse_home = (
+        settings.browse_home.expanduser()
+        if settings.browse_home is not None
+        else browser.RELAY_HOME
+    )
+    relay = browser.Relay(browse_home, port=settings.browse_port)
     pairing = browser.Pairing(relay)
     browser_view: BrowserView | None = None
 
@@ -786,6 +808,7 @@ def _create_app(
         """Authenticated transport handshake; no keys or account identifiers."""
         return JSONResponse(
             {
+                "version": __version__,
                 "mode": "simulate" if simulate else "accounts",
                 "scope": scope_id,
                 "restart_required": connections is not None and connections.restart_required(),
