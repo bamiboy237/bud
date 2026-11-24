@@ -12,6 +12,7 @@ let package = Package(
         // On-device speech recognition: Parakeet TDT v3 converted to Core ML, with CTC
         // vocabulary boosting for names. Apache 2.0; models download on first setup.
         .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.18.3"),
+        .package(url: "https://github.com/mgriebling/SwiftMath.git", exact: "1.7.3"),
     ],
     targets: [
         .executableTarget(
@@ -19,6 +20,7 @@ let package = Package(
             dependencies: [
                 .product(name: "Markdown", package: "swift-markdown"),
                 .product(name: "FluidAudio", package: "FluidAudio"),
+                .product(name: "SwiftMath", package: "SwiftMath"),
             ],
             path: "Sources/BudCompanion",
             resources: [

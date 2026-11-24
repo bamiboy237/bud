@@ -9,6 +9,7 @@ from typing import Any
 
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
+from pydantic_ai.profiles import ModelProfile
 from pydantic_ai.toolsets import FunctionToolset
 
 from bud.core.history import conversation_search
@@ -29,7 +30,9 @@ from bud.workspace import READ_TOOLS, WRITE_TOOLS, build_tools, read_capabilitie
 ResponseFunction = Callable[[list[ModelMessage], AgentInfo], ModelResponse]
 
 
-def scripted_model(function: ResponseFunction) -> FunctionModel:
+def scripted_model(
+    function: ResponseFunction, *, profile: ModelProfile | None = None
+) -> FunctionModel:
     async def stream(messages, info):
         response = function(messages, info)
         for index, part in enumerate(response.parts):
@@ -46,7 +49,7 @@ def scripted_model(function: ResponseFunction) -> FunctionModel:
             else:
                 raise AssertionError(f"Unsupported scripted response: {part}")
 
-    return FunctionModel(function, stream_function=stream, model_name="scripted")
+    return FunctionModel(function, stream_function=stream, model_name="scripted", profile=profile)
 
 
 @dataclass
@@ -75,6 +78,7 @@ async def running_bud(
     spiral: SpiralConfig | None = None,
     extra_tools: list[Any] | None = None,
     extra_policy: dict[str, Action] | None = None,
+    model_profile: ModelProfile | None = None,
 ):
     directory = directory.resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -84,7 +88,7 @@ async def running_bud(
     claims = directory / "dispatches.jsonl"
     spec = ModelSpec(provider="openai", name="scripted", tier="fast", input=0, output=0, cached=0)
     registry = Registry(models=[spec])
-    model = scripted_model(function)
+    model = scripted_model(function, profile=model_profile)
     gateway = Gateway(registry, Ledger(directory / "costs.db"), lambda _: model)
     policy: dict[str, Action] = dict.fromkeys(READ_TOOLS, "allow")
     policy.update(dict.fromkeys(WRITE_TOOLS, "ask"))

@@ -1,5 +1,5 @@
 {
-  "originHash" : "71abbfd008936c6616cb026232389f00a47baa25ea57c32f27b02ca4b60c8209",
+  "originHash" : "f54f02d3020de2236f4bd7ca30c6e89481d9a5efdeb5d6025feb5836b0f64e6a",
   "pins" : [
     {
       "identity" : "fluidaudio",
@@ -26,6 +26,15 @@
       "state" : {
         "revision" : "25cb61d3482054b09ae76ca4f281b1bfe7fe5a43",
         "version" : "0.9.0"
+      }
+    },
+    {
+      "identity" : "swiftmath",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/mgriebling/SwiftMath.git",
+      "state" : {
+        "revision" : "fa8244ed032f4a1ade4cb0571bf87d2f1a9fd2d7",
+        "version" : "1.7.3"
       }
     }
   ],

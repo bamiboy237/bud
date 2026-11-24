@@ -1,4 +1,5 @@
 import AppKit
+import CoreTransferable
 import Foundation
 import ImageIO
 import PDFKit
@@ -30,6 +31,7 @@ struct ChatAttachment: Codable, Identifiable, Equatable, Sendable {
 
 struct DraftAttachment: Identifiable, Equatable, Sendable {
     static let limit = 25 * 1024 * 1024
+    static let maxCount = 5
     let reference: ChatAttachment
     let data: Data
     var id: String { reference.id }
@@ -53,6 +55,54 @@ struct DraftAttachment: Identifiable, Equatable, Sendable {
     }
 }
 
+struct DroppedAttachment: Transferable {
+    let url: URL
+
+    init(fileURLData: Data) throws {
+        guard let url = URL(dataRepresentation: fileURLData, relativeTo: nil), url.isFileURL else {
+            throw CocoaError(.fileReadUnsupportedScheme)
+        }
+        self.url = url
+    }
+
+    static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(importedContentType: .fileURL) { data in
+            try Self(fileURLData: data)
+        }
+    }
+}
+
+extension View {
+    @MainActor
+    func dropAttachments(into companion: Companion, isTargeted: Binding<Bool>) -> some View {
+        dropDestination(for: DroppedAttachment.self) { items, _ in
+            guard companion.canAddAttachments, !items.isEmpty else { return false }
+            companion.addAttachments(items.map(\.url))
+            return true
+        } isTargeted: { isTargeted.wrappedValue = $0 }
+    }
+}
+
+struct DraftAttachmentChips: View {
+    let files: [DraftAttachment]
+    let remove: (String) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 8) {
+                ForEach(files) { file in
+                    HStack(spacing: 3) {
+                        AttachmentChip(name: file.reference.name)
+                        Button { remove(file.id) } label: { Image(systemName: "xmark") }
+                            .buttonStyle(IconButton(size: 20))
+                            .accessibilityLabel("Remove \(file.reference.name)")
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct AttachmentChip: View {
     let name: String
 
@@ -67,17 +117,21 @@ struct AttachmentChip: View {
     }
 }
 
+private final class ThumbnailState: ObservableObject {
+    @Published var image: NSImage?
+}
+
 /// A small image preview in the message. The original opens in the inspector.
 struct SentAttachment: View {
     let file: ChatAttachment
     let selection: AttachmentSelection?
     let open: () -> Void
-    @State private var thumbnail: NSImage?
+    @StateObject private var thumbnail = ThumbnailState()
 
     var body: some View {
         Button(action: open) {
-            if let thumbnail {
-                Image(nsImage: thumbnail)
+            if let image = thumbnail.image {
+                Image(nsImage: image)
                     .resizable()
                     .scaledToFit()
                     .frame(maxWidth: 260, maxHeight: 180)
@@ -86,7 +140,7 @@ struct SentAttachment: View {
                 AttachmentChip(name: file.name)
             }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PaperHit(shape: RoundedRectangle(cornerRadius: Paper.radiusMD)))
         .help("Open \(file.name)")
         .accessibilityLabel("Open attachment \(file.name)")
         .task(id: selection?.id) {
@@ -100,7 +154,7 @@ struct SentAttachment: View {
                     kCGImageSourceThumbnailMaxPixelSize: 520,
                   ] as CFDictionary)
             else { return }
-            thumbnail = NSImage(cgImage: image, size: .zero)
+            thumbnail.image = NSImage(cgImage: image, size: .zero)
         }
     }
 }
@@ -113,14 +167,19 @@ struct AttachmentSelection: Identifiable {
 }
 
 @MainActor
+private final class AttachmentInspectorState: ObservableObject {
+    @Published var content: AttachmentInspector.Content?
+    @Published var expanded = false
+    @Published var showDesktops = false
+}
+
+@MainActor
 struct AttachmentInspector: View {
     let selection: AttachmentSelection
     let close: () -> Void
-    @State private var content: Content?
-    @State private var expanded = false
-    @State private var showDesktops = false
+    @StateObject private var state = AttachmentInspectorState()
 
-    private enum Content {
+    fileprivate enum Content {
         case pdf(PDFDocument)
         case image(NSImage)
         case markdown(String)
@@ -137,23 +196,23 @@ struct AttachmentInspector: View {
                     .truncationMode(.middle)
                     .help(selection.file.name)
                 Spacer()
-                Button { showDesktops.toggle() } label: {
+                Button { state.showDesktops.toggle() } label: {
                     Image(systemName: "desktopcomputer.and.arrow.down")
                 }
                 .buttonStyle(IconButton(size: 24))
                 .help("Verify on paired desktops")
                 .accessibilityLabel("Verify on paired desktops")
-                .popover(isPresented: $showDesktops, arrowEdge: .bottom) {
+                .popover(isPresented: $state.showDesktops, arrowEdge: .bottom) {
                     DesktopHandoffPicker(selection: selection).padding(16)
                 }
-                Button { expanded.toggle() } label: {
-                    Image(systemName: expanded
+                Button { state.expanded.toggle() } label: {
+                    Image(systemName: state.expanded
                         ? "arrow.down.right.and.arrow.up.left"
                         : "arrow.up.left.and.arrow.down.right")
                 }
                 .buttonStyle(IconButton(size: 24))
-                .help(expanded ? "Narrow preview" : "Expand preview")
-                .accessibilityLabel(expanded ? "Narrow preview" : "Expand preview")
+                .help(state.expanded ? "Narrow preview" : "Expand preview")
+                .accessibilityLabel(state.expanded ? "Narrow preview" : "Expand preview")
                 Button(action: close) { Image(systemName: "xmark") }
                     .buttonStyle(IconButton(size: 24))
                     .help("Close preview")
@@ -161,7 +220,7 @@ struct AttachmentInspector: View {
             }
             .padding(12)
             Divider()
-            switch content {
+            switch state.content {
             case .pdf(let document):
                 PDFPreview(document: document)
             case .image(let image):
@@ -186,12 +245,12 @@ struct AttachmentInspector: View {
                 Spacer()
             }
         }
-        .inspectorColumnWidth(min: expanded ? 480 : 240, ideal: expanded ? 580 : 320, max: 900)
+        .inspectorColumnWidth(min: state.expanded ? 480 : 240, ideal: state.expanded ? 580 : 320, max: 900)
         .task(id: selection.id) { await load() }
     }
 
     private func load() async {
-        content = nil
+        state.content = nil
         let file = selection.file
         let path = file.path(in: selection.session)
         let connection = selection.connection
@@ -219,9 +278,9 @@ struct AttachmentInspector: View {
                 next = (parsed["markdown"] as? String).map(Content.markdown)
                     ?? .error("Bud couldn’t display this file.")
             }
-            if !Task.isCancelled { content = next }
+            if !Task.isCancelled { state.content = next }
         } catch {
-            if !Task.isCancelled { content = .error("\(error)") }
+            if !Task.isCancelled { state.content = .error("\(error)") }
         }
     }
 }

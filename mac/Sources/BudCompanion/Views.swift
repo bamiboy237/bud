@@ -414,7 +414,7 @@ struct UnsentSpeech: View {
                 .foregroundStyle(Paper.inkSecondary)
                 .lineLimit(2)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            Button(companion.inputPurpose == .ask ? "Send" : "Add to answer") { companion.resendSpeech() }
+            Button(companion.speechDestination == .ask ? "Send" : "Add to draft") { companion.resendSpeech() }
                 .buttonStyle(CardButton(kind: .secondary))
             Button { companion.dropSpeech() } label: {
                 Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
@@ -1068,10 +1068,44 @@ final class Flag: ObservableObject {
     @Published var on = false
 }
 
-/// Small icon buttons answer the pointer: a soft round highlight fades in, the icon darkens
-/// and grows a touch, and it presses in on click. Fast and small, since the pointer often
-/// only passes by. `highlight: false` keeps a button's own look (a filled circle) and only
-/// adds the motion. Reduced motion: colour only, no size change.
+struct PaperPress: ViewModifier {
+    let pressed: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func body(content: Content) -> some View {
+        content.scaleEffect(pressed && !reduceMotion && (NSEvent.pressedMouseButtons & 1) != 0 ? 0.97 : 1)
+    }
+}
+
+/// Feedback for controls whose label already defines its layout.
+struct PaperHit<S: Shape>: ButtonStyle {
+    let shape: S
+    var fill: Color = .clear
+
+    func makeBody(configuration: Configuration) -> some View {
+        Face(configuration: configuration, shape: shape, fill: fill)
+    }
+
+    private struct Face: View {
+        let configuration: Configuration
+        let shape: S
+        let fill: Color
+        @StateObject private var hover = Flag()
+        @Environment(\.isEnabled) private var enabled
+
+        var body: some View {
+            configuration.label
+                .background(fill, in: shape)
+                .overlay { shape.fill(enabled && hover.on ? Paper.fillHover : .clear).allowsHitTesting(false) }
+                .contentShape(shape)
+                .pointerStyle(enabled ? .link : .default)
+                .onHover { hover.on = $0 }
+                .modifier(PaperPress(pressed: enabled && configuration.isPressed))
+                .opacity(enabled ? 1 : 0.45)
+        }
+    }
+}
+
 struct IconButton: ButtonStyle {
     var size: CGFloat = 24
     var highlight = true
@@ -1085,30 +1119,18 @@ struct IconButton: ButtonStyle {
         let size: CGFloat
         let highlight: Bool
         @StateObject private var hover = Flag()
-        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+        @Environment(\.isEnabled) private var enabled
 
         var body: some View {
+            let hovered = enabled && hover.on
             configuration.label
-                .foregroundStyle(ink)
+                .foregroundStyle(!highlight ? Paper.canvas : hovered ? Paper.inkPrimary : Paper.inkSecondary)
                 .frame(width: size, height: size)
-                .background(Circle().fill(highlight && hover.on ? Paper.fillHover : .clear))
+                .background(highlight && hovered ? Paper.fillHover : .clear, in: Circle())
                 .contentShape(Circle())
-                .scaleEffect(scale)
-                .pointerStyle(.link)
+                .modifier(PaperPress(pressed: enabled && configuration.isPressed))
+                .pointerStyle(enabled ? .link : .default)
                 .onHover { hover.on = $0 }
-                .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
-                .animation(.easeOut(duration: 0.12), value: hover.on)
-        }
-
-        private var ink: AnyShapeStyle {
-            guard highlight else { return AnyShapeStyle(Paper.canvas) }
-            return hover.on ? AnyShapeStyle(Paper.inkPrimary) : AnyShapeStyle(Paper.inkSecondary)
-        }
-
-        private var scale: CGFloat {
-            if reduceMotion { return 1 }
-            if configuration.isPressed { return 0.9 }
-            return hover.on ? 1.08 : 1
         }
     }
 }
@@ -1125,6 +1147,7 @@ struct CardButton: ButtonStyle {
         let configuration: Configuration
         let kind: Kind
         @StateObject private var hover = Flag()
+        @Environment(\.isEnabled) private var enabled
 
         var body: some View {
             let shape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
@@ -1135,27 +1158,26 @@ struct CardButton: ButtonStyle {
                 .frame(height: 26)
                 .background {
                     switch kind {
-                    case .primary: shape.fill(Paper.inkPrimary.opacity(hover.on ? 0.88 : 1))
+                    case .primary: shape.fill(Paper.inkPrimary.opacity(highlighted ? 0.88 : 1))
                     case .secondary:
-                        shape.fill(hover.on ? Paper.fillHover : Paper.fillSubtle)
+                        shape.fill(highlighted ? Paper.fillHover : Paper.fillSubtle)
                             .overlay(shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5))
-                    case .quiet: shape.fill(hover.on ? Paper.fillHover : .clear)
+                    case .quiet: shape.fill(highlighted ? Paper.fillHover : .clear)
                     }
                 }
                 .contentShape(shape)
-                .scaleEffect(configuration.isPressed ? 0.97 : 1)
-                .pointerStyle(.link)
+                .modifier(PaperPress(pressed: enabled && configuration.isPressed))
+                .pointerStyle(enabled ? .link : .default)
                 .onHover { hover.on = $0 }
-                // Press is instant feedback; hover eases, since the pointer only passes by.
-                .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
-                .animation(.easeOut(duration: 0.12), value: hover.on)
         }
+
+        private var highlighted: Bool { enabled && hover.on }
 
         private var ink: AnyShapeStyle {
             switch kind {
             case .primary: AnyShapeStyle(Paper.canvas)
             case .secondary: AnyShapeStyle(Paper.inkPrimary)
-            case .quiet: hover.on ? AnyShapeStyle(Paper.inkPrimary) : AnyShapeStyle(Paper.inkSecondary)
+            case .quiet: highlighted ? AnyShapeStyle(Paper.inkPrimary) : AnyShapeStyle(Paper.inkSecondary)
             }
         }
     }
@@ -1184,11 +1206,9 @@ struct ChoiceRow: ButtonStyle {
                     in: shape)
                 .overlay(shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5))
                 .contentShape(shape)
-                .scaleEffect(configuration.isPressed ? 0.985 : 1)
+                .modifier(PaperPress(pressed: configuration.isPressed))
                 .pointerStyle(.link)
                 .onHover { hover.on = $0 }
-                .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
-                .animation(.easeOut(duration: 0.12), value: hover.on)
         }
     }
 }
@@ -1369,34 +1389,19 @@ struct RoundButton: View {
 private struct InputField: View {
     @Bindable var companion: Companion
     @FocusState private var focused: Bool
+    @StateObject private var droppingAttachments = Flag()
 
     var body: some View {
         let hasText = !companion.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasFiles = companion.inputPurpose == .ask && !companion.draftAttachments.isEmpty
+        let dropTargeted = droppingAttachments.on && companion.canAddAttachments
+        let highlighted = focused || dropTargeted
         let shape = RoundedRectangle(cornerRadius: Paper.radiusLG, style: .continuous)
-        HStack(alignment: .bottom, spacing: 8) {
-            ZStack(alignment: .leading) {
-                if companion.draft.isEmpty {
-                    Text(companion.inputPurpose.prompt)
-                        .font(Paper.Typography.body)
-                        .foregroundStyle(Paper.placeholder)
-                        .lineLimit(1)
-                        .allowsHitTesting(false)
-                }
-                TextField("", text: $companion.draft, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(Paper.Typography.body)
-                    .lineLimit(1...5)
-                    .focused($focused)
-                    .onSubmit { companion.send() }
-                    .onExitCommand {
-                        companion.inputOpen = false
-                        companion.inputPurpose = .ask
-                    }
+        VStack(alignment: .leading, spacing: 6) {
+            if hasFiles {
+                DraftAttachmentChips(files: companion.draftAttachments, remove: companion.removeAttachment)
             }
-            .padding(.vertical, 3)
-
-            RoundButton(symbol: "arrow.up", label: "Send", size: 22, action: { companion.send() })
-                .opacity(hasText ? 1 : 0.35)
+            inputRow(canSend: hasText || hasFiles)
         }
         .padding(.leading, 14)
         .padding(.trailing, 8)
@@ -1406,12 +1411,42 @@ private struct InputField: View {
         .surface(
             shape,
             lift: 1,
-            fill: Paper.elevated,
-            border: focused ? Paper.accent : Paper.borderSubtle,
-            borderWidth: focused ? 1 : 0.5
+            fill: dropTargeted ? Paper.overlay : Paper.elevated,
+            border: highlighted ? Paper.accent : Paper.borderSubtle,
+            borderWidth: dropTargeted ? 2 : highlighted ? 1 : 0.5
         )
+        .dropAttachments(into: companion, isTargeted: $droppingAttachments.on)
         .animation(.easeOut(duration: 0.12), value: focused)
         .onAppear { focused = true }
+    }
+
+    private func inputRow(canSend: Bool) -> some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            ZStack(alignment: .leading) {
+                if companion.draft.isEmpty {
+                    Text(companion.inputPurpose.prompt)
+                        .font(Paper.Typography.body)
+                        .foregroundStyle(Paper.placeholder)
+                        .lineLimit(1)
+                        .allowsHitTesting(false)
+                }
+                ChatInput(title: "", text: $companion.draft, focus: $focused, submit: { companion.send() })
+                    .font(Paper.Typography.body)
+                    .lineLimit(1...5)
+                    .onExitCommand {
+                        companion.inputOpen = false
+                        companion.inputPurpose = .ask
+                    }
+            }
+            .padding(.vertical, 3)
+
+            if companion.inputPurpose == .ask && (companion.readingAttachments || companion.uploadingAttachments) {
+                ProgressView().controlSize(.small)
+                    .accessibilityLabel(companion.readingAttachments ? "Reading files" : "Uploading files")
+            }
+            RoundButton(symbol: "arrow.up", label: "Send", size: 22, action: { companion.send() })
+                .opacity(canSend ? 1 : 0.35)
+        }
     }
 }
 
@@ -1469,7 +1504,6 @@ private struct BrowserCaution: View {
             Text(Approval.browserSummary)
                 .font(Paper.Typography.callout)
                 .fixedSize(horizontal: false, vertical: true)
-            // The group keeps its own open state, so no @State macro is needed.
             DisclosureGroup("What this allows") {
                 Text(Approval.browserCaution)
                     .font(Paper.Typography.callout)

@@ -9,6 +9,7 @@ from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 
@@ -19,6 +20,7 @@ from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RequestUsage
 
+from bud.gateway.attachments import render_attachments
 from bud.gateway.errors import error_summary
 from bud.gateway.ledger import Ledger, LedgerEntry
 from bud.gateway.registry import ModelSpec
@@ -54,12 +56,24 @@ class TrackedModel(WrapperModel):
         ledger: Ledger,
         session_id: str | None = None,
         steer_signal: Callable[[str, str | None], Any] | None = None,
+        workspace: Path | None = None,
     ) -> None:
         super().__init__(wrapped)
         self.spec = spec
         self.ledger = ledger
         self.session_id = session_id
         self.steer_signal = steer_signal
+        self.workspace = workspace
+
+    async def _render_attachments(self, messages: list[ModelMessage]) -> list[ModelMessage]:
+        if self.workspace is None:
+            return messages
+        return await asyncio.to_thread(
+            render_attachments,
+            messages,
+            self.workspace,
+            vision=self.profile.get("supports_image_input", True),
+        )
 
     async def request(
         self,
@@ -69,6 +83,7 @@ class TrackedModel(WrapperModel):
     ) -> ModelResponse:
         started = perf_counter()
         try:
+            messages = await self._render_attachments(messages)
             response = await super().request(messages, model_settings, model_request_parameters)
         except BaseException as exc:
             await self._record_failure(exc, started)
@@ -86,6 +101,7 @@ class TrackedModel(WrapperModel):
         run_context: RunContext[Any] | None = None,
     ) -> AsyncGenerator[StreamedResponse]:
         started = perf_counter()
+        messages = await self._render_attachments(messages)
         signal = None
         if self.steer_signal is not None:
             sid = self.session_id or request_session.get() or ""

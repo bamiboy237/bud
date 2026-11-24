@@ -9,27 +9,40 @@ import SwiftUI
 /// Changed text is parsed afresh, so an unfinished construct settles as soon as it closes.
 /// Unchanged replies reuse their parse when the conversation is rebuilt.
 struct MarkdownView: View {
-    let blocks: [any Markup]
+    private let parsed: ParsedMarkdown.Entry
     let rich: Bool
     @Environment(\.replyType) private var type
 
     init(_ text: String, rich: Bool = false) {
         self.rich = rich
-        blocks = ParsedMarkdown.blocks(text)
+        parsed = ParsedMarkdown.parse(text)
     }
 
     var body: some View {
         // Links and citations take the one accent, scoped here so pickers elsewhere keep theirs.
-        Blocks(blocks: blocks, spacing: type.blockSpacing, rich: rich)
+        Blocks(blocks: parsed.blocks, spacing: type.blockSpacing, rich: rich)
+            .environment(\.markdownEquations, parsed.equations)
             .tint(Paper.accent)
     }
 }
 
 @MainActor
 private enum ParsedMarkdown {
-    private final class Entry {
+    final class Entry {
         let blocks: [any Markup]
-        init(_ blocks: [any Markup]) { self.blocks = blocks }
+        let equations: [Character: MarkdownEquation]
+
+        init(_ text: String) {
+            let document = Document(parsing: text)
+            if text.contains("$") || text.contains("\\(") || text.contains("\\[") {
+                let math = MarkdownMath(text, document: document)
+                equations = math.equations
+                blocks = Array((equations.isEmpty ? document : Document(parsing: math.source)).children)
+            } else {
+                equations = [:]
+                blocks = Array(document.children)
+            }
+        }
     }
 
     private static let cache: NSCache<NSString, Entry> = {
@@ -38,12 +51,23 @@ private enum ParsedMarkdown {
         return cache
     }()
 
-    static func blocks(_ text: String) -> [any Markup] {
+    static func parse(_ text: String) -> Entry {
         let key = text as NSString
-        if let entry = cache.object(forKey: key) { return entry.blocks }
-        let blocks = Array(Document(parsing: text).children)
-        cache.setObject(Entry(blocks), forKey: key)
-        return blocks
+        if let entry = cache.object(forKey: key) { return entry }
+        let entry = Entry(text)
+        cache.setObject(entry, forKey: key)
+        return entry
+    }
+}
+
+private struct MarkdownEquationsKey: EnvironmentKey {
+    static let defaultValue: [Character: MarkdownEquation] = [:]
+}
+
+private extension EnvironmentValues {
+    var markdownEquations: [Character: MarkdownEquation] {
+        get { self[MarkdownEquationsKey.self] }
+        set { self[MarkdownEquationsKey.self] = newValue }
     }
 }
 
@@ -126,6 +150,7 @@ private struct Block: View {
     let first: Bool
     var rich = false
     @Environment(\.replyType) private var type
+    @Environment(\.markdownEquations) private var equations
 
     var body: some View {
         switch markup {
@@ -145,25 +170,14 @@ private struct Block: View {
             }
             .padding(.top, first ? 0 : heading.level <= 2 ? type.blockSpacing * 0.6 : 2)
         case let paragraph as Paragraph:
-            if rich, paragraph.childCount == 1, let child = paragraph.child(at: 0) {
-                switch child {
-                case let link as Markdown.Link:
-                    if let url = SafePreviewURL(link.destination) {
-                        WebLinkCard(url: url.value, title: String(inline(link).characters))
-                    } else {
-                        Prose(text: inline(paragraph, code: type.code))
-                    }
-                case let image as Markdown.Image:
-                    if let url = SafePreviewURL(image.source) {
-                        WebImageCard(url: url.value, title: String(inline(image).characters))
-                    } else {
-                        Prose(text: inline(paragraph, code: type.code))
-                    }
-                default:
-                    Prose(text: inline(paragraph, code: type.code))
-                }
+            if rich, paragraph.childCount == 1, let link = paragraph.child(at: 0) as? Markdown.Link,
+               let url = SafePreviewURL(link.destination) {
+                WebLinkCard(url: url.value, title: String(inline(link).characters))
+            } else if rich, paragraph.childCount == 1, let image = paragraph.child(at: 0) as? Markdown.Image,
+                      let url = SafePreviewURL(image.source) {
+                WebImageCard(url: url.value, title: String(inline(image).characters))
             } else {
-                Prose(text: inline(paragraph, code: type.code))
+                paragraphText(inline(paragraph, code: type.code))
             }
         case let list as UnorderedList:
             ListBlock(items: Array(list.listItems), start: nil)
@@ -189,6 +203,30 @@ private struct Block: View {
         }
     }
 
+    @ViewBuilder
+    private func paragraphText(_ text: AttributedString) -> some View {
+        let parts = MarkdownMath.paragraphParts(text, equations: equations)
+        if parts.count == 1, case .prose = parts[0] {
+            Prose(text: text)
+        } else {
+            VStack(alignment: .leading, spacing: type.blockSpacing) {
+                ForEach(Array(parts.enumerated()), id: \.offset) { _, part in
+                    switch part {
+                    case .prose(let content):
+                        Prose(text: content)
+                    case .equation(let equation):
+                        let formula = MathTypesetter.text(equation, size: type.size + 2, display: true)
+                        ViewThatFits(in: .horizontal) {
+                            formula.fixedSize()
+                            ScrollView(.horizontal) { formula.fixedSize() }
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                }
+            }
+        }
+    }
+
     private func font(_ level: Int) -> Font {
         switch level {
         case 1: type.title
@@ -206,9 +244,10 @@ private struct Prose: View {
     var spacing: CGFloat?
     var tracking: CGFloat = 0
     @Environment(\.replyType) private var type
+    @Environment(\.markdownEquations) private var equations
 
     var body: some View {
-        chipped(text)
+        chipped(text, equations: equations, size: type.size)
             .font(font ?? type.body)
             .tracking(tracking)
             .lineSpacing(spacing ?? type.lineSpacing)
@@ -251,10 +290,25 @@ private struct CitationPillAttribute: TextAttribute {}
 private struct TightTrailingAttribute: TextAttribute {}
 
 /// One Text from an attributed string, with inline code and citations tagged for pills.
-private func chipped(_ text: AttributedString) -> SwiftUI.Text {
+@MainActor
+private func chipped(
+    _ text: AttributedString, equations: [Character: MarkdownEquation], size: CGFloat
+) -> SwiftUI.Text {
     var out = SwiftUI.Text(verbatim: "")
     for run in text.runs {
-        var piece = SwiftUI.Text(AttributedString(text[run.range]))
+        let content = text[run.range]
+        var piece = SwiftUI.Text(AttributedString(content))
+        if !equations.isEmpty, content.characters.contains(where: { equations[$0] != nil }) {
+            piece = SwiftUI.Text(verbatim: "")
+            var start = run.range.lowerBound
+            for index in content.characters.indices {
+                guard let equation = equations[content.characters[index]] else { continue }
+                piece = piece + SwiftUI.Text(AttributedString(text[start..<index]))
+                    + MathTypesetter.text(equation, size: size)
+                start = content.characters.index(after: index)
+            }
+            piece = piece + SwiftUI.Text(AttributedString(text[start..<run.range.upperBound]))
+        }
         if run[TightTrailingRun.self] == true {
             piece = piece.customAttribute(TightTrailingAttribute())
         }
@@ -469,6 +523,7 @@ private struct CodeBlockView: View {
 private struct TableView: View {
     let table: Markdown.Table
     @Environment(\.replyType) private var type
+    @Environment(\.markdownEquations) private var equations
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
@@ -497,7 +552,9 @@ private struct TableView: View {
     private func cells(_ cells: [any Markup], header: Bool) -> some View {
         ForEach(Array(cells.enumerated()), id: \.offset) { index, cell in
             let alignment = alignment(index)
-            chipped(inline(cell, code: Fonts.mono(size: max(10, type.codeSize - 1))))
+            chipped(
+                inline(cell, code: Fonts.mono(size: max(10, type.codeSize - 1))),
+                equations: equations, size: type.size - 1.5)
                 .textRenderer(InlinePillRenderer(
                     codeFill: Paper.codeChipFill,
                     codeBorder: Paper.codeChipBorder,

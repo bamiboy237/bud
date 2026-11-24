@@ -50,7 +50,6 @@ struct Approval: Identifiable, Equatable {
     /// The text that will go out, when there is one, so you can read before approving.
     let body: String?
     let questions: [Question]
-    let isQuestionList: Bool
 
     var isQuestion: Bool { tool == "ask_user" }
 
@@ -96,9 +95,7 @@ struct Approval: Identifiable, Equatable {
         expectsOriginalEmail = ["archive_email", "mark_read", "draft_reply"].contains(tool)
             || args["thread_id"] != nil || args["draft_id"] != nil
         job = (raw["task_id"] as? Int).flatMap { jobs[$0] }
-        let parsed = Question.parse(args)
-        questions = parsed.questions
-        isQuestionList = parsed.isList
+        questions = Question.parse(args)
         let words = Self.describe(tool.lowercased(), args)
         action = tool == "ask_user" ? (questions.first?.text ?? "") : words.title
         verb = words.verb
@@ -295,16 +292,16 @@ struct Question: Equatable, Sendable {
     let options: [QuestionOption]
     let multiSelect: Bool
 
-    static func parse(_ args: [String: Any]) -> (questions: [Question], isList: Bool) {
+    static func parse(_ args: [String: Any]) -> [Question] {
         if let raw = args["questions"] as? [[String: Any]] {
             let parsed = raw.compactMap(Question.init)
-            if !parsed.isEmpty { return (parsed, true) }
+            if !parsed.isEmpty { return parsed }
         }
         let text = args["question"] as? String ?? ""
         let choices = (args["choices"] as? [String]) ?? []
-        return ([Question(header: "Question", text: text.isEmpty ? "bud has a question" : text,
-                          options: choices.filter { !$0.isEmpty }.map { QuestionOption(label: $0) },
-                          multiSelect: false)], false)
+        return [Question(header: "Question", text: text.isEmpty ? "bud has a question" : text,
+                         options: choices.filter { !$0.isEmpty }.map { QuestionOption(label: $0) },
+                         multiSelect: false)]
     }
 
     private init?(_ raw: [String: Any]) {

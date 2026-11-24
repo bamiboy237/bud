@@ -21,16 +21,46 @@ enum PetStatus: String {
 /// What the text you type is for: a new message, or a reply to something bud is waiting on.
 enum InputPurpose: Hashable {
     case ask
-    /// Your own answer to a question, when none of its options fit.
-    case answer(String)
     /// Instead of approving an action: what bud should change before trying again.
     case revise(String)
 
     var prompt: String {
         switch self {
         case .ask: "Ask bud…"
-        case .answer: "Your answer…"
         case .revise: "What should change?"
+        }
+    }
+}
+
+enum SpeechDestination: Equatable {
+    case ask
+    case revise(String)
+    case question(id: String, position: Int)
+}
+
+enum InspectorSelection {
+    case attachment(AttachmentSelection)
+    case routine(RoutineSelection)
+    case browser(BrowserSelection)
+    case source(SourcePanel, request: UUID)
+
+    enum Target: Equatable {
+        case attachment(session: String, file: String)
+        case routine(session: String, routine: String?, occurrence: String?)
+        case browser
+        case source(SourceTarget)
+    }
+
+    var target: Target {
+        switch self {
+        case .attachment(let selection):
+            .attachment(session: selection.session, file: selection.file.id)
+        case .routine(let selection):
+            .routine(session: selection.session, routine: selection.routineID, occurrence: selection.occurrenceID)
+        case .browser:
+            .browser
+        case .source(let panel, _):
+            .source(panel.target)
         }
     }
 }
@@ -208,11 +238,7 @@ final class Companion {
     private(set) var focusRequest = 0
     private(set) var citedConversations: [SourcePanel] = []
     var citedConversation: SourcePanel? { citedConversations.last }
-    /// A cited message and its conversation, shown beside the chat.
-    var sourcePanel: SourcePanel?
-    var attachmentSelection: AttachmentSelection?
-    var browserSelection: BrowserSelection?
-    var routineSelection: RoutineSelection?
+    private(set) var inspector: InspectorSelection?
     var draftAttachments: [DraftAttachment] = []
     private(set) var readingAttachments = false
     private(set) var uploadingAttachments = false
@@ -353,9 +379,7 @@ final class Companion {
     }
 
     private func startConnection(resetBackoff: Bool) {
-        attachmentSelection = nil
-        browserSelection = nil
-        routineSelection = nil
+        closeInspector()
         citedConversations = []
         setupMonitor?.cancel()
         setupMonitor = nil
@@ -603,17 +627,15 @@ final class Companion {
         ConversationWindow.shared.show()
         guard let connection else { return true }
         let mine = generation
-        attachmentSelection = nil
-        browserSelection = nil
-        routineSelection = nil
         let requested = SourcePanel(target: target)
         if let focus = chatFocus(for: requested) {
             citedConversations.removeAll()
-            sourcePanel = nil
+            closeInspector()
             highlight(focus)
             return true
         }
-        sourcePanel = requested
+        let request = UUID()
+        guard toggleInspector(.source(requested, request: request)) else { return true }
         Task {
             let found: [String: Any]?
             let unavailable: String
@@ -627,28 +649,34 @@ final class Companion {
                 unavailable = "This file isn't available anymore."
             }
             // Another link was followed, or the connection changed, while this one loaded.
-            guard mine == generation, sourcePanel?.target == target else { return }
+            guard mine == generation, case .source(_, let current) = inspector,
+                  current == request else { return }
             guard let panel = found.flatMap(SourcePanel.init) else {
-                sourcePanel = SourcePanel(target: target, problem: unavailable)
+                inspector = .source(SourcePanel(target: target, problem: unavailable), request: request)
                 return
             }
             if panel.citedTurn != nil {
-                sourcePanel = nil
+                closeInspector()
                 if let index = citedConversations.firstIndex(where: { $0.target == panel.target }) {
                     citedConversations.removeLast(citedConversations.count - index - 1)
                 } else {
                     citedConversations.append(panel)
                 }
             } else {
-                sourcePanel = panel
+                inspector = .source(panel, request: request)
             }
         }
         return true
     }
 
+    var canAddAttachments: Bool {
+        inputPurpose == .ask && !readingAttachments && !uploadingAttachments
+            && draftAttachments.count < DraftAttachment.maxCount
+    }
+
     func addAttachments(_ urls: [URL]) {
-        guard inputPurpose == .ask, !readingAttachments, !urls.isEmpty else { return }
-        let available = 5 - draftAttachments.count
+        guard inputPurpose == .ask, !readingAttachments, !uploadingAttachments, !urls.isEmpty else { return }
+        let available = DraftAttachment.maxCount - draftAttachments.count
         if urls.count > available { nudge("You can attach up to five files per message.") }
         guard available > 0 else { return }
         readingAttachments = true
@@ -657,13 +685,16 @@ final class Companion {
             for url in urls.prefix(available) {
                 do {
                     let file = try await Task.detached { try DraftAttachment.read(url) }.value
-                    guard draftAttachments.count < 5 else { break }
                     draftAttachments.append(file)
                 } catch {
                     nudge("Couldn't attach \(url.lastPathComponent). Choose a file up to 25 MiB.")
                 }
             }
         }
+    }
+
+    func removeAttachment(_ id: String) {
+        draftAttachments.removeAll { $0.id == id }
     }
 
     func selection(for file: ChatAttachment, in sourceSession: String? = nil) -> AttachmentSelection? {
@@ -675,21 +706,7 @@ final class Companion {
             nudge("Reconnect to Bud to open the attachment.")
             return
         }
-        sourcePanel = nil
-        browserSelection = nil
-        routineSelection = nil
-        attachmentSelection = selection
-    }
-
-    func openBrowserView() {
-        guard let connection else {
-            nudge("Reconnect to Bud to view the browser.")
-            return
-        }
-        sourcePanel = nil
-        attachmentSelection = nil
-        routineSelection = nil
-        browserSelection = BrowserSelection(connection: connection)
+        toggleInspector(.attachment(selection))
     }
 
     func openRoutines(_ id: String? = nil, occurrence: String? = nil) {
@@ -697,11 +714,30 @@ final class Companion {
             nudge("Reconnect to Bud to view routines.")
             return
         }
-        sourcePanel = nil
-        attachmentSelection = nil
-        browserSelection = nil
-        routineSelection = RoutineSelection(
-            connection: connection, session: session, routineID: id, occurrenceID: occurrence)
+        if id == nil, case .routine = inspector {
+            closeInspector()
+            return
+        }
+        toggleInspector(.routine(RoutineSelection(
+            connection: connection, session: session, routineID: id, occurrenceID: occurrence)))
+    }
+
+    func openBrowserView() {
+        guard let connection else {
+            nudge("Reconnect to Bud to view the browser.")
+            return
+        }
+        toggleInspector(.browser(BrowserSelection(connection: connection)))
+    }
+
+    @discardableResult
+    func toggleInspector(_ selection: InspectorSelection) -> Bool {
+        inspector = inspector?.target == selection.target ? nil : selection
+        return inspector != nil
+    }
+
+    func closeInspector() {
+        inspector = nil
     }
 
     /// Where the panel's cited message sits in the chat on screen, if it's there.
@@ -719,8 +755,7 @@ final class Companion {
 
     func backFromCitation() {
         _ = citedConversations.popLast()
-        sourcePanel = nil
-        attachmentSelection = nil
+        closeInspector()
     }
 
     func receiveSetup(_ data: [String: Any], replacing: Bool = false) {
@@ -871,8 +906,7 @@ final class Companion {
     }
 
     /// Sends what's in the field, or `spoken` words. Spoken words sent as a message leave the
-    /// field as it was; spoken words answering bud's question are added to the field instead,
-    /// for you to send with Return.
+    /// field as it was; spoken revisions are added to the field for you to confirm with Return.
     /// `messageID` resends a held recording under its first id, so it can't arrive twice.
     func send(spoken: String? = nil, messageID heldID: String? = nil) {
         if spoken == nil, inputPurpose == .ask, readingAttachments || uploadingAttachments { return }
@@ -890,21 +924,12 @@ final class Companion {
             nudge("Reconnect to the original bud session to retry this message.")
             return
         }
-        // An answer to bud's question is yours to confirm: spoken words join the field, after
-        // anything already typed, and Return sends them like a typed answer.
         if spoken != nil, inputPurpose != .ask {
             draft = draft.isEmpty ? text : draft + " " + text
             inputOpen = true
             return
         }
         switch inputPurpose {
-        case .answer(let id):
-            if let approval = approvals.first(where: { $0.id == id }), approval.isQuestionList {
-                answerQuestionText(text, for: approval)
-            } else {
-                respond(to: id, path: "answer", body: ["text": text])
-            }
-            return
         case .revise(let id):
             respond(to: id, path: "revise", body: [
                 "text": text, "message_id": UUID().uuidString.replacingOccurrences(of: "-", with: ""),
@@ -1001,28 +1026,50 @@ final class Companion {
     private(set) var unsentSpeech: String?
     /// The id a held recording was first sent under, when it got that far.
     @ObservationIgnored private var unsentSpeechID: String?
+    private var focusedQuestion: SpeechDestination?
 
-    /// Spoken words: sent at once as a message, or added to the field when they answer a
-    /// question of bud's.
-    /// `destination` is what the field was for when you started talking. If a question was
-    /// settled, or one arrived, while you spoke, the words are held rather than sent somewhere
-    /// you didn't mean.
-    func say(_ text: String, meant destination: InputPurpose) {
-        guard destination == inputPurpose else {
+    var speechDestination: SpeechDestination {
+        if case .question(let id, let position) = focusedQuestion,
+           questionFlows[id]?.answers.index == position, !deciding.contains(id) {
+            return .question(id: id, position: position)
+        }
+        if case .revise(let id) = inputPurpose { return .revise(id) }
+        return .ask
+    }
+
+    func focusQuestion(_ id: String, position: Int, focused: Bool) {
+        let destination = SpeechDestination.question(id: id, position: position)
+        if focused {
+            focusedQuestion = destination
+        } else if focusedQuestion == destination {
+            focusedQuestion = nil
+        }
+    }
+
+    /// Hold the words if their destination changes while the owner speaks.
+    func say(_ text: String, meant destination: SpeechDestination) {
+        guard destination == speechDestination else {
             holdSpeech(text, because: "Things changed while you were talking, so that wasn't sent.")
             return
         }
-        send(spoken: text)
+        deliverSpeech(text, to: destination)
     }
 
-    /// The held line's button: sends the words as a message, or, while bud waits for an
-    /// answer, adds them to the field (the button then says so).
     func resendSpeech() {
         guard let text = unsentSpeech else { return }
         let id = unsentSpeechID
         unsentSpeech = nil
         unsentSpeechID = nil
-        send(spoken: text, messageID: id)
+        deliverSpeech(text, to: speechDestination, messageID: id)
+    }
+
+    private func deliverSpeech(_ text: String, to destination: SpeechDestination, messageID: String? = nil) {
+        if case .question(let id, let position) = destination, let flow = questionFlows[id] {
+            let existing = flow.answers.typed(at: position) ?? ""
+            flow.answers.type(existing.isEmpty ? text : existing + " " + text, at: position)
+        } else {
+            send(spoken: text, messageID: messageID)
+        }
     }
 
     func dropSpeech() {
@@ -1157,7 +1204,7 @@ final class Companion {
         refreshApprovals()
     }
 
-    /// Opens the field to answer a question in your own words, or to say what should change.
+    /// Opens the composer to say what should change before Bud tries an action again.
     func write(_ purpose: InputPurpose) {
         savedDrafts[inputPurpose] = draft
         inputPurpose = purpose
@@ -1181,19 +1228,11 @@ final class Companion {
         respond(to: id, path: "answer", body: ["answers": answers])
     }
 
-    func answerQuestionText(_ text: String, for approval: Approval) {
-        savedDrafts.removeValue(forKey: .answer(approval.id))
-        draft = savedDrafts.removeValue(forKey: .ask) ?? ""
-        inputOpen = !draft.isEmpty
-        inputPurpose = .ask
-        questionFlow(for: approval).answerTyped(text)
-    }
-
-    /// A field opened to answer or revise something that's since been settled (in another
+    /// A field opened to revise something that's since been settled (in another
     /// interface, say) has nothing left to reply to.
     private func closeStaleInput() {
         let target: String? = switch inputPurpose {
-        case .answer(let id), .revise(let id): id
+        case .revise(let id): id
         case .ask: nil
         }
         guard let target, !approvals.contains(where: { $0.id == target }) else { return }
@@ -1242,12 +1281,7 @@ final class Companion {
     ) -> Bool {
         guard let connection, let decisionAttempt = approvalDeck.beginDecision(id: id) else { return false }
         let route = "sessions/\(session)/approvals/\(id)" + (path.map { "/\($0)" } ?? "")
-        // Typed in the field for this approval (an answer or a change), as opposed to a
-        // button. A draft opened for another approval stays where it is.
-        let targetsThis: Bool = switch inputPurpose {
-        case .answer(let target), .revise(let target): target == id
-        case .ask: false
-        }
+        let targetsThis = inputPurpose == .revise(id)
         let typed = targetsThis ? draft : ""
         if targetsThis {
             draft = savedDrafts.removeValue(forKey: .ask) ?? ""
@@ -1286,7 +1320,7 @@ final class Companion {
                 if !typed.isEmpty {
                     // Keep what was typed, so trying again is one Return.
                     savedDrafts[inputPurpose] = draft
-                    inputPurpose = path == "answer" ? .answer(id) : .revise(id)
+                    inputPurpose = .revise(id)
                     draft = typed
                     inputOpen = true
                 }

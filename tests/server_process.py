@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 
 import uvicorn
 from pydantic_ai.messages import (
+    BinaryContent,
     ModelMessage,
     ModelResponse,
     TextPart,
@@ -40,6 +41,22 @@ FILENAME = "report.md"
 
 def scripted_response(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
     parts = [part for message in messages for part in message.parts]
+    if any(
+        isinstance(part, UserPromptPart)
+        and (
+            part.content == "Inspect the attached PNG."
+            or (not isinstance(part.content, str) and "Inspect the attached PNG." in part.content)
+        )
+        for part in parts
+    ):
+        images = [
+            item
+            for part in parts
+            if isinstance(part, UserPromptPart) and not isinstance(part.content, str)
+            for item in part.content
+            if isinstance(item, BinaryContent) and item.media_type == "image/png"
+        ]
+        return ModelResponse(parts=[TextPart(f"Visible PNG images: {len(images)}")])
     tools = {tool.name for tool in info.function_tools}
     outputs = {tool.name for tool in info.output_tools}
     if not tools and not outputs:
