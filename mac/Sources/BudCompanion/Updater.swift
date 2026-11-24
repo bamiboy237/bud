@@ -63,15 +63,15 @@ final class AppUpdater {
         self.fetcher = fetcher
     }
 
-    static func isDevBuild(bundle: Bundle = .main) -> Bool {
+    nonisolated static func isDevBuild(bundle: Bundle = .main) -> Bool {
         (bundle.bundleIdentifier ?? "").hasSuffix(".dev")
     }
 
-    static func currentAppVersion(bundle: Bundle = .main) -> String {
+    nonisolated static func currentAppVersion(bundle: Bundle = .main) -> String {
         bundle.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
     }
 
-    static func installedCLIPath(
+    nonisolated static func installedCLIPath(
         userHome: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> URL? {
         let budHome = userHome.appending(path: ".bud")
@@ -83,7 +83,7 @@ final class AppUpdater {
         return candidates.first { files.isExecutableFile(atPath: $0.path()) }
     }
 
-    static func parseLatestReleaseJSON(_ data: Data) -> (version: String, url: URL?)? {
+    nonisolated static func parseLatestReleaseJSON(_ data: Data) -> (version: String, url: URL?)? {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rawTag = object["tag_name"] as? String,
               let parsed = SemanticVersion(rawTag)
