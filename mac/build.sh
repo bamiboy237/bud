@@ -13,6 +13,8 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin/BudCompanion" "$app/Contents/MacOS/bud"
 cp "$here/Info.plist" "$app/Contents/Info.plist"
+cp -R "$bin/SwiftMath_SwiftMath.bundle" "$app/Contents/Resources/"
+cp "$here/.build/checkouts/SwiftMath/LICENSE" "$app/Contents/Resources/SwiftMath-LICENSE"
 if [[ -d "$here/Sources/BudCompanion/Resources/Fonts" ]]; then
   mkdir -p "$app/Contents/Resources/Fonts"
   cp "$here/Sources/BudCompanion/Resources/Fonts"/* "$app/Contents/Resources/Fonts/"
