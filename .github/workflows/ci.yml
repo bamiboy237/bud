@@ -50,7 +50,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked
       # The JUnit file is the failure artifact; the test selection matches `uv run pytest`.
-      - run: uv run pytest --junitxml=test-results/junit.xml
+      - run: uv run pytest -n auto --junitxml=test-results/junit.xml
       - name: Upload test results
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -106,21 +106,7 @@ jobs:
             echo "::endgroup::"
           done
 
-  # The Rust terminal client in tui/ only exists on branches that carry it;
-  # skip the job entirely where there is no crate to check.
-  detect:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      tui: ${{ steps.detect.outputs.tui }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - id: detect
-        run: echo "tui=$([ -f tui/Cargo.toml ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
-
   tui:
-    needs: detect
-    if: needs.detect.outputs.tui == 'yes'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -149,8 +135,19 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: mac/.build
+          key: ${{ runner.os }}-swiftpm-${{ hashFiles('mac/Package.resolved', 'mac/Package.swift') }}
+          restore-keys: |
+            ${{ runner.os }}-swiftpm-
       - run: swift --version
       - run: swift test -c release --package-path mac
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name == 'push'
+        with:
+          path: mac/build/browse-*.tgz
+          key: ${{ runner.os }}-browse-${{ hashFiles('mac/build.sh') }}
       - if: github.event_name == 'push'
         run: ./mac/build.sh
       - name: Verify bundled dog
@@ -160,4 +157,5 @@ jobs:
             cmp "$source" "mac/build/bud.app/Contents/Resources/pets/dog/${source##*/}"
           done
           test "$(find mac/build/bud.app/Contents/Resources/pets/dog -type f | wc -l)" -eq 2
+          cmp mac/Resources/AppIcon.icns mac/build/bud.app/Contents/Resources/AppIcon.icns
           codesign --verify --deep --strict mac/build/bud.app

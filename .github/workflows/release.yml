@@ -28,6 +28,16 @@ jobs:
       - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: tui
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: mac/.build
+          key: ${{ runner.os }}-swiftpm-${{ hashFiles('mac/Package.resolved', 'mac/Package.swift') }}
+          restore-keys: |
+            ${{ runner.os }}-swiftpm-
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: mac/build/browse-*.tgz
+          key: ${{ runner.os }}-browse-${{ hashFiles('mac/build.sh') }}
       - run: uv sync --locked
 
       - name: Build release bundle
