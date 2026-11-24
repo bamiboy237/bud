@@ -29,6 +29,7 @@ class ModelSpec(BaseModel):
     base_url: str | None = None
     protocol: Literal["chat", "responses"] | None = None
     supports_tools: bool | None = None
+    supports_image_input: bool | None = None
     context_window: int | None = Field(default=None, gt=0)
     max_tokens: int | None = Field(default=None, gt=0)
     reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] | None = (

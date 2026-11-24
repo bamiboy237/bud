@@ -34,14 +34,17 @@ from bud.harness.review import ReviewRequest, ToolReviewer, Verdict, too_long_to
 logger = logging.getLogger(__name__)
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
-SHELL_TOOLS = {"run_command"}
+NETWORK_COMMAND = "run_command"
+LOCAL_COMMAND = "run_local_command"
+SHELL_TOOLS = {NETWORK_COMMAND, LOCAL_COMMAND}
 NETWORK_TOOL = "allow_network"
 OUTPUT_CHARS = 200_000
-GUIDANCE = """run_command runs a shell command in your workspace, sandboxed: it can write only
-there, cannot read the person's other files, and has no secrets. Use it to install packages
-(`uv pip install python-docx`, `npm install`), run scripts with `python`, and create files of
-any type, such as Word, Excel, PDF, or charts, with real libraries. Python packages go into
-the workspace's own environment, which `python` uses. Websites other than package
+GUIDANCE = """Use run_local_command for work on files already in your workspace: inspect
+images with installed libraries, process data, or create files. It cannot use the network.
+Use run_command only when you need the network, such as to install a missing package
+(`uv pip install python-docx`, `npm install`). Both commands are sandboxed, cannot read the
+person's other files, and get no secrets. Python packages go into the workspace's own
+environment, which `python` uses. Websites other than package
 registries and code hosts are checked first; a blocked site is listed in the result, and
 allow_network asks the person to allow it.
 """
@@ -86,7 +89,7 @@ def toolchains() -> list[Path]:
     return [path.resolve() for path in found if path.exists()]
 
 
-def profile(workspace: Path, port: int, private: Sequence[Path] = ()) -> str:
+def profile(workspace: Path, port: int | None, private: Sequence[Path] = ()) -> str:
     """The Seatbelt rules for one command. Later rules win over earlier ones.
 
     `private` are folders outside the home folder a command must not read either, such as
@@ -96,6 +99,11 @@ def profile(workspace: Path, port: int, private: Sequence[Path] = ()) -> str:
         f"(subpath {_quoted(p)})" for p in [Path.home().resolve(), *map(Path.resolve, private)]
     )
     readable = " ".join(f"(subpath {_quoted(p)})" for p in [workspace, *toolchains()])
+    proxy_rule = (
+        f"(allow network-outbound (remote ip {_quoted(f'localhost:{port}')}))"
+        if port is not None
+        else ""
+    )
     return f"""(version 1)
 (allow default)
 (deny file-read-data {hidden})
@@ -104,7 +112,7 @@ def profile(workspace: Path, port: int, private: Sequence[Path] = ()) -> str:
 (allow file-write* (subpath {_quoted(workspace)}) (subpath "/private/var/folders")
   (literal "/dev/null") (literal "/dev/zero") (literal "/dev/dtracehelper"))
 (deny network*)
-(allow network-outbound (remote ip {_quoted(f"localhost:{port}")}))
+{proxy_rule}
 (deny appleevent-send)
 (deny process-exec (literal "/usr/bin/open") (literal "/usr/bin/osascript")
   (literal "/usr/bin/security"))
@@ -115,9 +123,14 @@ def profile(workspace: Path, port: int, private: Sequence[Path] = ()) -> str:
 """
 
 
-def environment(workspace: Path, port: int) -> dict[str, str]:
-    """A minimal environment: tools, caches, and the proxy. Nothing from Bud's own."""
-    proxy = f"http://127.0.0.1:{port}"
+def environment(workspace: Path, port: int | None) -> dict[str, str]:
+    """Tools and caches, and proxy settings only when the command can use a proxy."""
+    proxy_vars = {}
+    if port is not None:
+        proxy = f"http://127.0.0.1:{port}"
+        proxy_vars = dict.fromkeys(
+            ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"), proxy
+        )
     tools = [str(path) for path in toolchains() if path.name in {"bin"}]
     cargo = Path.home() / ".cargo" / "bin"
     venv = workspace / ".venv"
@@ -136,7 +149,7 @@ def environment(workspace: Path, port: int) -> dict[str, str]:
         "npm_config_cache": str(workspace / ".cache" / "npm"),
         # `uv pip install` and `python` share the workspace's environment.
         "VIRTUAL_ENV": str(venv),
-        **{name: proxy for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")},
+        **proxy_vars,
         "NO_PROXY": "",
     }
 
@@ -294,13 +307,13 @@ async def run(
     workspace: Path,
     command: str,
     timeout: float,
-    judge: Judge,
+    judge: Judge | None,
     private: Sequence[Path] = (),
 ) -> dict[str, Any]:
-    """Runs one command in the sandbox and reports its output and any blocked sites."""
+    """Runs a command offline unless given a judge for proxied network connections."""
     workspace = workspace.resolve()  # Seatbelt matches real paths, not links
-    proxy = Proxy(judge)
-    port = await proxy.start()
+    proxy = Proxy(judge) if judge is not None else None
+    port = await proxy.start() if proxy is not None else None
     (workspace / ".tmp").mkdir(exist_ok=True)
     process = await asyncio.create_subprocess_exec(
         SANDBOX_EXEC,
@@ -330,7 +343,8 @@ async def run(
         if process.returncode is None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(process.wait(), 5)  # reap it; no zombie is left
-        await proxy.close()
+        if proxy is not None:
+            await proxy.close()
     result: dict[str, Any] = {
         "exit_code": process.returncode,
         "stdout": stdout.decode("utf-8", "replace")[-OUTPUT_CHARS:],
@@ -338,7 +352,7 @@ async def run(
     }
     if timed_out:
         result["timed_out"] = f"Stopped after {timeout:g} seconds."
-    if proxy.blocked:
+    if proxy is not None and proxy.blocked:
         result["blocked_sites"] = sorted(proxy.blocked)
         result["note"] = "To use a blocked site, call allow_network so the person can allow it."
     return result
@@ -415,18 +429,42 @@ def build_tools(
     reviewer: Callable[[], ToolReviewer | None],
     private: Sequence[Path] = (),
 ) -> list[Tool[None]]:
-    """run_command and allow_network. `reviewer` returns the decision model, if any.
+    """Local and network-capable commands. `reviewer` returns the decision model, if any.
     `private` are folders outside the home folder that commands must not read."""
     workspace = workspace.resolve()
     remembered: set[str] = set()
+
+    async def execute(command: str, timeout_seconds: int, judge: Judge | None) -> dict[str, Any]:
+        async def invoke() -> dict[str, Any]:
+            return await run(workspace, command, timeout_seconds, judge, private)
+
+        if DBOS.workflow_id is not None and DBOS.step_id is None:
+            # Crash recovery returns the recorded output instead of running the command again.
+            return await DBOS.run_step_async(
+                {"name": "bud.shell", "retries_allowed": False}, invoke
+            )
+        return await invoke()
+
+    async def run_local_command(
+        command: str,
+        timeout_seconds: Annotated[int, Field(ge=1, le=600)] = 120,
+    ) -> dict[str, Any]:
+        """Run a sandboxed command (zsh) in your workspace with all networking blocked.
+        Use for processing local files with installed software.
+
+        Args:
+            command: The command line, run from the workspace folder.
+            timeout_seconds: Seconds before the command is stopped, from 1 to 600.
+        """
+        return await execute(command, timeout_seconds, None)
 
     async def run_command(
         ctx: RunContext[None],
         command: str,
         timeout_seconds: Annotated[int, Field(ge=1, le=600)] = 120,
     ) -> dict[str, Any]:
-        """Run a shell command (zsh) in your workspace, sandboxed. Output comes back in full
-        for small results; large output is saved and previewed.
+        """Run a sandboxed command (zsh) that needs the network. For local work use
+        run_local_command instead.
 
         Args:
             command: The command line, run from the workspace folder.
@@ -443,16 +481,7 @@ def build_tools(
                 return True
             return False
 
-        async def execute() -> dict[str, Any]:
-            return await run(workspace, command, timeout_seconds, judge, private)
-
-        if DBOS.workflow_id is not None and DBOS.step_id is None:
-            # One recorded step: crash recovery returns this output instead of running the
-            # command again.
-            return await DBOS.run_step_async(
-                {"name": "bud.shell", "retries_allowed": False}, execute
-            )
-        return await execute()
+        return await execute(command, timeout_seconds, judge)
 
     def allow_network(host: str, reason: str) -> str:
         """Ask the person to let shell commands reach a website that was blocked.
@@ -468,4 +497,4 @@ def build_tools(
         grants.add(name)
         return f"Shell commands may now reach {name}."
 
-    return [Tool(run_command), Tool(allow_network)]
+    return [Tool(run_local_command), Tool(run_command), Tool(allow_network)]
