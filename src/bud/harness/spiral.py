@@ -45,6 +45,7 @@ from pydantic_ai_harness import DetectLoops
 from pydantic_ai_harness.detect_loops import DetectedLoop
 
 from bud.harness.review import DECISIONS_URL
+from bud.harness.taint import owner_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -184,13 +185,9 @@ def owner_request(messages: Sequence[ModelMessage]) -> str:
     for message in reversed(messages):
         if not isinstance(message, ModelRequest):
             continue
-        for part in message.parts:
-            if (
-                isinstance(part, UserPromptPart)
-                and isinstance(part.content, str)
-                and not part.content.startswith("[bud system note]")
-            ):
-                return part.content
+        for part in reversed(message.parts):
+            if isinstance(part, UserPromptPart) and (text := owner_prompt(part)) is not None:
+                return text
     return ""
 
 
