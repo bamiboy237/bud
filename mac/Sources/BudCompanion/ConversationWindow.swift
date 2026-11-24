@@ -236,6 +236,9 @@ private struct ConversationView: View {
             case .browser(let selection):
                 BrowserInspector(selection: selection, close: companion.closeInspector)
                     .id(selection.id)
+            case .delivery(let selection):
+                DesktopDeliveryInspector(selection: selection, close: companion.closeInspector)
+                    .id(selection.id)
             case .source(let panel, let request):
                 SourcePanelView(panel: panel, companion: companion)
                     .id(request)
@@ -627,7 +630,18 @@ private struct TurnView: View {
                         companion.openRoutines(card.id, occurrence: card.occurrenceID)
                     }
                 }
-                if !turn.text.isEmpty {
+                if let jobID = turn.desktopJobID {
+                    Button {
+                        companion.openDesktopDelivery(jobID)
+                    } label: {
+                        Label(turn.text, systemImage: "macwindow")
+                            .font(Paper.Typography.callout)
+                            .padding(10)
+                            .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusMD))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open browser delivery")
+                } else if !turn.text.isEmpty {
                     Reply(text: turn.text, sources: turn.sources, companion: companion, finished: true)
                 }
             }

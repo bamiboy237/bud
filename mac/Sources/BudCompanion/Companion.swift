@@ -42,12 +42,14 @@ enum InspectorSelection {
     case attachment(AttachmentSelection)
     case routine(RoutineSelection)
     case browser(BrowserSelection)
+    case delivery(DesktopDeliverySelection)
     case source(SourcePanel, request: UUID)
 
     enum Target: Equatable {
         case attachment(session: String, file: String)
         case routine(session: String, routine: String?, occurrence: String?)
         case browser
+        case delivery(session: String, job: String)
         case source(SourceTarget)
     }
 
@@ -59,6 +61,8 @@ enum InspectorSelection {
             .routine(session: selection.session, routine: selection.routineID, occurrence: selection.occurrenceID)
         case .browser:
             .browser
+        case .delivery(let selection):
+            .delivery(session: selection.session, job: selection.jobID)
         case .source(let panel, _):
             .source(panel.target)
         }
@@ -147,6 +151,7 @@ struct Turn: Identifiable, Equatable {
     var sources: [String: Source] = [:]
     var attachments: [ChatAttachment] = []
     var routine: RoutineCard?
+    var desktopJobID: String?
 }
 
 /// A run's work, for the folded line above its reply: "Worked for 34s · 4 steps".
@@ -499,12 +504,13 @@ final class Companion {
             return Turn(
                 fromOwner: turn["role"] as? String == "user", text: text, seq: turn["seq"] as? Int,
                 sources: Citations.sources(turn["sources"]),
-                attachments: attachments, routine: routine)
+                attachments: attachments, routine: routine,
+                desktopJobID: turn["desktop_job_id"] as? String)
         }
         question = turns.last(where: \.fromOwner)?.text ?? ""
         // Only a reply to the latest message: after a newer message, an older reply misleads.
         // It becomes the reply, not a turn: the latest reply is always `reply`, so it's drawn once.
-        if let last = turns.last, !last.fromOwner, last.routine == nil {
+        if let last = turns.last, !last.fromOwner, last.routine == nil, last.desktopJobID == nil {
             replySeq = last.seq
             replySources = last.sources
             reply = last.text
@@ -738,6 +744,15 @@ final class Companion {
 
     func closeInspector() {
         inspector = nil
+    }
+
+    func openDesktopDelivery(_ jobID: String) {
+        guard let connection else {
+            nudge("Reconnect to Bud to open the browser delivery.")
+            return
+        }
+        toggleInspector(.delivery(DesktopDeliverySelection(
+            connection: connection, session: session, jobID: jobID)))
     }
 
     /// Where the panel's cited message sits in the chat on screen, if it's there.
@@ -1674,6 +1689,17 @@ final class Companion {
                 turns.append(Turn(fromOwner: false, text: text, seq: event.seq, routine: card))
             }
         case "background.finished":
+            if let jobID = event.data["desktop_job_id"] as? String {
+                if !running {
+                    archiveReply()
+                    reply = ""
+                    showWhole()
+                }
+                turns.append(Turn(
+                    fromOwner: false, text: event.string("text"), seq: event.seq,
+                    desktopJobID: jobID))
+                break
+            }
             // A reminder or a background command, posted by the server; no run follows.
             notice(event)
             react(.hop)

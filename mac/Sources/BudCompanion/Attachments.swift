@@ -200,8 +200,8 @@ struct AttachmentInspector: View {
                     Image(systemName: "desktopcomputer.and.arrow.down")
                 }
                 .buttonStyle(IconButton(size: 24))
-                .help("Verify on paired desktops")
-                .accessibilityLabel("Verify on paired desktops")
+                .help("Send to paired desktops")
+                .accessibilityLabel("Send to paired desktops")
                 .popover(isPresented: $state.showDesktops, arrowEdge: .bottom) {
                     DesktopHandoffPicker(selection: selection).padding(16)
                 }
