@@ -7,6 +7,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 
@@ -14,6 +15,7 @@ from bud.composio.connection import Connections
 from bud.config import Settings
 from bud.core.auth import owner_token
 from bud.core.log import EventLog
+from bud.release.runtime_move_client import move_runtime
 
 
 @contextmanager
@@ -45,6 +47,33 @@ def status(client: httpx.Client, server: subprocess.Popen) -> dict:
     raise AssertionError("Bud did not start.")
 
 
+class LostCommitResponse(Exception):
+    pass
+
+
+class DropCommitResponse(httpx.HTTPTransport):
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        response = super().handle_request(request)
+        if request.method == "POST" and request.url.path.endswith("/activate"):
+            response.read()
+            response.raise_for_status()
+            response.close()
+            raise LostCommitResponse
+        return response
+
+
+def interrupt_move(source: Path, url: str, token: str) -> None:
+    new_client = httpx.Client
+    with patch.object(
+        httpx, "Client", side_effect=lambda **kw: new_client(**kw, transport=DropCommitResponse())
+    ):
+        try:
+            move_runtime(source, url, token)
+        except LostCommitResponse:
+            return
+    raise AssertionError("The move did not reach the commit checkpoint.")
+
+
 def smoke() -> None:
     assert os.getuid() != 0
     subprocess.run(["browse", "version"], check=True)
@@ -73,7 +102,14 @@ def smoke() -> None:
                     if first:
                         assert runtime["mode"] == "receiving"
                         assert client.get(f"/sessions/{chat}").status_code == 404
-                        for action in ([], ["--cancel"], []):
+                        interrupt_move(source, url, token)
+                        for _ in range(80):
+                            runtime = status(client, server)
+                            if runtime["mode"] == "accounts":
+                                break
+                            time.sleep(0.15)
+                    else:
+                        for action in (["--cancel"], []):
                             subprocess.run(
                                 ["bud", "move-runtime", str(source), url, *action],
                                 input=token + "\n",
@@ -88,7 +124,6 @@ def smoke() -> None:
                             timeout=30,
                         )
                         assert frozen.returncode != 0 and "stopped for a move" in frozen.stderr
-                        runtime = status(client, server)
                     assert runtime["mode"] == "accounts" and runtime["received_move_id"]
                     assert client.get(f"/sessions/{chat}").status_code == 200
                     assert client.get("/sessions").json()["conversations"][0]["title"] == (

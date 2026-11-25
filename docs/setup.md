@@ -114,7 +114,8 @@ Pair this Mac**. Keep the Bud Mac app open. The local assistant service can stay
 Bud can find and create notes, list and add reminders, and control Music. macOS asks
 for Automation permission the first time Bud uses each app. Bud can also open a
 workspace document on that Mac. App changes and document opens require approval
-in chat. To stop app access from this server, select **Remove**.
+in chat. Select **Remove** to block future actions from this server. This does
+not stop an action the Mac already accepted.
 
 ### Add a Daytona browser
 

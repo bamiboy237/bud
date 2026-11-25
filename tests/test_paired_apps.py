@@ -59,9 +59,12 @@ async def test_mac_worker_is_scoped_and_cannot_reclaim_a_write(tmp_path, monkeyp
         monkeypatch.setattr(paired_apps, "_RUN_SECONDS", 1)
         task = asyncio.create_task(apps.dispatch(first["id"], "notes_create", ["Lost receipt", ""]))
         await asyncio.sleep(0)
-        assert owner.post(MAC_WORK_PATH, headers=worker).json()["action"] == "notes_create"
-        assert owner.post(MAC_WORK_PATH, headers=worker).json() == {}
-        assert (await task)["uncertain"]
+        work = owner.post(MAC_WORK_PATH, headers=worker).json()
+        assert work["action"] == "notes_create"
         assert owner.post(MAC_WORK_PATH, headers=worker).json() == {}
         assert owner.delete(f"/desktops/{first['id']}").status_code == 204
+        late = {"id": work["id"], "state": "ok", "text": "Created."}
+        assert owner.put(MAC_WORK_PATH, headers=worker, json=late).status_code == 401
+        assert (await task)["uncertain"]
+        assert owner.post(MAC_WORK_PATH, headers=other).json() == {}
         assert owner.post(MAC_WORK_PATH, headers=worker).status_code == 401

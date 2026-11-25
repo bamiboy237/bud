@@ -26,9 +26,11 @@ write_files:
       Type=oneshot
       RemainAfterExit=yes
       WorkingDirectory=/opt/bud
-      ExecStart=/usr/bin/docker compose up --no-build --wait
+      ExecStart=/usr/bin/docker compose up --no-build --pull missing --wait
       ExecStop=/usr/bin/docker compose stop
       TimeoutStartSec=300
+      Restart=on-failure
+      RestartSec=20
 
       [Install]
       WantedBy=multi-user.target
@@ -39,5 +41,4 @@ runcmd:
     printf '%s' "$image" | grep -Eq '^[A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}$'
     printf 'BUD_IMAGE=%s\n' "$image" >> /opt/bud/.env
     systemctl enable --now docker.service
-    docker pull "$image"
-    systemctl enable --now bud.service
+    systemctl enable --now --no-block bud.service
