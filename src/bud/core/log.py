@@ -477,6 +477,25 @@ class EventLog:
                 is not None
             )
 
+    def conversation_history(self, offset: int) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            db.row_factory = sqlite3.Row
+            return [
+                dict(row)
+                for row in db.execute(
+                    """WITH chats AS (
+                        SELECT session_id, MIN(seq) AS first_seq, MAX(created_at) AS updated
+                        FROM events WHERE type='user.message' GROUP BY session_id
+                    )
+                    SELECT chats.session_id, chats.first_seq AS seq, chats.updated,
+                        SUBSTR(json_extract(events.data, '$.text'), 1, 120) AS title
+                    FROM chats JOIN events
+                    ON events.session_id=chats.session_id AND events.seq=chats.first_seq
+                    ORDER BY chats.updated DESC, chats.session_id LIMIT 50 OFFSET ?""",
+                    (offset,),
+                )
+            ]
+
     def primary_session(self, preferred: str | None = None) -> str:
         """Choose once, transactionally; never guess which old thread to merge."""
         with self._connect() as db:

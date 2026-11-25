@@ -35,6 +35,7 @@ def build_gateway(
         for model in state.get("models", [])
         for tier in ("fast", "frontier")
     ]
+    explicit_models: frozenset[str] = frozenset()
     if model_id is not None:
         registry = Registry(
             models=[spec for spec in chatgpt_models + registry.models if spec.id == model_id]
@@ -47,11 +48,14 @@ def build_gateway(
         if not selected or selected not in {spec.name for spec in chatgpt_models}:
             raise NoModelAvailable("ChatGPT has no saved model catalog. Run `bud models`.")
         seen: set[tuple[str, str]] = set()
+        other_models = [spec for spec in chatgpt_models if spec.name != selected]
+        explicit_models = frozenset(spec.id for spec in other_models)
         registry = Registry(
             models=[
                 spec
                 for spec in [spec for spec in chatgpt_models if spec.name == selected]
                 + registry.models
+                + other_models
                 if (spec.id, spec.tier) not in seen and not seen.add((spec.id, spec.tier))
             ]
         )
@@ -70,4 +74,5 @@ def build_gateway(
         selected_model=model_id,
         chatgpt=chatgpt,
         fallback=settings.model_fallback,
+        explicit_models=explicit_models,
     )

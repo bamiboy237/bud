@@ -22,24 +22,25 @@ from dbos import DBOS
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
-from pydantic_ai import ModelRetry
+from pydantic_ai import ModelRetry, Tool
 from pydantic_ai.toolsets import AbstractToolset, CombinedToolset, FunctionToolset
 
 from bud import __version__, browser
 from bud.apps import CHANGES as APP_CHANGES
 from bud.apps import GUIDANCE as APP_GUIDANCE
-from bud.apps import OPEN_IN_APP, quiet_open
+from bud.apps import OPEN_IN_APP, AppDispatch, quiet_open
 from bud.apps import READS as APP_READS
 from bud.apps import available as apps_available
 from bud.apps import build_tools as build_app_tools
 from bud.composio.binding import AccountBinding, valid_toolkit
 from bud.composio.connection import ConnectionError, Connections
-from bud.config import Settings, get_settings
+from bud.config import MOVE_FENCE, Settings, get_settings
 from bud.core.auth import OwnerAuthentication, owner_token
 from bud.core.background import GUIDANCE as BACKGROUND_GUIDANCE
 from bud.core.background import STARTS as BACKGROUND_STARTS
 from bud.core.background import TOOLS as BACKGROUND_TOOLS
 from bud.core.background import Background
+from bud.core.browser_computers import BrowserComputers
 from bud.core.browser_delivery import local_routes
 from bud.core.browser_view import BrowserView
 from bud.core.composition import compose_runner, compose_world_harness
@@ -49,12 +50,15 @@ from bud.core.hub import Hub
 from bud.core.log import EventLog, QueueFull
 from bud.core.onboarding import (
     ChatGPTLoginManager,
+    DefaultModelChoice,
     OnboardingError,
     onboarding_snapshot,
     reload_settings,
     resolve_config_env_path,
+    selectable_models,
     write_env_updates,
 )
+from bud.core.paired_apps import PairedApps
 from bud.core.profiles import Mode, ProfileStore, apply_mode, as_mode, mode_summary
 from bud.core.projection import (
     Attachment,
@@ -80,6 +84,7 @@ from bud.core.runner import (
     StaleApproval,
     UnknownApproval,
 )
+from bud.core.runtime_receiver import create_receiver
 from bud.core.setup import (
     SetupJournal,
     SetupRegistry,
@@ -106,6 +111,7 @@ from bud.harness.taint import KnownAddresses
 from bud.limits import MAX_MESSAGE_CHARS
 from bud.logs import guard_logs
 from bud.photon_config import PhotonConfig
+from bud.release.move_archive import RuntimeMoveError
 from bud.shell import GUIDANCE as SHELL_GUIDANCE
 from bud.shell import NETWORK_TOOL, SHELL_TOOLS, NetworkGrants
 from bud.shell import available as shell_available
@@ -151,6 +157,10 @@ class ModeRequest(BaseModel):
 
 class OnboardingKeysRequest(BaseModel):
     keys: dict[str, str | None] = Field(default_factory=dict)
+
+
+class DefaultModelRequest(BaseModel):
+    model: str | None
 
 
 class NewMessage(BaseModel):
@@ -266,11 +276,17 @@ def workspace_tools(
     reviewer: Callable[[], ToolReviewer | None],
     private: Sequence[Path] = (),
     background: Background | None = None,
+    app_dispatch: AppDispatch | None = None,
 ) -> FunctionToolset[None]:
     """File tools, and on macOS the sandboxed shell, whose network checks use `reviewer`.
     Shell commands cannot read `private` folders, such as Bud's data and its .env."""
     grants = NetworkGrants(state_dir / "network-grants.json")
     shell = build_shell_tools(root, grants, reviewer, private) if shell_available() else []
+    apps = (
+        build_app_tools(root, state_dir / "open-copies", dispatch=app_dispatch)
+        if apps_available() or app_dispatch is not None
+        else []
+    )
     return FunctionToolset(
         [
             *build_workspace_tools(root, state_dir / "workspace-dispatches.jsonl"),
@@ -278,7 +294,7 @@ def workspace_tools(
             *local_tools(local_blocked(Path.home(), list(private), root)),
             *shell,
             *(background.tools() if background is not None else []),
-            *(build_app_tools(root, state_dir / "open-copies") if apps_available() else []),
+            *apps,
         ]
     )
 
@@ -381,6 +397,7 @@ def create_app(
     simulate: bool = False,
     model_id: str | None = None,
     operating_profile: OperatingProfile | None = None,
+    activate_move: Callable[[], None] | None = None,
 ) -> FastAPI:
     settings = get_settings()
     token = owner_token(settings)
@@ -391,6 +408,12 @@ def create_app(
         None if simulate else hold_single_server_lock(settings.data_dir / "live-server.lock")
     )
     try:
+        if (settings.data_dir / MOVE_FENCE).exists():
+            raise RuntimeMoveError("This Bud runtime is stopped for a move to another server.")
+        if settings.receive_move and settings.received_move_id is None:
+            if live_lock is None:
+                raise RuntimeMoveError("A simulated server cannot receive a Bud runtime.")
+            return create_receiver(settings, token, live_lock, activate_move)
         return _create_app(
             settings,
             token,
@@ -439,6 +462,14 @@ def _create_app(
     account_toolset: (
         Callable[[AccountBinding | None, Path | None], CombinedToolset[None]] | None
     ) = None
+    paired_apps: PairedApps
+
+    def paired_macs() -> list[dict]:
+        """List paired Macs and their IDs. Use the exact ID in each Mac app action."""
+        return paired_apps.devices()
+
+    async def remote_app_action(mac: str | None, action: str, args: list[str]) -> dict:
+        return await paired_apps.dispatch(mac, action, args)
 
     # The approval mode applies to the harness policy after composition (the
     # Harness unions memory/skill rules in), one seam for every tool class.
@@ -496,6 +527,10 @@ def _create_app(
         tools_policy = policy()
         tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS, "allow"))
         allow_file_tools(tools_policy)
+        use_paired_mac = not apps_available()
+        if use_paired_mac:
+            tools_policy.tools.update({"paired_macs": "allow", "open_app": "ask"})
+            tools_policy.always_ask |= APP_CHANGES | {"open_app"}
         tools_policy.tools["setup_capability"] = "allow"
         browsing = settings.browser_tools
         consent = browser.Consent(settings.data_dir / "browser-consent.json")
@@ -533,7 +568,9 @@ def _create_app(
                         lambda: harness.reviewer,
                         private_folders(settings),
                         background,
+                        app_dispatch=remote_app_action if use_paired_mac else None,
                     ),
+                    *([FunctionToolset([Tool(paired_macs)])] if use_paired_mac else []),
                     build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
                     *browser_toolsets(browse),
                 ]
@@ -580,6 +617,13 @@ def _create_app(
             "connection is ready on the next message; no restart is needed."
             + WEB_GUIDANCE
             + file_guidance()
+            + (
+                "\nMac app actions run on a paired Mac. Call paired_macs to get the Mac's ID. "
+                "Specify that ID in every app action. If a result is uncertain, verify what "
+                "happened instead of repeating it.\n"
+                if use_paired_mac
+                else ""
+            )
             + (browser.GUIDANCE if browsing else "")
             + f"Your workspace is the folder {display_path(workspace)} on the machine running "
             "the Bud server. Local file paths resolve on that machine, even when the person "
@@ -600,6 +644,16 @@ def _create_app(
         )
         harness.known = KnownAddresses(session_dir / "known-addresses")
         tools_policy = harness.policy
+        if use_paired_mac:
+
+            def describe_mac(args: dict) -> str:
+                name = next(
+                    (mac["name"] for mac in paired_apps.devices() if mac["id"] == args.get("mac")),
+                    None,
+                )
+                return f"On {name}" if name else "No paired Mac selected"
+
+            harness.describers.update(dict.fromkeys(APP_CHANGES | {"open_app"}, describe_mac))
         if browsing:
             harness.describers.update(browser.describers(relay, view=browser_view))
             harness.harmless.update(browser.harmless(consent))
@@ -701,6 +755,14 @@ def _create_app(
         allow_unconfigured=allow_unconfigured,
     )
     config_env_path = resolve_config_env_path(settings)
+    model_choice = DefaultModelChoice(settings.data_dir / "default-model")
+    model_locked = bool(model_id or settings.default_model or active_profile.model.model_id)
+
+    def apply_default_model() -> None:
+        choice = None if model_locked else model_choice.read()
+        runner.owner_model = choice if choice and choice in selectable_models(gateway) else None
+
+    apply_default_model()
 
     def reload_runtime_config(*, cleared_keys: set[str] | None = None) -> None:
         nonlocal settings, gateway, has_reviewer, config_env_path
@@ -720,6 +782,7 @@ def _create_app(
             has_reviewer = new_reviewer is not None
             config_env_path = resolve_config_env_path(new_settings)
             runner.reload_gateway(new_gateway, reviewer=new_reviewer)
+            apply_default_model()
             apply_mode(harness.policy, live_mode["mode"], reviewer=has_reviewer)
             if connections is not None and account_toolset is not None:
                 connections.settings = new_settings
@@ -854,9 +917,14 @@ def _create_app(
     app.state.reload_runtime_config = reload_runtime_config
     if browser_view is not None:
         app.include_router(browser_view.routes())
+        app.include_router(
+            BrowserComputers(browser_view, pairing, settings.browse_peer_ip).routes()
+        )
         app.include_router(local_routes(browser_view))
     handoffs = DesktopHandoffs(db_path.with_suffix(".handoff.db"), workspace, hub)
     app.include_router(handoffs.routes())
+    paired_apps = PairedApps(handoffs)
+    app.include_router(paired_apps.routes())
     app.add_middleware(
         OwnerAuthentication, token=token, scope_id=scope_id, desktop_worker=handoffs.authorized
     )
@@ -879,6 +947,7 @@ def _create_app(
                 "version": __version__,
                 "mode": "simulate" if simulate else "accounts",
                 "scope": scope_id,
+                "received_move_id": settings.received_move_id,
                 "has_model": has_model,
                 "needs_onboarding": not simulate and not has_model,
                 "restart_required": connections is not None and connections.restart_required(),
@@ -899,12 +968,25 @@ def _create_app(
                 has_model=runner.is_configured,
                 simulate=simulate,
                 active_model=runner.active_model_id,
+                default_model=runner.owner_model,
+                model_locked=model_locked,
             ),
             headers={"Cache-Control": "no-store"},
         )
 
     @app.get("/onboarding")
     def get_onboarding() -> JSONResponse:
+        return _onboarding_payload()
+
+    @app.put("/onboarding/model")
+    def select_default_model(body: DefaultModelRequest) -> JSONResponse:
+        if model_locked:
+            raise HTTPException(409, "The server configuration sets the default model.")
+        with refresh_lock:
+            if body.model is not None and body.model not in selectable_models(gateway):
+                raise HTTPException(422, "This model isn’t available.")
+            model_choice.write(body.model)
+            runner.owner_model = body.model
         return _onboarding_payload()
 
     @app.post("/onboarding/keys")
@@ -1147,6 +1229,12 @@ def _create_app(
             runner.set_model(session_id, request.model)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
+
+    @app.get("/sessions")
+    def conversation_history(offset: int = 0) -> dict:
+        if offset < 0:
+            raise HTTPException(422, "Invalid history page.")
+        return {"conversations": log.conversation_history(offset)}
 
     @app.post("/sessions/primary")
     def primary_session(request: NewSession | None = None) -> dict[str, str]:

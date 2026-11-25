@@ -97,6 +97,66 @@ import Testing
         #expect(fromCheckout == repoToken)
     }
 
+    @Test func installedAppUsesItsServiceInsteadOfAnOldCheckoutFolder() throws {
+        let serviceHome = URL(filePath: "/Users/example/.bud")
+        let service = LocalBudService(home: serviceHome, port: 8420)
+        let stale = BudSettings(url: BudSettings.defaultURL, home: "/Users/example/Desktop/bud")
+
+        let selected = stale.selectingLocalService(service, isDevBuild: false, environment: [:])
+        #expect(selected.home == serviceHome.path)
+        #expect(selected.url == BudSettings.defaultURL)
+        #expect(selected.localService == service)
+    }
+
+    @Test func installedServiceDoesNotReplaceExplicitDevOrRemoteConnection() throws {
+        let service = LocalBudService(home: URL(filePath: "/Users/example/.bud"), port: 8420)
+        let local = BudSettings(url: BudSettings.defaultURL, home: "/repo")
+        let remote = BudSettings(url: "https://bud.example.net", home: "/remote")
+
+        let dev = local.selectingLocalService(service, isDevBuild: true, environment: [:])
+        #expect(dev.home == "/repo")
+        #expect(dev.localService == nil)
+        let explicit = local.selectingLocalService(
+            service, isDevBuild: false, environment: ["BUD_HOME": "/repo"])
+        #expect(explicit.home == "/repo")
+        #expect(explicit.localService == nil)
+        let selectedRemote = remote.selectingLocalService(service, isDevBuild: false, environment: [:])
+        #expect(selectedRemote.url == remote.url)
+        #expect(selectedRemote.home == remote.home)
+        #expect(selectedRemote.localService == nil)
+    }
+
+    @Test func localServiceStartsWithoutRestartingAnAlreadyLoadedAgent() async throws {
+        let userHome = URL(filePath: "/Users/example")
+        var commands: [[String]] = []
+        try await LocalBudService.start(userHome: userHome, uid: 501) { command in
+            commands.append(command)
+            return command.first == "kickstart" ? 1 : 0
+        }
+        #expect(commands == [
+            ["kickstart", "gui/501/app.bud.server"],
+            ["bootstrap", "gui/501", "/Users/example/Library/LaunchAgents/app.bud.server.plist"],
+        ])
+        commands.removeAll()
+        try await LocalBudService.start(userHome: userHome, uid: 501) { command in
+            commands.append(command)
+            return 0
+        }
+        #expect(commands == [["kickstart", "gui/501/app.bud.server"]])
+    }
+
+    @Test func remoteServerRequiresAnHTTPSOrigin() {
+        #expect(RemoteBudServer.origin(" https://Bud.Example.com:443/ ")?.absoluteString
+                == "https://bud.example.com")
+        #expect(RemoteBudServer.origin("https://bud.example.com:8443")?.port == 8443)
+        for address in [
+            "http://localhost:8420", "https://bud.example.com/chat", "https://bud.example.com/#home",
+            "https://user:password@bud.example.com", "https://bud.example.com?secret=1",
+        ] {
+            #expect(RemoteBudServer.origin(address) == nil)
+        }
+    }
+
     @Test func diagnosticsFormatterIncludesServerVersionWhenPresent() {
         let snapshot = DiagnosticsSnapshot(
             appVersion: "0.1.0",

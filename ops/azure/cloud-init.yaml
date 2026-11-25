@@ -1,0 +1,43 @@
+#cloud-config
+packages:
+  - docker.io
+  - docker-compose-v2
+write_files:
+  - path: /opt/bud/compose.yaml
+    encoding: b64
+    content: __COMPOSE__
+  - path: /opt/bud/ops/Caddyfile
+    encoding: b64
+    content: __CADDY__
+  - path: /opt/bud/.env
+    permissions: "0640"
+    content: |
+      BUD_DOMAIN=__DOMAIN__
+      BUD_RECEIVE_MOVE=__RECEIVE_MOVE__
+  - path: /etc/systemd/system/bud.service
+    content: |
+      [Unit]
+      Description=Bud server
+      Requires=docker.service
+      After=docker.service network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      WorkingDirectory=/opt/bud
+      ExecStart=/usr/bin/docker compose up --no-build --wait
+      ExecStop=/usr/bin/docker compose stop
+      TimeoutStartSec=300
+
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - |
+    set -eu
+    image="$(printf '%s' '__IMAGE__' | base64 -d)"
+    printf '%s' "$image" | grep -Eq '^[A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}$'
+    printf 'BUD_IMAGE=%s\n' "$image" >> /opt/bud/.env
+    systemctl enable --now docker.service
+    docker pull "$image"
+    systemctl enable --now bud.service

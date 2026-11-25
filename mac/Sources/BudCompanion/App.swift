@@ -28,7 +28,7 @@ private struct MenuContent: View {
     var body: some View {
         Text(status)
         if companion.needsOnboarding {
-            Button("Set up bud…") { OnboardingWindow.shared.show() }
+            Button("Add a model…") { OnboardingWindow.shared.show() }
         }
         Divider()
         Button("Ask bud…") { delegate.ask() }
@@ -126,6 +126,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.panel = panel
         BundledBrowse.install()
         companion.start()
+        MacActionWorker.shared.start()
+        if !AppUpdater.isDevBuild(), !UserDefaults.standard.bool(forKey: "openedBudConversation") {
+            UserDefaults.standard.set(true, forKey: "openedBudConversation")
+            ConversationWindow.shared.show()
+        }
         Voice.shared.start()
     }
 

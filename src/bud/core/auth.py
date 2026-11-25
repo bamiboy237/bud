@@ -155,6 +155,10 @@ class OwnerAuthentication:
             and (
                 (request.method in {"GET", "PUT"} and scope["path"] == "/desktop-worker/work")
                 or (request.method == "GET" and _WORKER_FILE.fullmatch(scope["path"]))
+                or (
+                    request.method in {"POST", "PUT"}
+                    and scope["path"] == "/desktop-worker/mac-actions"
+                )
             )
             and await run_in_threadpool(self.desktop_worker, credentials.credentials)
         ):

@@ -1458,30 +1458,60 @@ private struct InputField: View {
 final class SettingsDraft {
     static let shared = SettingsDraft()
     var settings = BudSettings.load()
-    var savedFeedback: String? = nil
+    var server: ServerSettingsDraft?
+    var move: MoveBudDraft?
+    var showingMove = false
+
+    func connectToServer() {
+        SettingsTabState.shared.selected = .connection
+        let next = ServerSettingsDraft()
+        if settings.savedRemote { next.address = settings.url }
+        server = next
+    }
+
+    func showMove() {
+        if move == nil {
+            let draft = MoveBudDraft()
+            if settings.savedRemote, let origin = RemoteBudServer.origin(settings.url) {
+                draft.server.address = origin.absoluteString
+                draft.server.token = (try? RemoteBudServer.token(for: origin)) ?? ""
+            }
+            draft.source = LocalBudService.installed()?.home
+                ?? (settings.home.isEmpty ? nil : URL(filePath: settings.home))
+            move = draft
+        }
+        showingMove = true
+    }
+
+    func finishMove() {
+        showingMove = false
+        move = nil
+        switchServer()
+    }
+
+    func useThisMac() {
+        BudSettings(url: BudSettings.defaultURL, home: "").save()
+        switchServer()
+    }
+
+    func switchServer() {
+        server = nil
+        settings = BudSettings.load()
+        Companion.shared.switchServer()
+    }
+
+    func reconnect() {
+        Companion.shared.start()
+    }
 }
 
 @MainActor @Observable
 final class SettingsTabState {
     static let shared = SettingsTabState()
 
-    enum Tab: String, CaseIterable, Identifiable {
-        case models = "Models"
-        case integrations = "Integrations"
-        case connection = "Connection"
+    enum Pane { case connection, models, integrations, computers }
 
-        var id: String { rawValue }
-
-        var symbol: String {
-            switch self {
-            case .models: "sparkles"
-            case .integrations: "key"
-            case .connection: "link"
-            }
-        }
-    }
-
-    var selected: Tab = .models
+    var selected: Pane = .connection
 }
 
 /// Settings: model sign-in, optional integration keys, and server connection details.
@@ -1489,202 +1519,137 @@ struct SettingsView: View {
     @Bindable var tab = SettingsTabState.shared
     @Bindable var store = OnboardingStore.shared
     @Bindable var draft = SettingsDraft.shared
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    private var contentTransitionAnimation: Animation {
-        reduceMotion ? .easeOut(duration: 0.14) : .easeOut(duration: 0.18)
-    }
-
-    private var bannerKey: String {
-        store.error ?? store.feedback ?? draft.savedFeedback ?? ""
-    }
+    @Bindable var companion = Companion.shared
 
     var body: some View {
-        VStack(spacing: 0) {
-            PaperSegmentedTabs(selected: $tab.selected)
-                .padding(.horizontal, 20)
-                .padding(.vertical, 12)
-
-            Rectangle().fill(Paper.hairline).frame(height: 0.5)
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    settingsBanner
-                    Group {
-                        switch tab.selected {
-                        case .models:
-                            ModelSetupPanel(store: store)
-                        case .integrations:
-                            IntegrationKeysPanel(store: store)
-                        case .connection:
-                            PaperConnectionPanel(draft: draft)
-                        }
-                    }
-                    .id(tab.selected)
-                    .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.99)))
-                }
-                .padding(20)
+        TabView(selection: $tab.selected) {
+            Tab("General", systemImage: "gearshape", value: .connection) {
+                pane { PaperConnectionPanel(draft: draft) }
             }
-            .animation(contentTransitionAnimation, value: tab.selected)
-            .animation(.easeOut(duration: 0.18), value: bannerKey)
+            Tab("Models", systemImage: "cpu", value: .models) {
+                pane {
+                    modelSettings { ModelSetupPanel(store: store) }
+                }
+            }
+            Tab("Apps", systemImage: "square.grid.2x2", value: .integrations) {
+                pane {
+                    modelSettings { IntegrationKeysPanel(store: store) }
+                }
+            }
+            Tab("Computers", systemImage: "desktopcomputer", value: .computers) {
+                pane { ComputerSettings() }
+            }
         }
-        .frame(width: 540, height: 520)
+        .frame(width: 540, height: 320)
         .background(Paper.canvas)
         .onAppear {
             draft.settings = BudSettings.load()
-            draft.savedFeedback = nil
-            Task { await store.refresh() }
+            if companion.link == .connected { Task { await store.refresh() } }
         }
-    }
-
-    @ViewBuilder
-    private var settingsBanner: some View {
-        if tab.selected == .connection {
-            if let ok = draft.savedFeedback, !ok.isEmpty {
-                StatusStrip(text: ok, isError: false) { draft.savedFeedback = nil }
-            }
-        } else if let err = store.error, !err.isEmpty {
-            StatusStrip(text: err, isError: true) { store.clearBanner() }
-        } else if let ok = store.feedback, !ok.isEmpty {
-            StatusStrip(text: ok, isError: false) { store.clearBanner() }
+        .onChange(of: companion.link) { _, link in
+            if link == .connected { Task { await store.refresh() } }
         }
-    }
-}
-
-private struct PaperSegmentedTabs: View {
-    @Binding var selected: SettingsTabState.Tab
-    @Namespace private var tabNamespace
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        let trackShape = RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous)
-        HStack(spacing: 3) {
-            ForEach(SettingsTabState.Tab.allCases) { item in
-                TabButton(
-                    item: item,
-                    active: selected == item,
-                    namespace: tabNamespace
-                ) {
-                    withAnimation(reduceMotion ? nil : .spring(duration: 0.26, bounce: 0)) {
-                        selected = item
-                    }
-                }
+        .sheet(isPresented: Binding(
+            get: { draft.server != nil },
+            set: { if !$0 { draft.server = nil } }
+        )) {
+            if let server = draft.server {
+                ServerSettings(
+                    draft: server, cancel: { draft.server = nil }, connected: draft.switchServer)
+                    .interactiveDismissDisabled(server.checking)
             }
         }
-        .padding(3)
-        .background(Paper.recessed, in: trackShape)
-        .overlay(trackShape.strokeBorder(Paper.hairline, lineWidth: 0.5))
-    }
-
-    private struct TabButton: View {
-        let item: SettingsTabState.Tab
-        let active: Bool
-        let namespace: Namespace.ID
-        let action: () -> Void
-        @StateObject private var hover = Flag()
-        @Environment(\.colorScheme) private var scheme
-
-        var body: some View {
-            let pillShape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
-            Button(action: action) {
-                HStack(spacing: 5) {
-                    Image(systemName: item.symbol)
-                        .font(.system(size: 11, weight: .medium))
-                    Text(item.rawValue)
-                        .font(Paper.Typography.label)
-                }
-                .foregroundStyle(active ? Paper.inkPrimary : (hover.on ? Paper.inkPrimary : Paper.inkSecondary))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
-                .background {
-                    if active {
-                        pillShape
-                            .fill(Paper.elevated)
-                            .overlay(pillShape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5))
-                            .shadow(
-                                color: .black.opacity(scheme == .dark ? 0.26 : 0.06),
-                                radius: 2,
-                                y: 1
-                            )
-                            .matchedGeometryEffect(id: "settings-tab", in: namespace)
-                    } else if hover.on {
-                        pillShape.fill(Paper.fillSubtle)
-                    }
-                }
-                .contentShape(pillShape)
+        .sheet(isPresented: $draft.showingMove) {
+            if let move = draft.move {
+                MoveBudView(draft: move, cancel: { draft.showingMove = false }, moved: draft.finishMove)
+                    .interactiveDismissDisabled(move.active)
             }
-            .buttonStyle(TabPressStyle())
-            .pointerStyle(.link)
-            .onHover { hover.on = $0 }
         }
     }
 
-    private struct TabPressStyle: ButtonStyle {
-        func makeBody(configuration: Configuration) -> some View {
-            configuration.label.modifier(PaperPress(pressed: configuration.isPressed))
+    private func pane<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14, content: content)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(26)
+        }
+        .background(Paper.canvas)
+    }
+
+    @ViewBuilder private func modelSettings<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        switch companion.link {
+        case .connecting:
+            ProgressView("Connecting…").controlSize(.small)
+        case .problem:
+            HStack {
+                Text("Bud isn’t connected.")
+                Spacer()
+                Button("Try Again", action: draft.reconnect)
+            }
+        case .connected:
+            if let err = store.error, !err.isEmpty {
+                StatusStrip(text: err, isError: true) { store.clearBanner() }
+            } else if let ok = store.feedback, !ok.isEmpty {
+                StatusStrip(text: ok, isError: false) { store.clearBanner() }
+            }
+            if store.status == .empty, store.loading {
+                ProgressView().controlSize(.small)
+            } else if store.status != .empty {
+                content()
+            }
         }
     }
 }
 
 private struct PaperConnectionPanel: View {
     @Bindable var draft: SettingsDraft
-    @FocusState private var urlFocused: Bool
-    @FocusState private var folderFocused: Bool
+    @Bindable var companion = Companion.shared
 
     var body: some View {
-        let cardShape = RoundedRectangle(cornerRadius: Paper.radiusLG, style: .continuous)
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Connection")
-                    .font(Paper.Typography.h2)
-                    .tracking(Paper.Typography.h2Tracking)
-                    .foregroundStyle(Paper.inkPrimary)
-                Text("Local server address and bud data folder.")
-                    .font(Paper.Typography.callout)
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Location").font(Paper.Typography.h3)
+                .padding(.bottom, 6)
+            HStack(alignment: .firstTextBaseline) {
+                Text("Bud runs on")
+                    .font(Paper.Typography.body)
+                Spacer()
+                Text(URL(string: draft.settings.url)?.scheme == "https"
+                     ? URL(string: draft.settings.url)?.host() ?? draft.settings.url
+                     : "This Mac")
                     .foregroundStyle(Paper.inkSecondary)
             }
-
-            VStack(spacing: 0) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("bud URL")
-                        .font(Paper.Typography.label)
-                        .foregroundStyle(Paper.inkPrimary)
-                    PaperFieldBox(focused: urlFocused) {
-                        TextField("http://127.0.0.1:8420", text: $draft.settings.url)
-                            .focused($urlFocused)
-                    }
+            Divider()
+            HStack {
+                switch companion.link {
+                case .connecting:
+                    ProgressView().controlSize(.small)
+                    Text("Connecting…")
+                case .connected:
+                    Text("Server")
+                case .problem:
+                    Text("Not connected")
+                    Button("Try Again", action: draft.reconnect)
                 }
-                .padding(14)
-
-                Rectangle().fill(Paper.hairline).frame(height: 0.5)
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("bud folder")
-                        .font(Paper.Typography.label)
-                        .foregroundStyle(Paper.inkPrimary)
-                    PaperFieldBox(focused: folderFocused) {
-                        TextField("/path/to/bud", text: $draft.settings.home)
-                            .focused($folderFocused)
-                    }
-                    Text("Holds bud's config.env, data, and owner token.")
-                        .font(Paper.Typography.caption)
-                        .foregroundStyle(Paper.inkMuted)
+                Spacer()
+                if draft.settings.savedRemote || URL(string: draft.settings.url)?.scheme == "https" {
+                    Button("Use This Mac", action: draft.useThisMac)
                 }
-                .padding(14)
+                Button("Connect to a server…", action: draft.connectToServer)
             }
-            .surface(cardShape, lift: 1, fill: Paper.elevated, border: Paper.borderStrong, borderWidth: 0.5)
-
-            HStack(spacing: 10) {
-                Button("Run Setup Assistant…") { OnboardingWindow.shared.show() }
-                    .buttonStyle(CardButton(kind: .secondary))
-                Spacer(minLength: 8)
-                Button("Save and reconnect") {
-                    draft.settings.save()
-                    draft.savedFeedback = "Saved connection settings. Reconnecting..."
-                    Companion.shared.start()
-                }
-                .buttonStyle(CardButton(kind: .primary))
+            .font(Paper.Typography.body)
+            Divider()
+            HStack {
+                Text("Keep Bud running when this Mac is off.")
+                    .font(Paper.Typography.callout)
+                    .foregroundStyle(Paper.inkSecondary)
+                Spacer()
+                Button("Move Bud to a server…", action: draft.showMove)
             }
+            SwiftUI.Link("Set up on Azure", destination: URL(
+                string: "https://github.com/bamiboy237/bud/blob/master/docs/setup.md#host-bud-on-azure")!)
+                .font(Paper.Typography.callout)
         }
     }
 }

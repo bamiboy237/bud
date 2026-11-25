@@ -81,6 +81,7 @@ def consequential_tools() -> frozenset[str]:
     background commands, browser steps, network access, reminders, and the simulated world's
     writes. The taint check (bud.harness.taint) looks at these; protected tools also match by
     prefix (is_protected). A private note or memory is not here: its text has no target."""
+    from bud.apps import CHANGES as APP_CHANGES
     from bud.browser import STEPS as BROWSER_STEPS
     from bud.core.background import STARTS as BACKGROUND_STARTS
     from bud.shell import NETWORK_COMMAND, NETWORK_TOOL
@@ -88,7 +89,8 @@ def consequential_tools() -> frozenset[str]:
 
     return (
         PROTECTED
-        | {NETWORK_COMMAND, NETWORK_TOOL}
+        | {NETWORK_COMMAND, NETWORK_TOOL, "open_app"}
+        | APP_CHANGES
         | BROWSER_STEPS
         | BACKGROUND_STARTS
         | WORLD_WRITE_TOOLS

@@ -186,6 +186,23 @@ async def test_unconfigured_server_starts_and_hot_reloads_keys_in_place(
             assert found.settings.composio_api_key is not None
             assert found.settings.composio_api_key.get_secret_value() == secret_composio
 
+            assert updated["models"]
+            available = updated["models"][-1]
+            selected = await client.put(
+                "/onboarding/model", headers=headers, json={"model": available}
+            )
+            assert selected.status_code == 200
+            assert selected.json()["default_model"] == available
+            assert runner._inputs("example", "new message")["owner_model"] == available
+            invalid = await client.put(
+                "/onboarding/model", headers=headers, json={"model": "nonexistent:model"}
+            )
+            assert invalid.status_code == 422
+            assert (data_dir / "default-model").read_text() == available
+            automatic = await client.put("/onboarding/model", headers=headers, json={"model": None})
+            assert automatic.json()["default_model"] is None
+            assert runner._inputs("example", "another message")["owner_model"] is None
+
             remove_resp = await client.post(
                 "/onboarding/keys",
                 headers=headers,

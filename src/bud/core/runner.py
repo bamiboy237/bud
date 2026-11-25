@@ -244,6 +244,7 @@ class Runner(DBOSConfiguredInstance):
         if self.profile.digest != harness.operating_profile.digest:
             raise ValueError("Runner operating_profile must match harness.operating_profile")
         self.tier: Tier = tier or self.profile.model.tier
+        self.owner_model: str | None = None
         self.durable = durable
         self._jobs = jobs
         self._allow_unconfigured = allow_unconfigured
@@ -522,6 +523,8 @@ class Runner(DBOSConfiguredInstance):
             return self.profile.model.model_id
         if self.gateway.selected_model:
             return self.gateway.selected_model
+        if self.owner_model:
+            return self.owner_model
         model = self.agent.model
         if isinstance(model, _UnconfiguredModel):
             return "unconfigured"
@@ -616,6 +619,7 @@ class Runner(DBOSConfiguredInstance):
             "results": RESULTS.dump_json(results).decode() if results is not None else None,
             "skills": skills,
             "model": self._resolve_run_model(session_id),
+            "owner_model": self.owner_model,
             "profile": self.profile.attribution(),
             "prompt_version": self.harness.prompt_version,
             "config": self.fingerprint,
@@ -2087,7 +2091,7 @@ class Runner(DBOSConfiguredInstance):
                 history = [*history, ModelResponse(parts=[call])]
             if conversation is not None and conversation.conversation_id != run["session_id"]:
                 raise RecoveryRefused("Conversation does not belong to this session.")
-            model_override = self.session_models.get(run["session_id"])
+            model_override = self.session_models.get(run["session_id"]) or run.get("owner_model")
             if (
                 model_override is not None
                 and self.durable

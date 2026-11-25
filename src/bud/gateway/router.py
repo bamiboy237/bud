@@ -154,6 +154,7 @@ class Gateway:
         selected_model: str | None = None,
         chatgpt: ChatGPTStore | None = None,
         fallback: bool = True,
+        explicit_models: frozenset[str] = frozenset(),
     ) -> None:
         self.registry = registry
         self.ledger = ledger
@@ -161,6 +162,7 @@ class Gateway:
         self.selected_model = selected_model
         self.chatgpt = chatgpt
         self.fallback = fallback
+        self.explicit_models = explicit_models
 
     def close(self) -> None:
         if self.chatgpt is not None:
@@ -179,7 +181,9 @@ class Gateway:
         if target:
             specs = [spec for spec in self.registry.models if spec.id == target][:1]
         else:
-            specs = self.registry.tier(tier)
+            specs = [
+                spec for spec in self.registry.tier(tier) if spec.id not in self.explicit_models
+            ]
         chain: list[TrackedModel] = []
         for spec in specs:
             if (

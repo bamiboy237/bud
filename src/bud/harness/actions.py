@@ -79,12 +79,15 @@ class Policy(BaseModel):
     tools: dict[str, Action]
     grants: frozenset[str] = frozenset()
     no_grants: frozenset[str] = frozenset()
+    always_ask: frozenset[str] = frozenset()
 
     def decide(self, tool: str) -> Action:
         """Fails closed: a tool nobody classified is denied."""
         action = self.tools.get(tool)
         if action is None:
             return "deny"
+        if tool in self.always_ask:
+            return "ask"
         if tool in self.grants and tool not in self.no_grants and not never_reviewed(tool):
             return "allow"
         return action
@@ -105,6 +108,7 @@ class Policy(BaseModel):
         return (
             self.tools.get(tool) in ("ask", "review")
             and tool not in self.no_grants
+            and tool not in self.always_ask
             and not never_reviewed(tool)
         )
 

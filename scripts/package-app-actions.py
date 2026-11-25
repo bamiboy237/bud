@@ -1,0 +1,21 @@
+"""Copy the fixed scripts and allowed app names into the signed Mac bundle."""
+
+import ast
+import json
+import sys
+from pathlib import Path
+
+source, destination = map(Path, sys.argv[1:])
+values = {
+    item.targets[0].id: item.value
+    for item in ast.parse(source.read_text()).body
+    if isinstance(item, ast.Assign) and isinstance(item.targets[0], ast.Name)
+}
+scripts = values["MAC_SCRIPTS"]
+assert isinstance(scripts, ast.Dict)
+destination.mkdir(exist_ok=True)
+for key, value in zip(scripts.keys, scripts.values, strict=True):
+    assert isinstance(key, ast.Constant) and isinstance(value, ast.Name)
+    script = ast.literal_eval(values[value.id])
+    (destination / f"{key.value}.applescript").write_text(script)
+(destination / "apps.json").write_text(json.dumps(ast.literal_eval(values["ALLOWED_APPS"])))

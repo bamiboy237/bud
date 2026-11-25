@@ -1,0 +1,44 @@
+services:
+  bud:
+    build: .
+    image: ${BUD_IMAGE:-bud-server:local}
+    restart: unless-stopped
+    environment:
+      BUD_RECEIVE_MOVE: ${BUD_RECEIVE_MOVE:-false}
+    volumes:
+      - bud-data:/home/bud/.bud
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import http.client
+          c = http.client.HTTPConnection("127.0.0.1", 8420, timeout=3)
+          c.request("GET", "/runtime")
+          assert c.getresponse().status == 401
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+  https:
+    image: caddy:2.11-alpine
+    restart: unless-stopped
+    depends_on:
+      bud:
+        condition: service_healthy
+    environment:
+      BUD_DOMAIN: ${BUD_DOMAIN:?Set BUD_DOMAIN to the DNS name of your server}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./ops/Caddyfile:/etc/caddy/Caddyfile:ro
+      - tls-state:/data
+      - tls-config:/config
+volumes:
+  bud-data:
+  tls-state:
+  tls-config:

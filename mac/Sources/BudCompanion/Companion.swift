@@ -350,10 +350,19 @@ final class Companion {
     func sendOnboardingRequest(
         _ method: String, _ path: String, json: [String: Any]? = nil
     ) async throws -> [String: Any] {
-        let active = try connection ?? BudConnection(settings: BudSettings.load())
-        let req = active.request(method, path, json: json)
-        return try await active.send(req)
+        guard let connection else { throw ConnectionError.unreachable }
+        let request = connection.request(method, path, json: json)
+        return try await connection.send(request)
     }
+
+    func conversationHistory(offset: Int) async throws -> Data {
+        guard let connection else { throw ConnectionError.unreachable }
+        let response = try await connection.send(
+            "GET", "sessions", queryItems: [URLQueryItem(name: "offset", value: String(offset))])
+        guard let conversations = response["conversations"] else { throw ConnectionError.notBudServer }
+        return try JSONSerialization.data(withJSONObject: conversations)
+    }
+
     @ObservationIgnored private var blocks: [(id: String, text: String)] = []
     /// Model requests already streamed. A second text.reset for one means bud is replaying that
     /// step after a restart, so its partial text is dropped instead of shown twice.
@@ -395,6 +404,62 @@ final class Companion {
         startConnection(resetBackoff: true)
     }
 
+    func switchServer() {
+        sendTask?.cancel()
+        OnboardingStore.shared.reset()
+        turns = []
+        steps = []
+        lastSteps = []
+        lastWork = nil
+        question = ""
+        reply = ""
+        shown = ""
+        replySources = [:]
+        replySeq = nil
+        replyingTo = nil
+        focus = nil
+        pendingMessages = []
+        draftAttachments = []
+        notices = []
+        needsOnboarding = false
+        activity = .idle
+        MacActionWorker.shared.start()
+        start()
+    }
+
+    private func connectRuntime(
+        settings: BudSettings, startLocalIfNeeded: Bool
+    ) async throws -> (BudConnection, [String: Any]) {
+        func connect() async throws -> (BudConnection, [String: Any]) {
+            let connection = try BudConnection(settings: settings)
+            return (connection, try await connection.send("GET", "runtime"))
+        }
+
+        do {
+            return try await connect()
+        } catch let error as ConnectionError {
+            guard startLocalIfNeeded, settings.localService != nil else { throw error }
+            switch error {
+            case .unreachable, .noToken: break
+            default: throw error
+            }
+        }
+
+        try Task.checkCancellation()
+        try await LocalBudService.start()
+        for _ in 0..<20 {
+            try await Task.sleep(for: .milliseconds(250))
+            do {
+                return try await connect()
+            } catch ConnectionError.unreachable {
+                continue
+            } catch ConnectionError.noToken {
+                continue
+            }
+        }
+        throw ConnectionError.localStartupFailed
+    }
+
     private func startConnection(resetBackoff: Bool) {
         closeInspector()
         citedConversations = []
@@ -423,10 +488,12 @@ final class Companion {
                 retry?.cancel()
                 approvalPoll?.cancel()
             case .beginHandshake(let mine):
+                let startLocalIfNeeded = connectionMachine.backoffAttempt == 0
                 handshake = Task {
                     do {
-                        var connection = try BudConnection(settings: BudSettings.load())
-                        let runtime = try await connection.send("GET", "runtime")
+                        let (initialConnection, runtime) = try await connectRuntime(
+                            settings: BudSettings.load(), startLocalIfNeeded: startLocalIfNeeded)
+                        var connection = initialConnection
                         connection.scope = runtime["scope"] as? String ?? ""
                         let runtimeVersion = runtime["version"] as? String
                         let needsSetup = (runtime["needs_onboarding"] as? Bool) ?? false
@@ -443,9 +510,6 @@ final class Companion {
                         self.session = session
                         seenSeq = 0
                         apply(snapshot: snapshot)
-                        if needsSetup {
-                            OnboardingWindow.shared.showIfNeeded()
-                        }
                         let startSeq = snapshot["last_seq"] as? Int ?? 0
                         for next in nextEffects {
                             if case .startStream(let attempt) = next {
@@ -973,6 +1037,11 @@ final class Companion {
         case .ask:
             break
         }
+        if needsOnboarding {
+            if spoken != nil { holdSpeech(text, because: "Add a model to send messages.") }
+            OnboardingWindow.shared.show()
+            return
+        }
         if spoken == nil {
             draft = ""
             draftAttachments = []
@@ -1007,6 +1076,7 @@ final class Companion {
                 try await connection.postMessage(
                     message, id: messageID, session: destination, attachments: files)
             } catch {
+                guard !Task.isCancelled else { return }
                 pendingMessages.removeAll { $0.id == messageID }
                 // Keep what was typed: put it back in the field so one Return resends it. The
                 // request may have arrived before the error, so the resend reuses its id and

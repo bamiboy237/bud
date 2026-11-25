@@ -26,12 +26,38 @@ from bud.gateway.chatgpt import (
     _wait_for_listener,
     refresh_models,
 )
+from bud.gateway.router import NoModelAvailable
+from bud.release.backup import _atomic_write_bytes
 
 _ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=.*$")
 
 
 class OnboardingError(Exception):
     """A safe, credential-free onboarding or configuration error."""
+
+
+@dataclass(frozen=True)
+class DefaultModelChoice:
+    path: Path
+
+    def read(self) -> str | None:
+        if not self.path.is_file():
+            return None
+        return self.path.read_text(encoding="utf-8").strip() or None
+
+    def write(self, model: str | None) -> None:
+        _atomic_write_bytes(self.path, (model or "").encode("utf-8"))
+
+
+def selectable_models(gateway: Gateway) -> list[str]:
+    choices: list[str] = []
+    for name in dict.fromkeys(spec.id for spec in gateway.registry.models):
+        try:
+            gateway.model("frontier", require_tools=True, selected=name)
+        except NoModelAvailable:
+            continue
+        choices.append(name)
+    return choices
 
 
 @dataclass(frozen=True)
@@ -449,9 +475,10 @@ def onboarding_snapshot(
     has_model: bool,
     simulate: bool,
     active_model: str | None,
+    default_model: str | None,
+    model_locked: bool,
 ) -> dict[str, Any]:
     """Return owner-safe setup status for the Mac onboarding and Settings views."""
-    _ = gateway  # reserved for future model-level status metadata
     keys: dict[str, dict[str, Any]] = {}
     for spec in MANAGED_KEYS:
         secret = getattr(settings, spec.field_name, None)
@@ -466,6 +493,9 @@ def onboarding_snapshot(
         "has_model": has_model,
         "needs_onboarding": not simulate and not has_model,
         "active_model": active_model,
+        "default_model": default_model,
+        "models": selectable_models(gateway),
+        "model_locked": model_locked,
         "config_path": str(resolve_config_env_path(settings)),
         "chatgpt": chatgpt_login.snapshot(),
         "keys": keys,

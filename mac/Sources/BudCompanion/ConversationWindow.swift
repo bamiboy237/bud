@@ -101,7 +101,9 @@ private struct ConversationView: View {
     @FocusState private var typing: Bool
     @StateObject private var restoreTyping = Flag()
     @StateObject private var scroll = ScrollState()
+    @StateObject private var history = Flag()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.openSettings) private var openSettings
 
     /// Lines longer than this are hard to read, however wide the window gets.
     private let column: CGFloat = 640
@@ -116,6 +118,10 @@ private struct ConversationView: View {
     @StateObject private var droppingAttachments = Flag()
 
     var body: some View {
+        conversation.sheet(isPresented: $history.on, content: historySheet)
+    }
+
+    private var conversation: some View {
         VStack(spacing: 0) {
             headerBar
             Rectangle().fill(Paper.hairline).frame(height: 0.5)
@@ -139,6 +145,11 @@ private struct ConversationView: View {
                     .padding(.top, 20)
                     .padding(.bottom, 44)
                     .frame(maxWidth: .infinity)
+                }
+                .overlay {
+                    if companion.turns.isEmpty, companion.shown.isEmpty {
+                        connectionStatus
+                    }
                 }
                 // Opens at the latest message, and stays there as a reply streams in, unless
                 // you've scrolled up to read something earlier.
@@ -265,6 +276,42 @@ private struct ConversationView: View {
         }
     }
 
+    private func historySheet() -> some View {
+        ConversationHistory(show: { url in
+            history.on = false
+            _ = companion.openSource(url)
+        }, close: { history.on = false })
+    }
+
+    @ViewBuilder private var connectionStatus: some View {
+        switch companion.link {
+        case .connecting:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Connecting to Bud…")
+            }
+            .font(Paper.Typography.callout)
+            .foregroundStyle(Paper.inkSecondary)
+        case .problem:
+            VStack(spacing: 10) {
+                Text("Couldn’t open conversations.")
+                    .font(Paper.Typography.body)
+                Button("Try Again", action: companion.start)
+                connectToServer
+            }
+        case .connected:
+            if companion.needsOnboarding { connectToServer }
+        }
+    }
+
+    private var connectToServer: some View {
+        Button("Connect to a server…") {
+            SettingsDraft.shared.connectToServer()
+            openSettings()
+        }
+        .buttonStyle(.link)
+    }
+
     /// Clean 38pt chrome bar aligned with macOS traffic lights: wordmark + status dot on the
     /// left, pin and collapse controls on the right.
     private var headerBar: some View {
@@ -290,6 +337,9 @@ private struct ConversationView: View {
 
     private var overviewMenu: some View {
         Menu {
+            Button { history.on = true } label: {
+                Label("Conversations…", systemImage: "text.bubble")
+            }
             Button(action: companion.openBrowserView) {
                 Label("Browser", systemImage: browserOpen ? "checkmark" : "macwindow")
             }
@@ -499,7 +549,10 @@ private struct ConversationView: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 8)
-                if companion.running, !canSend {
+                if companion.needsOnboarding, companion.inputPurpose == .ask {
+                    Button("Add a model…") { OnboardingWindow.shared.show() }
+                        .padding(.trailing, 4)
+                } else if companion.running, !canSend {
                     RoundButton(symbol: "stop.fill", label: "Stop bud", action: companion.stop)
                 } else {
                     RoundButton(symbol: "arrow.up", label: "Send", action: { companion.send() })
