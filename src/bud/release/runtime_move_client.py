@@ -47,7 +47,10 @@ def _installed_service(home: Path) -> ServiceManager | None:
 
 
 def _active(client: httpx.Client, transfer: str) -> bool:
-    runtime = client.get("/runtime").raise_for_status().json()
+    response = client.get("/runtime", timeout=3)
+    if response.status_code in {502, 503, 504}:
+        return False
+    runtime = response.raise_for_status().json()
     return runtime.get("received_move_id") == transfer and runtime.get("mode") == "accounts"
 
 
@@ -67,14 +70,18 @@ def move_runtime(
     home: Path, address: str, token: str, *, workspace: Path | None = None, cancel: bool = False
 ) -> dict:
     home = home.expanduser().resolve()
-    data, workspace = source_paths(home, workspace)
+    service = _installed_service(home)
+    data, workspace = (
+        (service.data_dir, workspace or home / "workspace")
+        if service is not None
+        else source_paths(home, workspace)
+    )
     if not data.is_dir():
         raise RuntimeMoveError("Choose the folder for the Bud runtime on this Mac.")
     data = data.resolve()
     fence = data / MOVE_FENCE
     origin = _origin(address)
     config = next((home / name for name in ("config.env", ".env") if (home / name).is_file()), None)
-    service = _installed_service(home)
     with (
         hold_single_server_lock(data / "runtime-move.lock"),
         httpx.Client(

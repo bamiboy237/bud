@@ -1,3 +1,4 @@
+import httpx
 from fastapi.testclient import TestClient
 
 from bud.composio.connection import Connections
@@ -77,3 +78,21 @@ def test_staged_runtime_cannot_run_until_committed(tmp_path, monkeypatch):
             assert view["status"] == "active"
     finally:
         get_settings.cache_clear()
+
+
+def test_activation_confirmation_waits_for_proxy_restart():
+    from bud.release.runtime_move_client import _wait_for_runtime
+
+    transfer = "d" * 32
+    responses = iter(
+        (
+            httpx.Response(502),
+            httpx.Response(200, json={"mode": "receiving"}),
+            httpx.Response(200, json={"mode": "accounts", "received_move_id": transfer}),
+        )
+    )
+    with httpx.Client(
+        base_url="https://bud.example.test",
+        transport=httpx.MockTransport(lambda request: next(responses)),
+    ) as client:
+        _wait_for_runtime(client, transfer)
