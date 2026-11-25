@@ -112,8 +112,9 @@ resume on this Mac.
 When Bud runs on a Linux server, open **Settings → Computers → Add a computer →
 Pair this Mac**. Keep the Bud Mac app open. The local assistant service can stay off.
 Bud can find and create notes, list and add reminders, and control Music. macOS asks
-for Automation permission the first time Bud uses each app. App changes require
-approval in chat. To stop app access from this server, select **Remove**.
+for Automation permission the first time Bud uses each app. Bud can also open a
+workspace document on that Mac. App changes and document opens require approval
+in chat. To stop app access from this server, select **Remove**.
 
 ### Add a Daytona browser
 

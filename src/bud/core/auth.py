@@ -22,6 +22,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from bud.config import Settings
 
 _WORKER_FILE = re.compile(r"/desktop-worker/work/[a-f0-9]{32}/file")
+_MAC_FILE = re.compile(r"/desktop-worker/mac-actions/[a-f0-9]{32}/file")
 
 
 class OwnerAuthError(Exception):
@@ -155,6 +156,7 @@ class OwnerAuthentication:
             and (
                 (request.method in {"GET", "PUT"} and scope["path"] == "/desktop-worker/work")
                 or (request.method == "GET" and _WORKER_FILE.fullmatch(scope["path"]))
+                or (request.method == "GET" and _MAC_FILE.fullmatch(scope["path"]))
                 or (
                     request.method in {"POST", "PUT"}
                     and scope["path"] == "/desktop-worker/mac-actions"

@@ -67,7 +67,7 @@ be controlled. The first time, macOS asks the person to let Bud control the app.
 Runner = Callable[[str, list[str]], Awaitable[tuple[int, str, str]]]
 # (arguments to /usr/bin/open) -> whether it opened
 Opener = Callable[[list[str]], Awaitable[bool]]
-AppDispatch = Callable[[str | None, str, list[str]], Awaitable[dict[str, Any]]]
+AppDispatch = Callable[[str | None, str, list[str], bytes | None], Awaitable[dict[str, Any]]]
 TIMED_OUT = "The app did not answer in time."
 
 _NOT_ALLOWED = (
@@ -263,7 +263,7 @@ def build_tools(
         mac: str | None, name: str, args: list[str], *, local_args: list[str] | None = None
     ) -> dict[str, Any]:
         if dispatch is not None:
-            return await dispatch(mac, name, args)
+            return await dispatch(mac, name, args, None)
         return _result(*await run(MAC_SCRIPTS[name], args if local_args is None else local_args))
 
     async def open_app(app: str, mac: str | None = None) -> dict[str, Any]:
@@ -276,14 +276,15 @@ def build_tools(
         if app not in ALLOWED_APPS:
             return {"ok": False, "error": _NOT_ALLOWED}
         if dispatch is not None:
-            return await dispatch(mac, "open_app", [app])
+            return await dispatch(mac, "open_app", [app], None)
         return {"ok": await opener(["-a", app])}
 
-    async def open_in_app(path: str) -> dict[str, Any]:
+    async def open_in_app(path: str, mac: str | None = None) -> dict[str, Any]:
         """Open a file from your workspace in its usual app, such as a PDF in Preview.
 
         Args:
             path: Relative path in the workspace, such as reports/q3.pdf.
+            mac: The paired Mac ID if Bud runs on a server.
         """
         suffix = Path(path).suffix.lower()
         if suffix not in DOCUMENT_TYPES:
@@ -291,6 +292,9 @@ def build_tools(
         data = read_workspace_bytes(workspace, path)
         if data is None:
             return {"ok": False, "error": "Give a visible file in your workspace."}
+        filename = f"{Path(path).stem[:60] or 'file'}{suffix}"
+        if dispatch is not None:
+            return await dispatch(mac, OPEN_IN_APP, [filename], data)
         # Open a private copy in Bud's own data, never the workspace file: no sandboxed
         # command can reach it to swap in a link, and the copy cannot run.
         folder: Path | None = None
@@ -298,7 +302,7 @@ def build_tools(
             copies.mkdir(mode=0o700, parents=True, exist_ok=True)
             _prune(copies)
             folder = Path(tempfile.mkdtemp(prefix="open-", dir=copies))
-            copy = folder / f"{Path(path).stem[:60] or 'file'}{suffix}"
+            copy = folder / filename
             fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
@@ -386,7 +390,7 @@ def build_tools(
 
     return [
         Tool(open_app),
-        *([Tool(open_in_app)] if dispatch is None else []),
+        Tool(open_in_app),
         Tool(music_now_playing),
         Tool(music_control),
         Tool(notes_list),

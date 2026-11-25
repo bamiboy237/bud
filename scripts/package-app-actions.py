@@ -20,3 +20,8 @@ for index, key in enumerate(scripts.keys):
     script = ast.literal_eval(values[value.id])
     (destination / f"{key.value}.applescript").write_text(script)
 (destination / "apps.json").write_text(json.dumps(ast.literal_eval(values["ALLOWED_APPS"])))
+quiet = ast.literal_eval(values["QUIET_TYPES"])
+asked_types = values["ASKED_TYPES"]
+assert isinstance(asked_types, ast.Call)
+asked = ast.literal_eval(asked_types.args[0])
+(destination / "documents.json").write_text(json.dumps({**quiet, **dict.fromkeys(asked, "")}))

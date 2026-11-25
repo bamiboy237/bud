@@ -29,7 +29,13 @@ final class MacActionWorker {
                     try Task.checkCancellation()
                     if let id = work["id"] as? String, let action = work["action"] as? String,
                        let args = work["args"] as? [String] {
-                        let reply = await MacAppAction.execute(action, args: args)
+                        let file = if action == "open_in_app" {
+                            try? await connection.getBytes("\(Self.path)/\(id)/file", queryItems: [])
+                        } else {
+                            nil as Data?
+                        }
+                        try Task.checkCancellation()
+                        let reply = await MacAppAction.execute(action, args: args, file: file)
                         _ = try await connection.send("PUT", Self.path, json: [
                             "id": id, "state": reply.state, "text": reply.text,
                         ])
@@ -99,15 +105,23 @@ enum MacAppAction {
         let text: String
     }
 
-    static func execute(_ action: String, args: [String]) async -> Reply {
+    static func execute(_ action: String, args: [String], file: Data? = nil) async -> Reply {
         await Task.detached {
             let session = CGSessionCopyCurrentDictionary() as? [String: Any]
             guard session?[kCGSessionOnConsoleKey as String] as? Bool == true,
                   session?["CGSSessionScreenIsLocked"] as? Bool != true else {
                 return Reply(state: "failed", text: "Unlock the Mac and try again.")
             }
-            guard let directory = Bundle.main.resourceURL?.appending(path: "MacActions"),
-                  let launch = command(action, args: args, directory: directory) else {
+            guard let directory = Bundle.main.resourceURL?.appending(path: "MacActions") else {
+                return Reply(state: "failed", text: "Bud is missing its Mac app actions.")
+            }
+            if action == "open_in_app" {
+                guard args.count == 1, let file else {
+                    return Reply(state: "failed", text: "Bud could not fetch the document.")
+                }
+                return openDocument(args[0], data: file, directory: directory)
+            }
+            guard let launch = command(action, args: args, directory: directory) else {
                 return Reply(state: "failed", text: "Bud does not support that Mac app action.")
             }
             return perform(executable: launch.0, arguments: launch.1)
@@ -157,6 +171,43 @@ enum MacAppAction {
 
     private static func script(_ action: String, _ args: [String], _ directory: URL) -> (String, [String]) {
         ("/usr/bin/osascript", [directory.appending(path: "\(action).applescript").path()] + args)
+    }
+
+    static func documentApp(_ name: String, directory: URL) -> String? {
+        guard !name.hasPrefix("."), !name.contains("/"), !name.contains("\\"),
+              !name.utf8.contains(0), name.utf8.count <= 255,
+              let list = try? Data(contentsOf: directory.appending(path: "documents.json")),
+              let allowed = try? JSONDecoder().decode([String: String].self, from: list)
+        else { return nil }
+        return allowed["." + (name as NSString).pathExtension.lowercased()]
+    }
+
+    private static func openDocument(_ name: String, data: Data, directory: URL) -> Reply {
+        guard let app = documentApp(name, directory: directory), data.count <= 25 * 1024 * 1024 else {
+            return Reply(state: "failed", text: "Bud can only open supported documents.")
+        }
+        let files = FileManager.default
+        let copies = files.temporaryDirectory.appending(path: "BudMacDocuments", directoryHint: .isDirectory)
+        let folder = copies.appending(path: UUID().uuidString)
+        do {
+            try files.createDirectory(at: folder, withIntermediateDirectories: true,
+                                      attributes: [.posixPermissions: 0o700])
+            let cutoff = Date().addingTimeInterval(-3600)
+            let saved = try files.contentsOfDirectory(at: copies, includingPropertiesForKeys: [.contentModificationDateKey])
+            for copy in saved where UUID(uuidString: copy.lastPathComponent) != nil {
+                if let edited = try copy.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+                   edited < cutoff {
+                    try files.removeItem(at: copy)
+                }
+            }
+            let file = folder.appending(path: name)
+            try data.write(to: file, options: .withoutOverwriting)
+            return perform(executable: "/usr/bin/open",
+                           arguments: app.isEmpty ? [file.path()] : ["-a", app, file.path()])
+        } catch {
+            try? files.removeItem(at: folder)
+            return Reply(state: "failed", text: "Bud could not save the document on this Mac.")
+        }
     }
 
     private static func perform(executable: String, arguments: [String]) -> Reply {

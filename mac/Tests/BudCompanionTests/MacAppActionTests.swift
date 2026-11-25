@@ -16,4 +16,17 @@ import Testing
         #expect(MacAppAction.command("notes_read", args: ["\0"], directory: directory) == nil)
         #expect(MacAppAction.command("notes_list", args: ["101"], directory: directory) == nil)
     }
+
+    @Test func openingFilesAcceptsOnlySupportedDocumentNames() throws {
+        let files = FileManager.default
+        let directory = files.temporaryDirectory.appending(path: UUID().uuidString)
+        try files.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? files.removeItem(at: directory) }
+        try Data(#"{".pdf":"Preview",".docx":""}"#.utf8)
+            .write(to: directory.appending(path: "documents.json"))
+        #expect(MacAppAction.documentApp("Report.PDF", directory: directory) == "Preview")
+        #expect(MacAppAction.documentApp("Draft.docx", directory: directory) == "")
+        #expect(MacAppAction.documentApp("../private.pdf", directory: directory) == nil)
+        #expect(MacAppAction.documentApp("run.command", directory: directory) == nil)
+    }
 }

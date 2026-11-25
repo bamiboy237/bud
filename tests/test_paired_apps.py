@@ -40,5 +40,18 @@ async def test_mac_worker_is_scoped_and_cannot_reclaim_a_write(tmp_path):
         assert not task.done()
         assert owner.put(MAC_WORK_PATH, headers=worker, json=receipt).status_code == 204
         assert await task == {"ok": True, "result": "Created.", "mac": "My Mac"}
+
+        document = b"Only the selected Mac receives this."
+        task = asyncio.create_task(
+            apps.dispatch(first["id"], "open_in_app", ["report.txt"], document)
+        )
+        await asyncio.sleep(0)
+        work = owner.post(MAC_WORK_PATH, headers=worker).json()
+        file_route = f"{MAC_WORK_PATH}/{work['id']}/file"
+        assert owner.get(file_route, headers=other).status_code == 404
+        assert owner.get(file_route, headers=worker).content == document
+        owner.put(MAC_WORK_PATH, headers=worker, json={"id": work["id"], "state": "ok", "text": ""})
+        assert (await task)["ok"]
+        assert owner.get(file_route, headers=worker).status_code == 404
         assert owner.delete(f"/desktops/{first['id']}").status_code == 204
         assert owner.post(MAC_WORK_PATH, headers=worker).status_code == 401

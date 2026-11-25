@@ -468,8 +468,10 @@ def _create_app(
         """List paired Macs and their IDs. Use the exact ID in each Mac app action."""
         return paired_apps.devices()
 
-    async def remote_app_action(mac: str | None, action: str, args: list[str]) -> dict:
-        return await paired_apps.dispatch(mac, action, args)
+    async def remote_app_action(
+        mac: str | None, action: str, args: list[str], file: bytes | None
+    ) -> dict:
+        return await paired_apps.dispatch(mac, action, args, file)
 
     # The approval mode applies to the harness policy after composition (the
     # Harness unions memory/skill rules in), one seam for every tool class.
@@ -530,7 +532,7 @@ def _create_app(
         use_paired_mac = not apps_available()
         if use_paired_mac:
             tools_policy.tools.update({"paired_macs": "allow", "open_app": "ask"})
-            tools_policy.always_ask |= APP_CHANGES | {"open_app"}
+            tools_policy.always_ask |= APP_CHANGES | {"open_app", OPEN_IN_APP}
         tools_policy.tools["setup_capability"] = "allow"
         browsing = settings.browser_tools
         consent = browser.Consent(settings.data_dir / "browser-consent.json")
@@ -653,7 +655,9 @@ def _create_app(
                 )
                 return f"On {name}" if name else "No paired Mac selected"
 
-            harness.describers.update(dict.fromkeys(APP_CHANGES | {"open_app"}, describe_mac))
+            harness.describers.update(
+                dict.fromkeys(APP_CHANGES | {"open_app", OPEN_IN_APP}, describe_mac)
+            )
         if browsing:
             harness.describers.update(browser.describers(relay, view=browser_view))
             harness.harmless.update(browser.harmless(consent))
@@ -703,7 +707,8 @@ def _create_app(
         )
         harness_ref.append(harness)
     # The card names the real file a local read opens, which a link cannot disguise.
-    harness.harmless[OPEN_IN_APP] = quiet_open
+    if apps_available():
+        harness.harmless[OPEN_IN_APP] = quiet_open
     outside = local_blocked(Path.home(), private_folders(settings), workspace)
     harness.describers.update(
         dict.fromkeys(LOCAL_TOOLS, lambda tool_args: describe_local(tool_args, outside))

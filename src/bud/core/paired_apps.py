@@ -8,7 +8,7 @@ import time
 from typing import Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -40,6 +40,10 @@ class PairedApps:
                     state TEXT NOT NULL DEFAULT 'waiting', result TEXT
                 );
                 CREATE INDEX IF NOT EXISTS mac_actions_desktop ON mac_actions(desktop, state);
+                CREATE TABLE IF NOT EXISTS mac_action_files (
+                    action TEXT PRIMARY KEY REFERENCES mac_actions(id) ON DELETE CASCADE,
+                    data BLOB NOT NULL
+                );
                 """)
 
     def devices(self) -> list[dict]:
@@ -53,7 +57,9 @@ class PairedApps:
                 )
             ]
 
-    async def dispatch(self, mac: str | None, action: str, args: list[str]) -> dict:
+    async def dispatch(
+        self, mac: str | None, action: str, args: list[str], file: bytes | None = None
+    ) -> dict:
         device = next((device for device in self.devices() if device["id"] == mac), None)
         if device is None:
             return {"ok": False, "error": "Pair a Mac in Settings and use its ID from paired_macs."}
@@ -67,6 +73,8 @@ class PairedApps:
                 "VALUES (?, ?, ?, ?, ?)",
                 (work_id, mac, action, json.dumps(args), time.time() + _CLAIM_SECONDS),
             )
+            if file is not None:
+                db.execute("INSERT INTO mac_action_files VALUES (?, ?)", (work_id, file))
         deadline = time.monotonic() + _CLAIM_SECONDS + _RUN_SECONDS
         try:
             while time.monotonic() < deadline:
@@ -137,6 +145,21 @@ class PairedApps:
             if work is None:
                 return {}
             return {"id": work[0], "action": work[1], "args": json.loads(work[2])}
+
+        @router.get(MAC_WORK_PATH + "/{work_id}/file")
+        def download(work_id: Id, request: Request) -> Response:
+            with self.handoffs.transaction() as db:
+                desktop = self.handoffs._worker(db, request)
+                row = db.execute(
+                    "SELECT f.data FROM mac_action_files f JOIN mac_actions a ON a.id = f.action "
+                    "WHERE a.id = ? AND a.desktop = ? AND a.state = 'claimed'",
+                    (work_id, desktop),
+                ).fetchone()
+            if row is None:
+                raise HTTPException(404, "This Mac cannot open that file.")
+            return Response(
+                row[0], media_type="application/octet-stream", headers={"Cache-Control": "no-store"}
+            )
 
         @router.put(MAC_WORK_PATH, status_code=204)
         def finish(request: Request, body: Result) -> None:

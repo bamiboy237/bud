@@ -61,6 +61,7 @@ def test_staged_runtime_cannot_run_until_committed(tmp_path, monkeypatch):
             assert receiver.put(cancelled, content=archive.read_bytes()).status_code == 409
             assert receiver.post(f"{cancelled}/activate").status_code == 409
 
+        monkeypatch.delenv("BUD_RECEIVE_MOVE")
         get_settings.cache_clear()
         with TestClient(create_app(), headers=headers) as receiver:
             assert receiver.get(route).json()["state"] == "staged"

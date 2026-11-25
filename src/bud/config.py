@@ -148,8 +148,9 @@ def get_settings() -> Settings:
     if "workspace_dir" not in settings.model_fields_set and default_workspace_dir is not None:
         updates["workspace_dir"] = default_workspace_dir
     settings = settings.model_copy(update=updates)
-    active = settings.data_dir / MOVE_DIRECTORY / "active"
-    if settings.receive_move and active.is_dir():
+    receiver = settings.data_dir / MOVE_DIRECTORY
+    active = receiver / "active"
+    if active.is_dir():
         return Settings(_env_file=active / "config.env").model_copy(
             update={
                 "data_dir": active / "data",
@@ -157,4 +158,6 @@ def get_settings() -> Settings:
                 "received_move_id": (active / "transfer-id").read_text().strip(),
             }
         )
+    if receiver.is_dir():
+        return settings.model_copy(update={"receive_move": True})
     return settings
