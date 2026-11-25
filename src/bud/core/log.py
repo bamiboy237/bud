@@ -1134,6 +1134,15 @@ class EventLog:
             ).fetchall()
         return [row[0] for row in rows]
 
+    def sessions_with_waiting_runs(self) -> list[str]:
+        with self._connect() as db:
+            return [
+                row[0]
+                for row in db.execute(
+                    "SELECT DISTINCT session_id FROM events WHERE type='run.waiting'"
+                )
+            ]
+
     def sessions_with_decisions(self) -> list[str]:
         with self._connect() as db:
             rows = db.execute(

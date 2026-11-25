@@ -153,9 +153,9 @@ def create_receiver(
             current = state(transfer)
             if current == "staged":
                 os.rename(staged, active)
-                sync_directory(root)
             elif current != "committed":
                 raise HTTPException(409, f"This move is {current}.")
+            sync_directory(root)
         if restart is not None:
             background.add_task(restart)
         return {"state": "committed"}

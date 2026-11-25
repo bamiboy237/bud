@@ -4,7 +4,7 @@ import json
 import plistlib
 import sys
 import time
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import uuid4
@@ -131,7 +131,11 @@ def move_runtime(
                 with (
                     hold_single_server_lock(data / "live-server.lock"),
                     TemporaryDirectory(prefix="bud-runtime-") as folder,
+                    ExitStack() as locks,
                 ):
+                    chatgpt = data / "chatgpt"
+                    if chatgpt.is_dir() and not chatgpt.is_symlink():
+                        locks.enter_context(hold_single_server_lock(chatgpt / "credentials.lock"))
                     archive = Path(folder) / "profile.zip"
                     pack_runtime(settings, archive)
                     with archive.open("rb") as stream:

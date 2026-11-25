@@ -18,6 +18,8 @@ from pydantic_ai.providers.openai_chatgpt import (
     OpenAIChatGPTProvider,
 )
 
+from bud.config import MOVE_FENCE
+
 LOGIN_TIMEOUT_SECONDS = 300
 CALLBACK_PORT = 1455
 
@@ -81,6 +83,9 @@ class ChatGPTStore(OpenAIChatGPTCredentialSource):
                 "Another bud process is using ChatGPT. Stop it before signing in, "
                 "listing ChatGPT models, or starting another ChatGPT process."
             ) from None
+        if (self.folder.parent / MOVE_FENCE).exists():
+            lock.close()
+            raise ChatGPTError("This Bud runtime is stopped for a move to another server.")
         self._lock = lock
 
     def close(self) -> None:

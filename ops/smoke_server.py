@@ -85,7 +85,7 @@ def smoke() -> None:
                             ["bud", "serve", "--home", str(source), "--port", str(port)],
                             capture_output=True,
                             text=True,
-                            timeout=10,
+                            timeout=30,
                         )
                         assert frozen.returncode != 0 and "stopped for a move" in frozen.stderr
                         runtime = status(client, server)

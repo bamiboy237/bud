@@ -14,7 +14,8 @@ values = {
 scripts = values["MAC_SCRIPTS"]
 assert isinstance(scripts, ast.Dict)
 destination.mkdir(exist_ok=True)
-for key, value in zip(scripts.keys, scripts.values, strict=True):
+for index, key in enumerate(scripts.keys):
+    value = scripts.values[index]
     assert isinstance(key, ast.Constant) and isinstance(value, ast.Name)
     script = ast.literal_eval(values[value.id])
     (destination / f"{key.value}.applescript").write_text(script)

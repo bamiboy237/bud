@@ -10,12 +10,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from zipfile import ZIP_DEFLATED, ZipFile
 
+from dotenv import dotenv_values
+
 from bud import __version__
 from bud.composio.binding import BindingStore
 from bud.config import Settings
 from bud.core.hub import Hub
 from bud.core.log import EventLog
-from bud.core.projection import queued_messages, runs, undecided_approvals
+from bud.core.projection import parked_approvals, queued_messages, runs, undecided_approvals
 from bud.core.routines import RoutineStore
 from bud.core.workspace_home import workspace_home
 from bud.release.backup import _atomic_write_bytes, _copy_file_consistent
@@ -57,6 +59,9 @@ _PORTABLE_FIELDS = (
     "openai_api_key",
     "operating_profile",
 )
+_PORTABLE_ENV_NAMES = {
+    "BUD_DAILY_USD" if name == "daily_spend_usd" else name.upper() for name in _PORTABLE_FIELDS
+}
 
 
 def _permitted_data(path: Path) -> bool:
@@ -140,17 +145,19 @@ def _check_idle(data: Path) -> None:
             raise RuntimeMoveError("Finish or clear queued messages before moving Bud.")
         for session in log.sessions_with_requests():
             events = log.read(session)
-            if undecided_approvals(events):
+            if undecided_approvals(events) or parked_approvals(events):
                 raise RuntimeMoveError("Resolve open approvals before moving Bud.")
+        for session in log.sessions_with_waiting_runs():
+            if any(run.status == "awaiting_approval" for run in runs(log.read(session))[-1:]):
+                raise RuntimeMoveError(
+                    "Finish the conversation waiting for an answer before moving."
+                )
         for session in log.setup_wakeup_sessions():
             if log.pending_setup_wakeups(session):
                 raise RuntimeMoveError("Finish pending sign-ins before moving Bud.")
         routine_store = RoutineStore(Hub(log))
         if routine_store.active_occurrences() or routine_store.unconfirmed_deliveries():
             raise RuntimeMoveError("Finish active routine runs and deliveries before moving Bud.")
-        for session in log.sessions_with_decisions():
-            if any(run.status == "awaiting_approval" for run in runs(log.read(session))[-1:]):
-                raise RuntimeMoveError("Wait for approved work to finish before moving Bud.")
         background = database.with_name("background.db")
         if background.is_file():
             with closing(sqlite3.connect(f"{background.as_uri()}?mode=ro", uri=True)) as db:
@@ -225,5 +232,7 @@ def verify_runtime(archive: Path, stage: Path) -> None:
     config = stage / "config.env"
     if not config.is_file():
         raise RuntimeMoveError("The Bud runtime archive is missing its configuration.")
+    if not dotenv_values(config, interpolate=False).keys() <= _PORTABLE_ENV_NAMES:
+        raise RuntimeMoveError("The Bud archive contains non-portable settings.")
     Settings(_env_file=config)
     _check_idle(stage / "data")

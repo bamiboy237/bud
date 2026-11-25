@@ -4,7 +4,9 @@ from bud.composio.connection import Connections
 from bud.config import get_settings
 from bud.core import server
 from bud.core.auth import owner_token
+from bud.core.hub import Hub
 from bud.core.log import EventLog
+from bud.core.routines import RoutineStore
 from bud.core.runner import Runner
 from bud.core.server import create_app
 
@@ -29,6 +31,13 @@ def test_staged_runtime_cannot_run_until_committed(tmp_path, monkeypatch):
     log = EventLog(connections.folder / "sessions" / scope / "bud.db")
     chat = log.primary_session()
     log.append(chat, "user.message", {"text": "This conversation follows Bud"})
+    routine = RoutineStore(Hub(log)).create(
+        feed_id=chat,
+        title="Weekly update",
+        skill="weekly-update",
+        prompt="Summarize the week.",
+        cron="0 12 * * 1",
+    )
     monkeypatch.setenv("DEEPSEEK_API_KEY", "offline-test-key")
     get_settings.cache_clear()
     settings = get_settings()
@@ -63,5 +72,7 @@ def test_staged_runtime_cannot_run_until_committed(tmp_path, monkeypatch):
             assert active.get("/runtime").json()["received_move_id"] == "a" * 32
             assert active.get(f"/sessions/{chat}").status_code == 200
             assert active.get("/onboarding").json()["default_model"] == "deepseek:deepseek-flash"
+            view = active.get(f"/routines/{routine.routine_id}").json()
+            assert view["status"] == "active"
     finally:
         get_settings.cache_clear()
