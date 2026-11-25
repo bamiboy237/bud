@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from bud.config import get_settings
+from bud.core import paired_apps
 from bud.core.auth import OwnerAuthentication, owner_token
 from bud.core.handoff import DesktopHandoffs
 from bud.core.hub import Hub
@@ -11,7 +12,7 @@ from bud.core.log import EventLog
 from bud.core.paired_apps import MAC_WORK_PATH, PairedApps
 
 
-async def test_mac_worker_is_scoped_and_cannot_reclaim_a_write(tmp_path):
+async def test_mac_worker_is_scoped_and_cannot_reclaim_a_write(tmp_path, monkeypatch):
     token = owner_token(get_settings())
     hub = Hub(EventLog(tmp_path / "bud.db"))
     handoffs = DesktopHandoffs(tmp_path / "handoffs.db", tmp_path, hub)
@@ -53,5 +54,14 @@ async def test_mac_worker_is_scoped_and_cannot_reclaim_a_write(tmp_path):
         owner.put(MAC_WORK_PATH, headers=worker, json={"id": work["id"], "state": "ok", "text": ""})
         assert (await task)["ok"]
         assert owner.get(file_route, headers=worker).status_code == 404
+
+        monkeypatch.setattr(paired_apps, "_CLAIM_SECONDS", 1)
+        monkeypatch.setattr(paired_apps, "_RUN_SECONDS", 1)
+        task = asyncio.create_task(apps.dispatch(first["id"], "notes_create", ["Lost receipt", ""]))
+        await asyncio.sleep(0)
+        assert owner.post(MAC_WORK_PATH, headers=worker).json()["action"] == "notes_create"
+        assert owner.post(MAC_WORK_PATH, headers=worker).json() == {}
+        assert (await task)["uncertain"]
+        assert owner.post(MAC_WORK_PATH, headers=worker).json() == {}
         assert owner.delete(f"/desktops/{first['id']}").status_code == 204
         assert owner.post(MAC_WORK_PATH, headers=worker).status_code == 401

@@ -73,9 +73,9 @@ def smoke() -> None:
                     if first:
                         assert runtime["mode"] == "receiving"
                         assert client.get(f"/sessions/{chat}").status_code == 404
-                        for _ in range(2):
+                        for action in ([], ["--cancel"], []):
                             subprocess.run(
-                                ["bud", "move-runtime", str(source), url],
+                                ["bud", "move-runtime", str(source), url, *action],
                                 input=token + "\n",
                                 text=True,
                                 check=True,
