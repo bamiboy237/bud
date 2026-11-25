@@ -54,9 +54,12 @@ class LostCommitResponse(Exception):
 class DropCommitResponse(httpx.HTTPTransport):
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         response = super().handle_request(request)
-        if request.method == "POST" and request.url.path.endswith("/activate"):
+        if (
+            request.method == "POST"
+            and request.url.path.endswith("/activate")
+            and response.is_success
+        ):
             response.read()
-            response.raise_for_status()
             response.close()
             raise LostCommitResponse
         return response
