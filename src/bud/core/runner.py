@@ -400,17 +400,15 @@ class Runner(DBOSConfiguredInstance):
 
     @property
     def is_configured(self) -> bool:
-        """True when default runs have an automatic or owner-selected model."""
-        with self._routing_lock:
-            return self.owner_model is not None or not isinstance(
-                self.agent.model, _UnconfiguredModel
-            )
+        """True when new runs have a default model."""
+        return self.active_model_id is not None
 
     @property
     def active_model_id(self) -> str | None:
         """Primary model ID that new runs use, or None when unconfigured."""
         with self._routing_lock:
-            return self._resolve_run_route(self.owner_model)[0] if self.is_configured else None
+            model_id, _ = self._resolve_run_route()
+            return None if model_id == "unconfigured" else model_id
 
     def reload_gateway(
         self,
@@ -538,9 +536,12 @@ class Runner(DBOSConfiguredInstance):
             self._reconcile_routines_on_recovery()
             self.tick_routines()
 
-    def _resolve_run_route(self, selected: str | None) -> tuple[str, list[str]]:
-        if selected:
-            return selected, []
+    def _resolve_run_route(self, override: str | None = None) -> tuple[str, list[str]]:
+        if override is not None:
+            return override, []
+        if self.profile.model.model_id is None and self.owner_model is not None:
+            return self.owner_model, []
+        # The agent model already reflects the profile pin, gateway default, or tier route.
         model = self.agent.model
         if isinstance(model, TrackedModel):
             return model.spec.id, []
@@ -614,7 +615,7 @@ class Runner(DBOSConfiguredInstance):
                     self.gateway.validate_model(override, require_tools=True)
                 except NoModelAvailable:
                     override = None
-            model_id, fallbacks = self._resolve_run_route(override or owner_model)
+            model_id, fallbacks = self._resolve_run_route(override)
         endings = [event for event in events if event.type in RUN_END_EVENTS]
         checkpoint = next(
             (

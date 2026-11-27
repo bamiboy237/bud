@@ -482,6 +482,20 @@ def _create_app(
         settings.operating_profile,
         store=OperatingProfileStore(settings.data_dir / "operating-profile.json"),
     )
+
+    def build_runtime_gateway(current: Settings) -> Gateway:
+        providers = (
+            None if simulate else {"openai-chatgpt", "openai", "meta", "mistral", "deepseek"}
+        )
+        if model_id is not None or current.default_model is None:
+            return build_gateway(current, providers=providers, model_id=model_id)
+        # Keep the full catalog for Settings and use DEFAULT_MODEL only as the default route.
+        candidate = build_gateway(
+            current.model_copy(update={"default_model": None}), providers=providers
+        )
+        candidate.selected_model = current.default_model
+        return candidate
+
     retention = (
         timedelta(hours=settings.tool_result_retention_hours)
         if settings.tool_result_retention_hours != 24
@@ -522,11 +536,7 @@ def _create_app(
         db_path = session_dir / "bud.db"
         workspace = workspace_home(settings)
         background = build_background(workspace, session_dir, private_folders(settings))
-        gateway = build_gateway(
-            settings,
-            providers={"openai-chatgpt", "openai", "meta", "mistral", "deepseek"},
-            model_id=model_id,
-        )
+        gateway = build_runtime_gateway(settings)
         tools_policy = policy()
         tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS, "allow"))
         allow_file_tools(tools_policy)
@@ -675,7 +685,7 @@ def _create_app(
         db_path = settings.data_dir / "bud.db"
         workspace = workspace_root(settings.data_dir)
         background = build_background(workspace, settings.data_dir, private_folders(settings))
-        gateway = build_gateway(settings, model_id=model_id)
+        gateway = build_runtime_gateway(settings)
         world = World(settings.data_dir / "world.db")
         tools_policy = load_policy()
         allow_file_tools(tools_policy)
@@ -762,7 +772,7 @@ def _create_app(
     )
     config_env_path = resolve_config_env_path(settings)
     model_choice = DefaultModelChoice(settings.data_dir / "default-model")
-    model_locked = bool(model_id or settings.default_model or active_profile.model.model_id)
+    model_locked = bool(model_id or active_profile.model.model_id)
 
     def default_model_for(candidate: Gateway) -> str | None:
         choice = None if model_locked else model_choice.read()
@@ -773,20 +783,16 @@ def _create_app(
 
     runner.owner_model = default_model_for(gateway)
 
-    def reload_runtime_config(*, cleared_keys: set[str] | None = None) -> None:
+    def reload_runtime_config(
+        *, cleared_keys: set[str] | None = None, chatgpt_auth_changed: bool = False
+    ) -> None:
         nonlocal settings, gateway, has_reviewer, config_env_path
         with refresh_lock:
             old_gateway = gateway
             new_gateway = None
             try:
                 new_settings = reload_settings(settings, config_env_path, cleared_keys=cleared_keys)
-                new_gateway = build_gateway(
-                    new_settings,
-                    providers={"openai-chatgpt", "openai", "meta", "mistral", "deepseek"}
-                    if not simulate
-                    else None,
-                    model_id=model_id,
-                )
+                new_gateway = build_runtime_gateway(new_settings)
                 chatgpt = old_gateway.chatgpt
                 if (
                     chatgpt is not None
@@ -820,11 +826,31 @@ def _create_app(
                 connections.settings = new_settings
                 current_binding = connections.binding or connections.stored()
                 harness.swap_tools(account_toolset(current_binding, loaded.get("browse")))
+            if chatgpt_auth_changed:
+                try:
+                    choice = model_choice.read()
+                    connected = new_gateway.chatgpt is not None and new_gateway.chatgpt.connected
+                    if not connected and choice and choice.startswith("openai-chatgpt:"):
+                        model_choice.write(None)
+                    elif connected and not model_locked and choice is None:
+                        selected = next(
+                            (
+                                model
+                                for model in new_gateway.selectable_models(require_tools=True)
+                                if model.startswith("openai-chatgpt:")
+                            ),
+                            None,
+                        )
+                        if selected is not None:
+                            model_choice.write(selected)
+                            runner.owner_model = selected
+                except OSError:
+                    raise OnboardingError("Bud could not save the default model.") from None
 
     chatgpt_login = ChatGPTLoginManager(
         settings.data_dir,
         on_before_auth=lambda: gateway.close(),
-        on_complete=reload_runtime_config,
+        on_complete=lambda: reload_runtime_config(chatgpt_auth_changed=True),
     )
     if setup_journal is not None:
         # The setup toolset was built before the log, hub, and runner existed; one seam

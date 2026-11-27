@@ -36,7 +36,7 @@ def responses(*items):
     return respond
 
 
-def configure_model_choices(bud, *, alternate=True, primary_offline=False):
+def configure_model_choices(bud, *, alternate=True, primary_offline=False, pin_primary=False):
     old = bud.runner.gateway
     primary = old.registry.models[0]
     secondary = primary.model_copy(update={"name": "alternate"})
@@ -51,7 +51,12 @@ def configure_model_choices(bud, *, alternate=True, primary_offline=False):
         secondary.id: scripted_model(lambda *_: reply("Alternate model")) if alternate else None,
     }
     bud.runner.reload_gateway(
-        Gateway(Registry(models=[primary, secondary]), old.ledger, lambda spec: models[spec.id])
+        Gateway(
+            Registry(models=[primary, secondary]),
+            old.ledger,
+            lambda spec: models[spec.id],
+            selected_model=primary.id if pin_primary else None,
+        )
     )
     return primary.id, secondary.id
 
@@ -83,6 +88,27 @@ async def test_session_model_survives_restart_or_uses_default(tmp_path, alternat
         bud.runner.start("owner", "Which model is running after reset?", "second")
         await bud.settle()
         assert bud.runner.snapshot("owner").transcript[-1].text == "Primary model"
+
+
+async def test_new_runs_prefer_session_then_settings_over_gateway_default(tmp_path):
+    async with running_bud(tmp_path, responses()) as bud:
+        primary, alternate = configure_model_choices(bud, pin_primary=True)
+        bud.log.append("owner", "session.created")
+        bud.runner.owner_model = alternate
+        bud.runner.set_model("owner", primary)
+
+        async def assert_run(message_id, model, reply_text):
+            bud.runner.start("owner", "Which model is running?", message_id)
+            await bud.settle()
+            state = bud.runner.snapshot("owner")
+            assert state.recent_runs[-1].model == model
+            assert state.transcript[-1].text == reply_text
+
+        await assert_run("first", primary, "Primary model")
+        bud.runner.set_model("owner", None)
+        await assert_run("second", alternate, "Alternate model")
+        bud.runner.owner_model = None
+        await assert_run("third", primary, "Primary model")
 
 
 @pytest.mark.parametrize("selection", ["automatic", "session", "default"])

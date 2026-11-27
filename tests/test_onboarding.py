@@ -28,6 +28,7 @@ from bud.core.onboarding import (
 )
 from bud.core.runner import Runner
 from bud.core.server import _create_app
+from bud.harness.operating_profile import ModelProfileConfig, OperatingProfile
 
 
 def _clear_managed_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -48,6 +49,19 @@ def _mock_connections(data_dir: Path, settings: Settings) -> Mock:
     found.store = Mock()
     found.store.session_scope.return_value = "scope"
     return found
+
+
+def _use_nondurable_runner(monkeypatch: pytest.MonkeyPatch) -> list[Runner]:
+    created: list[Runner] = []
+
+    def non_durable_runner(*args, **kwargs):
+        kwargs["durable"] = False
+        instance = Runner(*args, **kwargs)
+        created.append(instance)
+        return instance
+
+    monkeypatch.setattr("bud.core.server.Runner", non_durable_runner)
+    return created
 
 
 def test_write_env_updates_atomic_preserves_comments_and_rejects_unsafe_input(tmp_path: Path):
@@ -143,15 +157,7 @@ billing = "subscription"
     monkeypatch.setattr("bud.core.server.Connections", lambda _: found)
     monkeypatch.setattr("bud.composio.tools.build_toolset", lambda *args: FunctionToolset[None]([]))
 
-    created: list[Runner] = []
-
-    def non_durable_runner(*args, **kwargs):
-        kwargs["durable"] = False
-        instance = Runner(*args, **kwargs)
-        created.append(instance)
-        return instance
-
-    monkeypatch.setattr("bud.core.server.Runner", non_durable_runner)
+    created = _use_nondurable_runner(monkeypatch)
     token = "onboarding-test-" + "a" * 43
     app = _create_app(settings, SecretStr(token), None, simulate=False, model_id=None)
     runner = created[0]
@@ -308,6 +314,81 @@ billing = "subscription"
         runner.gateway.close()
 
 
+@pytest.mark.parametrize("pin", [None, "cli", "profile"])
+async def test_env_default_allows_settings_changes_unless_model_is_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pin: str | None
+):
+    env_default = "openai:gpt-6-luna"
+    alternate = "openai:gpt-6.1-sol"
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"DEFAULT_MODEL={env_default}\n", encoding="utf-8")
+    settings = Settings(
+        _env_file=env_path,
+        openai_api_key=SecretStr("sk-offline-test"),
+    )
+    profile = (
+        OperatingProfile(id="pinned", version="1", model=ModelProfileConfig(model_id=alternate))
+        if pin == "profile"
+        else None
+    )
+    found = _mock_connections(settings.data_dir, settings)
+    monkeypatch.setattr("bud.core.server.Connections", lambda _: found)
+    monkeypatch.setattr("bud.composio.tools.build_toolset", lambda *args: FunctionToolset[None]([]))
+    created = _use_nondurable_runner(monkeypatch)
+    token = "onboarding-test-" + "a" * 43
+    app = _create_app(
+        settings,
+        SecretStr(token),
+        None,
+        simulate=False,
+        model_id=alternate if pin == "cli" else None,
+        operating_profile=profile,
+    )
+    runner = created[0]
+    choice_file = settings.data_dir / "default-model"
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": f"Bearer {token}"},
+        ) as client:
+            state = (await client.get("/onboarding")).json()
+            assert state["model_locked"] is (pin is not None)
+            assert state["default_model"] is None
+            assert state["active_model"] == (alternate if pin else env_default)
+
+            if pin:
+                locked = await client.put("/onboarding/model", json={"model": env_default})
+                assert locked.status_code == 409
+                assert not choice_file.exists()
+                assert runner._inputs("example", "new message")["model"] == alternate
+                return
+
+            assert alternate in state["models"]
+            selected = await client.put("/onboarding/model", json={"model": alternate})
+            assert selected.status_code == 200
+            assert selected.json()["default_model"] == alternate
+            assert selected.json()["active_model"] == alternate
+            assert choice_file.read_text() == alternate
+            assert runner._inputs("example", "new message")["model"] == alternate
+
+            reloaded = await client.post(
+                "/onboarding/keys", json={"keys": {"OPENAI_API_KEY": "sk-offline-refreshed"}}
+            )
+            assert reloaded.status_code == 200
+            assert reloaded.json()["active_model"] == alternate
+            automatic = await client.put("/onboarding/model", json={"model": None})
+            assert automatic.status_code == 200
+            assert automatic.json()["default_model"] is None
+            assert automatic.json()["active_model"] == env_default
+            assert choice_file.read_text() == ""
+            assert runner.owner_model is None
+            assert runner._inputs("example", "new message")["model"] == env_default
+    finally:
+        runner.gateway.close()
+
+
 def test_durable_runner_reload_gateway_updates_dbos_model_table(tmp_path: Path):
     """Run durable=True in a fresh subprocess so DBOS's global registry stays isolated."""
     driver = tmp_path / "durable_reload_driver.py"
@@ -392,8 +473,15 @@ print(json.dumps({"ok": True, "active": runner.active_model_id}))
     assert payload["active"] == "openai:gpt-reload-test"
 
 
+@pytest.mark.parametrize(
+    ("env_default", "saved_choice"),
+    [(None, None), ("openai:gpt-6-luna", None), ("openai:gpt-6-luna", "openai:gpt-6.1-sol")],
+)
 async def test_chatgpt_login_manager_start_complete_and_logout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    env_default: str | None,
+    saved_choice: str | None,
 ):
     _clear_managed_env(monkeypatch)
     bud_home = tmp_path / "bud_chatgpt"
@@ -403,20 +491,14 @@ async def test_chatgpt_login_manager_start_complete_and_logout(
         data_dir=data_dir,
         workspace_dir=bud_home / "workspace",
         approval_review=True,
+        default_model=env_default,
+        openai_api_key=SecretStr("sk-offline-test") if env_default else None,
     )
     found = _mock_connections(data_dir, settings)
     monkeypatch.setattr("bud.core.server.Connections", lambda _: found)
     monkeypatch.setattr("bud.composio.tools.build_toolset", lambda *args: FunctionToolset[None]([]))
 
-    created: list[Runner] = []
-
-    def non_durable_runner(*args, **kwargs):
-        kwargs["durable"] = False
-        instance = Runner(*args, **kwargs)
-        created.append(instance)
-        return instance
-
-    monkeypatch.setattr("bud.core.server.Runner", non_durable_runner)
+    created = _use_nondurable_runner(monkeypatch)
     token = "chatgpt-test-" + "b" * 43
     app = _create_app(settings, SecretStr(token), None, simulate=False, model_id=None)
     runner = created[0]
@@ -441,28 +523,31 @@ async def test_chatgpt_login_manager_start_complete_and_logout(
         store.acquire()
         try:
             state = store.state()
-            state["models"] = [{"slug": "gpt-test", "display_name": "GPT Test"}]
+            state["models"] = [
+                {"slug": "gpt-other", "display_name": "GPT Other"},
+                {"slug": "gpt-test", "display_name": "GPT Test"},
+            ]
             state["selected_model"] = "gpt-test"
             store.save_state(state)
         finally:
             store.close()
         return state["models"]
 
-    manager = ChatGPTLoginManager(
-        data_dir,
-        on_before_auth=lambda: runner.gateway.close(),
-        on_complete=app.state.reload_runtime_config,
-        flow_factory=FakeFlow,
-        wait_listener=noop_wait,
-        refresh_fn=fake_refresh,
-    )
-    app.state.chatgpt_login = manager
+    manager: ChatGPTLoginManager = app.state.chatgpt_login
+    monkeypatch.setattr(manager, "_flow_factory", FakeFlow)
+    monkeypatch.setattr(manager, "_wait_listener", noop_wait)
+    monkeypatch.setattr(manager, "_refresh_fn", fake_refresh)
 
     try:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
             headers = {"Authorization": f"Bearer {token}"}
+            if saved_choice:
+                selected = await client.put(
+                    "/onboarding/model", headers=headers, json={"model": saved_choice}
+                )
+                assert selected.status_code == 200
             started = await client.post("/onboarding/chatgpt/start", headers=headers)
             assert started.status_code == 200
             start_json = started.json()
@@ -488,16 +573,23 @@ async def test_chatgpt_login_manager_start_complete_and_logout(
             assert done_json["chatgpt"]["status"] == "connected"
             assert done_json["has_model"] is True
             assert done_json["needs_onboarding"] is False
-            assert done_json["active_model"] == "openai-chatgpt:gpt-test"
+            expected = saved_choice or "openai-chatgpt:gpt-test"
+            assert done_json["default_model"] == expected
+            assert done_json["active_model"] == expected
+            assert runner._inputs("example", "new message")["model"] == expected
+            assert (data_dir / "default-model").read_text() == expected
             assert runner.is_configured is True
 
             logged_out = await client.post("/onboarding/chatgpt/logout", headers=headers)
             assert logged_out.status_code == 200
             out_json = logged_out.json()
             assert out_json["chatgpt"]["connected"] is False
-            assert out_json["has_model"] is False
-            assert out_json["needs_onboarding"] is True
-            assert runner.is_configured is False
+            assert out_json["has_model"] is bool(env_default)
+            assert out_json["needs_onboarding"] is (env_default is None)
+            assert out_json["default_model"] == saved_choice
+            assert out_json["active_model"] == (saved_choice or env_default)
+            assert (data_dir / "default-model").read_text() == (saved_choice or "")
+            assert runner.is_configured is bool(env_default)
     finally:
         await manager.shutdown()
         runner.gateway.close()
