@@ -55,18 +55,159 @@ struct BrowserTabFocus {
 }
 
 @MainActor
-private final class BrowserInspectorState: ObservableObject {
+final class BrowserInspectorState: ObservableObject {
     @Published var groups: [BrowserTabGroup] = []
     @Published var focus = BrowserTabFocus()
-    @Published var screenshot: NSImage?
+    @Published var activeTabID: String?
+    @Published var screenshots: [String: NSImage] = [:]
+    @Published var previewIssues: [String: String] = [:]
     @Published var expanded = false
     @Published var enabled: Bool?
     @Published var connected: Bool?
-    @Published var privateInput = false
+    @Published private(set) var privateInput = false
     @Published var handoffOpen = false
     @Published var sending = false
     @Published var problem: String?
-    @Published var previewIssue: String?
+    @Published private(set) var refreshID = 0
+
+    var visibleTabIDs: Set<String> = []
+    private var lastRefreshedTabID: String?
+
+    var tabCount: Int { groups.reduce(0) { $0 + $1.tabs.count } }
+    var previewIssue: String? { previewIssues[focus.selected] }
+
+    func select(_ tabID: String) {
+        guard tabID != focus.selected else { return }
+        focus.selected = tabID
+        if screenshots[tabID] == nil {
+            refreshID += 1
+        }
+    }
+
+    func applyStatus(_ status: [String: Any]) {
+        if status["private"] as? Bool == true {
+            enterPrivateInput(handoffOpen: status["handoff_open"] as? Bool == true)
+            return
+        }
+        privateInput = false
+        handoffOpen = false
+        problem = nil
+        enabled = status["enabled"] as? Bool
+        connected = status["connected"] as? Bool
+        let tabs = (status["tabs"] as? [[String: Any]] ?? []).compactMap(BrowserTab.init)
+        groups = BrowserTabGroup.make(
+            tabs: tabs, browsers: status["browsers"] as? [[String: Any]] ?? [])
+        activeTabID = status["active_tab"] as? String
+        let tabIDs = groups.flatMap { $0.tabs.map(\.id) }
+        focus.refresh(tabIDs: tabIDs, active: activeTabID)
+        let currentIDs = Set(tabIDs)
+        screenshots = screenshots.filter { currentIDs.contains($0.key) }
+        previewIssues = previewIssues.filter { currentIDs.contains($0.key) }
+    }
+
+    func refresh(using connection: BudConnection, id: Int) async {
+        guard canRefresh(id) else { return }
+        do {
+            let status = try await connection.send("GET", "browser/view")
+            guard canRefresh(id) else { return }
+            applyStatus(status)
+        } catch {
+            guard canRefresh(id) else { return }
+            connectionFailed(error)
+            return
+        }
+
+        let selected = focus.selected
+        guard !privateInput, !selected.isEmpty else { return }
+        await refreshPreview(selected, using: connection, id: id)
+
+        let otherTabs = groups.flatMap(\.tabs).map(\.id).filter {
+            $0 != selected && visibleTabIDs.contains($0)
+        }
+        let start = otherTabs.firstIndex { $0 == lastRefreshedTabID }.map { $0 + 1 } ?? 0
+        for tabID in (otherTabs[start...] + otherTabs[..<start]).prefix(4) {
+            guard canRefresh(id), !privateInput, !groups.isEmpty else { break }
+            guard visibleTabIDs.contains(tabID) else { continue }
+            lastRefreshedTabID = tabID
+            await refreshPreview(tabID, using: connection, id: id)
+        }
+    }
+
+    private func refreshPreview(_ tabID: String, using connection: BudConnection, id: Int) async {
+        let image: NSImage?
+        do {
+            let data = try await connection.getBytes("browser/view/\(tabID)/image", queryItems: [])
+            guard canRefresh(id), !privateInput else { return }
+            image = NSImage(data: data)
+        } catch {
+            guard canRefresh(id), !privateInput else { return }
+            switch error {
+            case ConnectionError.http(423, _):
+                enterPrivateInput(handoffOpen: true)
+                return
+            case ConnectionError.unreachable,
+                 ConnectionError.http(401, _), ConnectionError.http(403, _), ConnectionError.http(409, _):
+                connectionFailed(error)
+                return
+            default:
+                image = nil
+            }
+        }
+        screenshots[tabID] = image
+        previewIssues[tabID] = image == nil ? "Preview unavailable." : nil
+    }
+
+    private func canRefresh(_ id: Int) -> Bool {
+        id == refreshID && !sending && !Task.isCancelled
+    }
+
+    private func enterPrivateInput(handoffOpen: Bool) {
+        privateInput = true
+        self.handoffOpen = handoffOpen
+        clearTabs()
+    }
+
+    private func connectionFailed(_ error: Error) {
+        clearTabs()
+        enabled = nil
+        connected = nil
+        if case ConnectionError.http(502, let detail) = error {
+            problem = detail
+        } else {
+            problem = "\(error)"
+        }
+    }
+
+    private func clearTabs() {
+        activeTabID = nil
+        groups = []
+        clearPreviews()
+    }
+
+    private func clearPreviews() {
+        screenshots = [:]
+        previewIssues = [:]
+    }
+
+    func send(_ action: String, using connection: BudConnection, body: [String: String]? = nil) async {
+        guard !sending else { return }
+        sending = true
+        clearPreviews()
+        problem = nil
+        do {
+            let response = try await connection.send("POST", "browser/view/\(action)", json: body)
+            if response["private"] as? Bool == true {
+                enterPrivateInput(handoffOpen: true)
+            } else {
+                privateInput = false
+                handoffOpen = false
+            }
+        } catch {
+            problem = "\(error)"
+        }
+        sending = false
+        refreshID += 1
+    }
 }
 
 @MainActor
@@ -77,179 +218,216 @@ struct BrowserInspector: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("Browser")
-                    .font(Paper.Typography.label)
-                    .foregroundStyle(Paper.inkPrimary)
-                Spacer()
-                Button { state.expanded.toggle() } label: {
-                    Image(systemName: state.expanded
-                        ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
-                }
-                .buttonStyle(IconButton(size: 26))
-                .accessibilityLabel(state.expanded ? "Narrow browser" : "Expand browser")
-                Button(action: close) { Image(systemName: "xmark") }
-                    .buttonStyle(IconButton(size: 26))
-                    .accessibilityLabel("Close browser")
-            }
-            .font(.system(size: 12, weight: .medium))
-            .padding(.horizontal, 14)
-            .frame(height: 40)
+            header
             Rectangle().fill(Paper.hairline).frame(height: 0.5)
-            Group {
-                if state.privateInput {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Label("Private input", systemImage: "lock.fill")
-                            .font(Paper.Typography.callout)
-                        Text("Bud’s browser actions and preview are paused.")
-                        if state.handoffOpen {
-                            Text("Finish in the browser, then select Continue in the tab.")
-                        } else if !state.sending {
-                            Text("Finish private input in the browser before resuming.")
-                            Button("Resume Bud") { Task { await send("resume") } }
-                                .buttonStyle(CardButton(kind: .primary))
-                        }
-                    }
-                } else if state.sending {
-                    VStack(alignment: .leading, spacing: 10) {
-                        ProgressView().controlSize(.small)
-                        Text("Wait for Private input before entering private information.")
-                    }
-                } else if state.enabled == false {
-                    Text("Connect and enable Browse from chat to view its tabs.")
-                } else if state.connected == false {
-                    Text("No browser is connected. Open a browser with the Browse extension enabled.")
-                } else if !state.groups.isEmpty {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Picker("Tab", selection: Binding(
-                            get: { state.focus.selected },
-                            set: {
-                                state.focus.selected = $0
-                                clearPreview()
-                            }
-                        )) {
-                            ForEach(state.groups) { group in
-                                Section(group.name) {
-                                    ForEach(group.tabs) { tab in
-                                        Text(tab.host.isEmpty ? tab.title : "\(tab.title) · \(tab.host)")
-                                            .tag(tab.id)
-                                    }
-                                }
-                            }
-                        }
-                        Button("Take over privately") {
-                            let tab = state.focus.selected
-                            Task { await send("takeover", body: ["tab": tab]) }
-                        }
-                        .buttonStyle(CardButton(kind: .secondary))
-                        .disabled(state.sending || state.focus.selected.isEmpty)
-                        .opacity(state.sending ? 0.55 : 1)
-                        if let screenshot = state.screenshot {
-                            let shape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
-                            Image(nsImage: screenshot)
-                                .resizable().scaledToFit()
-                                .clipShape(shape)
-                                .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5) }
-                                .frame(maxWidth: .infinity)
-                                .accessibilityLabel("Preview of the selected browser tab")
-                        } else if let previewIssue = state.previewIssue {
-                            Text(previewIssue)
-                        } else {
-                            ProgressView().controlSize(.small)
-                        }
-                    }
-                } else if state.enabled == true {
-                    Text("No tabs to show. Ask Bud to open a tab, or lend one from the Browse extension.")
-                } else if state.problem == nil {
+            if state.privateInput {
+                privateInput
+                    .padding(14)
+            } else if state.sending {
+                VStack(alignment: .leading, spacing: 10) {
                     ProgressView().controlSize(.small)
+                    Text("Wait for Private input before entering private information.")
                 }
+                .font(Paper.Typography.callout)
+                .foregroundStyle(Paper.inkSecondary)
+                .padding(14)
+            } else if state.enabled == false {
+                guidance("Connect and enable Browse from chat to view its tabs.")
+            } else if state.connected == false {
+                guidance("Open a browser with the Browse extension enabled to connect.")
+            } else if !state.groups.isEmpty {
+                tabList
+            } else if state.enabled == true {
+                guidance("Ask Bud to open a tab, or lend one from the Browse extension.")
+            } else if let problem = state.problem {
+                guidance(problem)
+            } else {
+                ProgressView().controlSize(.small).padding(14)
             }
-            .foregroundStyle(Paper.inkSecondary)
-            .padding(14)
-            if let problem = state.problem {
-                Text(problem).foregroundStyle(Paper.errorInk).padding(.horizontal, 14)
+            if state.privateInput, let problem = state.problem {
+                Text(problem)
+                    .font(Paper.Typography.callout)
+                    .foregroundStyle(Paper.errorInk)
+                    .padding(.horizontal, 14)
             }
-            Spacer()
         }
-        .foregroundStyle(Paper.inkPrimary)
+        .frame(maxHeight: .infinity, alignment: .topLeading)
         .background(Paper.canvas)
         .inspectorColumnWidth(min: state.expanded ? 470 : 265, ideal: state.expanded ? 650 : 340, max: 900)
-        .task {
-            while !Task.isCancelled {
-                await refresh()
+        .task(id: state.refreshID) { [id = state.refreshID] in
+            while !Task.isCancelled, id == state.refreshID {
+                await state.refresh(using: selection.connection, id: id)
                 try? await Task.sleep(for: .seconds(state.privateInput ? 1 : 3))
             }
         }
     }
 
-    private func refresh() async {
-        guard !state.sending else { return }
-        do {
-            let status = try await selection.connection.send("GET", "browser/view")
-            guard !state.sending, !Task.isCancelled else { return }
-            state.privateInput = status["private"] as? Bool == true
-            state.handoffOpen = status["handoff_open"] as? Bool == true
-            if state.privateInput {
-                clearPreview()
-                state.groups = []
-                return
+    private var header: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Browser")
+                    .font(Paper.Typography.label)
+                    .foregroundStyle(Paper.inkPrimary)
+                let count = state.tabCount
+                if count > 0, !state.privateInput, !state.sending {
+                    Text("\(count) \(count == 1 ? "tab" : "tabs")")
+                        .font(Paper.Typography.caption)
+                        .foregroundStyle(Paper.inkMuted)
+                }
             }
-            state.problem = nil
-            state.enabled = status["enabled"] as? Bool
-            state.connected = status["connected"] as? Bool
-            let tabs = (status["tabs"] as? [[String: Any]] ?? []).compactMap(BrowserTab.init)
-            state.groups = BrowserTabGroup.make(
-                tabs: tabs, browsers: status["browsers"] as? [[String: Any]] ?? [])
-            let previous = state.focus.selected
-            state.focus.refresh(tabIDs: state.groups.flatMap { $0.tabs.map(\.id) },
-                                active: status["active_tab"] as? String)
-            if state.focus.selected != previous { clearPreview() }
-        } catch {
-            guard !state.sending, !Task.isCancelled else { return }
-            state.screenshot = nil
-            state.groups = []
-            state.enabled = nil
-            state.connected = nil
-            if case ConnectionError.http(502, let detail) = error {
-                state.problem = detail
-            } else {
-                state.problem = "\(error)"
+            Spacer()
+            Button { state.expanded.toggle() } label: {
+                Image(systemName: state.expanded
+                    ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
             }
-            return
+            .buttonStyle(IconButton(size: 26))
+            .accessibilityLabel(state.expanded ? "Narrow browser" : "Expand browser")
+            Button(action: close) { Image(systemName: "xmark") }
+                .buttonStyle(IconButton(size: 26))
+                .accessibilityLabel("Close browser")
         }
-        let target = state.focus.selected
-        guard !target.isEmpty else { return }
-        do {
-            let data = try await selection.connection.getBytes(
-                "browser/view/\(target)/image", queryItems: [])
-            if !state.sending, !state.privateInput, target == state.focus.selected, !Task.isCancelled {
-                state.screenshot = NSImage(data: data)
-                state.previewIssue = state.screenshot == nil ? "Preview unavailable." : nil
+        .font(.system(size: 12, weight: .medium))
+        .padding(.horizontal, 14)
+        .frame(height: 40)
+    }
+
+    private var tabList: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 16) {
+                ForEach(state.groups) { group in
+                    if state.groups.count > 1 {
+                        if group.id != state.groups.first?.id {
+                            Rectangle().fill(Paper.hairline).frame(height: 0.5)
+                        }
+                        Text(group.name)
+                            .font(Paper.Typography.captionMedium)
+                            .foregroundStyle(Paper.inkMuted)
+                    }
+                    ForEach(group.tabs) { tab in
+                        tabCard(tab)
+                            .onScrollVisibilityChange(threshold: 0.01) { visible in
+                                if visible {
+                                    state.visibleTabIDs.insert(tab.id)
+                                } else {
+                                    state.visibleTabIDs.remove(tab.id)
+                                }
+                            }
+                    }
+                }
             }
-        } catch {
-            if !state.sending, !state.privateInput, target == state.focus.selected, !Task.isCancelled {
-                state.screenshot = nil
-                state.previewIssue = "Preview unavailable."
+            .padding(14)
+        }
+    }
+
+    private func tabCard(_ tab: BrowserTab) -> some View {
+        let selected = tab.id == state.focus.selected
+        let fallbackTitle = tab.host.isEmpty ? "Untitled tab" : tab.host
+        let title = tab.title.isEmpty ? fallbackTitle : tab.title
+        let previewLabel = selected ? "Preview of the selected browser tab" : "Preview of \(title)"
+        let issue = selected ? state.previewIssue : state.previewIssues[tab.id]
+        let shape = RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous)
+        return VStack(alignment: .leading, spacing: 0) {
+            Button {
+                state.select(tab.id)
+            } label: {
+                Paper.recessed
+                    .aspectRatio(16.0 / 10.0, contentMode: .fit)
+                    .overlay {
+                        if let image = state.screenshots[tab.id] {
+                            Image(nsImage: image)
+                                .resizable()
+                                .scaledToFit()
+                                .accessibilityLabel(previewLabel)
+                        } else if let issue {
+                            VStack(spacing: 6) {
+                                Image(systemName: "macwindow")
+                                Text(issue).font(Paper.Typography.caption)
+                            }
+                            .foregroundStyle(Paper.inkMuted)
+                        } else {
+                            ProgressView().controlSize(.small)
+                        }
+                    }
+                    .clipShape(shape)
+                    .overlay {
+                        shape.strokeBorder(selected ? Paper.accent : Paper.borderSubtle,
+                                           lineWidth: selected ? 1.5 : 0.5)
+                    }
+                    .contentShape(shape)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(previewLabel)
+            .accessibilityValue(issue ?? "")
+            .accessibilityAddTraits(selected ? .isSelected : [])
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(title)
+                        .font(Paper.Typography.label)
+                        .foregroundStyle(Paper.inkPrimary)
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    if selected {
+                        Button("Take over") {
+                            Task {
+                                await state.send("takeover", using: selection.connection, body: ["tab": tab.id])
+                            }
+                        }
+                        .buttonStyle(CardButton(kind: .secondary))
+                        .help("Take over privately")
+                        .accessibilityLabel("Take over privately")
+                        .disabled(state.sending)
+                    }
+                }
+                HStack(spacing: 6) {
+                    if tab.id == state.activeTabID {
+                        Circle()
+                            .fill(Paper.approveInk)
+                            .frame(width: 6, height: 6)
+                            .accessibilityHidden(true)
+                        Text("Live")
+                            .font(Paper.Typography.captionMedium)
+                            .foregroundStyle(Paper.inkSecondary)
+                        if !tab.host.isEmpty { Text("·").accessibilityHidden(true) }
+                    }
+                    if !tab.host.isEmpty {
+                        Text(tab.host).lineLimit(1)
+                    }
+                }
+                .font(Paper.Typography.caption)
+                .foregroundStyle(Paper.inkMuted)
+            }
+            .padding(.top, 6)
+        }
+    }
+
+    private var privateInput: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label {
+                Text("Private input").font(Paper.Typography.label)
+            } icon: {
+                Image(systemName: "lock.fill").font(.system(size: 14))
+            }
+            .foregroundStyle(Paper.inkPrimary)
+            Text(state.handoffOpen
+                 ? "Finish in the browser, then select Continue in the tab."
+                 : "Finish private input in the browser before resuming Bud.")
+                .font(Paper.Typography.callout)
+                .foregroundStyle(Paper.inkSecondary)
+            if !state.handoffOpen, !state.sending {
+                Button("Resume Bud") { Task { await state.send("resume", using: selection.connection) } }
+                    .buttonStyle(CardButton(kind: .primary))
             }
         }
     }
 
-    private func clearPreview() {
-        state.screenshot = nil
-        state.previewIssue = nil
-    }
-
-    private func send(_ action: String, body: [String: String]? = nil) async {
-        guard !state.sending else { return }
-        state.sending = true
-        clearPreview()
-        state.problem = nil
-        do {
-            let stateResponse = try await selection.connection.send("POST", "browser/view/\(action)", json: body)
-            state.privateInput = stateResponse["private"] as? Bool == true
-            state.handoffOpen = state.privateInput
-        } catch { state.problem = "\(error)" }
-        state.sending = false
-        await refresh()
+    private func guidance(_ message: String) -> some View {
+        Label {
+            Text(message).font(Paper.Typography.callout)
+        } icon: {
+            Image(systemName: "macwindow").font(.system(size: 14))
+        }
+        .foregroundStyle(Paper.inkSecondary)
+        .padding(14)
     }
 }

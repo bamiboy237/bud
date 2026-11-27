@@ -45,19 +45,27 @@ struct RoutineMessageCard: View {
         let shape = RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous)
         Button(action: open) {
             HStack(spacing: 10) {
-                Image(systemName: "clock.arrow.circlepath").foregroundStyle(Paper.accent)
+                Image(systemName: "clock")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Paper.inkSecondary)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(card.title).font(Paper.Typography.callout).lineLimit(2)
-                    Text(card.label).font(Paper.Typography.ledgerMeta)
-                        .foregroundStyle(Paper.inkSecondary)
+                    Text(card.title)
+                        .font(Paper.Typography.callout)
+                        .foregroundStyle(Paper.inkPrimary)
+                        .lineLimit(2)
+                    Text(card.label)
+                        .font(Paper.Typography.caption)
+                        .foregroundStyle(Paper.inkMuted)
                 }
                 Spacer(minLength: 8)
-                Image(systemName: "chevron.right")
-                    .font(Paper.Typography.ledgerMeta)
-                    .foregroundStyle(Paper.inkMuted)
+                HStack(spacing: 4) {
+                    Text("Open").font(Paper.Typography.captionMedium)
+                    Image(systemName: "chevron.right").font(.system(size: 9))
+                }
+                .foregroundStyle(Paper.inkSecondary)
             }
             .padding(10)
-            .frame(maxWidth: 320, alignment: .leading)
+            .frame(maxWidth: 360, alignment: .leading)
         }
         .buttonStyle(PaperHit(shape: shape, fill: Paper.elevated))
         .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5).allowsHitTesting(false) }
