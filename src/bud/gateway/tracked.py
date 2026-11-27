@@ -14,6 +14,7 @@ from time import perf_counter
 from typing import Any
 
 from pydantic_ai import RunContext
+from pydantic_ai.exceptions import ModelContextWindowExceededError
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse
 from pydantic_ai.models.wrapper import WrapperModel
@@ -41,6 +42,8 @@ request_session: ContextVar[str | None] = ContextVar("request_session", default=
 request_attribution: ContextVar[RequestAttribution | None] = ContextVar(
     "request_attribution", default=None
 )
+# None outside recovery, False before overflow, True while a retry is requested.
+context_overflow_retry: ContextVar[bool | None] = ContextVar("context_overflow_retry", default=None)
 
 
 @dataclass(init=False)
@@ -82,12 +85,9 @@ class TrackedModel(WrapperModel):
         model_request_parameters: ModelRequestParameters,
     ) -> ModelResponse:
         started = perf_counter()
-        try:
+        async with self._track_failures(started):
             messages = await self._render_attachments(messages)
             response = await super().request(messages, model_settings, model_request_parameters)
-        except BaseException as exc:
-            await self._record_failure(exc, started)
-            raise
         response.metadata = (response.metadata or {}) | {"bud_model_id": self.spec.id}
         await self._record_usage(response.usage, started)
         return response
@@ -130,23 +130,19 @@ class TrackedModel(WrapperModel):
                 signal=signal,
                 fallback_model_name=self.model_name,
             )
-            try:
+            async with self._track_failures(started, streaming=True):
                 stream.metadata = (stream.metadata or {}) | {"bud_model_id": self.spec.id}
                 yield stream
-            except BaseException as exc:
-                await self._record_failure(exc, started)
-                raise
             await self._record_usage(stream.usage, started)
             return
-        try:
-            async with super().request_stream(
+        async with (
+            self._track_failures(started, streaming=True),
+            super().request_stream(
                 messages, model_settings, model_request_parameters, run_context
-            ) as stream:
-                stream.metadata = (stream.metadata or {}) | {"bud_model_id": self.spec.id}
-                yield stream
-        except BaseException as exc:
-            await self._record_failure(exc, started)
-            raise
+            ) as stream,
+        ):
+            stream.metadata = (stream.metadata or {}) | {"bud_model_id": self.spec.id}
+            yield stream
         await self._record_usage(stream.usage, started)
 
     async def _record_usage(self, usage: RequestUsage, started: float) -> None:
@@ -163,8 +159,21 @@ class TrackedModel(WrapperModel):
             cost_usd=self.spec.cost(usage),
         )
 
-    async def _record_failure(self, exc: BaseException, started: float) -> None:
-        await self._write("failed", started, error=error_summary(exc))
+    @asynccontextmanager
+    async def _track_failures(
+        self, started: float, *, streaming: bool = False
+    ) -> AsyncGenerator[None]:
+        try:
+            yield
+        except BaseException as exc:
+            summary = error_summary(exc)
+            await self._write("failed", started, error=summary)
+            if isinstance(exc, ModelContextWindowExceededError) and (
+                streaming or context_overflow_retry.get() is not None
+            ):
+                # The agent records the failed attempt on the next response.
+                raise ModelContextWindowExceededError(self.spec.name, summary) from None
+            raise
 
     async def _write(self, status: str, started: float, **fields: Any) -> None:
         # The write is SQLite, so it runs off the event loop. The entry is built here, where

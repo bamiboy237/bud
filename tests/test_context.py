@@ -4,6 +4,7 @@ from datetime import timedelta
 import pytest
 from pydantic_ai import Agent, RunContext, Tool
 from pydantic_ai.capabilities import Capability
+from pydantic_ai.exceptions import ModelContextWindowExceededError
 from pydantic_ai.messages import (
     CompactionPart,
     ModelRequest,
@@ -19,7 +20,10 @@ from pydantic_ai.usage import RequestUsage, RunUsage
 from pydantic_ai_harness.compaction import estimate_token_count
 
 from bud.core.log import EventLog
-from bud.gateway.errors import WorkingContextBudgetError
+from bud.gateway.errors import WorkingContextBudgetError, failure
+from bud.gateway.ledger import Ledger
+from bud.gateway.registry import ModelSpec
+from bud.gateway.tracked import TrackedModel
 from bud.harness.context import BackgroundCompaction
 from bud.harness.results import SqliteResultStore
 
@@ -112,6 +116,10 @@ async def test_compaction_uses_the_request_model_window(request_window, result_s
     request_model = FunctionModel(
         profile={"context_window": request_window}, stream_function=summarize
     )
+    for message in messages:
+        if isinstance(message, ModelResponse):
+            message.model_name = request_model.model_name
+            message.provider_name = request_model.system
     ctx = RunContext(
         deps=None,
         model=ctx_model,
@@ -269,3 +277,85 @@ async def test_compacted_history_budget_counts_only_tools_sent_to_model(defer_lo
     else:
         with pytest.raises(WorkingContextBudgetError, match="exceed bud's working context budget"):
             await run
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "retry_overflows", "cannot_shrink"])
+async def test_provider_overflow_retries_only_with_smaller_history(tmp_path, streamed, outcome):
+    calls = []
+    request_sizes = []
+    records = []
+    secret = "private provider body"
+
+    def search() -> str:
+        pytest.fail("Overflow recovery must run before any tool call.")
+
+    def respond(messages, info):
+        if (info.model_settings or {}).get("max_tokens") == 4_096:
+            calls.append("summary")
+            assert not info.function_tools
+            return "x " * 10_000 if outcome == "cannot_shrink" else "The inbox was reviewed."
+        calls.append("request")
+        assert [tool.name for tool in info.function_tools] == ["search"]
+        request_sizes.append(estimate_token_count(messages))
+        if len(request_sizes) == 1 or outcome == "retry_overflows":
+            raise ModelContextWindowExceededError("deepseek-flash", secret, body=secret)
+        assert any(isinstance(part, CompactionPart) for msg in messages for part in msg.parts)
+        return "Updated inbox summary."
+
+    async def stream(messages, info):
+        yield respond(messages, info)
+
+    model = TrackedModel(
+        FunctionModel(
+            lambda messages, info: ModelResponse(parts=[TextPart(respond(messages, info))]),
+            stream_function=stream,
+            model_name="deepseek-flash",
+        ),
+        ModelSpec(
+            provider="deepseek", name="deepseek-flash", tier="fast", input=0, output=0, cached=0
+        ),
+        Ledger(tmp_path / "ledger.db"),
+    )
+    compaction = BackgroundCompaction(record=records.append, keep_tokens=100)
+    agent = Agent(model, capabilities=[compaction], tools=[Tool(search)])
+
+    async def drain_events(ctx, events):
+        async for _ in events:
+            pass
+
+    run = agent.run(
+        "Continue",
+        message_history=[
+            ModelRequest(parts=[UserPromptPart("Earlier inbox item " * 1_000)]),
+            ModelResponse(parts=[TextPart("Reviewed.")]),
+        ],
+        conversation_id="session",
+        run_id="run",
+        event_stream_handler=drain_events if streamed else None,
+    )
+
+    if outcome == "success":
+        result = await run
+        assert result.output == "Updated inbox summary."
+        messages = result.all_messages()
+        assert any(isinstance(part, CompactionPart) for msg in messages for part in msg.parts)
+        response = messages[-1]
+        assert isinstance(response, ModelResponse) and response.failed_attempts
+        error_detail = response.failed_attempts[0].error
+        assert error_detail and secret not in error_detail
+    else:
+        with pytest.raises(WorkingContextBudgetError) as caught:
+            await run
+        error = failure(caught.value)
+        assert error["kind"] == "context_full"
+        assert secret not in str(error)
+
+    if outcome == "cannot_shrink":
+        assert calls == ["request", "summary"]
+        assert [record["stage"] for record in records] == ["ready"]
+    else:
+        assert calls == ["request", "summary", "request"]
+        assert request_sizes[1] < request_sizes[0]
+        assert [record["stage"] for record in records] == ["ready", "compacted"]
+        assert records[-1]["source"] == "overflow"

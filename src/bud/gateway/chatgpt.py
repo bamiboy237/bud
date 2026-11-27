@@ -7,6 +7,7 @@ import os
 import re
 import tempfile
 import webbrowser
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, NotRequired, TextIO, TypedDict
@@ -36,15 +37,15 @@ class ChatGPTModel(TypedDict):
     context_window: NotRequired[int]
 
 
-def _catalog_context_window(model: dict[str, Any]) -> int | None:
-    for field in ("context_window", "max_context_length", "max_tokens"):
+def _catalog_context_window(model: Mapping[str, Any]) -> int | None:
+    for field in ("context_window", "max_context_length", "context_length", "max_input_tokens"):
         value = model.get(field)
         if type(value) is int and value > 0:
             return value
     return None
 
 
-def chatgpt_context_window(model: dict[str, Any]) -> int | None:
+def chatgpt_context_window(model: Mapping[str, Any]) -> int | None:
     window = _catalog_context_window(model)
     if window is not None:
         return window
