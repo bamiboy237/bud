@@ -3,9 +3,7 @@ import CoreText
 import Foundation
 import SwiftUI
 
-/// Bundled optical-weight typography for bud: Inter Variable for prose/UI and IBM Plex Mono
-/// (Text + Bold) for code, citations, and archival ledger metadata. Falls back safely to SF Pro
-/// and SF Mono if bundled font registration or lookup ever fails.
+/// System typography with bundled Inter Variable and IBM Plex Mono as an option.
 enum Fonts {
     static let bundledFontNames = [
         "InterVariable",
@@ -64,13 +62,25 @@ enum Fonts {
         bundledFontNames.compactMap { fontURL(name: $0, ext: "ttf") }
     }
 
-    /// Resolves Inter Variable at the requested size and optical weight (`440` regular, `530`
-    /// medium, `590` semibold, `650` bold), falling back to SF Pro if unavailable.
     static func sansNSFont(
         size: CGFloat,
         weight: CGFloat = OpticalWeight.regular,
         tabularDigits: Bool = false
     ) -> NSFont {
+        AppearanceStore.observeRevision()
+        return sansNSFont(
+            size: size, weight: weight, tabularDigits: tabularDigits, family: AppearanceStore.activeFont)
+    }
+
+    static func sansNSFont(
+        size: CGFloat,
+        weight: CGFloat = OpticalWeight.regular,
+        tabularDigits: Bool = false,
+        family: BudFont
+    ) -> NSFont {
+        guard family == .inter else {
+            return fallbackSansNSFont(size: size, weight: weight, tabularDigits: tabularDigits)
+        }
         _ = register()
         guard let base = NSFont(name: interPostScriptName, size: size) else {
             return fallbackSansNSFont(size: size, weight: weight, tabularDigits: tabularDigits)
@@ -95,28 +105,55 @@ enum Fonts {
         return NSFont(descriptor: descriptor, size: size) ?? base
     }
 
-    /// SwiftUI `Font` for Inter Variable at the requested size and optical weight.
     static func sans(
         size: CGFloat,
         weight: CGFloat = OpticalWeight.regular,
         tabularDigits: Bool = false
     ) -> Font {
-        _ = register()
-        if NSFont(name: interPostScriptName, size: size) != nil {
-            let resolved = sansNSFont(size: size, weight: weight, tabularDigits: tabularDigits)
-            let font = Font(resolved as CTFont)
-            return tabularDigits ? font.monospacedDigit() : font
+        AppearanceStore.observeRevision()
+        let font: Font
+        if AppearanceStore.activeFont == .inter {
+            let resolved = sansNSFont(
+                size: size, weight: weight, tabularDigits: tabularDigits, family: .inter)
+            font = Font(resolved as CTFont)
+        } else {
+            font = .system(size: size, weight: swiftUIWeight(for: weight))
         }
-        let fallback = Font.system(size: size, weight: swiftUIWeight(for: weight))
-        return tabularDigits ? fallback.monospacedDigit() : fallback
+        return tabularDigits ? font.monospacedDigit() : font
     }
 
-    /// Resolves IBM Plex Mono Text (`450`) or Bold (`700`), falling back to SF Mono if unavailable.
+    static func prose(
+        size: CGFloat,
+        weight: CGFloat = OpticalWeight.regular,
+        tabularDigits: Bool = false
+    ) -> Font {
+        AppearanceStore.observeRevision()
+        guard AppearanceStore.activeFont == .editorial else {
+            return sans(size: size, weight: weight, tabularDigits: tabularDigits)
+        }
+        let font = Font.system(size: size, weight: swiftUIWeight(for: weight), design: .serif)
+        return tabularDigits ? font.monospacedDigit() : font
+    }
+
     static func monoNSFont(
         size: CGFloat,
         bold: Bool = false,
         tabularDigits: Bool = false
     ) -> NSFont {
+        AppearanceStore.observeRevision()
+        return monoNSFont(
+            size: size, bold: bold, tabularDigits: tabularDigits, family: AppearanceStore.activeFont)
+    }
+
+    static func monoNSFont(
+        size: CGFloat,
+        bold: Bool = false,
+        tabularDigits: Bool = false,
+        family: BudFont
+    ) -> NSFont {
+        guard family == .inter else {
+            return fallbackMonoNSFont(size: size, bold: bold, tabularDigits: tabularDigits)
+        }
         _ = register()
         let name = bold ? monoBoldPostScriptName : monoTextPostScriptName
         guard let base = NSFont(name: name, size: size) else {
@@ -129,21 +166,20 @@ enum Fonts {
         return NSFont(descriptor: descriptor, size: size) ?? base
     }
 
-    /// SwiftUI `Font` for IBM Plex Mono Text (`450`) or Bold (`700`).
     static func mono(
         size: CGFloat,
         bold: Bool = false,
         tabularDigits: Bool = false
     ) -> Font {
-        _ = register()
-        let name = bold ? monoBoldPostScriptName : monoTextPostScriptName
-        if NSFont(name: name, size: size) != nil {
-            let resolved = monoNSFont(size: size, bold: bold, tabularDigits: tabularDigits)
-            let font = Font(resolved as CTFont)
-            return tabularDigits ? font.monospacedDigit() : font
+        AppearanceStore.observeRevision()
+        let font: Font
+        if AppearanceStore.activeFont == .inter {
+            let resolved = monoNSFont(size: size, bold: bold, tabularDigits: tabularDigits, family: .inter)
+            font = Font(resolved as CTFont)
+        } else {
+            font = .system(size: size, weight: bold ? .bold : .regular, design: .monospaced)
         }
-        let fallback = Font.system(size: size, weight: bold ? .bold : .medium, design: .monospaced)
-        return tabularDigits ? fallback.monospacedDigit() : fallback
+        return tabularDigits ? font.monospacedDigit() : font
     }
 
     /// Editorial serif wordmark ("bud").

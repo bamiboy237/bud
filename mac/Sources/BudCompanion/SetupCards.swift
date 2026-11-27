@@ -90,8 +90,6 @@ struct SetupCard: View {
         }
     }
 
-    /// Crisp elevated card used in the full Conversation Window so setup actions never blend
-    /// into the dithered backdrop.
     private var windowCard: some View {
         let shape = RoundedRectangle(cornerRadius: Paper.radiusLG, style: .continuous)
         return VStack(alignment: .leading, spacing: 0) {
@@ -151,7 +149,7 @@ struct SetupCard: View {
             shape,
             lift: 1,
             fill: Paper.elevated,
-            border: Paper.borderStrong,
+            border: Paper.borderSubtle,
             borderWidth: 0.5
         )
     }

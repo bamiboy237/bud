@@ -71,9 +71,7 @@ private extension EnvironmentValues {
     }
 }
 
-/// One type scale for replies, built on bundled Inter Variable + IBM Plex Mono from a single
-/// body size: the bubble reads at 13 pt, the conversation window at 14 pt. Headings, lists,
-/// tables, and code all derive from it, so nothing in a reply picks its own typeface or size.
+/// One type scale for replies. The bubble reads at 13 pt and the conversation window at 14 pt.
 struct ReplyType {
     var size: CGFloat = 13
     var lineSpacing: CGFloat = 3
@@ -83,17 +81,17 @@ struct ReplyType {
     /// The floating bubble: code wraps instead of scrolling sideways.
     var compact: Bool = true
 
-    var body: Font { Fonts.sans(size: size, weight: Fonts.OpticalWeight.regular) }
+    var body: Font { Fonts.prose(size: size) }
     var title: Font {
-        Fonts.sans(size: size >= 14 ? 20 : size + 5.5, weight: Fonts.OpticalWeight.bold)
+        Fonts.prose(size: size >= 14 ? 20 : size + 5.5, weight: Fonts.OpticalWeight.bold)
     }
     var heading: Font {
-        Fonts.sans(size: size >= 14 ? 16.5 : size + 2.5, weight: Fonts.OpticalWeight.semibold)
+        Fonts.prose(size: size >= 14 ? 16.5 : size + 2.5, weight: Fonts.OpticalWeight.semibold)
     }
     var section: Font {
-        Fonts.sans(size: size >= 14 ? 14.5 : size + 1, weight: Fonts.OpticalWeight.semibold)
+        Fonts.prose(size: size >= 14 ? 14.5 : size + 1, weight: Fonts.OpticalWeight.semibold)
     }
-    var minor: Font { Fonts.sans(size: size, weight: Fonts.OpticalWeight.medium) }
+    var minor: Font { Fonts.prose(size: size, weight: Fonts.OpticalWeight.medium) }
     var marker: Font {
         Fonts.sans(size: size - 0.5, weight: Fonts.OpticalWeight.regular, tabularDigits: true)
     }

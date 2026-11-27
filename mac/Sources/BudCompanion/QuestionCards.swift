@@ -297,28 +297,26 @@ private struct WindowOptionRow: View {
                 Spacer(minLength: 6)
                 Text("\(index)")
                     .font(Paper.Typography.ledgerMeta)
-                    .foregroundStyle(selected ? Paper.citationInk : Paper.inkMuted)
+                    .foregroundStyle(selected ? Paper.inkPrimary : Paper.inkMuted)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
                     .background(
-                        selected ? Paper.citationFill : Paper.recessed,
+                        selected ? Paper.fillHover : Paper.recessed,
                         in: RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
                     .overlay(
                         RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous)
-                            .strokeBorder(
-                                selected ? Paper.citationBorder : Paper.borderSubtle,
-                                lineWidth: 0.5))
+                            .strokeBorder(Paper.borderSubtle, lineWidth: 0.5))
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
-                selected ? Paper.citationFill : Paper.fillSubtle,
+                selected ? Paper.fillHover : Paper.fillSubtle,
                 in: shape
             )
             .overlay(
                 shape.strokeBorder(
-                    selected ? Paper.accent : Paper.borderSubtle,
+                    selected ? Paper.borderStrong : Paper.borderSubtle,
                     lineWidth: selected ? 1 : 0.5)
             )
             .contentShape(shape)
@@ -334,7 +332,7 @@ private struct WindowOptionRow: View {
             let box = RoundedRectangle(cornerRadius: 4, style: .continuous)
             ZStack {
                 if selected {
-                    box.fill(Paper.accent)
+                    box.fill(Paper.inkPrimary)
                     Image(systemName: "checkmark")
                         .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(Paper.canvas)
@@ -347,11 +345,11 @@ private struct WindowOptionRow: View {
             ZStack {
                 Circle()
                     .strokeBorder(
-                        selected ? Paper.accent : Paper.borderStrong,
+                        selected ? Paper.inkPrimary : Paper.borderStrong,
                         lineWidth: selected ? 1.5 : 1)
                 if selected {
                     Circle()
-                        .fill(Paper.accent)
+                        .fill(Paper.inkPrimary)
                         .frame(width: 7, height: 7)
                 }
             }
@@ -386,7 +384,11 @@ private struct InlineCustomAnswer: View {
                 .lineLimit(1...4)
             }
             .background(Paper.fillSubtle, in: shape)
-            .overlay { shape.strokeBorder(focused ? Paper.borderFocus : Paper.borderSubtle, lineWidth: 1) }
+            .overlay {
+                shape.strokeBorder(
+                    focused ? Paper.borderStrong : Paper.borderSubtle,
+                    lineWidth: focused ? 1 : 0.5)
+            }
         } else {
             Button {
                 if replyType.compact { PetPanel.current?.makeKey() }
@@ -397,6 +399,7 @@ private struct InlineCustomAnswer: View {
                     Text("Something else…").foregroundStyle(Paper.inkSecondary)
                     Spacer(minLength: 0)
                 }
+                .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5) }
             }
             .buttonStyle(PaperHit(shape: shape, fill: Paper.fillSubtle))
             .accessibilityLabel("Something else")
