@@ -4,14 +4,18 @@ import base64
 import hashlib
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import httpx
 import pytest
 from fastapi import FastAPI
+from pydantic import ValidationError
 
 from bud.browser import Consent, Relay
-from bud.core.browser_delivery import local_routes
+from bud.core import browser_worker
+from bud.core.browser_delivery import BrowserForm, local_routes
 from bud.core.browser_view import BrowserView
 from bud.core.handoff import WORKER_PATH
 from bud.core.handoff_client import work_once
@@ -68,6 +72,8 @@ async def test_prepare_requires_one_browser(tmp_path, monkeypatch, browser_count
         (["ready", "ready", "ready", "delivered"], ["fill", "upload", "click"], "delivered"),
         (["ready", "ready", "delivered", "delivered"], ["fill", "upload"], "delivered"),
         (["ready", "other_page"], ["fill"], "uncertain"),
+        (["unavailable"], [], "unavailable"),
+        (["ready", "ready", "ready", "unavailable"], ["fill", "upload", "click"], "unavailable"),
     ],
 )
 async def test_local_submit_uses_browse_json_and_rechecks_form(
@@ -127,7 +133,8 @@ async def test_local_submit_uses_browse_json_and_rechecks_form(
 
 
 @pytest.mark.parametrize("cut", ["before_submit", "after_submit"])
-def test_browser_worker_recovers_without_reissuing_submission(tmp_path, cut):
+def test_browser_worker_recovers_without_reissuing_submission(tmp_path, monkeypatch, cut):
+    monkeypatch.setattr(browser_worker, "_LOCK_DIR", tmp_path)
 
     attachment = {"id": "a" * 32, "name": "invoice.pdf"}
     content = b"%PDF-1.4 synthetic attachment"
@@ -160,7 +167,7 @@ def test_browser_worker_recovers_without_reissuing_submission(tmp_path, cut):
         )
 
     with httpx.Client(
-        base_url="http://127.0.0.1:8420",
+        base_url="http://local",
         transport=httpx.MockTransport(browser),
         headers={"Authorization": "Bearer local-test-only"},
     ) as local:
@@ -248,3 +255,179 @@ def test_browser_worker_recovers_without_reissuing_submission(tmp_path, cut):
                 sum("confirmed the browser receipt" in text and last in text for text in chat) == 1
             )
             assert all("local-test-only" not in text for text in chat)
+
+
+@pytest.mark.parametrize(
+    ("tab_status", "inspection", "expected"),
+    [
+        ("offline", None, "unavailable"),
+        ("closed", None, "uncertain"),
+        ("private", None, "unavailable"),
+        ("open", b"invalid JSON", "unavailable"),
+        ("open", b'{"state":"ready"}', "uncertain"),
+        ("open", b'{"state":"delivered"}', "delivered"),
+    ],
+)
+async def test_receipt_check_distinguishes_missing_receipts_from_outages(
+    tmp_path, monkeypatch, tab_status, inspection, expected
+):
+    consent = Consent(tmp_path / "consent")
+    consent.set(True)
+    view = BrowserView(tmp_path / "private", consent, Relay(tmp_path), lambda: Path("browse"))
+    step = "d" * 32
+
+    async def command(_, action, *args, timeout):
+        if action == "status":
+            tab = {"tab": 7, "id": f"delivery-{step}"}
+            if tab_status == "private":
+                tab["handoff"] = {}
+            return json.dumps(
+                {
+                    "extension": {"connected": tab_status != "offline"},
+                    "tabs": [tab] if tab_status in ("open", "private") else [],
+                }
+            ).encode()
+        assert action == "execute" and inspection is not None
+        return inspection
+
+    monkeypatch.setattr(view, "_command", command)
+    app = FastAPI()
+    app.include_router(local_routes(view))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        body = {"step": step, "form": FORM, "action": "check"}
+        response = await client.post("/browser/desktop-delivery", json=body)
+        assert response.json() == {"state": expected}
+        await view.enter()
+        consent.set(False)
+        response = await client.post("/browser/desktop-delivery", json=body)
+        assert response.json() == {"state": "sign_in"}
+
+
+async def test_submit_rejects_file_names_with_a_null_byte_before_using_browser(tmp_path):
+    consent = Consent(tmp_path / "consent")
+    consent.set(True)
+    view = BrowserView(tmp_path / "private", consent, Relay(tmp_path), lambda: Path("browse"))
+    app = FastAPI()
+    app.include_router(local_routes(view))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/browser/desktop-delivery",
+            json={
+                "step": "d" * 32,
+                "form": FORM,
+                "action": "submit",
+                "file": {"id": "a" * 32, "name": "invoice\0.pdf"},
+                "sha256": hashlib.sha256(b"sample").hexdigest(),
+                "data": base64.b64encode(b"sample").decode(),
+            },
+        )
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid file name."}
+
+
+def test_second_worker_cannot_check_a_submission_still_in_progress(tmp_path, monkeypatch):
+    monkeypatch.setattr(browser_worker, "_LOCK_DIR", tmp_path)
+    downloading = Event()
+    release_file = Event()
+    updates = []
+    actions = []
+    content = b"sample"
+
+    def coordinator(request):
+        if request.method == "PUT":
+            updates.append(json.loads(request.content)["phase"])
+            return httpx.Response(200, json={"changed": True})
+        assert request.method == "GET"
+        downloading.set()
+        assert release_file.wait(timeout=2)
+        return httpx.Response(200, content=content)
+
+    def local(request):
+        action = json.loads(request.content)["action"]
+        actions.append(action)
+        return httpx.Response(
+            200, json={"state": "delivered" if action == "submit" else "uncertain"}
+        )
+
+    work = {
+        "step_id": "d" * 32,
+        "phase": "approved",
+        "form": FORM,
+        "file": {"id": "a" * 32, "name": "invoice.pdf"},
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+    with (
+        httpx.Client(
+            base_url="http://coordinator", transport=httpx.MockTransport(coordinator)
+        ) as c,
+        httpx.Client(base_url="http://localhost", transport=httpx.MockTransport(local)) as b,
+        ThreadPoolExecutor(max_workers=1) as executor,
+    ):
+        first = executor.submit(browser_worker.browser_step, c, b, work)
+        try:
+            assert downloading.wait(timeout=1)
+            assert not browser_worker.browser_step(c, b, {**work, "phase": "sending"})
+            assert actions == []
+            assert updates == ["sending"]
+        finally:
+            release_file.set()
+        assert first.result(timeout=1) is True
+    assert actions == ["submit"]
+    assert updates == ["sending", "delivered"]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [httpx.Response(503), httpx.Response(200, json=[]), httpx.Response(200, text="invalid")],
+)
+def test_worker_keeps_receipt_pending_on_invalid_local_response(tmp_path, monkeypatch, reply):
+    monkeypatch.setattr(browser_worker, "_LOCK_DIR", tmp_path)
+
+    def publish(request):
+        pytest.fail(f"Unexpected worker update for {request.method}")
+
+    with (
+        httpx.Client(base_url="http://coordinator", transport=httpx.MockTransport(publish)) as c,
+        httpx.Client(
+            base_url="http://localhost", transport=httpx.MockTransport(lambda _: reply)
+        ) as b,
+    ):
+        work = {"step_id": "d" * 32, "phase": "sending", "form": FORM}
+        assert not browser_worker.browser_step(c, b, work)
+
+
+@pytest.mark.parametrize(("phase", "changed"), [("approved", "true"), ("sending", False)])
+def test_worker_requires_an_acknowledged_phase_change(tmp_path, monkeypatch, phase, changed):
+    monkeypatch.setattr(browser_worker, "_LOCK_DIR", tmp_path)
+
+    def coordinator(request):
+        assert request.method == "PUT"
+        assert json.loads(request.content)["phase"] == (
+            "sending" if phase == "approved" else "delivered"
+        )
+        return httpx.Response(200, json={"changed": changed})
+
+    def local(request):
+        assert phase == "sending" and json.loads(request.content)["action"] == "check"
+        return httpx.Response(200, json={"state": "delivered"})
+
+    with (
+        httpx.Client(
+            base_url="http://coordinator", transport=httpx.MockTransport(coordinator)
+        ) as c,
+        httpx.Client(base_url="http://localhost", transport=httpx.MockTransport(local)) as b,
+    ):
+        work = {"step_id": "d" * 32, "phase": phase, "form": FORM}
+        assert not browser_worker.browser_step(c, b, work)
+
+
+def test_form_and_local_browser_reject_even_an_empty_credential_field():
+    url = "http://@localhost/"
+    with pytest.raises(ValidationError, match="without credentials"):
+        BrowserForm.model_validate({**FORM, "url": url})
+    with pytest.raises(ValueError, match="local Bud URL"):
+        browser_worker.local_browser(url, "test-token")

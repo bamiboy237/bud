@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 
 from bud import browser
-from bud.composio.connection import ConnectionError
+from bud.composio.binding import ConnectionError
 from bud.core.browser_view import BrowserView
 
 _PRIVATE_NETWORKS = tuple(
@@ -66,16 +66,22 @@ class BrowserComputers:
                 raise HTTPException(
                     409, "Connect the Bud server to a private browser network first."
                 )
+            if self.view.private:
+                raise HTTPException(423, "Finish private input before adding a computer.")
             async with self.view.lock:
                 if self.view.private:
                     raise HTTPException(423, "Finish private input before adding a computer.")
                 path = self.view.locate()
                 if path is None:
                     raise HTTPException(409, "Browse isn’t installed on the Bud server.")
+                pairing = asyncio.create_task(asyncio.to_thread(self.pairing.code, path))
                 try:
-                    code = await asyncio.to_thread(self.pairing.code, path)
-                except ConnectionError as exc:
-                    raise HTTPException(503, str(exc)) from None
+                    code = await asyncio.shield(pairing)
+                except asyncio.CancelledError:
+                    await asyncio.gather(pairing, return_exceptions=True)
+                    raise
+                except (ConnectionError, OSError):
+                    raise HTTPException(503, "Browse could not start pairing. Try again.") from None
             return {"code": code, "address": f"{host}:{self.view.relay.port}"}
 
         return api

@@ -13,6 +13,8 @@ from bud import browser
 from bud.core.auth import OwnerAuthentication
 from bud.core.browser_view import BrowserView
 
+JPEG = b"\xff\xd8\xff\xda fixture \xff\xd9"
+
 
 @pytest.mark.parametrize(
     ("output", "exit_code", "expected_status", "connected"),
@@ -22,6 +24,8 @@ from bud.core.browser_view import BrowserView
         ('{"extension":{"connected":false},"tabs":[]}', 0, 200, False),
         ('{"extension":{"connected":true},"tabs":[]}', 1, 502, None),
         ("not json", 0, 502, None),
+        ("[" * 2000, 0, 502, None),
+        ('{"extension":{"connected":true,"browsers":{}},"tabs":[]}', 0, 502, None),
         ("{}", 0, 502, None),
     ],
 )
@@ -31,7 +35,8 @@ async def test_view_distinguishes_empty_offline_and_failed_lookup(
     browse = tmp_path / "browse"
     browse.write_text(
         '#!/bin/sh\n[ "$*" = "status --json" ] || exit 2\n'
-        f"printf '%s' {shlex.quote(output)}\nexit {exit_code}\n"
+        f"printf '%s' {shlex.quote(output)}\nprintf 'internal socket detail' >&2\n"
+        f"exit {exit_code}\n"
     )
     browse.chmod(0o755)
     consent = browser.Consent(tmp_path / "consent.json")
@@ -49,6 +54,10 @@ async def test_view_distinguishes_empty_offline_and_failed_lookup(
     if response.is_success:
         assert response.json()["connected"] is connected
         assert response.json()["tabs"] == []
+    else:
+        assert response.json() == {
+            "detail": "Couldn’t load Browse tabs. Check the Browse connection."
+        }
 
 
 async def test_private_input_blocks_preview_agent_reads_and_survives_restart(tmp_path, monkeypatch):
@@ -108,7 +117,7 @@ async def test_private_input_blocks_preview_agent_reads_and_survives_restart(tmp
         assert payload == {"tab": 6, "format": "jpeg", "quality": 55}
         assert args[2] == "--output"
         counts["preview"] += 1
-        Path(args[-1]).write_bytes(b"\xff\xd8fixture")
+        Path(args[-1]).write_bytes(JPEG)
         return b"{}"
 
     async def invoke(*_):
@@ -177,3 +186,209 @@ async def test_private_input_blocks_preview_agent_reads_and_survives_restart(tmp
         assert counts["tool"] == 1
         assert (await client.get("/browser/view")).json()["active_tab"] == "6"
         await view.stop()
+
+
+@pytest.fixture
+def preview_app(tmp_path, monkeypatch):
+    consent = browser.Consent(tmp_path / "consent")
+    consent.set(True)
+    view = BrowserView(
+        tmp_path / "private", consent, browser.Relay(tmp_path), lambda: Path("browse")
+    )
+    app = FastAPI()
+    app.include_router(view.routes())
+    status = {
+        "extension": {"connected": True},
+        "tabs": [
+            {"tab": 6, "id": "fixture"},
+            {"tab": 7},
+            {"tab": 8, "title": "private title", "handoff": {"message": "private message"}},
+            {"tab": None},
+        ],
+    }
+
+    def install(command):
+        async def dispatch(path, action, *args, timeout):
+            if action == "status":
+                return json.dumps(status).encode()
+            return await command(path, action, *args, timeout=timeout)
+
+        monkeypatch.setattr(view, "_command", dispatch)
+
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+    return app, client, view, status, install
+
+
+async def test_preview_targets_background_tabs_and_rejects_unmanaged_or_private_ids(preview_app):
+    _, client, view, _, install = preview_app
+    view.active_tab = "7"
+    captured = []
+    concurrent = asyncio.Event()
+    release = asyncio.Event()
+
+    async def command(_, action, *args, timeout):
+        assert action == "screenshot"
+        tab = json.loads(args[1])["tab"]
+        captured.append(tab)
+        if len(captured) == 3:
+            concurrent.set()
+        if len(captured) > 1:
+            await release.wait()
+        Path(args[-1]).write_bytes(JPEG.replace(b"fixture", str(tab).encode()))
+        return b"{}"
+
+    install(command)
+    async with client:
+        first = await client.get("/browser/view/fixture/image")
+        assert first.content == JPEG.replace(b"fixture", b"6")
+        first_background = asyncio.create_task(client.get("/browser/view/6/image"))
+        second_background = asyncio.create_task(client.get("/browser/view/7/image"))
+        try:
+            await asyncio.wait_for(concurrent.wait(), timeout=1)
+        finally:
+            release.set()
+            responses = await asyncio.gather(first_background, second_background)
+        assert [r.content for r in responses] == [
+            JPEG.replace(b"fixture", b"6"),
+            JPEG.replace(b"fixture", b"7"),
+        ]
+        assert [r.status_code for r in responses] == [200, 200]
+        assert (await client.get("/browser/view/99/image")).status_code == 404
+        assert (await client.get("/browser/view/None/image")).status_code == 404
+        assert (await client.get("/browser/view/8/image")).status_code == 423
+        inventory = await client.get("/browser/view")
+        assert inventory.headers["cache-control"] == "no-store"
+        assert [tab["id"] for tab in inventory.json()["tabs"]] == ["6", "7"]
+        assert inventory.json()["active_tab"] == "7"
+        assert "private title" not in inventory.text and "_tab_ids" not in inventory.text
+        assert captured == [6, 6, 7]
+
+
+async def test_takeover_discards_in_flight_preview_and_closed_handoff_can_resume(preview_app):
+    _, client, view, status, install = preview_app
+    capturing = asyncio.Event()
+    release = asyncio.Event()
+    handoff = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def command(_, action, *args, timeout):
+        if action == "screenshot":
+            capturing.set()
+            await release.wait()
+            Path(args[-1]).write_bytes(JPEG)
+        else:
+            assert action == "handoff"
+            assert release.is_set()
+            handoff.set()
+            await closed.wait()
+            status["tabs"].pop(0)
+            return b'{"outcome":"closed","detail":"internal data"}'
+        return b"{}"
+
+    install(command)
+    async with client:
+        unknown = await client.post("/browser/view/takeover", json={"tab": "999"})
+        assert unknown.status_code == 404 and not view.private
+        image = asyncio.create_task(client.get("/browser/view/6/image"))
+        try:
+            await asyncio.wait_for(capturing.wait(), timeout=1)
+            takeover = await asyncio.wait_for(
+                client.post("/browser/view/takeover", json={"tab": "fixture"}), timeout=1
+            )
+            assert takeover.status_code == 202 and view.private
+            assert not handoff.is_set()
+            assert (await client.get("/browser/view/7/image")).status_code == 423
+            assert (await client.post("/browser/view/resume")).status_code == 409
+            release.set()
+            response = await image
+            assert response.status_code == 423 and JPEG not in response.content
+            await asyncio.wait_for(handoff.wait(), timeout=1)
+            task = view.handoff
+            assert task is not None
+            closed.set()
+            assert await task == {"outcome": "closed"}
+            assert view.handoff is None and view.private
+            assert (await client.post("/browser/view/resume")).json() == {"private": False}
+            assert not view.marker.exists()
+            assert (await client.get("/browser/view/6/image")).status_code == 404
+        finally:
+            release.set()
+            closed.set()
+            await asyncio.gather(image, return_exceptions=True)
+            await view.stop()
+
+
+async def test_captured_response_is_discarded_if_private_input_starts_before_send(preview_app):
+    app, client, view, _, install = preview_app
+
+    async def command(_, action, *args, timeout):
+        assert action == "screenshot"
+        Path(args[-1]).write_bytes(JPEG)
+        return b"{}"
+
+    install(command)
+    capture = next(
+        route.endpoint for route in view.routes().routes if route.path.endswith("/{tab}/image")
+    )
+
+    @app.get("/delayed-frame")
+    async def delayed_frame():
+        response = await capture("6")
+        await view.enter()
+        view.resume()
+        return response
+
+    async with client:
+        response = await client.get("/delayed-frame")
+    assert response.status_code == 423 and JPEG not in response.content
+
+
+@pytest.mark.parametrize("failure", ["closed", "daemon", "timeout", "png", "truncated", "missing"])
+async def test_preview_returns_safe_errors(preview_app, failure):
+    _, client, _, status, install = preview_app
+
+    async def command(_, action, *args, timeout):
+        assert action == "screenshot"
+        if failure == "closed":
+            status["tabs"].pop(0)
+        if failure in ("closed", "daemon"):
+            raise RuntimeError("raw daemon stack")
+        if failure == "timeout":
+            raise TimeoutError("internal socket timeout")
+        if failure in ("png", "truncated"):
+            Path(args[-1]).write_bytes(b"\x89PNG\r\n\x1a\n" if failure == "png" else JPEG[:-2])
+        return b"{}"
+
+    install(command)
+    async with client:
+        response = await client.get("/browser/view/6/image")
+    if failure == "closed":
+        assert response.status_code == 404 and response.json() == {"detail": "Unknown tab."}
+    else:
+        assert response.status_code == 502
+        assert response.json() == {"detail": "Browse could not capture the preview."}
+
+
+async def test_missing_executable_disables_inventory_and_preview(preview_app, monkeypatch):
+    _, client, view, _, _ = preview_app
+    monkeypatch.setattr(view, "locate", lambda: None)
+    async with client:
+        assert (await client.get("/browser/view")).json() == {
+            "private": False,
+            "enabled": False,
+            "tabs": [],
+        }
+        assert (await client.get("/browser/view/6/image")).status_code == 409
+        assert (await client.post("/browser/view/takeover", json={"tab": "6"})).status_code == 409
+    assert not view.marker.exists()
+
+
+async def test_takeover_fails_safely_when_private_marker_cannot_be_written(preview_app):
+    _, client, view, _, install = preview_app
+    install(AsyncMock(side_effect=AssertionError("Handoff must not start")))
+    view.marker.mkdir()
+    async with client:
+        response = await client.post("/browser/view/takeover", json={"tab": "6"})
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Bud could not save the private browser pause."}
+    assert not view.handoff_open and not view.private
