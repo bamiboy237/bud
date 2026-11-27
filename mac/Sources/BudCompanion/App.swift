@@ -6,17 +6,90 @@ struct BudCompanionApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
+        let needsModelRefresh = Companion.shared.link == .connected
+            && OnboardingStore.shared.status.activeModel == nil
         MenuBarExtra {
             MenuContent(delegate: delegate)
         } label: {
-            // The pet itself, so bud is one character everywhere; the paw when none is installed.
-            if let icon = PetSprite.named(Companion.shared.petID)?.icon(height: 18) {
-                Image(nsImage: icon)
+            MenuBarPet(companion: Companion.shared)
+        }
+        .onChange(of: needsModelRefresh, initial: true) { _, needsRefresh in
+            guard needsRefresh else { return }
+            Task {
+                let store = OnboardingStore.shared
+                guard Companion.shared.link == .connected,
+                      store.status.activeModel == nil, !store.loading else { return }
+                await store.refresh(preservingError: store.error)
+            }
+        }
+        Settings { SettingsView() }
+    }
+}
+
+@MainActor
+struct MenuBarWaiting {
+    let waitingCount: Int
+
+    init(companion: Companion) {
+        // Questions already have approval cards in the conversation.
+        waitingCount = companion.approvals.count + companion.setups.count
+    }
+
+    var accessibilityLabel: String {
+        switch waitingCount {
+        case 0: "Bud"
+        case 1: "Bud, 1 item waiting"
+        default: "Bud, \(waitingCount) items waiting"
+        }
+    }
+
+    var reviewTitle: String? {
+        switch waitingCount {
+        case 0: nil
+        case 1: "Review waiting items"
+        default: "Review waiting items (\(waitingCount))"
+        }
+    }
+
+    func menuIcon(_ icon: NSImage) -> NSImage {
+        guard waitingCount > 0 else {
+            icon.accessibilityDescription = accessibilityLabel
+            return icon
+        }
+
+        let size = icon.size
+        let diameter: CGFloat = 4
+        let image = NSImage(
+            size: NSSize(width: size.width + diameter + 1, height: size.height), flipped: false
+        ) { _ in
+            icon.draw(in: NSRect(origin: .zero, size: size))
+            NSColor.black.setFill()
+            NSBezierPath(ovalIn: NSRect(
+                x: size.width + 1, y: size.height - diameter - 1, width: diameter, height: diameter
+            )).fill()
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = accessibilityLabel
+        return image
+    }
+}
+
+private struct MenuBarPet: View {
+    let companion: Companion
+
+    var body: some View {
+        let waiting = MenuBarWaiting(companion: companion)
+        let icon = PetSprite.named(companion.petID)?.icon(height: 18)
+            ?? NSImage(systemSymbolName: "pawprint", accessibilityDescription: waiting.accessibilityLabel)
+        Group {
+            if let icon {
+                Image(nsImage: waiting.menuIcon(icon))
             } else {
                 Image(systemName: "pawprint")
             }
         }
-        Settings { SettingsView() }
+        .accessibilityLabel(waiting.accessibilityLabel)
     }
 }
 
@@ -24,9 +97,19 @@ private struct MenuContent: View {
     let delegate: AppDelegate
     @Bindable var companion = Companion.shared
     @Bindable var updater = AppUpdater.shared
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
+        if let title = MenuBarWaiting(companion: companion).reviewTitle {
+            Button(title) { delegate.openConversation() }
+            Divider()
+        }
         Text(status)
+        if companion.link == .connected, let model = OnboardingStore.shared.status.activeModel {
+            Text(verbatim: modelLabel(model))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
         if companion.needsOnboarding {
             Button("Add a model…") { OnboardingWindow.shared.show() }
         }
@@ -50,9 +133,19 @@ private struct MenuContent: View {
         if !AppUpdater.isDevBuild() {
             updates
         }
-        SettingsLink { Text("Settings…") }
+        Button("Settings…") {
+            openSettings()
+            Task { await SettingsTabState.shared.bringSettingsToFront() }
+        }
+        .keyboardShortcut(",")
         Divider()
         Button("Quit bud") { NSApp.terminate(nil) }.keyboardShortcut("q")
+    }
+
+    private func modelLabel(_ id: String) -> String {
+        let parts = id.split(separator: ":", maxSplits: 1)
+        guard parts.count == 2 else { return id }
+        return parts[0] == "openai-chatgpt" ? "\(parts[1]) (ChatGPT)" : String(parts[1])
     }
 
     @ViewBuilder private var updates: some View {
@@ -142,12 +235,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func ask() {
         // With the window open, that's where you type.
         if Companion.shared.windowOpen {
-            ConversationWindow.shared.show()
+            Companion.shared.requestComposerFocus()
             return
         }
         if !petVisible { togglePet() }
         Companion.shared.inputOpen = true
         focusPanel()
+    }
+
+    func openConversation() {
+        let companion = Companion.shared
+        while companion.approvalDeck.canSelectPrevious {
+            companion.selectPreviousApproval()
+        }
+        companion.focus = nil
+        let conversation = ConversationWindow.shared
+        conversation.show()
+        guard let content = NSApp.windows.first(where: { $0.delegate === conversation })?.contentView else {
+            return
+        }
+        // The waiting cards sit at the end of the transcript, even when an open window is scrolled up.
+        content.layoutSubtreeIfNeeded()
+        guard let scrollView = conversationScrollView(in: content),
+              let document = scrollView.documentView else { return }
+        let clip = scrollView.contentView
+        let bottom = document.isFlipped ? clip.documentRect.maxY - clip.bounds.height : clip.documentRect.minY
+        clip.scroll(to: NSPoint(x: clip.bounds.minX, y: bottom))
+        scrollView.reflectScrolledClipView(clip)
+    }
+
+    private func conversationScrollView(in view: NSView) -> NSScrollView? {
+        if let scrollView = view as? NSScrollView { return scrollView }
+        return view.subviews.lazy.compactMap { self.conversationScrollView(in: $0) }.first
     }
 
     func togglePet() {

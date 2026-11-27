@@ -58,11 +58,9 @@ struct RoutineMessageCard: View {
                         .foregroundStyle(Paper.inkMuted)
                 }
                 Spacer(minLength: 8)
-                HStack(spacing: 4) {
-                    Text("Open").font(Paper.Typography.captionMedium)
-                    Image(systemName: "chevron.right").font(.system(size: 9))
-                }
-                .foregroundStyle(Paper.inkSecondary)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9))
+                    .foregroundStyle(Paper.inkSecondary)
             }
             .padding(10)
             .frame(maxWidth: 360, alignment: .leading)
@@ -70,6 +68,7 @@ struct RoutineMessageCard: View {
         .buttonStyle(PaperHit(shape: shape, fill: Paper.elevated))
         .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5).allowsHitTesting(false) }
         .accessibilityLabel("\(card.title), \(card.label)")
+        .help("Open routine")
     }
 }
 
@@ -84,6 +83,7 @@ struct RoutineSummary: Decodable, Equatable, Identifiable {
     let pauseReason: String?
     let nextRunAt: String?
     let recentOccurrences: [RoutineRun]
+    let hasMore: Bool?
     var id: String { routineId }
 }
 
@@ -93,7 +93,50 @@ struct RoutineRun: Decodable, Equatable, Identifiable {
     let executionStatus: String
     let deliveryStatus: String
     let reportPath: String?
+    let error: String?
+    let uncertainTools: [String]?
+    let unconfirmedActions: [RoutineUnconfirmedAction]?
     var id: String { occurrenceId }
+
+    var unconfirmedTools: [String] {
+        let actions = unconfirmedActions?.map(\.tool) ?? []
+        return actions + (uncertainTools ?? []).filter { !actions.contains($0) }
+    }
+
+    var requiresAcknowledgement: Bool {
+        [executionStatus, deliveryStatus].contains("needs_review")
+    }
+
+    var outcome: (label: String, needsReview: Bool) {
+        switch (executionStatus, deliveryStatus) {
+        case ("failed", _): ("Failed, needs review", true)
+        case ("needs_review", _), ("uncertain", _), (_, "needs_review"), (_, "uncertain"):
+            ("Needs review", true)
+        case (_, "failed"): ("Delivery failed, needs review", true)
+        case ("completed", "confirmed"): ("Report delivered", false)
+        case ("completed", _): ("Completed", false)
+        case ("running", _): ("Running", false)
+        case ("pending", _): ("Pending", false)
+        case ("queued", _): ("Queued", false)
+        case ("awaiting_approval", _): ("Waiting for approval", false)
+        case ("cancelled", _): ("Stopped", false)
+        case ("skipped", _): ("Skipped", false)
+        default: ("Status unavailable", false)
+        }
+    }
+
+    var canOpen: Bool { outcome.needsReview || reportPath != nil }
+}
+
+struct RoutineUnconfirmedAction: Decodable, Equatable {
+    let tool: String
+}
+
+private struct RoutineRunPage: Decodable {
+    static let size = 10
+
+    let occurrences: [RoutineRun]
+    let hasMore: Bool?
 }
 
 @MainActor
@@ -101,6 +144,12 @@ final class RoutineInspectorState: ObservableObject {
     @Published var list: [RoutineSummary] = []
     @Published var routine: RoutineSummary?
     @Published var report: String?
+    @Published private(set) var openedRun: RoutineRun?
+    @Published private(set) var pausing = false
+    @Published private(set) var loadingOlder = false
+    @Published private(set) var historyProblem: String?
+    @Published private var olderRuns: [RoutineRun] = []
+    @Published private var pageHasMore: Bool?
     @Published var listing = true
     @Published var pending = true
     @Published var problem: String?
@@ -115,11 +164,23 @@ final class RoutineInspectorState: ObservableObject {
     private var started = false
     private var editBaseline: [String: String]?
     private var activeRoutineID: String?
+    private var olderOffset = 0
     private var viewGeneration = 0
     private var mutating = false
     private var refreshNeeded = false
     private var refreshTaskID = 0
     private var refreshTask: Task<Void, Never>?
+
+    var runs: [RoutineRun] { (routine?.recentOccurrences ?? []) + olderRuns }
+
+    var hasMoreRuns: Bool {
+        pageHasMore ?? routine?.hasMore ?? ((routine?.recentOccurrences.count ?? 0) >= RoutineRunPage.size)
+    }
+
+    var canAcknowledgeReview: Bool {
+        guard let openedRun, routine?.pauseReason == "uncertain" else { return false }
+        return runs.first(where: { $0.id == openedRun.id })?.requiresAcknowledgement == true
+    }
 
     func start(with selection: RoutineSelection) async {
         started = true
@@ -152,8 +213,10 @@ final class RoutineInspectorState: ObservableObject {
     }
 
     func back(using selection: RoutineSelection) {
-        if report != nil {
+        if openedRun != nil {
+            openedRun = nil
             report = nil
+            problem = nil
         } else {
             markedRun = nil
             listing = true
@@ -196,6 +259,12 @@ final class RoutineInspectorState: ObservableObject {
         let generation = viewGeneration
         listing = false
         activeRoutineID = id
+        routine = nil
+        olderRuns = []
+        olderOffset = 0
+        pageHasMore = nil
+        loadingOlder = false
+        historyProblem = nil
         pending = true
         mutating = true
         problem = nil
@@ -217,30 +286,74 @@ final class RoutineInspectorState: ObservableObject {
         _ id: String,
         path: String = "",
         method: String = "POST",
-        body: [String: String]? = nil,
+        body: [String: Any]? = nil,
         using selection: RoutineSelection
     ) async {
         guard !pending else { return }
         cancelRefresh()
         let generation = viewGeneration
         pending = true
+        pausing = path == "/pause"
         mutating = true
         problem = nil
         do {
-            _ = try await selection.connection.send(method, "routines/\(id)\(path)", json: body)
+            let request = selection.connection.request(method, "routines/\(id)\(path)", json: body)
+            let result = try await selection.connection.send(request)
+            if pausing, generation == viewGeneration, let updated: RoutineSummary = try? Self.decode(result) {
+                applyRoutine(updated)
+            }
             if path == "/run-now" { triggerID = UUID().uuidString }
             endEditing()
             refreshNeeded = false
             let response = try await selection.connection.send("GET", "routines/\(id)")
             if generation == viewGeneration {
-                routine = try Self.decode(response)
+                applyRoutine(try Self.decode(response))
             }
         } catch {
             if generation == viewGeneration { problem = "\(error)" }
         }
         pending = false
+        pausing = false
         mutating = false
         startRefreshTask(using: selection)
+    }
+
+    func acknowledgeReview(using selection: RoutineSelection) async {
+        guard canAcknowledgeReview, let id = routine?.id else { return }
+        await change(id, path: "/resume", body: ["acknowledge_uncertain": true], using: selection)
+    }
+
+    func loadOlderRuns(using selection: RoutineSelection) async {
+        guard !loadingOlder, hasMoreRuns, let id = activeRoutineID else { return }
+        let offset = max(olderOffset, runs.count)
+        let generation = viewGeneration
+        loadingOlder = true
+        historyProblem = nil
+        defer { if generation == viewGeneration { loadingOlder = false } }
+        do {
+            let response = try await selection.connection.send(
+                "GET", "routines/\(id)/occurrences", queryItems: [
+                    URLQueryItem(name: "offset", value: String(offset)),
+                    URLQueryItem(name: "limit", value: String(RoutineRunPage.size)),
+                ])
+            guard generation == viewGeneration else { return }
+            let page: RoutineRunPage = try Self.decode(response)
+            var seen = Set(runs.map(\.id))
+            olderRuns.append(contentsOf: page.occurrences.filter { seen.insert($0.id).inserted })
+            olderOffset = offset + page.occurrences.count
+            pageHasMore = page.hasMore ?? (page.occurrences.count >= RoutineRunPage.size)
+        } catch {
+            guard generation == viewGeneration else { return }
+            historyProblem = "Couldn’t load older runs. Try again."
+        }
+    }
+
+    private func applyRoutine(_ updated: RoutineSummary) {
+        if loadingOlder || pageHasMore != nil || !olderRuns.isEmpty {
+            let latest = Set(updated.recentOccurrences.map(\.id))
+            olderRuns = runs.filter { !latest.contains($0.id) }
+        }
+        routine = updated
     }
 
     func beginEditing(_ value: RoutineSummary) {
@@ -272,15 +385,19 @@ final class RoutineInspectorState: ObservableObject {
         ["title": title, "prompt": prompt, "cron": schedule.cron, "timezone": timezone]
     }
 
-    func openReport(_ routineID: String, _ occurrenceID: String, using selection: RoutineSelection) async {
+    func openRun(_ run: RoutineRun, using selection: RoutineSelection) async {
+        guard !pending, run.canOpen, let routineID = activeRoutineID else { return }
+        markedRun = run.id
+        openedRun = run
+        problem = nil
+        guard run.reportPath != nil else { return }
         cancelRefresh(preservingRequest: true)
         let generation = viewGeneration
         pending = true
         mutating = true
-        problem = nil
         do {
             let response = try await selection.connection.send(
-                "GET", "routines/\(routineID)/occurrences/\(occurrenceID)/report")
+                "GET", "routines/\(routineID)/occurrences/\(run.id)/report")
             if generation == viewGeneration {
                 report = response["content"] as? String
             }
@@ -321,8 +438,8 @@ final class RoutineInspectorState: ObservableObject {
                 guard !Task.isCancelled, !mutating, generation == viewGeneration,
                       !listing, activeRoutineID == id
                 else { return }
-                routine = try Self.decode(response)
-                if !editing { problem = nil }
+                applyRoutine(try Self.decode(response))
+                if !editing && openedRun == nil { problem = nil }
             } else if listing {
                 let response = try await selection.connection.send(
                     "GET", "routines", queryItems: [URLQueryItem(name: "feed_id", value: selection.session)])
@@ -335,10 +452,10 @@ final class RoutineInspectorState: ObservableObject {
         }
     }
 
-    private static func decode(_ data: [String: Any]) throws -> RoutineSummary {
+    private static func decode<Value: Decodable>(_ data: [String: Any]) throws -> Value {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        return try decoder.decode(RoutineSummary.self, from: JSONSerialization.data(withJSONObject: data))
+        return try decoder.decode(Value.self, from: JSONSerialization.data(withJSONObject: data))
     }
 }
 
@@ -352,10 +469,11 @@ struct RoutineInspector: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                if state.report != nil || !state.listing {
+                if !state.listing {
                     Button { state.back(using: selection) } label: { Image(systemName: "chevron.left") }
                         .buttonStyle(IconButton(size: 26))
                         .accessibilityLabel("Back")
+                        .help("Back")
                         .disabled(state.pending)
                 }
                 Text(heading)
@@ -366,31 +484,38 @@ struct RoutineInspector: View {
                 Button(action: close) { Image(systemName: "xmark") }
                     .buttonStyle(IconButton(size: 26))
                     .accessibilityLabel("Close routines")
+                    .help("Close routines")
             }
             .font(.system(size: 12, weight: .medium))
             .padding(.horizontal, 14)
             .frame(height: 40)
             hairline
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    if !state.editing, let problem = state.problem {
-                        Text(problem).foregroundStyle(Paper.errorInk).textSelection(.enabled)
-                    }
-                    if let report = state.report {
-                        MarkdownView(report, rich: true).textSelection(.enabled)
-                    } else if state.listing {
-                        if state.list.isEmpty, !state.pending, state.problem == nil {
-                            Text("Ask Bud in chat to schedule a routine.")
-                                .foregroundStyle(Paper.inkSecondary)
+            ZStack {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        if !state.editing, state.openedRun == nil, let problem = state.problem {
+                            Text(problem).foregroundStyle(Paper.errorInk).textSelection(.enabled)
                         }
-                        routineList
-                    } else if let routine = state.routine {
-                        detail(routine)
+                        if state.listing {
+                            if state.list.isEmpty, !state.pending, state.problem == nil {
+                                Text("Ask Bud in chat to schedule a routine.")
+                                    .foregroundStyle(Paper.inkSecondary)
+                            }
+                            routineList
+                        } else if let routine = state.routine {
+                            detail(routine)
+                        }
+                        if state.pending && state.openedRun == nil { ProgressView().controlSize(.small) }
                     }
-                    if state.pending { ProgressView().controlSize(.small) }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(14)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(14)
+                .opacity(state.openedRun == nil ? 1 : 0)
+                .allowsHitTesting(state.openedRun == nil)
+                .accessibilityHidden(state.openedRun != nil)
+                if let run = state.openedRun {
+                    runDetail(run).id(run.id)
+                }
             }
         }
         .foregroundStyle(Paper.inkPrimary)
@@ -409,7 +534,7 @@ struct RoutineInspector: View {
     }
 
     private var heading: String {
-        if state.report != nil { return "Run report" }
+        if let run = state.openedRun { return run.outcome.needsReview ? "Run review" : "Run report" }
         if state.listing { return "Routines" }
         return state.editing ? "Edit routine" : "Routine"
     }
@@ -439,6 +564,7 @@ struct RoutineInspector: View {
                     .padding(9)
                 }
                 .buttonStyle(PaperHit(shape: RoundedRectangle(cornerRadius: Paper.radiusSM)))
+                .help("Open routine")
                 .disabled(state.pending)
                 if item.id != state.list.last?.id { hairline }
             }
@@ -476,8 +602,7 @@ struct RoutineInspector: View {
             }
             scheduleSummary(RoutineSchedule(cron: value.cron), timezone: value.timezone)
             if let next = value.nextRunAt {
-                LabeledContent("Next run", value: date(next, timezone: TimeZone(identifier: value.timezone) ?? .current))
-                    .font(Paper.Typography.callout)
+                nextRun(next, timezone: TimeZone(identifier: value.timezone) ?? .current)
             }
             if value.pauseReason == "uncertain" {
                 Text("Review the last run before resuming. Bud could not confirm an action.")
@@ -485,7 +610,9 @@ struct RoutineInspector: View {
             }
             HStack(spacing: 6) {
                 if value.status == "active" {
-                    Button("Pause") { Task { await state.change(value.id, path: "/pause", using: selection) } }
+                    Button(state.pausing ? "Pausing…" : "Pause") {
+                        Task { await state.change(value.id, path: "/pause", using: selection) }
+                    }
                         .buttonStyle(CardButton(kind: .quiet))
                 } else if value.status == "paused", value.pauseReason != "uncertain" {
                     Button("Resume") { Task { await state.change(value.id, path: "/resume", using: selection) } }
@@ -508,24 +635,39 @@ struct RoutineInspector: View {
             .disabled(state.pending)
             .opacity(state.pending ? 0.55 : 1)
         }
-        if !state.editing && !value.recentOccurrences.isEmpty {
+        if !state.editing && !state.runs.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
                 Text("Run history")
                     .font(Paper.Typography.label)
                     .padding(.bottom, 6)
-                ForEach(value.recentOccurrences) { run in
+                ForEach(state.runs) { run in
                     hairline
-                    runHistoryRow(run, routineID: value.id)
+                    runHistoryRow(run)
+                }
+                if let problem = state.historyProblem {
+                    Text(problem)
+                        .font(Paper.Typography.caption)
+                        .foregroundStyle(Paper.errorInk)
+                        .padding(.top, 8)
+                }
+                if state.hasMoreRuns {
+                    hairline
+                    Button(state.loadingOlder ? "Loading older runs…" : "Load older runs") {
+                        Task { await state.loadOlderRuns(using: selection) }
+                    }
+                    .buttonStyle(CardButton(kind: .quiet))
+                    .disabled(state.loadingOlder)
+                    .padding(.top, 6)
                 }
             }
         }
     }
 
     @ViewBuilder
-    private func runHistoryRow(_ run: RoutineRun, routineID: String) -> some View {
+    private func runHistoryRow(_ run: RoutineRun) -> some View {
         let timestamp = date(run.scheduledFor)
-        let outcome = runOutcome(run)
-        let hasReport = run.reportPath != nil
+        let outcome = run.outcome
+        let action = outcome.needsReview ? "Review run" : "Open report"
         let shape = RoundedRectangle(cornerRadius: Paper.radiusSM)
         let row = HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 4) {
@@ -544,7 +686,7 @@ struct RoutineInspector: View {
                 .foregroundStyle(outcome.needsReview ? Paper.errorInk : Paper.inkSecondary)
             }
             Spacer(minLength: 0)
-            if hasReport {
+            if run.canOpen {
                 Image(systemName: "chevron.right")
                     .font(.system(size: 10))
                     .foregroundStyle(Paper.inkMuted)
@@ -555,17 +697,67 @@ struct RoutineInspector: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(run.id == state.markedRun ? Paper.accentFill : .clear, in: shape)
 
-        if hasReport {
+        if run.canOpen {
             Button {
-                Task { await state.openReport(routineID, run.id, using: selection) }
+                Task { await state.openRun(run, using: selection) }
             } label: {
                 row
             }
             .buttonStyle(PaperHit(shape: shape))
             .disabled(state.pending)
-            .accessibilityLabel("Open report, \(timestamp), \(outcome.label)")
+            .accessibilityLabel("\(action), \(timestamp), \(outcome.label)")
+            .accessibilityAddTraits(run.id == state.markedRun ? .isSelected : [])
+            .help(action)
         } else {
             row
+        }
+    }
+
+    private func runDetail(_ run: RoutineRun) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                if run.outcome.needsReview {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(run.outcome.label).font(Paper.Typography.h3)
+                        Text(date(run.scheduledFor))
+                            .font(Paper.Typography.caption)
+                            .foregroundStyle(Paper.inkSecondary)
+                    }
+                    if let error = run.error, !error.isEmpty {
+                        hairline
+                        section("Recorded error") {
+                            Text(error).textSelection(.enabled)
+                        }
+                    }
+                    let actions = run.unconfirmedTools
+                    if !actions.isEmpty {
+                        hairline
+                        section("Unconfirmed actions") {
+                            ForEach(actions.indices, id: \.self) { index in
+                                Text(actions[index]).textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
+                if let report = state.report {
+                    if run.outcome.needsReview { hairline }
+                    MarkdownView(report, rich: true).textSelection(.enabled)
+                }
+                if let problem = state.problem {
+                    Text(problem).foregroundStyle(Paper.errorInk).textSelection(.enabled)
+                }
+                if state.canAcknowledgeReview {
+                    hairline
+                    Button("Acknowledge and resume") {
+                        Task { await state.acknowledgeReview(using: selection) }
+                    }
+                    .buttonStyle(CardButton(kind: .primary))
+                    .disabled(state.pending)
+                }
+                if state.pending { ProgressView().controlSize(.small) }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(14)
         }
     }
 
@@ -615,22 +807,14 @@ struct RoutineInspector: View {
 
     private var scheduleEditor: some View {
         frequencySection {
-            Picker("Repeat", selection: Binding(
-                get: { state.schedule.frequency },
-                set: { state.schedule.select($0) }
-            )) {
-                ForEach(RoutineSchedule.Repeat.allCases, id: \.self) { repeatValue in
-                    Text(repeatValue.rawValue).tag(repeatValue)
-                }
-            }
+            schedulePresets
+            hairline
             if state.schedule.frequency == .custom {
-                hairline
                 TextField("Cron expression", text: $state.schedule.customCron,
                           prompt: Text("Minute hour day month weekday"))
                     .font(Paper.Typography.code)
                     .accessibilityLabel("Cron expression")
             } else {
-                hairline
                 DatePicker("Time", selection: $state.schedule.time, displayedComponents: .hourAndMinute)
                     .environment(\.calendar, RoutineSchedule.clockCalendar)
                     .environment(\.timeZone, .gmt)
@@ -660,6 +844,35 @@ struct RoutineInspector: View {
                     .frame(maxWidth: 156)
             }
         }
+    }
+
+    private var schedulePresets: some View {
+        let shape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
+        let segment = RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous)
+        return HStack(spacing: 2) {
+            ForEach(RoutineSchedule.Repeat.allCases, id: \.self) { frequency in
+                let selected = state.schedule.frequency == frequency
+                Button {
+                    state.schedule.select(frequency)
+                } label: {
+                    Text(frequency == .custom ? "Custom" : frequency.rawValue)
+                        .font(Paper.Typography.captionMedium)
+                        .foregroundStyle(selected ? Paper.inkPrimary : Paper.inkSecondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 26)
+                }
+                .buttonStyle(PaperHit(shape: segment, fill: selected ? Paper.elevated : .clear))
+                .accessibilityLabel(frequency.rawValue)
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+        }
+        .padding(3)
+        .background(Paper.recessed, in: shape)
+        .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5).allowsHitTesting(false) }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Repeat")
     }
 
     private func scheduleSummary(_ schedule: RoutineSchedule, timezone: String) -> some View {
@@ -705,27 +918,51 @@ struct RoutineInspector: View {
         }
     }
 
-    private func runOutcome(_ run: RoutineRun) -> (label: String, needsReview: Bool) {
-        switch (run.executionStatus, run.deliveryStatus) {
-        case ("failed", _): ("Failed, needs review", true)
-        case ("needs_review", _), ("uncertain", _), (_, "needs_review"), (_, "uncertain"):
-            ("Needs review", true)
-        case (_, "failed"): ("Delivery failed, needs review", true)
-        case ("completed", "confirmed"): ("Report delivered", false)
-        case ("completed", _): ("Completed", false)
-        case ("running", _): ("Running", false)
-        case ("pending", _): ("Pending", false)
-        case ("queued", _): ("Queued", false)
-        case ("awaiting_approval", _): ("Waiting for approval", false)
-        case ("cancelled", _): ("Stopped", false)
-        case ("skipped", _): ("Skipped", false)
-        default: ("Status unavailable", false)
+    private func nextRun(_ raw: String, timezone: TimeZone) -> some View {
+        var calendar = Calendar.autoupdatingCurrent
+        calendar.timeZone = timezone
+        let formatter = RelativeDateTimeFormatter()
+        formatter.calendar = calendar
+        return LabeledContent("Next run") {
+            if let date = parseDate(raw) {
+                TimelineView(.periodic(from: .now, by: 60)) { context in
+                    VStack(alignment: .trailing, spacing: 2) {
+                        nextRunDate(date, relativeTo: context.date, calendar: calendar)
+                        if date > context.date {
+                            Text(formatter.localizedString(for: date, relativeTo: context.date))
+                                .font(Paper.Typography.caption)
+                                .foregroundStyle(Paper.inkMuted)
+                        }
+                    }
+                    .multilineTextAlignment(.trailing)
+                }
+            } else {
+                Text(raw)
+            }
         }
+        .font(Paper.Typography.callout)
     }
 
-    private func date(_ raw: String, timezone: TimeZone = .current) -> String {
-        guard let value = (try? Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(raw))
-                ?? (try? Date.ISO8601FormatStyle().parse(raw)) else { return raw }
-        return value.formatted(Date.FormatStyle(date: .abbreviated, time: .shortened, timeZone: timezone))
+    private func nextRunDate(_ date: Date, relativeTo now: Date, calendar: Calendar) -> Text {
+        let timezone = calendar.timeZone
+        let time = date.formatted(Date.FormatStyle(date: .omitted, time: .shortened, timeZone: timezone))
+        if calendar.isDate(date, inSameDayAs: now) {
+            return Text("Today, \(time)")
+        }
+        if let tomorrow = calendar.date(byAdding: .day, value: 1, to: now),
+           calendar.isDate(date, inSameDayAs: tomorrow) {
+            return Text("Tomorrow, \(time)")
+        }
+        return Text(date.formatted(Date.FormatStyle(date: .abbreviated, time: .shortened, timeZone: timezone)))
+    }
+
+    private func parseDate(_ raw: String) -> Date? {
+        (try? Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(raw))
+            ?? (try? Date.ISO8601FormatStyle().parse(raw))
+    }
+
+    private func date(_ raw: String) -> String {
+        guard let value = parseDate(raw) else { return raw }
+        return value.formatted(date: .abbreviated, time: .shortened)
     }
 }

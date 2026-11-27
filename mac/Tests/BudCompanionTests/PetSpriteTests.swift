@@ -60,6 +60,60 @@ struct PetSpriteTests {
     }
 
     @Test
+    func runFinishPlaysOnceAndHoldsTheFinalFrameForThreeHundredMilliseconds() throws {
+        var manifest = Self.manifest()
+        var actions = manifest["actions"] as! [String: Any]
+        actions["done"] = [
+            "loop": true,
+            "frames": [2, 4].map { ["rect": [$0, 0, 2, 2], "durationMs": 100] },
+        ]
+        manifest["actions"] = actions
+        let sprite = try load(manifest)
+        let start = Date(timeIntervalSince1970: 1000)
+        let pose = PetPose(status: .done, statusSince: start, reaction: (.hop, start), isRunFinish: true)
+
+        #expect(sprite.finishDuration(reduceMotion: false) == .milliseconds(400))
+        #expect(sprite.frame(for: pose, at: start)?.minX == 2)
+        #expect(sprite.frame(for: pose, at: start.addingTimeInterval(0.101))?.minX == 4)
+        #expect(sprite.frame(for: pose, at: start.addingTimeInterval(0.399))?.minX == 4)
+        #expect(sprite.frame(for: pose, at: start.addingTimeInterval(0.401))?.minX == 0)
+
+        #expect(sprite.finishDuration(reduceMotion: true) == .milliseconds(300))
+        #expect(sprite.frame(for: pose, at: start, reduceMotion: true)?.minX == 4)
+        #expect(sprite.frame(for: pose, at: start.addingTimeInterval(0.299), reduceMotion: true)?.minX == 4)
+        #expect(sprite.frame(for: pose, at: start.addingTimeInterval(0.301), reduceMotion: true)?.minX == 0)
+    }
+
+    @Test
+    func aNewRunInterruptsTheFinishGesture() throws {
+        let companion = Companion()
+        companion.handle(try #require(BudEvent(json: #"{"seq":1,"type":"run.completed","data":{}}"#)))
+        #expect(companion.pose.isRunFinish)
+        #expect(companion.pose.reaction == nil)
+
+        companion.handle(try #require(BudEvent(json: #"{"seq":2,"type":"run.started","data":{}}"#)))
+        #expect(companion.pose.status == .working)
+        #expect(!companion.pose.isRunFinish)
+    }
+
+    @Test(arguments: ["send_email", "ask_user"])
+    func aDecisionInterruptsTheFinishGestureAndItDoesNotResume(tool: String) throws {
+        let companion = Companion()
+        companion.handle(try #require(BudEvent(json: #"{"seq":1,"type":"run.completed","data":{}}"#)))
+        #expect(companion.pose.isRunFinish)
+
+        companion.handle(try #require(BudEvent(json:
+            #"{"seq":2,"type":"approval.requested","data":{"approval_id":"a","tool":"\#(tool)"}}"#)))
+        #expect(companion.pose.status == .needsYou)
+        #expect(!companion.pose.isRunFinish)
+
+        companion.handle(try #require(BudEvent(json:
+            #"{"seq":3,"type":"approval.denied","data":{"approval_id":"a"}}"#)))
+        #expect(companion.pose.status == .idle)
+        #expect(!companion.pose.isRunFinish)
+    }
+
+    @Test
     func priorityAndFixedPanelBox() throws {
         let sprite = try load(Self.manifest())
         let start = Date(timeIntervalSince1970: 1000)

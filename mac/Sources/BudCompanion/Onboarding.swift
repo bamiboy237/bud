@@ -146,6 +146,7 @@ final class OnboardingStore {
     var status = OnboardingStatus.empty
     var apiKeysExpanded = false
     var keyDrafts: [String: String] = [:]
+    private(set) var keyErrors: [String: String] = [:]
     private(set) var replacingKey: String?
     var loading = false
     var changingModel = false
@@ -186,6 +187,7 @@ final class OnboardingStore {
         stopPolling()
         status = .empty
         keyDrafts = [:]
+        keyErrors = [:]
         replacingKey = nil
         apiKeysExpanded = false
         initializedExpansion = false
@@ -302,24 +304,42 @@ final class OnboardingStore {
     func cancelKeyEdit() {
         guard let replacingKey else { return }
         keyDrafts[replacingKey] = ""
+        keyErrors[replacingKey] = nil
         self.replacingKey = nil
+    }
+
+    func updateKeyDraft(_ value: String, for id: String) {
+        guard value != (keyDrafts[id] ?? "") else { return }
+        keyDrafts[id] = value
+        keyErrors[id] = nil
     }
 
     func saveKey(_ envName: String) async {
         let trimmed = (keyDrafts[envName] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard savingKey == nil, !trimmed.isEmpty else { return }
+        let generation = serverGeneration
         savingKey = envName
+        keyErrors[envName] = nil
         error = nil
         feedback = nil
         defer { savingKey = nil }
         do {
             let raw = try await sendRequest("POST", "onboarding/keys", ["keys": [envName: trimmed]])
+            guard generation == serverGeneration else { return }
             keyDrafts[envName] = ""
             if replacingKey == envName { replacingKey = nil }
             apply(raw)
             feedback = "Saved and applied."
+        } catch ConnectionError.unreachable {
+            guard generation == serverGeneration else { return }
+            keyErrors[envName] = "Couldn’t reach Bud. Try again."
+        } catch ConnectionError.http(422, let detail)
+            where !detail.isEmpty && detail.count <= 120 && !detail.hasPrefix("[") && !detail.contains(trimmed) {
+            guard generation == serverGeneration else { return }
+            keyErrors[envName] = detail
         } catch {
-            self.error = "\(error)"
+            guard generation == serverGeneration else { return }
+            keyErrors[envName] = "Couldn’t save the API key. Try again."
         }
     }
 
@@ -438,10 +458,22 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
     }
 }
 
+private struct APIKeyEditorFocus: FocusedValueKey {
+    typealias Value = Bool
+}
+
+extension FocusedValues {
+    fileprivate var apiKeyEditorFocused: Bool? {
+        get { self[APIKeyEditorFocus.self] }
+        set { self[APIKeyEditorFocus.self] = newValue }
+    }
+}
+
 private struct AddModelView: View {
     @Bindable var store: OnboardingStore
     let close: () -> Void
     let updateBackground: () -> Void
+    @FocusedValue(\.apiKeyEditorFocused) private var apiKeyEditorFocused
     private let appearance = AppearanceStore.shared
 
     var body: some View {
@@ -468,15 +500,25 @@ private struct AddModelView: View {
             Rectangle().fill(Paper.hairline).frame(height: 0.5)
             HStack {
                 Spacer()
-                Button(store.status.hasModel ? "Done" : "Close", action: close)
-                    .buttonStyle(CardButton(kind: store.status.hasModel ? .primary : .secondary))
-                    .keyboardShortcut(.cancelAction)
+                if store.status.hasModel {
+                    Button("Start chatting") {
+                        close()
+                        Companion.shared.requestComposerFocus()
+                    }
+                    .buttonStyle(CardButton(kind: .primary))
+                    .keyboardShortcut(apiKeyEditorFocused == true ? nil : .defaultAction)
+                } else {
+                    Button("Close", action: close)
+                        .buttonStyle(CardButton(kind: .secondary))
+                        .keyboardShortcut(.cancelAction)
+                }
             }
             .padding(16)
         }
         .frame(width: 500, height: 365)
         .background(Paper.canvas)
         .preferredColorScheme(appearance.mode.colorScheme)
+        .onExitCommand(perform: close)
         .onChange(of: appearance.revision, initial: true) { _, _ in
             updateBackground()
         }
@@ -525,20 +567,7 @@ struct ModelSetupPanel: View {
                     Text(store.status.activeModel.map(modelLabel) ?? "Not set")
                         .foregroundStyle(Paper.inkSecondary)
                 } else {
-                    Picker("Default model", selection: Binding(
-                        get: { store.status.defaultModel ?? "" },
-                        set: { model in Task { await store.chooseModel(model) } }
-                    )) {
-                        Text(store.status.defaultModel == nil
-                             ? "Automatic (\(store.status.activeModel.map(modelLabel) ?? "Not set"))"
-                             : "Automatic").tag("")
-                        ForEach(store.status.models, id: \.self) { model in
-                            Text(modelLabel(model)).tag(model)
-                        }
-                    }
-                    .labelsHidden()
-                    .fixedSize()
-                    .disabled(store.changingModel)
+                    modelPicker
                 }
             }
             .font(Paper.Typography.body)
@@ -556,10 +585,53 @@ struct ModelSetupPanel: View {
         }
     }
 
+    private var modelPicker: some View {
+        let chatGPTPrefix = "openai-chatgpt:"
+        let chatGPTModels = store.status.models.filter { $0.hasPrefix(chatGPTPrefix) }
+        let apiModels = store.status.models.filter { !$0.hasPrefix(chatGPTPrefix) }
+        let activeLabel = store.status.activeModel.map(modelLabel) ?? "Not set"
+        return Picker("Default model", selection: Binding(
+            get: { store.status.defaultModel ?? "" },
+            set: { model in Task { await store.chooseModel(model) } }
+        )) {
+            Text(store.status.defaultModel == nil ? "Automatic (\(activeLabel))" : "Automatic").tag("")
+            if !chatGPTModels.isEmpty {
+                Section("ChatGPT") {
+                    ForEach(chatGPTModels, id: \.self) { model in
+                        Text(verbatim: String(model.dropFirst(chatGPTPrefix.count))).tag(model)
+                    }
+                }
+            }
+            if !apiModels.isEmpty {
+                Section("API Keys") {
+                    ForEach(apiModels, id: \.self) { model in apiModelLabel(model).tag(model) }
+                }
+            }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .fixedSize()
+        .disabled(store.changingModel)
+    }
+
     private func modelLabel(_ id: String) -> String {
         let parts = id.split(separator: ":", maxSplits: 1)
         guard parts.count == 2 else { return id }
         return parts[0] == "openai-chatgpt" ? "\(parts[1]) (ChatGPT)" : String(parts[1])
+    }
+
+    private func apiModelLabel(_ id: String) -> Text {
+        let parts = id.split(separator: ":", maxSplits: 1)
+        guard parts.count == 2 else { return Text(verbatim: id) }
+        let provider: String = switch parts[0] {
+        case "openai": "OpenAI"
+        case "deepseek": "DeepSeek"
+        case "mistral": "Mistral"
+        case "meta": "Meta"
+        default: parts[0].capitalized
+        }
+        let suffix = Text(verbatim: provider).foregroundColor(Paper.inkSecondary)
+        return Text("\(String(parts[1])) · \(suffix)")
     }
 
     private var chatGPTRow: some View {
@@ -622,7 +694,7 @@ private struct KeyRowView: View {
     private var draftBinding: Binding<String> {
         Binding(
             get: { store.keyDrafts[key.envName] ?? "" },
-            set: { store.keyDrafts[key.envName] = $0 }
+            set: { store.updateKeyDraft($0, for: key.id) }
         )
     }
 
@@ -691,32 +763,48 @@ private struct KeyRowView: View {
     }
 
     private var editor: some View {
-        HStack(spacing: 8) {
-            PaperFieldBox(focused: focused) {
-                SecureField(key.configured ? "Replace API key" : "API key", text: draftBinding)
-                    .accessibilityLabel("\(key.label) API key")
-                    .focused($focused)
-                    .onAppear { focused = true }
-                    .onSubmit {
-                        if hasDraft && !busy {
-                            Task { await store.saveKey(key.envName) }
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                PaperFieldBox(focused: focused) {
+                    SecureField(key.configured ? "Replace API key" : "API key", text: draftBinding)
+                        .accessibilityLabel("\(key.label) API key")
+                        .focused($focused)
+                        .focusedValue(\.apiKeyEditorFocused, true)
+                        .onAppear { focused = true }
+                        .onSubmit {
+                            if hasDraft && !busy {
+                                save()
+                            }
                         }
-                    }
-            }
-            .disabled(busy)
-
-            if store.savingKey == key.envName {
-                ProgressView().controlSize(.small)
-            }
-
-            Button("Save") { Task { await store.saveKey(key.envName) } }
-                .buttonStyle(CardButton(kind: hasDraft ? .primary : .secondary))
-                .disabled(!hasDraft || busy)
-            Button("Cancel") { store.cancelKeyEdit() }
-                .buttonStyle(CardButton(kind: .quiet))
+                }
                 .disabled(busy)
+
+                if store.savingKey == key.envName {
+                    ProgressView().controlSize(.small)
+                }
+
+                Button("Save", action: save)
+                    .buttonStyle(CardButton(kind: hasDraft ? .primary : .secondary))
+                    .disabled(!hasDraft || busy)
+                Button("Cancel") { store.cancelKeyEdit() }
+                    .buttonStyle(CardButton(kind: .quiet))
+                    .disabled(busy)
+            }
+            if let error = store.keyErrors[key.id] {
+                Text(error)
+                    .font(Paper.Typography.caption)
+                    .foregroundStyle(Paper.errorInk)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.bottom, 8)
+    }
+
+    private func save() {
+        Task {
+            await store.saveKey(key.id)
+            if store.keyErrors[key.id] != nil { focused = true }
+        }
     }
 }
 

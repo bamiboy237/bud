@@ -29,6 +29,66 @@ struct CitationTests {
         #expect(Citations.linked("No sources here.", sources: [:]) == "No sources here.")
     }
 
+    @Test(arguments: [
+        "`[S1] [S99]`",
+        "``[S1] ` [S99]``",
+        "```[S1] `` [S99]```",
+        "``[S1]\n[S99]``",
+    ])
+    func inlineCodeKeepsKnownAndUnknownMarkers(_ code: String) {
+        let sources = Citations.sources(Self.raw)
+        let reply = "Café 📝 [S1] \(code) then [S1] [S99]."
+        #expect(Citations.linked(reply, sources: sources)
+            == "Café 📝 [Nov 18](bud-source://abc123/13) \(code) then [Nov 18](bud-source://abc123/13).")
+        #expect(Citations.plain(reply, sources: sources) == "Café 📝 (Nov 18) \(code) then (Nov 18).")
+        #expect(Citations.plain(code, sources: [:]) == code)
+    }
+
+    @Test(arguments: [
+        "```swift\nprint(\"[S1] [S99]\")\n```\n",
+        "```text [S1]\n[S99]\n```\n",
+        "  ````markdown\n[S1]\n```\n[S99]\n`````  \n",
+        "~~~text\r\n[S1]\r\n```\r\n[S99]\r\n~~~~\r\n",
+        "~~~\r[S1] [S99]\r~~~\r",
+        "> ~~~text\n> [S1] [S99]\n> ~~~\n",
+        "- Example\n\n  ```text\n  [S1] [S99]\n  ```\n",
+    ])
+    func fencedCodeKeepsMarkersAndFenceBytes(_ block: String) {
+        let sources = Citations.sources(Self.raw)
+        let reply = "Before [S1].\n\n\(block)\nAfter [S1] [S99]."
+        #expect(Citations.linked(reply, sources: sources)
+            == "Before [Nov 18](bud-source://abc123/13).\n\n\(block)\nAfter [Nov 18](bud-source://abc123/13).")
+        #expect(Citations.plain(reply, sources: sources) == "Before (Nov 18).\n\n\(block)\nAfter (Nov 18).")
+    }
+
+    @Test(arguments: ["```swift\n[S1] [S99]", "~~~text\n[S1] [S99]\n"])
+    func unfinishedFenceKeepsMarkersWhileStreaming(_ block: String) {
+        let reply = "Before [S1].\n\n\(block)"
+        let sources = Citations.sources(Self.raw)
+        #expect(Citations.linked(reply, sources: sources)
+            == "Before [Nov 18](bud-source://abc123/13).\n\n\(block)")
+        #expect(Citations.plain(reply, sources: sources) == "Before (Nov 18).\n\n\(block)")
+    }
+
+    @Test
+    func unmatchedAndEscapedBackticksLeaveProseCitationsActive() {
+        let sources = Citations.sources(Self.raw)
+        let reply = "Use ` or `` [S1].\n\n" + #"And \`escaped [S99]."#
+        #expect(Citations.plain(reply, sources: sources) == "Use ` or `` (Nov 18).\n\n" + #"And \`escaped."#)
+    }
+
+    @Test
+    func inlineCodeKeepsMarkersWhenMarkdownOffsetsShift() {
+        let sources = Citations.sources(Self.raw)
+        let quote = "> > > > Before [S1] ``[S1]\n> > > > [S99]`` after [S1]."
+        #expect(Citations.plain(quote, sources: sources)
+            == "> > > > Before (Nov 18) ``[S1]\n> > > > [S99]`` after (Nov 18).")
+        let header = "| Text |\n| --- |\n"
+        let cell = #"| \| \| \| \| \| \| `[S1] [S99]` then [S1]. |"#
+        #expect(Citations.plain(header + cell, sources: sources)
+            == header + #"| \| \| \| \| \| \| `[S1] [S99]` then (Nov 18). |"#)
+    }
+
     @Test
     func onlySourceLinksOpenAMessageOrWorkspaceFile() throws {
         let turn = try #require(Citations.target(URL(string: "bud-source://abc123/13")!))

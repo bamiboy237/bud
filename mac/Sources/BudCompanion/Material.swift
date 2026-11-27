@@ -154,10 +154,9 @@ enum Paper {
     }
     static var borderFocus: Color {
         themed(
-            stone: .init(light: 0x9E9B90, dark: 0x52534C, contrastLight: 0x555249, contrastDark: 0x9A9B91),
-            studio: .init(light: 0xA1A1AA, dark: 0xFFFFFF, contrastLight: 0x52525B,
-                          darkAlpha: 0.26, contrastDarkAlpha: 0.58),
-            paper: .init(light: 0x1E4E79, dark: 0x7BB3EB))
+            stone: .init(light: 0x6E6E6E, dark: 0xA3A3A3, contrastLight: 0x424242, contrastDark: 0xD1D1D1),
+            studio: .init(light: 0x707070, dark: 0xA6A6A6, contrastLight: 0x454545, contrastDark: 0xD4D4D4),
+            paper: .init(light: 0x686868, dark: 0xADADAD, contrastLight: 0x3F3F3F, contrastDark: 0xD9D9D9))
     }
     static var inkRule: Color { borderStrong }
 
@@ -205,7 +204,7 @@ enum Paper {
             paper: .init(light: 0x626670, dark: 0xFFFFFF, lightAlpha: 0.88, darkAlpha: 0.48))
     }
 
-    /// Prussian Ink: links, citations, the active pin, focus border, and cited margin bars.
+    /// Prussian Ink: links, citations, the active pin, and cited margin bars.
     static let accent = dynamic(light: 0x1E4E79, dark: 0x7BB3EB)
     static let accentFill = accent.opacity(0.09)
     static let citationInk = dynamic(light: 0x1E4E79, dark: 0x8FC4FA)
@@ -323,6 +322,23 @@ enum Paper {
     }
 }
 
+struct PaperOutline<S: Shape>: View {
+    let shape: S
+    var color: Color = Paper.borderSubtle
+    var lineWidth: CGFloat = 0
+    var focused = false
+    @Environment(\.displayScale) private var displayScale
+
+    var body: some View {
+        let pixels: CGFloat = focused ? 2 : 1
+        let insetWidth = max(lineWidth, pixels / displayScale)
+        // Clip the outer half so custom shapes such as BubbleShape also get an inset edge.
+        shape.stroke(focused ? Paper.borderFocus : color, lineWidth: 2 * insetWidth)
+            .clipShape(shape)
+            .allowsHitTesting(false)
+    }
+}
+
 extension View {
     /// A paper surface with a hairline edge and a tight dual lift, shaped by `shape`.
     func surface<S: Shape>(
@@ -330,7 +346,7 @@ extension View {
         lift: CGFloat = 1,
         fill: Color = Paper.canvas,
         border: Color = Paper.borderSubtle,
-        borderWidth: CGFloat = 0.5
+        borderWidth: CGFloat = 0
     ) -> some View {
         modifier(PaperSurface(
             shape: shape, lift: lift, fill: fill, border: border, borderWidth: borderWidth))
@@ -349,11 +365,8 @@ private struct PaperSurface<S: Shape>: ViewModifier {
         AppearanceStore.observeRevision()
         return content
             .background(shape.fill(fill))
-            .overlay(shape.stroke(border, lineWidth: borderWidth))
             .overlay {
-                if scheme == .dark && lift > 0 && AppearanceStore.activeTheme == .paper {
-                    shape.stroke(.white.opacity(0.10), lineWidth: 0.5)
-                }
+                PaperOutline(shape: shape, color: border, lineWidth: borderWidth)
             }
             .shadow(color: .black.opacity((scheme == .dark ? 0.22 : 0.05) * lift), radius: 1, y: 0.5)
             .shadow(color: .black.opacity((scheme == .dark ? 0.30 : 0.08) * lift), radius: 8 * lift, y: 3 * lift)

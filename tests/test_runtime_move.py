@@ -1,3 +1,4 @@
+import json
 from time import monotonic, sleep
 
 import httpx
@@ -6,8 +7,9 @@ from fastapi.testclient import TestClient
 from pydantic_ai.messages import BinaryContent, ModelRequest, UserPromptPart
 from pydantic_ai.profiles import ModelProfile
 
+from bud import __version__
 from bud.composio.connection import Connections
-from bud.config import get_settings
+from bud.config import MOVE_FENCE, get_settings
 from bud.core import server
 from bud.core.auth import owner_token
 from bud.core.hub import Hub
@@ -175,3 +177,68 @@ def test_activation_confirmation_waits_for_proxy_restart():
         transport=httpx.MockTransport(lambda request: next(responses)),
     ) as client:
         _wait_for_runtime(client, transfer)
+
+
+@pytest.mark.parametrize(("resuming", "progress"), [(False, True), (True, True), (False, False)])
+def test_move_cli_reports_only_stages_about_to_run(
+    tmp_path, monkeypatch, capsys, resuming, progress
+):
+    from bud.release import runtime_move_client as client
+
+    origin = "https://bud.example.test/"
+    home = tmp_path / "source"
+    data = home / "data"
+    data.mkdir(parents=True)
+    if resuming:
+        record = {"id": "a" * 32, "destination": origin, "workspace": str(home / "workspace")}
+        (data / MOVE_FENCE).write_text(json.dumps(record))
+    if progress:
+        monkeypatch.setenv("BUD_MOVE_PROGRESS", "1")
+    else:
+        monkeypatch.delenv("BUD_MOVE_PROGRESS", raising=False)
+    monkeypatch.setattr(client, "_installed_service", lambda _: None)
+    observed = []
+    transfer = None
+
+    def observe(operation):
+        output = capsys.readouterr()
+        assert not output.out
+        stages = [json.loads(line)["stage"] for line in output.err.splitlines()]
+        observed.append((operation, stages))
+
+    def pack(_settings, archive):
+        observe("pack")
+        archive.write_bytes(b"profile")
+
+    def request(request):
+        nonlocal transfer
+        path = request.url.path
+        if path == "/runtime":
+            if transfer:
+                return httpx.Response(200, json={"mode": "accounts", "received_move_id": transfer})
+            return httpx.Response(200, json={"mode": "receiving", "version": __version__})
+        if request.method == "GET":
+            return httpx.Response(200, json={"state": "staged" if resuming else "ready"})
+        if request.method == "PUT":
+            observe("upload")
+            assert request.content == b"profile"
+            return httpx.Response(200, json={"state": "staged"})
+        assert path.endswith("/activate")
+        observe("start")
+        transfer = path.split("/")[-2]
+        return httpx.Response(200, json={"state": "committed"})
+
+    mock = httpx.MockTransport(request)
+    make_client = httpx.Client
+    monkeypatch.setattr(
+        client.httpx, "Client", lambda **kwargs: make_client(transport=mock, **kwargs)
+    )
+    monkeypatch.setattr(client, "pack_runtime", pack)
+
+    assert client.move_runtime(home, origin, "test-token") == {"state": "complete"}
+    expected = [
+        ("pack", ["packing"] if progress else []),
+        ("upload", ["uploading"] if progress else []),
+        ("start", ["starting"] if progress else []),
+    ]
+    assert observed == (expected[2:] if resuming else expected)

@@ -51,6 +51,7 @@ struct PetPose {
     var listeningSince: Date?
     var reaction: (move: PetMove, since: Date)?
     var reactionAtStatusStart: (move: PetMove, since: Date)?
+    var isRunFinish = false
 }
 
 /// A pet's art, cut from its sheet as needed. The app bundles the default dog.
@@ -89,20 +90,36 @@ final class PetSprite {
 
     // MARK: Choosing the frame
 
+    static let finishHoldMs = 300
+
+    private var finishAnimationMs: Int { actions[.done]?.durations.dropLast().reduce(0, +) ?? 0 }
+
+    func finishDuration(reduceMotion: Bool) -> Duration {
+        .milliseconds(Self.finishHoldMs) + .milliseconds(reduceMotion ? 0 : finishAnimationMs)
+    }
+
     /// The frame for this moment. In order: being carried, listening, a reaction still
-    /// playing, then the status pose. A status animation that plays once (a thumbs-up when
-    /// done, a sigh when it failed) plays when it's first seen and then holds its last frame
-    /// until the status changes; a reaction that covered its start makes it play afterwards,
-    /// and one that came after it finished leaves it settled.
-    func frame(for pose: PetPose, at now: Date) -> CGRect? {
+    /// playing, then the status pose. A run finish has its own timing and skips reactions.
+    func frame(for pose: PetPose, at now: Date, reduceMotion: Bool = false) -> CGRect? {
         func ms(since start: Date) -> Int { max(0, Int(now.timeIntervalSince(start) * 1000)) }
 
         if let walk = pose.walk, let action = actions[walk.move] {
-            return action.frame(at: ms(since: walk.since))
+            return action.frame(at: reduceMotion ? 0 : ms(since: walk.since))
         }
         if let since = pose.listeningSince, let action = actions[.listen] {
-            return action.frame(at: ms(since: since))
+            return action.frame(at: reduceMotion ? 0 : ms(since: since))
         }
+        if pose.isRunFinish, pose.status == .done, let finish = actions[.done] {
+            let elapsed = ms(since: pose.statusSince)
+            let animationMs = reduceMotion ? 0 : finishAnimationMs
+            let finalFrameMs = elapsed - animationMs
+            if finalFrameMs >= Self.finishHoldMs {
+                let idleMs = reduceMotion ? 0 : finalFrameMs - Self.finishHoldMs
+                return actions[.idle]?.frame(at: idleMs)
+            }
+            return finalFrameMs >= 0 ? finish.frames.last : finish.frame(at: elapsed)
+        }
+        if reduceMotion { return actions[pose.status]?.frames.first }
         if let reaction = pose.reaction, let action = actions[reaction.move],
            ms(since: reaction.since) < action.totalMs
         {
@@ -259,7 +276,7 @@ final class PetSprite {
 
 /// The pet, showing whichever frame the sprite picks for the moment. The frame comes from the
 /// clock and the companion's facts, so the view keeps no animation state of its own.
-/// Reduced motion: each pose's first frame, still.
+/// Reduced motion uses a still frame for each pose.
 struct AnimatedPet: View {
     let sprite: PetSprite
     let size: CGSize?
@@ -273,10 +290,9 @@ struct AnimatedPet: View {
     }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 0.04, paused: reduceMotion)) { context in
-            let pose = pose()
-            let moment = reduceMotion ? Date.distantPast : context.date
-            if let rect = sprite.frame(for: still(pose), at: moment),
+        let still = reduceMotion || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        TimelineView(.animation(minimumInterval: 0.04, paused: still)) { context in
+            if let rect = sprite.frame(for: pose(), at: context.date, reduceMotion: still),
                let image = sprite.image(rect)
             {
                 Image(nsImage: image)
@@ -286,16 +302,5 @@ struct AnimatedPet: View {
             }
         }
         .frame(width: size?.width ?? sprite.displaySize.width, height: size?.height ?? sprite.displaySize.height)
-    }
-
-    /// With reduced motion every animation starts "now", so the first frame shows and stays.
-    private func still(_ pose: PetPose) -> PetPose {
-        guard reduceMotion else { return pose }
-        let start = Date.distantPast
-        return PetPose(
-            status: pose.status, statusSince: start,
-            walk: pose.walk.map { ($0.move, start) },
-            listeningSince: pose.listeningSince.map { _ in start },
-            reaction: nil)
     }
 }

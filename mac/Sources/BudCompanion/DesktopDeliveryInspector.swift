@@ -39,17 +39,101 @@ struct DesktopDeliveryStatus {
 
     var canApprove: Bool { phase == "ready" && !revoked }
     var canChange: Bool { ["queued", "sign_in", "ready"].contains(phase) }
+    var awaitsReceipt: Bool { phase == "approved" || phase == "sending" }
+    var receiptUnconfirmed: Bool { phase == "uncertain" }
+}
+
+enum DesktopDeliveryAction: String, Sendable {
+    case approve, cancel, retarget, verify
+
+    var title: String {
+        switch self {
+        case .approve: "Approve submission"
+        case .cancel: "Cancel delivery"
+        case .retarget: "Use selected desktop"
+        case .verify: "Check for receipt"
+        }
+    }
+
+    var progressTitle: String {
+        switch self {
+        case .approve: "Approving…"
+        case .cancel: "Cancelling…"
+        case .retarget: "Changing desktop…"
+        case .verify: "Checking for receipt…"
+        }
+    }
 }
 
 @MainActor
-private final class DesktopDeliveryState: ObservableObject {
-    @Published var status: DesktopDeliveryStatus?
+final class DesktopDeliveryState: ObservableObject {
+    @Published private(set) var status: DesktopDeliveryStatus?
     @Published var preview: AttachmentSelection?
-    @Published var problem: String?
-    @Published var working = false
+    @Published private var actionProblem: String?
+    @Published private var loadProblem: String?
+    @Published private(set) var action: DesktopDeliveryAction?
     @Published var desktopChoices: [String: String] = [:]
     @Published var targetID = ""
-    var loadVersion = 0
+    private var loadVersion = 0
+
+    var problem: String? { actionProblem ?? loadProblem }
+    var canCheckReceipt: Bool {
+        status?.receiptUnconfirmed == true
+            || (status?.awaitsReceipt == true && (loadProblem != nil || action == .verify))
+    }
+
+    func refresh(_ selection: DesktopDeliverySelection) async {
+        guard action == nil else { return }
+        await load(selection)
+    }
+
+    func perform(
+        _ action: DesktopDeliveryAction, on selection: DesktopDeliverySelection, desktopID: String? = nil
+    ) async {
+        guard self.action == nil else { return }
+        self.action = action
+        loadVersion += 1
+        actionProblem = nil
+        loadProblem = nil
+        defer { self.action = nil }
+
+        do {
+            // Only an uncertain job accepts the server's read-only receipt check.
+            // If its status could not be loaded, ask for the latest state first.
+            if action != .verify || status?.receiptUnconfirmed == true {
+                let request = selection.connection.request(
+                    "POST", "\(selection.path)/browser/\(action.rawValue)",
+                    json: desktopID.map { ["desktop": $0] })
+                _ = try await selection.connection.send(request)
+                targetID = ""
+            }
+            await load(selection)
+        } catch {
+            actionProblem = "\(error)"
+        }
+    }
+
+    private func load(_ selection: DesktopDeliverySelection) async {
+        let version = loadVersion
+        do {
+            let payload = try await selection.connection.send("GET", selection.path)
+            guard version == loadVersion, !Task.isCancelled else { return }
+            guard let next = DesktopDeliveryStatus(payload) else {
+                loadProblem = "Couldn’t load the delivery details."
+                return
+            }
+            let desktopChanged = status?.desktopID != next.desktopID
+            if desktopChanged { targetID = "" }
+            if desktopChanged || status?.phase != next.phase {
+                actionProblem = nil
+            }
+            status = next
+            loadProblem = nil
+        } catch {
+            guard version == loadVersion, !Task.isCancelled else { return }
+            loadProblem = "\(error)"
+        }
+    }
 }
 
 @MainActor
@@ -76,8 +160,6 @@ struct DesktopDeliveryInspector: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     if let status = state.status {
-                        Text(summary(status)).font(Paper.Typography.callout)
-                        Rectangle().fill(Paper.hairline).frame(height: 0.5)
                         LabeledContent("File", value: status.file.name)
                         Button("Preview selected file") {
                             state.preview = AttachmentSelection(
@@ -91,46 +173,14 @@ struct DesktopDeliveryInspector: View {
                             .font(Paper.Typography.caption)
                             .foregroundStyle(Paper.inkSecondary)
                             .textSelection(.enabled)
-                        if status.phase == "delivered" || status.phase == "uncertain" {
+                        if status.phase == "delivered" || status.receiptUnconfirmed {
                             Text("Reference \(status.reference)")
                                 .font(Paper.Typography.caption)
                                 .foregroundStyle(Paper.inkSecondary)
                                 .textSelection(.enabled)
                         }
-                        if status.canApprove {
-                            Button("Approve submission") {
-                                Task { await act("approve", body: ["desktop": status.desktopID]) }
-                            }
-                            .buttonStyle(CardButton(kind: .primary))
-                            .disabled(state.working)
-                        }
-                        if status.canChange || status.phase == "approved" {
-                            if status.canChange, !state.desktopChoices.isEmpty {
-                                Picker("Run browser on", selection: $state.targetID) {
-                                    Text(desktopLabel(status.desktop, id: status.desktopID)).tag("")
-                                    ForEach(state.desktopChoices.keys.sorted(), id: \.self) { id in
-                                        if let name = state.desktopChoices[id], id != status.desktopID {
-                                            Text(desktopLabel(name, id: id)).tag(id)
-                                        }
-                                    }
-                                }
-                                Button("Use selected desktop") {
-                                    let targetID = state.targetID
-                                    Task { await act("retarget", body: ["desktop": targetID]) }
-                                }
-                                .buttonStyle(CardButton(kind: .secondary))
-                                .disabled(state.working || state.targetID.isEmpty)
-                                .opacity(state.working || state.targetID.isEmpty ? 0.55 : 1)
-                            }
-                            Button("Cancel delivery") { Task { await act("cancel") } }
-                                .buttonStyle(CardButton(kind: .quiet))
-                                .disabled(state.working)
-                        }
-                        if status.phase == "uncertain" {
-                            Button("Check for receipt") { Task { await act("verify") } }
-                                .buttonStyle(CardButton(kind: .secondary))
-                                .disabled(state.working)
-                        }
+                        Rectangle().fill(Paper.hairline).frame(height: 0.5)
+                        actions(for: status)
                     } else if state.problem == nil {
                         ProgressView().controlSize(.small)
                     }
@@ -150,10 +200,60 @@ struct DesktopDeliveryInspector: View {
         .task {
             await loadDesktops()
             while !Task.isCancelled {
-                await load()
+                await state.refresh(selection)
                 if state.status?.phase == "delivered" || state.status?.phase == "cancelled" { break }
                 try? await Task.sleep(for: .seconds(2))
             }
+        }
+    }
+
+    private func actions(for status: DesktopDeliveryStatus) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text(state.canCheckReceipt ? "Receipt unconfirmed" : summary(status))
+                    .font(Paper.Typography.callout)
+                if state.canCheckReceipt {
+                    actionButton(.verify, kind: .secondary)
+                }
+            }
+            if status.canApprove {
+                actionButton(.approve, kind: .primary, desktopID: status.desktopID)
+            }
+            if status.canChange, !state.desktopChoices.isEmpty {
+                Picker("Run browser on", selection: $state.targetID) {
+                    Text(desktopLabel(status.desktop, id: status.desktopID)).tag("")
+                    ForEach(state.desktopChoices.keys.sorted(), id: \.self) { id in
+                        if let name = state.desktopChoices[id], id != status.desktopID {
+                            Text(desktopLabel(name, id: id)).tag(id)
+                        }
+                    }
+                }
+                .disabled(state.action != nil)
+                actionButton(
+                    .retarget, kind: .secondary, desktopID: state.targetID, enabled: !state.targetID.isEmpty)
+            }
+            if status.canChange || status.phase == "approved" {
+                actionButton(.cancel, kind: .quiet)
+            }
+        }
+    }
+
+    @ViewBuilder private func actionButton(
+        _ action: DesktopDeliveryAction, kind: CardButton.Kind,
+        desktopID: String? = nil, enabled: Bool = true
+    ) -> some View {
+        if state.action == action {
+            ProgressView(action.progressTitle)
+                .controlSize(.small)
+                .font(Paper.Typography.label)
+                .frame(minHeight: 26)
+        } else {
+            Button(action.title) {
+                Task { await state.perform(action, on: selection, desktopID: desktopID) }
+            }
+            .buttonStyle(CardButton(kind: kind))
+            .disabled(state.action != nil || !enabled)
+            .opacity(enabled ? 1 : 0.55)
         }
     }
 
@@ -168,7 +268,6 @@ struct DesktopDeliveryInspector: View {
         case "ready": status.revoked ? "Choose another desktop." : "Review the file and site before approving."
         case "approved", "sending": "Waiting for the browser receipt"
         case "delivered": "Receipt confirmed"
-        case "uncertain": "Bud couldn’t confirm submission. You can check again for a receipt."
         case "cancelled": "Delivery cancelled"
         default: "Browser delivery"
         }
@@ -181,43 +280,5 @@ struct DesktopDeliveryInspector: View {
         for row in rows {
             if let id = row["id"], let label = row["label"] { state.desktopChoices[id] = label }
         }
-    }
-
-    private func load() async {
-        guard !state.working else { return }
-        let version = state.loadVersion
-        do {
-            let status = try await selection.connection.send("GET", selection.path)
-            guard version == state.loadVersion, !Task.isCancelled else { return }
-            let next = DesktopDeliveryStatus(status)
-            if state.status?.desktopID != next?.desktopID {
-                state.targetID = ""
-            }
-            state.status = next
-            state.problem = next == nil ? "Couldn’t load the delivery details." : nil
-        } catch {
-            guard version == state.loadVersion, !Task.isCancelled else { return }
-            state.status = nil
-            state.problem = "\(error)"
-        }
-    }
-
-    private func act(_ action: String, body: [String: String]? = nil) async {
-        guard !state.working else { return }
-        state.working = true
-        state.loadVersion += 1
-        state.status = nil
-        state.problem = nil
-        do {
-            _ = try await selection.connection.send(
-                "POST", "\(selection.path)/browser/\(action)", json: body)
-            state.targetID = ""
-        } catch {
-            state.problem = "\(error)"
-            state.working = false
-            return
-        }
-        state.working = false
-        await load()
     }
 }

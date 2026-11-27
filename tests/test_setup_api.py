@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from unittest.mock import Mock
 
 import httpx
@@ -97,6 +98,27 @@ async def test_mac_can_recover_a_discovered_apps_link_and_check_it(setup_api):
         assert resumed.json()["url"] == "https://example.test/existing-sign-in"
         assert found.connect.call_count == 1
         found.pending_url.assert_called_once_with("github")
+        recover_only = {"resume": True, "refresh": False}
+        recovered = await client.post("/connections/github/connect", json=recover_only)
+        assert recovered.json()["url"] == "https://example.test/existing-sign-in"
+        assert recovered.json()["expired"] is False
+        found.pending_url.return_value = None
+        expired = await client.post("/connections/github/connect", json=recover_only)
+        assert expired.status_code == 200
+        assert expired.json()["expired"] is True
+        assert expired.json()["url"] is None
+        assert found.connect.call_count == 1
+        refreshed = await client.post("/connections/github/connect", json={"resume": True})
+        assert refreshed.json()["expired"] is False
+        assert refreshed.json()["url"] == "https://example.test/private-sign-in"
+        assert found.connect.call_count == 2
+        found.connect.assert_called_with("github", replace_active=False)
+        found.statuses.return_value = {"github": "EXPIRED"}
+        expired_check = await client.post(route)
+        assert expired_check.status_code == 200
+        assert expired_check.json()["status"] == "failed"
+        assert "expired" in expired_check.json()["reason"]
+        found.statuses.return_value = {"github": "ACTIVE"}
         checked = await client.post(route)
         assert checked.status_code == 200
         assert checked.json()["status"] == "connected"
@@ -107,6 +129,161 @@ async def test_mac_can_recover_a_discovered_apps_link_and_check_it(setup_api):
         assert (await client.post("/sessions/unknown/setup/github/check")).status_code == 404
         assert (await client.post("/sessions/session/setup/missing/check")).status_code == 404
         assert (await client.post("/connections/Bad%20Slug/connect")).status_code == 400
+
+
+async def test_connections_inventory_preserves_status_keys_and_can_disconnect(setup_api):
+    app, token, found, _, _, _ = setup_api
+    accounts = [
+        {
+            "toolkit": "github",
+            "account_id": "acct-gh",
+            "display_name": "GitHub",
+            "status": "expired",
+        }
+    ]
+    found.inventory.return_value = (
+        {"gmail": "ACTIVE", "googlecalendar": "NOT_CONNECTED"},
+        accounts,
+    )
+    found.disconnect.return_value = True
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        assert (await client.get("/connections")).status_code == 401
+        client.headers["Authorization"] = f"Bearer {token}"
+        for response in (
+            await client.get("/connections"),
+            await client.post("/connections/refresh"),
+        ):
+            assert response.status_code == 200
+            assert response.headers["cache-control"] == "no-store"
+            assert response.json() == {
+                "statuses": {"gmail": "ACTIVE", "calendar": "NOT_CONNECTED"},
+                "accounts": accounts,
+                "restart_required": False,
+                "refresh_boundary": "next_message",
+            }
+        disconnected = await client.post("/connections/calendar/disconnect")
+        assert disconnected.status_code == 200
+        assert disconnected.json()["disconnected"] is True
+        found.disconnect.assert_called_once_with("googlecalendar")
+
+
+async def test_routine_history_pages_keep_review_details_without_reports(setup_api):
+    app, token, _, log, runner, _ = setup_api
+    store = runner.routines
+    assert store is not None
+    routine = runner.create_routine(
+        feed_id="session",
+        title="Review history",
+        skill="attention-briefing",
+        prompt="Summarize recent messages.",
+        cron="0 9 * * *",
+    )
+    now = datetime.now(UTC)
+    occurrence_ids = []
+    for number in range(12):
+        occ, _ = store.claim_manual_occurrence(routine.routine_id, now=now)
+        occurrence_ids.append(occ.occurrence_id)
+        if number < 11:
+            store.sync_execution(occ.session_id, "failed", error=f"Failure {number}")
+    action = {
+        "run_id": occ.run_id,
+        "call_id": "slack-send",
+        "tool": "SLACK_SEND_MESSAGE",
+        "args": {"channel": "team", "text": "Status update"},
+    }
+    log.append(occ.session_id, "tool.call", action)
+    log.append(occ.session_id, "action.decided", {**action, "outcome": "approved"})
+    returned = {**action, "call_id": "returned"}
+    log.append(occ.session_id, "action.decided", {**returned, "outcome": "allowed"})
+    log.append(occ.session_id, "tool.result", returned)
+    store.sync_execution(
+        occ.session_id,
+        "needs_review",
+        uncertain_tools=[action["tool"]],
+        error="Slack delivery could not be confirmed.",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {token}"},
+    ) as client:
+        route = f"/routines/{routine.routine_id}"
+        initial = (await client.get(route)).json()
+        assert initial["has_more"] is True
+        assert len(initial["recent_occurrences"]) == 10
+        review = initial["latest_occurrence"]
+        assert review["execution_status"] == "needs_review"
+        assert review["report_path"] is None
+        assert review["error"] == "Slack delivery could not be confirmed."
+        assert review["unconfirmed_actions"] == [action]
+        assert initial["recent_occurrences"][0] == review
+        assert (await client.post(f"{route}/resume")).status_code == 409
+
+        older = (await client.get(f"{route}/occurrences?offset=10&limit=2")).json()
+        assert older["has_more"] is False
+        assert [run["occurrence_id"] for run in older["occurrences"]] == occurrence_ids[1::-1]
+        assert older["occurrences"][-1]["error"] == "Failure 0"
+        paged_detail = (await client.get(f"{route}?offset=10&limit=1")).json()
+        assert paged_detail["has_more"] is True
+        assert paged_detail["latest_occurrence"] == review
+        assert paged_detail["recent_occurrences"] == older["occurrences"][:1]
+        assert (await client.get(f"{route}/occurrences?offset=-1")).status_code == 422
+        assert (await client.get(f"{route}/occurrences?limit=0")).status_code == 422
+        resumed = await client.post(f"{route}/resume", json={"acknowledge_uncertain": True})
+        assert resumed.json()["status"] == "active"
+
+
+async def test_pause_stops_a_waiting_run_and_cancels_its_approval(setup_api):
+    app, token, _, log, runner, _ = setup_api
+    store = runner.routines
+    assert store is not None
+    routine = runner.create_routine(
+        feed_id="session",
+        title="Pause while waiting",
+        skill="attention-briefing",
+        prompt="Send an update.",
+        cron="0 9 * * *",
+    )
+    occ, _ = store.claim_manual_occurrence(routine.routine_id)
+    log.append(occ.session_id, "run.queued", {"run_id": occ.run_id, "trigger": "routine"})
+    log.append(
+        occ.session_id,
+        "approval.requested",
+        {
+            "run_id": occ.run_id,
+            "approval_id": "ask-send",
+            "call_id": "send",
+            "tool": "send_email",
+            "args": {"subject": "Update"},
+        },
+    )
+    log.append(occ.session_id, "run.waiting", {"run_id": occ.run_id, "messages": []})
+    store.sync_execution(occ.session_id, "awaiting_approval")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {token}"},
+    ) as client:
+        route = f"/routines/{routine.routine_id}"
+        detail = (await client.get(route)).json()
+        response = await client.post(f"{route}/pause")
+        assert response.status_code == 200
+        paused = response.json()
+        assert paused["status"] == "paused"
+        assert paused["next_run_at"] is None
+        assert paused["stop_requested"] is True
+        assert paused["active_run_stopped"] is True
+        assert paused["active_occurrence"] is None
+        assert paused["latest_occurrence"]["execution_status"] == "cancelled"
+        assert paused["pending_approvals"] == []
+        pending = detail["active_occurrence"]["pending_approvals"]
+        assert pending[0]["args"] == {"subject": "Update"}
+        assert detail["pending_approvals"] == pending
+        assert (await client.post(f"{route}/pause")).json()["stop_requested"] is False
 
 
 async def test_a_changed_account_binding_loads_in_place(setup_api):

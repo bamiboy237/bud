@@ -16,7 +16,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, SerializeAsAny
 
 from bud.core.hub import Hub
 from bud.core.log import _is_job_session
@@ -27,6 +27,8 @@ from bud.core.projection import (
     RoutineOccurrenceView,
     RoutineView,
     parked_approvals,
+    queue_paused,
+    runs,
     undecided_approvals,
 )
 from bud.skills import SkillStore, valid_name
@@ -38,6 +40,7 @@ logger = logging.getLogger(__name__)
 MAX_CATCH_UP = 5
 DEFAULT_APPROVAL_EXPIRY_SECONDS = 86_400
 DEFAULT_GRACE_SECONDS = 300
+RECENT_RUN_LIMIT = 10
 
 MissedRunPolicy = Literal["run_once", "skip", "catch_up"]
 OverlapPolicy = Literal["skip", "queue"]
@@ -288,6 +291,17 @@ class RoutineOccurrence(BaseModel):
             error=self.error,
             completed_at=self.completed_at.isoformat() if self.completed_at else None,
         )
+
+
+class RoutineRunView(RoutineOccurrenceView):
+    pending_approvals: list[PendingApproval] = Field(default_factory=list)
+    unconfirmed_actions: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class RoutineInspectionView(RoutineView):
+    active_occurrence: SerializeAsAny[RoutineOccurrenceView] | None = None
+    latest_occurrence: SerializeAsAny[RoutineOccurrenceView] | None = None
+    recent_occurrences: list[SerializeAsAny[RoutineOccurrenceView]] = Field(default_factory=list)
 
 
 _ROUTINE_COLS = (
@@ -714,8 +728,6 @@ class RoutineStore:
         if row is None:
             raise RoutineNotFoundError(f"Unknown routine: {routine_id}")
         current = self._routine(row)
-        if current.status == "paused" and current.pause_reason == reason:
-            return None
         # Preserve "uncertain" escalation even if another pause tries to overwrite it.
         effective_reason = (
             "uncertain"
@@ -724,6 +736,8 @@ class RoutineStore:
             and reason != "uncertain"
             else reason
         )
+        if current.status == "paused" and current.pause_reason == effective_reason:
+            return None
         db.execute(
             """UPDATE routines
                SET status='paused', pause_reason=?, last_evaluated_at=?,
@@ -749,6 +763,62 @@ class RoutineStore:
         if wake_feed is not None:
             self.hub.wake(wake_feed)
         return self.get(routine_id)
+
+    def pause_for_stop(self, routine_id: str, *, now: datetime) -> list[str]:
+        """Pause the schedule and record stop requests before another action can run."""
+        sessions: list[str] = []
+        reason = "Stopped by the user."
+        now_utc = _as_utc(now)
+        with self.log._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            wake_feed = self._pause_in_tx(db, routine_id, now_utc, "owner")
+            rows = db.execute(
+                f"SELECT {_OCC_COLS} FROM routine_occurrences WHERE routine_id = ? "
+                f"AND execution_status IN ({','.join('?' for _ in ACTIVE_OCCURRENCE_STATUSES)})",
+                (routine_id, *ACTIVE_OCCURRENCE_STATUSES),
+            ).fetchall()
+            for row in rows:
+                occ = self._occ(row)
+                events = self.log._read(db, occ.session_id)
+                states = runs(events)
+                current = states[-1] if states else None
+                run_id = current.run_id if current else occ.run_id
+                if run_id is None or (
+                    current
+                    and current.status not in ("queued", "running", "awaiting_approval", "stopping")
+                ):
+                    continue
+                if not queue_paused(events):
+                    self.log._insert(db, occ.session_id, "queue.paused", {"reason": "stopped"})
+                self.log._insert(
+                    db,
+                    occ.session_id,
+                    "run.stop_requested",
+                    {"run_id": run_id, "reason": reason},
+                    once=True,
+                    key=f"{run_id}:stop",
+                )
+                for request in undecided_approvals(events) + parked_approvals(events):
+                    self.log._insert(
+                        db,
+                        occ.session_id,
+                        "approval.denied",
+                        {"approval_id": request["approval_id"], "reason": reason},
+                        once=True,
+                    )
+                if current is None or current.status == "awaiting_approval":
+                    self.log._ack_stop(db, occ.session_id, run_id)
+                if current is None:
+                    db.execute(
+                        "UPDATE routine_occurrences SET execution_status = 'cancelled', "
+                        "delivery_status = 'not_required', error = ?, completed_at = ? "
+                        "WHERE occurrence_id = ?",
+                        (reason, now_utc.isoformat(), occ.occurrence_id),
+                    )
+                sessions.append(occ.session_id)
+        if wake_feed is not None:
+            self.hub.wake(wake_feed)
+        return sessions
 
     def resume(
         self,
@@ -1039,14 +1109,22 @@ class RoutineStore:
             ).fetchone()
         return self._occ(row) if row is not None else None
 
-    def occurrences(self, routine_id: str, *, limit: int = 20) -> list[RoutineOccurrence]:
+    def occurrences(
+        self, routine_id: str, *, limit: int = 20, offset: int = 0
+    ) -> list[RoutineOccurrence]:
         with self.log._connect() as db:
             rows = db.execute(
                 f"SELECT {_OCC_COLS} FROM routine_occurrences WHERE routine_id = ? "
-                "ORDER BY triggered_at DESC, rowid DESC LIMIT ?",
-                (routine_id, limit),
+                "ORDER BY triggered_at DESC, rowid DESC LIMIT ? OFFSET ?",
+                (routine_id, limit, offset),
             ).fetchall()
         return [self._occ(row) for row in rows]
+
+    def occurrence_page(
+        self, routine_id: str, *, limit: int, offset: int
+    ) -> tuple[list[RoutineOccurrence], bool]:
+        rows = self.occurrences(routine_id, limit=limit + 1, offset=offset)
+        return rows[:limit], len(rows) > limit
 
     def active_occurrences(
         self, *, feed_id: str | None = None, routine_id: str | None = None
@@ -1062,7 +1140,7 @@ class RoutineStore:
         with self.log._connect() as db:
             rows = db.execute(
                 f"SELECT {_OCC_COLS} FROM routine_occurrences WHERE {' AND '.join(clauses)} "
-                "ORDER BY triggered_at",
+                "ORDER BY triggered_at, rowid",
                 params,
             ).fetchall()
         return [self._occ(row) for row in rows]
@@ -1118,6 +1196,13 @@ class RoutineStore:
             if row is None:
                 return None
             occ = self._occ(row)
+            if (
+                occ.execution_status == "cancelled"
+                and status in ACTIVE_OCCURRENCE_STATUSES
+                and occ.run_id is not None
+                and self.log._stopped(db, occ.run_id)
+            ):
+                return occ
             tools = uncertain_tools if uncertain_tools is not None else occ.uncertain_tools
             delivery = occ.delivery_status
             if status == "needs_review":
@@ -1352,30 +1437,74 @@ class RoutineStore:
                             fallback = (occ.session_id, approval_id)
         return fallback
 
-    def view(self, routine: RoutineDefinition) -> RoutineView:
-        recent = self.occurrences(routine.routine_id, limit=10)
-        active = next(
-            (occ for occ in recent if occ.execution_status in ACTIVE_OCCURRENCE_STATUSES), None
+    def run_view(
+        self, occ: RoutineOccurrence, refs: dict[str, str] | None = None
+    ) -> RoutineRunView:
+        events = self.log.read(occ.session_id)
+        requests = undecided_approvals(events) + parked_approvals(events)
+        if requests and refs is None:
+            refs = self._references(self.get(occ.routine_id))
+        pending = [
+            PendingApproval.model_validate(
+                {
+                    **req,
+                    "routine_id": occ.routine_id,
+                    "occurrence_id": occ.occurrence_id,
+                    "reference": (refs or {}).get(req["approval_id"]),
+                }
+            )
+            for req in requests
+        ]
+        call_args = {}
+        approval_args = {}
+        returned = set()
+        decisions = []
+        for event in events:
+            if event.type == "tool.call":
+                call_args[event.data["run_id"], event.data["call_id"]] = event.data.get("args")
+            elif event.type == "tool.result":
+                returned.add((event.data["run_id"], event.data["call_id"]))
+            elif event.type == "action.decided" and event.data["outcome"] in (
+                "approved",
+                "allowed",
+                "auto-allow",
+            ):
+                decisions.append(event.data)
+            elif event.type == "approval.requested":
+                approval_args[event.data["call_id"]] = event.data.get("args")
+        unconfirmed = [
+            {
+                "run_id": action["run_id"],
+                "call_id": action["call_id"],
+                "tool": action["tool"],
+                "args": call_args.get(
+                    (action["run_id"], action["call_id"]), approval_args.get(action["call_id"])
+                ),
+            }
+            for action in decisions
+            if (action["run_id"], action["call_id"]) not in returned
+        ]
+        return RoutineRunView(
+            **occ.to_view().model_dump(), pending_approvals=pending, unconfirmed_actions=unconfirmed
         )
-        latest = recent[0] if recent else None
+
+    def view(
+        self,
+        routine: RoutineDefinition,
+        *,
+        recent: list[RoutineOccurrence] | None = None,
+        offset: int = 0,
+    ) -> RoutineInspectionView:
+        if recent is None:
+            recent = self.occurrences(routine.routine_id, limit=RECENT_RUN_LIMIT)
+        latest = self.occurrences(routine.routine_id, limit=1) if offset else recent[:1]
+        active = self.active_occurrences(routine_id=routine.routine_id)
         refs = self._references(routine)
-        pending: list[PendingApproval] = []
-        for occ in recent:
-            if occ.execution_status != "awaiting_approval":
-                continue
-            events = self.log.read(occ.session_id)
-            for req in undecided_approvals(events):
-                pending.append(
-                    PendingApproval.model_validate(
-                        {
-                            **req,
-                            "routine_id": routine.routine_id,
-                            "occurrence_id": occ.occurrence_id,
-                            "reference": refs.get(req["approval_id"]),
-                        }
-                    )
-                )
-        return RoutineView(
+        views = {occ.occurrence_id: self.run_view(occ, refs) for occ in recent}
+        for occ in latest + active:
+            if occ.occurrence_id not in views:
+                views[occ.occurrence_id] = self.run_view(occ, refs)
+        return RoutineInspectionView(
             routine_id=routine.routine_id,
             routine_seq=routine.routine_seq,
             revision=routine.revision,
@@ -1395,10 +1524,15 @@ class RoutineStore:
             last_evaluated_at=routine.last_evaluated_at.isoformat(),
             next_run_at=routine.next_run_at.isoformat() if routine.next_run_at else None,
             last_run_at=routine.last_run_at.isoformat() if routine.last_run_at else None,
-            active_occurrence=active.to_view() if active else None,
-            latest_occurrence=latest.to_view() if latest else None,
-            pending_approvals=pending,
-            recent_occurrences=[occ.to_view() for occ in recent],
+            active_occurrence=views[active[-1].occurrence_id] if active else None,
+            latest_occurrence=views[latest[0].occurrence_id] if latest else None,
+            pending_approvals=[
+                approval
+                for occ in reversed(active)
+                if occ.execution_status == "awaiting_approval"
+                for approval in views[occ.occurrence_id].pending_approvals
+            ],
+            recent_occurrences=[views[occ.occurrence_id] for occ in recent],
         )
 
     def views(self, feed_id: str | None = None) -> list[RoutineView]:

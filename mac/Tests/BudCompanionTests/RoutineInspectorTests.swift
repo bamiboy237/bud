@@ -154,7 +154,7 @@ struct RoutineInspectorTests {
     }
 
     @Test(arguments: [true, false]) @MainActor
-    func openingOlderReportPreservesCompletionRefresh(eventBeforeReport: Bool) async {
+    func openingOlderReportPreservesCompletionRefresh(eventBeforeReport: Bool) async throws {
         let refreshGate = AsyncGate()
         let reportGate = AsyncGate()
         let olderRun = occurrencePayload(
@@ -188,7 +188,8 @@ struct RoutineInspectorTests {
             state.requestRefresh(using: selection)
             await refreshGate.waitUntilArrived()
         }
-        let reportTask = Task { await state.openReport("r1", "occ-1", using: selection) }
+        let run = try #require(state.runs.last)
+        let reportTask = Task { await state.openRun(run, using: selection) }
         await reportGate.waitUntilArrived()
         if !eventBeforeReport {
             state.requestRefresh(using: selection)
@@ -202,8 +203,125 @@ struct RoutineInspectorTests {
         await refreshGate.release()
 
         #expect(state.report == nil)
+        #expect(state.markedRun == "occ-1")
         #expect(state.routine?.recentOccurrences.first?.id == "occ-2")
         #expect(state.routine?.recentOccurrences.first?.executionStatus == "completed")
+    }
+
+    @Test @MainActor
+    func reviewWithoutReportShowsRecordedActionsAndCanResume() async throws {
+        var run = occurrencePayload(
+            id: "occ-1", execution: "needs_review", delivery: "needs_review", reportPath: nil)
+        run["error"] = "The connection closed before Gmail confirmed delivery."
+        run["uncertain_tools"] = ["gmail_send_email", "calendar_create_event"]
+        run["unconfirmed_actions"] = [["tool": "gmail_send_email", "call_id": "action-1"]]
+        var paused = routinePayload(status: "paused", occurrences: [run])
+        paused["pause_reason"] = "uncertain"
+        let stopped = occurrencePayload(
+            id: "occ-1", execution: "cancelled", delivery: "failed", reportPath: nil)
+        let server = FakeRoutineServer(
+            responses: [paused, routinePayload(occurrences: [stopped])],
+            additionalResponse: { request in
+                guard request.url?.path == "/routines/r1/resume", request.httpMethod == "POST" else {
+                    return nil
+                }
+                let data = try #require(request.httpBody)
+                let body = try #require(JSONSerialization.jsonObject(with: data) as? [String: Bool])
+                #expect(body == ["acknowledge_uncertain": true])
+                return [:]
+            })
+        let selection = RoutineSelection(
+            connection: server.connection, session: "chat", routineID: "r1", occurrenceID: nil)
+        let state = RoutineInspectorState()
+        await state.start(with: selection)
+
+        let review = try #require(state.runs.first)
+        #expect(review.canOpen)
+        await state.openRun(review, using: selection)
+        #expect(state.report == nil)
+        #expect(state.problem == nil)
+        #expect(state.openedRun?.error == "The connection closed before Gmail confirmed delivery.")
+        #expect(state.openedRun?.unconfirmedTools == ["gmail_send_email", "calendar_create_event"])
+        #expect(state.canAcknowledgeReview)
+
+        await state.acknowledgeReview(using: selection)
+        #expect(state.routine?.status == "active")
+        #expect(!state.canAcknowledgeReview)
+        state.back(using: selection)
+        #expect(state.openedRun == nil)
+        #expect(state.markedRun == "occ-1")
+    }
+
+    @Test @MainActor
+    func loadingOlderRunsKeepsHistoryWhenNewRunsArrive() async {
+        let gate = AsyncGate()
+        let history = (1...13).reversed().map { id in
+            [
+                "occurrence_id": "occ-\(id)",
+                "scheduled_for": "2026-04-13T09:00:00Z",
+                "execution_status": "completed",
+                "delivery_status": "confirmed",
+            ]
+        }
+        var initial = routinePayload(occurrences: Array(history[1...10]))
+        initial["has_more"] = true
+        let server = FakeRoutineServer(
+            responses: [initial, routinePayload(occurrences: Array(history.prefix(10)))],
+            additionalResponse: { request in
+                guard let url = request.url, url.path == "/routines/r1/occurrences" else { return nil }
+                let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+                #expect(query?.first { $0.name == "offset" }?.value == "10")
+                #expect(query?.first { $0.name == "limit" }?.value == "10")
+                await gate.arriveAndWait()
+                return ["occurrences": Array(history.suffix(3)), "has_more": false]
+            })
+        let selection = RoutineSelection(
+            connection: server.connection, session: "chat", routineID: "r1", occurrenceID: nil)
+        let state = RoutineInspectorState()
+        await state.start(with: selection)
+        #expect(state.hasMoreRuns)
+
+        let page = Task { await state.loadOlderRuns(using: selection) }
+        await gate.waitUntilArrived()
+        state.requestRefresh(using: selection)
+        await state.waitForRefresh()
+        await gate.release()
+        await page.value
+
+        #expect(state.runs.map(\.id) == (1...13).reversed().map { "occ-\($0)" })
+        #expect(!state.hasMoreRuns)
+    }
+
+    @Test @MainActor
+    func pauseKeepsRunStatusUntilServerConfirms() async {
+        let gate = AsyncGate()
+        let running = occurrencePayload(id: "occ-1", execution: "running", delivery: "pending", reportPath: nil)
+        let stopped = occurrencePayload(id: "occ-1", execution: "cancelled", delivery: "not_required", reportPath: nil)
+        let server = FakeRoutineServer(
+            responses: [routinePayload(occurrences: [running]), routinePayload(status: "paused", occurrences: [stopped])],
+            additionalResponse: { request in
+                guard request.url?.path == "/routines/r1/pause", request.httpMethod == "POST" else { return nil }
+                await gate.arriveAndWait()
+                return routinePayload(status: "paused", occurrences: [
+                    occurrencePayload(
+                        id: "occ-1", execution: "cancelled", delivery: "not_required", reportPath: nil),
+                ])
+            })
+        let selection = RoutineSelection(
+            connection: server.connection, session: "chat", routineID: "r1", occurrenceID: nil)
+        let state = RoutineInspectorState()
+        await state.start(with: selection)
+
+        let pause = Task { await state.change("r1", path: "/pause", using: selection) }
+        await gate.waitUntilArrived()
+        #expect(state.pausing)
+        #expect(state.runs.first?.executionStatus == "running")
+        await gate.release()
+        await pause.value
+
+        #expect(!state.pausing)
+        #expect(state.routine?.status == "paused")
+        #expect(state.runs.first?.executionStatus == "cancelled")
     }
 
     @Test @MainActor
@@ -328,17 +446,20 @@ private final class FakeRoutineServer: @unchecked Sendable {
     private var receivedPatches: [[String: String]] = []
     private let onDetailFetch: (@Sendable (Int) async -> Void)?
     private let onReportFetch: (@Sendable () async -> Void)?
+    private let additionalResponse: (@Sendable (URLRequest) async throws -> [String: Any]?)?
 
     init(
         responses: [[String: Any]],
         listResponses: [[String: Any]] = [],
         onDetailFetch: (@Sendable (Int) async -> Void)? = nil,
-        onReportFetch: (@Sendable () async -> Void)? = nil
+        onReportFetch: (@Sendable () async -> Void)? = nil,
+        additionalResponse: (@Sendable (URLRequest) async throws -> [String: Any]?)? = nil
     ) {
         self.detailResponses = responses
         self.listResponses = listResponses
         self.onDetailFetch = onDetailFetch
         self.onReportFetch = onReportFetch
+        self.additionalResponse = additionalResponse
     }
 
     var patchBodies: [[String: String]] {
@@ -384,6 +505,9 @@ private final class FakeRoutineServer: @unchecked Sendable {
             await onReportFetch?()
             let data = try JSONSerialization.data(withJSONObject: ["content": "Older run report"])
             return (data, response)
+        }
+        if let payload = try await additionalResponse?(request) {
+            return (try JSONSerialization.data(withJSONObject: payload), response)
         }
         throw ConnectionError.http(404, "unexpected request \(request.httpMethod ?? "") \(url.path)")
     }

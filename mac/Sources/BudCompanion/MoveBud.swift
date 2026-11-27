@@ -6,9 +6,11 @@ final class MoveBudDraft {
     let server = ServerSettingsDraft()
     var source: URL? { didSet { restoreMove() } }
     var workspace: URL?
-    private(set) var active = false
+    var active: Bool { activity != nil }
     private(set) var pending = false
     private(set) var error: String?
+    private(set) var activity: String?
+    private(set) var progress: String?
 
     var sourceName: String {
         guard let source else { return "No folder selected" }
@@ -67,10 +69,15 @@ final class MoveBudDraft {
             error = "Install Bud on this Mac before moving it."
             return false
         }
-        active = true
+        if cancel {
+            activity = "Canceling move…"
+        } else {
+            activity = pending ? "Continuing move…" : "Moving Bud…"
+        }
         error = nil
         defer {
-            active = false
+            activity = nil
+            progress = nil
             restoreMove()
         }
         do {
@@ -78,7 +85,10 @@ final class MoveBudDraft {
             var arguments = ["move-runtime", source.path(), origin.absoluteString]
             if let workspace { arguments.append(workspace.path()) }
             if cancel { arguments.append("--cancel") }
-            let reply = try await runCLI(cli, arguments: arguments, token: token)
+            let serverLabel = origin.host() ?? origin.absoluteString
+            let reply = try await Self.runCLI(cli, arguments: arguments, token: token) { stage in
+                self.progress = stage.label(server: serverLabel)
+            }
             if reply.state == "complete" {
                 BudSettings.useRemote(origin)
                 return true
@@ -93,35 +103,85 @@ final class MoveBudDraft {
         return false
     }
 
-    private struct Recovery: Decodable { let destination: String }
-    private struct Reply: Decodable { let state: String }
-    private struct MoveError: Error { let message: String }
+    enum Stage: String, Decodable {
+        case packing
+        case uploading
+        case starting
 
-    private func runCLI(_ cli: URL, arguments: [String], token: String) async throws -> Reply {
-        let output = Pipe()
-        let input = Pipe()
-        let status: Int32 = try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            process.executableURL = cli
-            process.arguments = arguments
-            process.standardInput = input
-            process.standardOutput = output
-            process.standardError = output
-            process.terminationHandler = { continuation.resume(returning: $0.terminationStatus) }
-            do {
-                try process.run()
-                input.fileHandleForWriting.write(Data("\(token)\n".utf8))
-                input.fileHandleForWriting.closeFile()
-            } catch {
-                continuation.resume(throwing: error)
+        func label(server: String) -> String {
+            switch self {
+            case .packing: "Packing your files"
+            case .uploading: "Uploading to \(server)"
+            case .starting: "Starting Bud on \(server)"
             }
         }
-        let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        guard let line = text.split(whereSeparator: \.isNewline).last else {
+    }
+
+    private struct Recovery: Decodable { let destination: String }
+    private struct ProgressEvent: Decodable { let stage: Stage }
+    struct Reply: Decodable { let state: String }
+    private struct MoveError: Error { let message: String }
+
+    static func runCLI(
+        _ cli: URL, arguments: [String], token: String, report: (Stage) -> Void
+    ) async throws -> Reply {
+        let output = Pipe()
+        let input = Pipe()
+        let process = Process()
+        process.executableURL = cli
+        process.arguments = arguments
+        var environment = ProcessInfo.processInfo.environment
+        environment["BUD_MOVE_PROGRESS"] = "1"
+        process.environment = environment
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = output
+
+        let (statuses, exit) = AsyncStream<Int32>.makeStream()
+        process.terminationHandler = { process in
+            exit.yield(process.terminationStatus)
+            exit.finish()
+        }
+        try process.run()
+
+        let (chunks, outputStream) = AsyncStream<Data>.makeStream()
+        output.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                outputStream.finish()
+            } else {
+                outputStream.yield(chunk)
+            }
+        }
+        input.fileHandleForWriting.write(Data("\(token)\n".utf8))
+        input.fileHandleForWriting.closeFile()
+
+        let decoder = JSONDecoder()
+        var buffer = Data()
+        var lastLine = Data()
+        for await chunk in chunks {
+            buffer.append(chunk)
+            while let end = buffer.firstIndex(of: 0x0A) {
+                let line = buffer.prefix(upTo: end)
+                buffer.removeFirst(line.count + 1)
+                if let event = try? decoder.decode(ProgressEvent.self, from: line) {
+                    report(event.stage)
+                } else if !line.isEmpty {
+                    lastLine = line
+                }
+            }
+        }
+        if !buffer.isEmpty { lastLine = buffer }
+        var termination = statuses.makeAsyncIterator()
+        let status = await termination.next()
+        guard !lastLine.isEmpty else {
             throw MoveError(message: "Bud couldn’t finish the move.")
         }
-        guard status == 0 else { throw MoveError(message: String(line)) }
-        return try JSONDecoder().decode(Reply.self, from: Data(line.utf8))
+        guard status == 0 else {
+            throw MoveError(message: String(decoding: lastLine, as: UTF8.self))
+        }
+        return try decoder.decode(Reply.self, from: lastLine)
     }
 }
 
@@ -134,6 +194,17 @@ struct MoveBudView: View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Move Bud")
                 .font(Paper.Typography.h2)
+            if draft.pending {
+                Label(
+                    draft.active ? "Bud is stopped on this Mac" : "Move paused · Bud is stopped on this Mac",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(Paper.Typography.callout.weight(.semibold))
+                .foregroundStyle(Paper.errorInk)
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Paper.denyFill, in: RoundedRectangle(cornerRadius: Paper.radiusSM))
+            }
             Group {
                 HStack(alignment: .firstTextBaseline, spacing: 14) {
                     Text("From")
@@ -156,27 +227,41 @@ struct MoveBudView: View {
                 ServerFields(draft: draft.server, lockAddress: draft.pending)
             }
             .disabled(draft.active)
-            Text(draft.pending
-                 ? "Bud is stopped on this Mac. Continue the move, or cancel to run Bud here again."
-                 : "Bud will run on this server instead of your Mac. Your chats, workspace, routines, models, and supported sign-ins move with it.")
-                .font(Paper.Typography.callout)
-                .foregroundStyle(Paper.inkSecondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if !draft.pending {
+                Text("Bud will run on this server instead of your Mac. Your chats, workspace, routines, models, and supported sign-ins move with it.")
+                    .font(Paper.Typography.callout)
+                    .foregroundStyle(Paper.inkSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if let error = draft.error {
                 Text(error).font(Paper.Typography.callout).foregroundStyle(Paper.errorInk)
             }
-            HStack(spacing: 10) {
-                if draft.active {
+            if let activity = draft.activity {
+                HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text("Contacting server…").foregroundStyle(Paper.inkSecondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(activity)
+                        if let progress = draft.progress {
+                            Text(progress)
+                                .font(Paper.Typography.callout)
+                                .lineLimit(1)
+                                .help(progress)
+                        }
+                    }
+                    .foregroundStyle(Paper.inkSecondary)
                 }
+                .accessibilityElement(children: .combine)
+            }
+            HStack(spacing: 10) {
                 Spacer()
                 Button("Close", action: cancel)
                     .keyboardShortcut(.cancelAction)
                     .disabled(draft.active)
                 if draft.pending {
-                    Button("Cancel move") { Task { if await draft.move(cancel: true) { moved() } } }
-                        .disabled(!draft.canMove)
+                    Button("Cancel move and resume on this Mac") {
+                        Task { if await draft.move(cancel: true) { moved() } }
+                    }
+                    .disabled(!draft.canMove)
                 }
                 Button(draft.pending ? "Continue move" : "Move Bud") {
                     Task { if await draft.move() { moved() } }

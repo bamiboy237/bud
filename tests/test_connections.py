@@ -1,6 +1,7 @@
 """The account binding fence: a new app is additive, a removal or replacement is not."""
 
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
 
@@ -23,6 +24,7 @@ class FakeComposio:
         toolkit, status = self.accounts[nanoid]
         return SimpleNamespace(
             id=nanoid,
+            created_at=datetime.now(UTC).isoformat(),
             user_id=self.owner,
             toolkit=SimpleNamespace(slug=toolkit),
             is_disabled=False,
@@ -109,6 +111,46 @@ def test_retrying_expired_first_sign_in_preserves_the_active_binding(connections
     assert found.store.session_scope(found.capture_binding()) == scope
 
 
+def test_hosted_sign_in_can_expire_before_the_provider_status_updates(connections, monkeypatch):
+    found, remote = connections
+    attempt = found.store.begin_connect("github")
+    found.store.save_pending(attempt, "github", "acct-github")
+    remote["acct-github"] = ("github", "INITIALIZING")
+    provider = FakeComposio(found.user_id, remote)
+    account = provider.get(nanoid="acct-github")
+    monkeypatch.setattr(found, "client", lambda: SimpleNamespace(connected_accounts=provider))
+    monkeypatch.setattr(provider, "get", lambda **kwargs: account)
+    account.state.model_dump = lambda: {
+        "val": {
+            "composio_link_redirect_url": "https://example.test/hosted-link",
+            "redirect_url": "https://example.test/provider-link",
+        }
+    }
+    assert found.pending_url("github") == "https://example.test/hosted-link"
+    account.created_at = (datetime.now(UTC) - timedelta(minutes=11)).isoformat()
+
+    assert found.pending_url("github") is None
+    assert found.statuses()["github"] == "EXPIRED"
+
+
+def test_recovers_the_initial_url_when_composio_omits_it(connections, monkeypatch):
+    found, remote = connections
+    remote["acct-github"] = ("github", "INITIALIZING")
+    account = FakeComposio(found.user_id, remote).get(nanoid="acct-github")
+    account.state.model_dump = lambda: {"val": {"status": "INITIALIZING"}}
+    request = SimpleNamespace(id=account.id, redirect_url="https://example.test/initial-link")
+    client = SimpleNamespace(
+        connected_accounts=SimpleNamespace(get=lambda **kwargs: account),
+        create=lambda **kwargs: SimpleNamespace(authorize=lambda toolkit: request),
+    )
+    monkeypatch.setattr(found, "client", lambda: client)
+    monkeypatch.setattr("bud.composio.connection.monotonic", lambda: 100, raising=False)
+    assert found.connect("github") == request.redirect_url
+    assert found.pending_url("github") == request.redirect_url
+    monkeypatch.setattr("bud.composio.connection.monotonic", lambda: 701)
+    assert found.pending_url("github") is None
+
+
 def test_pending_link_checks_the_owner_before_returning_it(connections, monkeypatch):
     found, remote = connections
     attempt = found.store.begin_connect("github")
@@ -142,6 +184,9 @@ def test_resuming_cannot_bypass_the_fence_for_an_active_account(connections):
     found, remote = connections
     connect(found, remote, "gmail", "acct-gmail")
     binding = found.capture_binding()
+    with pytest.raises(ConnectionError, match="already connected"):
+        found.connect("gmail", replace_active=False)
+    assert not found.restart_required()
     found.store.begin_connect("gmail")
     assert found.restart_required()
     with pytest.raises(ConnectionError):
@@ -203,6 +248,51 @@ def test_removing_an_app_keeps_the_fence(connections):
     assert found.restart_required()
     with pytest.raises(ConnectionError):
         found.assert_current_binding(binding, "gmail")
+
+
+def test_inventory_keeps_expired_and_revoked_accounts_visible_without_restoring_them(connections):
+    found, remote = connections
+    connect(found, remote, "gmail", "acct-gmail")
+    connect(found, remote, "slack", "acct-slack")
+    connect(found, remote, "github", "acct-github")
+    binding = found.capture_binding()
+    remote["acct-slack"] = ("slack", "EXPIRED")
+    remote["acct-github"] = ("github", "REVOKED")
+
+    for _ in range(2):
+        statuses, accounts = found.inventory()
+        assert statuses["gmail"] == "ACTIVE"
+        assert {app["account_id"]: app["status"] for app in accounts} == {
+            "acct-gmail": "connected",
+            "acct-slack": "expired",
+            "acct-github": "revoked",
+        }
+        assert accounts[-1]["display_name"] == "Slack"
+    assert found.accounts() == {"gmail": "acct-gmail"}
+    assert found.restart_required()
+    remote["acct-slack"] = ("slack", "ACTIVE")
+    assert found.inventory()[1][-1]["status"] == "disconnected"
+    assert found.accounts() == {"gmail": "acct-gmail"}
+    with pytest.raises(ConnectionError):
+        found.assert_current_binding(binding, "slack")
+
+
+def test_disconnect_removes_the_reference_and_fences_the_old_binding(connections):
+    found, remote = connections
+    connect(found, remote, "slack", "acct-slack")
+    binding = found.capture_binding()
+
+    assert found.disconnect("slack")
+    assert not found.disconnect("slack")
+    assert found.inventory()[1] == []
+    assert found.stored().generation == binding.generation + 1
+    with pytest.raises(ConnectionError):
+        found.assert_current_binding(binding, "slack")
+
+    pending = found.store.begin_connect("slack")
+    assert found.disconnect("slack")
+    with pytest.raises(ConnectionError, match="changed during sign-in"):
+        found.store.save_pending(pending, "slack", "another-slack")
 
 
 def test_restarting_an_unfinished_first_sign_in_keeps_the_chat(connections):

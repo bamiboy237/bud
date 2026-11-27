@@ -511,7 +511,8 @@ async def test_delivery_claim_distinct_from_confirmed_and_uncertain_recovery(tmp
         assert resumed.pause_reason is None
 
 
-async def test_stop_with_inflight_consequential_tool_pauses_as_uncertain(tmp_path):
+@pytest.mark.parametrize("use_pause", [False, True])
+async def test_stop_with_inflight_consequential_tool_pauses_as_uncertain(tmp_path, use_pause):
     async with running_bud(tmp_path, lambda m, i: reply(), jobs=True) as bud:
         bud.log.append("owner", "session.created")
         routine = bud.runner.create_routine(
@@ -537,15 +538,47 @@ async def test_stop_with_inflight_consequential_tool_pauses_as_uncertain(tmp_pat
         bud.runner.routines.mark_queued(occ.occurrence_id)
         bud.runner.routines.sync_execution(occ.session_id, "running")
 
-        stop_res = await bud.runner.stop_routine(routine.routine_id)
-        assert stop_res["status"] == "paused"
-        assert stop_res["pause_reason"] == "uncertain"
+        if use_pause:
+            sessions = bud.runner.routines.pause_for_stop(routine.routine_id, now=datetime.now(UTC))
+            assert sessions == [occ.session_id]
+            await bud.runner.stop_session(occ.session_id)
+        else:
+            stop_res = await bud.runner.stop_routine(routine.routine_id)
+            assert stop_res["status"] == "paused"
+            assert stop_res["pause_reason"] == "uncertain"
+        paused = bud.runner.routines.get(routine.routine_id)
+        assert paused.status == "paused"
+        assert paused.pause_reason == "uncertain"
         updated = bud.runner.routines.occurrence(occ.occurrence_id)
         assert updated.execution_status == "needs_review"
         assert updated.uncertain_tools == ["send_email"]
 
         with pytest.raises(RoutineConflictError, match="uncertain"):
             bud.runner.run_routine_now(routine.routine_id)
+
+
+async def test_pause_records_a_stop_before_pending_dispatch(tmp_path):
+    async with running_bud(tmp_path, lambda m, i: reply(), jobs=True) as bud:
+        bud.log.append("owner", "session.created")
+        routine = bud.runner.create_routine(
+            feed_id="owner",
+            title="Pending routine",
+            skill="attention-briefing",
+            prompt="Summarize recent messages.",
+            cron="0 9 * * *",
+        )
+        store = bud.runner.routines
+        assert store is not None
+        occ, _ = store.claim_manual_occurrence(routine.routine_id)
+        assert occ.run_id is not None
+
+        assert store.pause_for_stop(routine.routine_id, now=datetime.now(UTC)) == [occ.session_id]
+        assert store.get(routine.routine_id).status == "paused"
+        assert bud.log.stop_requested(occ.run_id)
+        store.mark_queued(occ.occurrence_id)
+        store.sync_execution(occ.session_id, "queued")
+        assert store.occurrence(occ.occurrence_id).execution_status == "cancelled"
+        assert store.pending_dispatches() == []
 
 
 async def test_tick_routines_isolates_failures_per_routine(tmp_path, monkeypatch):

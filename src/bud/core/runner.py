@@ -1462,19 +1462,19 @@ class Runner(DBOSConfiguredInstance):
                 if occ.execution_status in ("queued", "running", "awaiting_approval"):
                     self._sync_routine_occurrence(occ.session_id)
 
-    async def stop_session(self, session_id: str) -> dict:
+    async def stop_session(self, session_id: str, *, include_children: bool = True) -> dict:
         timer = self._bursts.pop(session_id, None)
         if timer is not None:
             timer.cancel()
         request = await asyncio.to_thread(self.hub.log.request_stop, session_id)
         self.hub.wake(session_id)
         child_stopped = False
-        if self.work_items is not None:
+        if include_children and self.work_items is not None:
             for item in self.work_items.items(session_id):
                 if self.work_items.view(item).status not in FINISHED:
                     result = await self.stop_session(item.session_id)
                     child_stopped |= result["stop_requested"]
-        if self.routines is not None:
+        if include_children and self.routines is not None:
             for occ in self.routines.active_occurrences(feed_id=session_id):
                 if occ.session_id != session_id:
                     result = await self.stop_routine(occ.routine_id)

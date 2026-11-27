@@ -96,21 +96,30 @@ import Testing
         #expect(syncedOnboarding == [false, true])
     }
 
-    @Test @MainActor func failedKeySaveKeepsEditorOpenUntilCancelled() async {
+    @Test @MainActor func failedKeySaveKeepsDraftAndOnlyAnEditClearsItsError() async {
         let key = "OPENAI_API_KEY"
+        let other = "DEEPSEEK_API_KEY"
         let store = OnboardingStore(
             sendRequest: { _, _, _ in throw ConnectionError.unreachable },
             openURL: { _ in },
             syncNeedsOnboarding: { _ in }
         )
 
+        store.updateKeyDraft("test-draft", for: other)
+        await store.saveKey(other)
         store.beginKeyEdit(key)
-        store.keyDrafts[key] = "sk-test-123"
+        store.updateKeyDraft("sk-test-123", for: key)
         await store.saveKey(key)
 
         #expect(store.replacingKey == key)
         #expect(store.keyDrafts[key] == "sk-test-123")
-        #expect(store.error != nil)
+        #expect(store.error == nil)
+        #expect(store.keyErrors[key] == "Couldn’t reach Bud. Try again.")
+        store.updateKeyDraft("sk-test-123", for: key)
+        #expect(store.keyErrors[key] != nil)
+        store.updateKeyDraft("sk-test-edited", for: key)
+        #expect(store.keyErrors[key] == nil)
+        #expect(store.keyErrors[other] != nil)
 
         store.cancelKeyEdit()
 

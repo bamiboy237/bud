@@ -1,4 +1,5 @@
 import Foundation
+import Markdown
 
 enum SourceKind: Equatable {
     case turn(session: String, seq: Int)
@@ -84,9 +85,53 @@ enum Citations {
         _ text: String, _ sources: [String: Source], with render: (Source) -> String
     ) -> String {
         guard text.contains("[S") else { return text }
-        return text.replacing(#/ ?\[(S\d{1,6})\]/#) { match in
-            sources[String(match.output.1)].map(render) ?? ""
+        let matches = text.matches(of: #/ ?\[(S\d{1,6})\]/#)
+        guard !matches.isEmpty else { return text }
+
+        // Parse a copy with a unique ID inside each tag. Markdown's reported columns can
+        // shift after a container prefix or escaped table pipe, so use the code node contents.
+        let marker = "\u{E000}\(UUID().uuidString)\u{E001}"
+        var probe = ""
+        var cursor = text.startIndex
+        for (id, match) in matches.enumerated() {
+            let bracket = text.index(before: match.range.upperBound)
+            probe += text[cursor..<bracket]
+            probe += "\(marker)\(id)"
+            cursor = bracket
         }
+        probe += text[cursor...]
+        let protected = codeTags(in: Document(parsing: probe), marker: marker)
+
+        var result = ""
+        cursor = text.startIndex
+        for (id, match) in matches.enumerated() where !protected.contains(id) {
+            result += text[cursor..<match.range.lowerBound]
+            result += sources[String(match.output.1)].map(render) ?? ""
+            cursor = match.range.upperBound
+        }
+        result += text[cursor...]
+        return result
+    }
+
+    private static func codeTags(in document: Document, marker: String) -> Set<Int> {
+        var tags = Set<Int>()
+        func visit(_ markup: any Markup) {
+            let code: String
+            switch markup {
+            case let block as CodeBlock:
+                code = (block.language ?? "") + "\n" + block.code
+            case let span as InlineCode:
+                code = span.code
+            default:
+                for child in markup.children { visit(child) }
+                return
+            }
+            for suffix in code.components(separatedBy: marker).dropFirst() {
+                if let id = Int(suffix.prefix(while: \.isNumber)) { tags.insert(id) }
+            }
+        }
+        visit(document)
+        return tags
     }
 }
 

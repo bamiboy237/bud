@@ -86,6 +86,10 @@ class BindingStore:
                 "(toolkit TEXT PRIMARY KEY, account_id TEXT)"
             )
             db.execute(
+                "CREATE TABLE IF NOT EXISTS inactive_accounts "
+                "(toolkit TEXT PRIMARY KEY, account_id TEXT NOT NULL)"
+            )
+            db.execute(
                 "CREATE TABLE IF NOT EXISTS session_scopes "
                 "(generation INTEGER PRIMARY KEY, scope TEXT NOT NULL)"
             )
@@ -141,6 +145,16 @@ class BindingStore:
             db.execute("BEGIN")
             return self._read(db)
 
+    @staticmethod
+    def _inactive(db: sqlite3.Connection) -> dict[str, str]:
+        return dict(db.execute("SELECT toolkit, account_id FROM inactive_accounts"))
+
+    def inventory(self) -> tuple[AccountBinding, dict[str, str | None], dict[str, str]]:
+        with self._db() as db:
+            db.execute("BEGIN")
+            binding, pending = self._read(db)
+            return binding, pending, self._inactive(db)
+
     def session_scope(self, binding: AccountBinding) -> str:
         """The owner's one session directory, kept across account changes: a reconnect loads
         into the same chat and memory. A new generation reuses the latest directory; approvals
@@ -160,7 +174,7 @@ class BindingStore:
                 "SELECT scope FROM session_scopes WHERE generation = ?", (binding.generation,)
             ).fetchone()[0]
 
-    def begin_connect(self, toolkit: str) -> Attempt:
+    def begin_connect(self, toolkit: str, *, replace_active: bool = True) -> Attempt:
         if not valid_toolkit(toolkit):
             raise ConnectionError("Unsupported toolkit name.")
         with self._db() as db:
@@ -170,8 +184,11 @@ class BindingStore:
             # only pending was never active, so no approval or tool can point at it: a fresh
             # link replaces the unfinished one without a fence, as Cancel does.
             if toolkit in current.accounts:
+                if not replace_active:
+                    raise ConnectionError("This app is already connected.")
                 db.execute("UPDATE binding_state SET generation = generation + 1 WHERE id = 1")
             db.execute("DELETE FROM accounts WHERE toolkit = ?", (toolkit,))
+            db.execute("DELETE FROM inactive_accounts WHERE toolkit = ?", (toolkit,))
             token = uuid4().hex
             db.execute(
                 "INSERT OR REPLACE INTO pending_accounts (toolkit, account_id, attempt) "
@@ -213,25 +230,46 @@ class BindingStore:
             ).rowcount
             return removed == 1
 
+    def disconnect(self, toolkit: str) -> bool:
+        """Remove Bud's references and invalidate tools that held the active account."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            active = db.execute("DELETE FROM accounts WHERE toolkit = ?", (toolkit,)).rowcount
+            if active:
+                db.execute("UPDATE binding_state SET generation = generation + 1 WHERE id = 1")
+            pending = db.execute(
+                "DELETE FROM pending_accounts WHERE toolkit = ?", (toolkit,)
+            ).rowcount
+            inactive = db.execute(
+                "DELETE FROM inactive_accounts WHERE toolkit = ?", (toolkit,)
+            ).rowcount
+            return bool(active or pending or inactive)
+
     def accept_verified(
         self,
         expected: AccountBinding,
         pending: dict[str, str | None],
         active: dict[str, str],
         remaining: dict[str, str | None],
+        *,
+        inactive: dict[str, str] | None = None,
     ) -> AccountBinding:
         """Compare-and-swap a complete remotely verified snapshot, never a stale result."""
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            if self._read(db) != (expected, pending):
+            if self._read(db) != (expected, pending) or (
+                inactive is not None and self._inactive(db) != inactive
+            ):
                 raise ConnectionError(
                     "Connections changed during verification. Check /connections."
                 )
             if expected.accounts != active or pending != remaining:
-                if any(
-                    active.get(toolkit) != account for toolkit, account in expected.accounts.items()
-                ):
+                removed = expected.accounts.items() - active.items()
+                if removed:
                     db.execute("UPDATE binding_state SET generation = generation + 1 WHERE id = 1")
+                    db.executemany(
+                        "INSERT OR REPLACE INTO inactive_accounts VALUES (?, ?)", removed
+                    )
                 db.execute("DELETE FROM accounts")
                 db.executemany("INSERT INTO accounts VALUES (?, ?)", sorted(active.items()))
                 # Only remove rows: an unfinished sign-in keeps its attempt token.
@@ -247,4 +285,9 @@ class BindingStore:
             if self._read(db)[0] == expected:
                 db.execute("UPDATE binding_state SET generation = generation + 1 WHERE id = 1")
                 if disconnected is not None:
+                    db.execute(
+                        "INSERT OR REPLACE INTO inactive_accounts "
+                        "SELECT toolkit, account_id FROM accounts WHERE toolkit = ?",
+                        (disconnected,),
+                    )
                     db.execute("DELETE FROM accounts WHERE toolkit = ?", (disconnected,))

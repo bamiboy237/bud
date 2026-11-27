@@ -239,6 +239,39 @@ struct SetupTests {
     }
 
     @Test
+    func browserHandoffStartsAfterOpeningAndClearsWithSetup() throws {
+        let companion = Companion()
+        companion.connectForTesting(BudConnection(base: URL(string: "https://example.test")!, token: ""))
+        let raw: [String: Any] = [
+            "capability": "github", "status": "waiting", "url": "https://example.test/sign-in",
+        ]
+        companion.receiveSetup(raw, replacing: true)
+        let setup = try #require(companion.setups.first)
+        let signIn = try #require(setup.url)
+
+        companion.connectSetup(setup, openBrowser: { _ in false })
+        #expect(companion.openedSetups.isEmpty)
+
+        var opened: [URL] = []
+        for _ in 0..<2 {
+            companion.connectSetup(setup) { url in
+                opened.append(url)
+                return true
+            }
+            #expect(companion.openedSetups == ["github"])
+        }
+        #expect(opened == [signIn, signIn])
+
+        companion.receiveSetup(["capability": "github", "status": "failed"])
+        #expect(companion.openedSetups.isEmpty)
+
+        companion.receiveSetup(raw, replacing: true)
+        companion.connectSetup(setup, openBrowser: { _ in true })
+        companion.apply(snapshot: ["last_seq": 1, "pending_setup": []])
+        #expect(companion.openedSetups.isEmpty)
+    }
+
+    @Test
     func aStalledJobNeedsTheOwner() {
         let companion = Companion()
         companion.apply(snapshot: [

@@ -19,7 +19,7 @@ from typing import Annotated, Any, TextIO
 from uuid import uuid4
 
 from dbos import DBOS
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
 from pydantic_ai import ModelRetry, Tool
@@ -69,6 +69,7 @@ from bud.core.projection import (
 )
 from bud.core.routines import (
     DEFAULT_APPROVAL_EXPIRY_SECONDS,
+    RECENT_RUN_LIMIT,
     MissedRunPolicy,
     OverlapPolicy,
     RoutineConflictError,
@@ -198,6 +199,7 @@ class Answer(BaseModel):
 
 class ConnectRequest(BaseModel):
     resume: bool = False
+    refresh: bool = True
 
 
 class NewRoutine(BaseModel):
@@ -1123,7 +1125,7 @@ def _create_app(
     def connection_status() -> JSONResponse:
         current = live_connections()
         try:
-            statuses = current.statuses()
+            statuses, accounts = current.inventory()
             refresh_tools()  # any change, a reconnect included, loads in this chat
             restart_required = current.restart_required()
         except ConnectionError as exc:
@@ -1131,31 +1133,58 @@ def _create_app(
         return JSONResponse(
             {
                 "statuses": {"gmail": statuses["gmail"], "calendar": statuses["googlecalendar"]},
+                "accounts": accounts,
                 "restart_required": restart_required,
                 "refresh_boundary": "process_restart" if restart_required else "next_message",
             },
             headers={"Cache-Control": "no-store"},
         )
 
-    @app.post("/connections/{toolkit}/connect")
-    def connect_account(toolkit: str, request: ConnectRequest | None = None) -> JSONResponse:
-        current = live_connections()
+    def connection_toolkit(toolkit: str) -> str:
         name = {"calendar": "googlecalendar"}.get(toolkit, toolkit)
         if not valid_toolkit(name):
             raise HTTPException(400, "Use a valid app id.")
+        return name
+
+    @app.post("/connections/{toolkit}/connect")
+    def connect_account(toolkit: str, request: ConnectRequest | None = None) -> JSONResponse:
+        current = live_connections()
+        name = connection_toolkit(toolkit)
+        resume = bool(request and request.resume)
         try:
-            url = current.pending_url(name) if request is not None and request.resume else None
-            if url is None:
+            url = current.pending_url(name) if resume else None
+            if not resume:
                 url = current.connect(name)
+            elif url is None and request and request.refresh:
+                url = current.connect(name, replace_active=False)
             refresh_tools()  # a reconnect retires the old account at once, in place
             restart_required = current.restart_required()
         except ConnectionError as exc:
             raise HTTPException(503, str(exc)) from None
-        # The sign-in link exists only in this immediate authenticated response,
-        # not in session events, model input/history, status metadata or logs.
+        # Keep sign-in links out of session events, model history, status metadata and logs.
         return JSONResponse(
             {
                 "url": url,
+                "expired": url is None,
+                "restart_required": restart_required,
+                "refresh_boundary": "process_restart" if restart_required else "next_message",
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/connections/{toolkit}/disconnect")
+    def disconnect_account(toolkit: str) -> JSONResponse:
+        current = live_connections()
+        name = connection_toolkit(toolkit)
+        try:
+            removed = current.disconnect(name)
+            refresh_tools()
+            restart_required = current.restart_required()
+        except ConnectionError as exc:
+            raise HTTPException(503, str(exc)) from None
+        return JSONResponse(
+            {
+                "disconnected": removed,
                 "restart_required": restart_required,
                 "refresh_boundary": "process_restart" if restart_required else "next_message",
             },
@@ -1475,6 +1504,11 @@ def _create_app(
         background.stop_commands(session_id)
         return await runner.stop_session(session_id)
 
+    @app.post("/sessions/{session_id}/stop-response", status_code=202)
+    async def stop_session_response(session_id: str) -> dict:
+        require_session(session_id)
+        return await runner.stop_session(session_id, include_children=False)
+
     @app.post("/sessions/{session_id}/approvals/{approval_id}")
     def decide(session_id: str, approval_id: str, decision: Decision) -> dict[str, bool]:
         require_session(session_id)
@@ -1596,13 +1630,38 @@ def _create_app(
         return {"routines": [view.model_dump() for view in store.views(feed_id)]}
 
     @app.get("/routines/{routine_id}")
-    def get_routine(routine_id: str) -> dict[str, Any]:
+    def get_routine(
+        routine_id: str,
+        offset: Annotated[int, Query(ge=0, le=2**63 - 1)] = 0,
+        limit: Annotated[int, Query(ge=1, le=100)] = RECENT_RUN_LIMIT,
+    ) -> dict[str, Any]:
         store = _require_routines()
         try:
             routine = store.get(routine_id)
         except RoutineNotFoundError as exc:
             raise HTTPException(404, str(exc)) from None
-        return store.view(routine).model_dump()
+        recent, has_more = store.occurrence_page(routine_id, limit=limit, offset=offset)
+        return {
+            **store.view(routine, recent=recent, offset=offset).model_dump(),
+            "has_more": has_more,
+        }
+
+    @app.get("/routines/{routine_id}/occurrences")
+    def list_routine_occurrences(
+        routine_id: str,
+        offset: Annotated[int, Query(ge=0, le=2**63 - 1)] = 0,
+        limit: Annotated[int, Query(ge=1, le=100)] = RECENT_RUN_LIMIT,
+    ) -> dict[str, Any]:
+        store = _require_routines()
+        try:
+            store.get(routine_id)
+        except RoutineNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        occurrences, has_more = store.occurrence_page(routine_id, limit=limit, offset=offset)
+        return {
+            "occurrences": [store.run_view(occ).model_dump() for occ in occurrences],
+            "has_more": has_more,
+        }
 
     @app.get("/routines/{routine_id}/occurrences/{occurrence_id}/report")
     def get_routine_report(routine_id: str, occurrence_id: str) -> dict[str, str]:
@@ -1641,7 +1700,7 @@ def _create_app(
 
     @app.post("/routines/{routine_id}/run-now", status_code=202)
     def run_routine_now(routine_id: str, body: RunNowRequest | None = None) -> dict[str, Any]:
-        _require_routines()
+        store = _require_routines()
         require_current_binding()
         try:
             occ = runner.run_routine_now(routine_id, trigger_id=body.trigger_id if body else None)
@@ -1649,16 +1708,25 @@ def _create_app(
             raise HTTPException(404, str(exc)) from None
         except RoutineConflictError as exc:
             raise HTTPException(409, str(exc)) from None
-        return occ.to_view().model_dump()
+        return store.run_view(occ).model_dump()
 
     @app.post("/routines/{routine_id}/pause")
-    def pause_routine(routine_id: str) -> dict[str, Any]:
+    async def pause_routine(routine_id: str) -> dict[str, Any]:
         store = _require_routines()
         try:
-            routine = runner.pause_routine(routine_id)
+            sessions = store.pause_for_stop(routine_id, now=runner._clock_utc())
         except RoutineNotFoundError as exc:
             raise HTTPException(404, str(exc)) from None
-        return store.view(routine).model_dump()
+        runner.wake_routines()
+        for session_id in sessions:
+            await runner.stop_session(session_id)
+        active = store.active_occurrences(routine_id=routine_id)
+        return {
+            **store.view(store.get(routine_id)).model_dump(),
+            "stop_requested": bool(sessions),
+            "active_run_stopped": bool(sessions)
+            and all(occ.session_id not in sessions for occ in active),
+        }
 
     @app.post("/routines/{routine_id}/resume")
     def resume_routine(routine_id: str, body: ResumeRoutineRequest | None = None) -> dict[str, Any]:
@@ -1699,7 +1767,7 @@ def _create_app(
             )
         except RoutineNotFoundError as exc:
             raise HTTPException(404, str(exc)) from None
-        return updated.to_view().model_dump()
+        return store.run_view(updated).model_dump()
 
     @app.get("/sessions/{session_id}/events")
     async def stream_events(

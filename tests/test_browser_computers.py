@@ -1,4 +1,6 @@
 import asyncio
+import json
+from hashlib import pbkdf2_hmac
 from pathlib import Path
 from threading import Event
 from unittest.mock import AsyncMock, Mock
@@ -10,6 +12,77 @@ from fastapi import FastAPI
 from bud.browser import Consent, Pairing, Relay
 from bud.core.browser_computers import BrowserComputers
 from bud.core.browser_view import BrowserView
+
+
+async def test_browser_inventory_confirms_only_the_browser_that_used_the_issued_code(
+    tmp_path: Path, monkeypatch
+):
+    relay = Relay(tmp_path / "browse")
+    relay.home.mkdir()
+    pairing = Pairing(relay)
+    code = "AB12-CD34"
+    key = pbkdf2_hmac("sha256", b"AB12CD34", b"opencode-browser-pairing-v3|code", 100_000).hex()
+    codes = relay.home / "pairing-codes.json"
+    codes.write_text(
+        json.dumps(
+            {
+                "codes": [
+                    {"key": key, "receipt": "issued-receipt", "expiresAt": 4_102_444_800_000},
+                    {"key": "0" * 64, "receipt": "other-receipt", "expiresAt": 4_102_444_800_000},
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr(pairing, "code", Mock(side_effect=[code, "EF56-GH78"]))
+    view = BrowserView(
+        tmp_path / "private", Consent(tmp_path / "consent"), relay, lambda: Path("/test/browse")
+    )
+    browsers = [{"id": "other", "name": "Chrome"}]
+    monkeypatch.setattr(view, "_inventory", AsyncMock(return_value={"browsers": browsers}))
+    tokens = relay.home / "browser-tokens.json"
+    entries = {
+        "other-profile": {
+            "token": "X" * 43,
+            "receipt": "other-receipt",
+            "pairedAt": 1,
+            "lastSeen": 2,
+            "id": "other",
+            "name": "Chrome",
+        },
+        "vm-profile": {"token": "Y" * 43, "receipt": "issued-receipt", "pairedAt": 1},
+    }
+    tokens.write_text(json.dumps(entries))
+    app = FastAPI()
+    app.include_router(BrowserComputers(view, pairing, None).routes())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        issued = await client.post("/browser/computers/pair", json={"browser": "local"})
+        assert issued.json() == {"code": code, "address": "127.0.0.1:19989"}
+
+        codes.unlink()  # The code has been redeemed, but the browser has not connected yet.
+        waiting = (await client.get("/browser/computers")).json()
+        assert waiting["browsers"] == browsers
+        assert "pairing" not in waiting
+
+        entries["vm-profile"].update(lastSeen=2, id="vm", name="Chrome")
+        tokens.write_text(json.dumps(entries))
+        browsers.append({"id": "vm", "name": "Chrome"})
+        confirmed = await client.get("/browser/computers")
+        assert confirmed.headers["cache-control"] == "no-store"
+        assert confirmed.json() == {
+            **waiting,
+            "browsers": browsers,
+            "pairing": {"code": code, "id": "vm", "name": "Chrome"},
+        }
+
+        await view.enter()
+        assert "pairing" not in (await client.get("/browser/computers")).json()
+        view.resume()
+        assert (await client.get("/browser/computers")).json() == confirmed.json()
+
+        await client.post("/browser/computers/pair", json={"browser": "local"})
+        assert "pairing" not in (await client.get("/browser/computers")).json()
 
 
 async def test_daytona_pairs_with_private_address_without_enabling_browser_access(

@@ -29,7 +29,7 @@ protocol VoiceTranscriber: Sendable {
     func transcribe(_ clip: Clip) async throws -> String
 }
 
-/// Hold a key, talk, let go: your words go to bud as a message. Everything runs on this Mac.
+/// Hold a key, talk, let go: the words appear in the active draft. Recognition runs on this Mac.
 ///
 /// The microphone records while the key is down. On release, Parakeet (through FluidAudio)
 /// turns the whole clip into text in about a fifth of a second; batch, not streaming, because
@@ -41,8 +41,11 @@ final class Voice {
     static let shared = Voice()
 
     private(set) var state: VoiceState = .off
-    /// How loud the microphone is, 0 to 1, for the level pill.
+    /// Smoothed microphone level, from 0 to 1.
     private(set) var level: Float = 0
+    private(set) var noInputDetected = false
+    private(set) var microphoneDenied = false
+    private(set) var microphoneUnavailable = false
     /// Which key you hold: ⌥ Space, or right ⌥ when another app owns ⌥ Space.
     private(set) var keyName = "⌥ Space"
     /// The right ⌥ fallback needs Accessibility; the menu asks for it when this is true.
@@ -55,6 +58,10 @@ final class Voice {
         @MainActor (Int, Int, @escaping () -> Void, @escaping () -> Void) -> (any HotkeyToken)?
     @ObservationIgnored private let isDownloaded: () -> Bool
     @ObservationIgnored private let requestMicAccess: () async -> Bool
+    @ObservationIgnored private let microphoneAuthorization: () -> AVAuthorizationStatus
+    @ObservationIgnored private let hasMicrophone: () -> Bool
+    @ObservationIgnored private let notificationCenter: NotificationCenter
+    @ObservationIgnored private nonisolated(unsafe) var activationObserver: (any NSObjectProtocol)?
     @ObservationIgnored private let loadContacts: (Bool) async -> [String]
     @ObservationIgnored private let loadTranscriber:
         ([String], @escaping @Sendable (Double) -> Void) async throws -> any VoiceTranscriber
@@ -65,10 +72,17 @@ final class Voice {
     @ObservationIgnored private var talkKey: (any HotkeyToken)?
     @ObservationIgnored private var optionHold: RightOptionHold?
     @ObservationIgnored private var escapeKeys: [any HotkeyToken] = []
-    /// What the field was for when this recording started: a message, or an answer.
+    @ObservationIgnored private var activeDictation: UUID?
     @ObservationIgnored private var destination: SpeechDestination = .ask
+    @ObservationIgnored private let silenceThreshold: Duration
+    @ObservationIgnored private var lastAudibleInput = ContinuousClock.now
+    @ObservationIgnored private var silenceTask: Task<Void, Never>?
     @ObservationIgnored private(set) var setupTask: Task<Void, Never>?
     @ObservationIgnored private(set) var transcriptionTask: Task<Void, Never>?
+
+    private static let microphoneDeniedMessage =
+        "Microphone access is off. Turn it on in System Settings, Privacy & Security, Microphone."
+    private static let microphoneUnavailableMessage = "No microphone is available. Connect a microphone and try again."
 
     init(
         companion: Companion = .shared,
@@ -80,6 +94,12 @@ final class Voice {
         requestMicAccess: @escaping () async -> Bool = {
             await AVCaptureDevice.requestAccess(for: .audio)
         },
+        microphoneAuthorization: @escaping () -> AVAuthorizationStatus = {
+            AVCaptureDevice.authorizationStatus(for: .audio)
+        },
+        hasMicrophone: @escaping () -> Bool = { AVCaptureDevice.default(for: .audio) != nil },
+        notificationCenter: NotificationCenter = .default,
+        silenceThreshold: Duration = .milliseconds(2_500),
         loadContacts: @escaping (Bool) async -> [String] = { await ContactNames.load(ask: $0) },
         loadTranscriber: @escaping (
             [String], @escaping @Sendable (Double) -> Void
@@ -97,11 +117,25 @@ final class Voice {
         self.registerHotkey = registerHotkey
         self.isDownloaded = isDownloaded
         self.requestMicAccess = requestMicAccess
+        self.microphoneAuthorization = microphoneAuthorization
+        self.hasMicrophone = hasMicrophone
+        self.notificationCenter = notificationCenter
+        self.silenceThreshold = silenceThreshold
         self.loadContacts = loadContacts
         self.loadTranscriber = loadTranscriber
         self.rightOptionAllowed = rightOptionAllowed
         self.makeRightOptionHold = makeRightOptionHold
         self.playSound = playSound
+        refreshMicrophoneStatus()
+        activationObserver = notificationCenter.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { _ = self?.refreshMicrophoneStatus() }
+        }
+    }
+
+    deinit {
+        if let activationObserver { notificationCenter.removeObserver(activationObserver) }
     }
 
     /// Takes the key, and loads the models if they were set up before.
@@ -118,13 +152,36 @@ final class Voice {
 
     /// "Set up voice…": asks for the microphone (and Contacts, for names), then downloads.
     func setUp() {
+        guard setupTask == nil else { return }
         setupTask = Task {
+            defer { setupTask = nil }
             guard await requestMicAccess() else {
-                state = .failed("Microphone access is off. Turn it on in System Settings, Privacy & Security, Microphone.")
+                microphoneDenied = true
+                microphoneUnavailable = false
+                state = .failed(Self.microphoneDeniedMessage)
                 return
             }
-            await prepareAndWait(askForContacts: true)
+            refreshMicrophoneStatus()
+            if transcriber == nil {
+                await prepareAndWait(askForContacts: true)
+            }
         }
+    }
+
+    func openMicrophoneSettings() {
+        NSWorkspace.shared.open(
+            URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
+    }
+
+    @discardableResult
+    private func refreshMicrophoneStatus() -> AVAuthorizationStatus {
+        let authorization = microphoneAuthorization()
+        microphoneDenied = authorization == .denied || authorization == .restricted
+        microphoneUnavailable = authorization == .authorized && !hasMicrophone()
+        if !microphoneDenied, state == .failed(Self.microphoneDeniedMessage) {
+            state = transcriber == nil ? .off : .ready
+        }
+        return authorization
     }
 
     /// Opens the Accessibility prompt, then picks the key up once it's allowed. A monitor made
@@ -144,7 +201,10 @@ final class Voice {
 
     /// At launch nothing is asked: Contacts are used only if you allowed them during setup.
     private func prepare(askForContacts: Bool) {
-        setupTask = Task { await prepareAndWait(askForContacts: askForContacts) }
+        setupTask = Task {
+            defer { setupTask = nil }
+            await prepareAndWait(askForContacts: askForContacts)
+        }
     }
 
     private func prepareAndWait(askForContacts: Bool) async {
@@ -188,7 +248,10 @@ final class Voice {
             }
             begin()
         case .off, .failed:
-            companion.nudge("Voice isn't set up yet. Choose Set up voice… in the menu bar.")
+            refreshMicrophoneStatus()
+            companion.nudge(microphoneDenied
+                ? Self.microphoneDeniedMessage
+                : "Voice isn't set up yet. Choose Set up voice… in the menu bar.")
         case .preparing:
             companion.nudge("Voice is still getting ready.")
         case .listening, .transcribing:
@@ -197,60 +260,156 @@ final class Voice {
     }
 
     private func begin() {
+        let authorization = refreshMicrophoneStatus()
+        if microphoneDenied {
+            companion.nudge(Self.microphoneDeniedMessage)
+            return
+        }
+        if microphoneUnavailable {
+            companion.nudge(Self.microphoneUnavailableMessage)
+            return
+        }
+        if authorization == .notDetermined {
+            setUp()
+            return
+        }
+
+        let id = UUID()
         do {
             try recorder.start { [weak self] level in
-                Task { @MainActor in self?.level = level }
+                Task { @MainActor in self?.updateLevel(level, for: id) }
             }
         } catch {
             log.error("mic failed: \(error.localizedDescription, privacy: .public)")
-            companion.nudge("bud couldn't use the microphone.")
+            refreshMicrophoneStatus()
+            if microphoneDenied {
+                companion.nudge(Self.microphoneDeniedMessage)
+            } else if microphoneUnavailable || error is RecorderError {
+                microphoneUnavailable = true
+                companion.nudge(Self.microphoneUnavailableMessage)
+            } else {
+                companion.nudge("bud couldn't use the microphone.")
+            }
             return
         }
+        activeDictation = id
         state = .listening
         destination = companion.speechDestination
         companion.hearing = true
+        lastAudibleInput = .now
+        scheduleSilenceCheck(for: id)
         playSound(.start)
-        // Esc drops the recording; taken only while listening, so it's never stolen otherwise.
-        // Option is still held, so it arrives as ⌥ Esc; plain Esc covers a key let go early.
-        escapeKeys = [optionKey, 0].compactMap { registerHotkey(kVK_Escape, $0, cancel, {}) }
+        // Hold both Escape shortcuts until dictation ends, including transcription after release.
+        escapeKeys = [optionKey, 0].compactMap { modifiers in
+            registerHotkey(kVK_Escape, modifiers, { [weak self] in
+                guard let self, self.activeDictation == id else { return }
+                self.cancelActiveDictation()
+            }, {})
+        }
+    }
+
+    private func scheduleSilenceCheck(for id: UUID) {
+        let firstDeadline = lastAudibleInput + silenceThreshold
+        silenceTask = Task { [weak self, silenceThreshold] in
+            var deadline = firstDeadline
+            while !Task.isCancelled {
+                try? await Task.sleep(until: deadline, clock: .continuous)
+                guard !Task.isCancelled, let self, self.activeDictation == id else { return }
+                deadline = self.lastAudibleInput + silenceThreshold
+                if deadline <= .now {
+                    self.level = 0
+                    self.noInputDetected = true
+                    return
+                }
+            }
+        }
+    }
+
+    private func updateLevel(_ sample: Float, for id: UUID) {
+        guard activeDictation == id, state == .listening else { return }
+        let sample = min(max(sample, 0), 1)
+        let weight: Float = sample > level ? 0.55 : 0.2
+        let smoothed = level + (sample - level) * weight
+        level = smoothed < 0.001 ? 0 : smoothed
+        if sample >= 0.08 {
+            lastAudibleInput = .now
+            if noInputDetected {
+                noInputDetected = false
+                scheduleSilenceCheck(for: id)
+            }
+        }
     }
 
     func release() {
-        guard state == .listening else { return }
+        guard state == .listening, let id = activeDictation else { return }
         let clip = finishListening()
         playSound(.stop)
-        // A tap, not a sentence: nothing to send.
+        // A tap is too short to transcribe.
         guard clip.seconds >= 0.3, let transcriber else {
-            state = .ready
+            finishDictation()
             return
         }
         state = .transcribing
         let destination = destination
-        transcriptionTask = Task {
+        transcriptionTask = Task { [weak self] in
             do {
+                try Task.checkCancellation()
                 let text = try await transcriber.transcribe(clip)
-                state = .ready
-                if !text.isEmpty { companion.say(text, meant: destination) }
+                guard !Task.isCancelled, let self, self.activeDictation == id else { return }
+                self.finishDictation()
+                if !text.isEmpty { self.companion.insertDictation(text, meant: destination) }
             } catch {
+                guard !Task.isCancelled, let self, self.activeDictation == id else { return }
                 log.error("transcription failed: \(error.localizedDescription, privacy: .public)")
-                state = .ready
-                companion.nudge("bud didn't catch that. Try again?")
+                self.finishDictation()
+                self.companion.nudge("bud didn't catch that. Try again?")
             }
         }
     }
 
-    func cancel() {
-        guard state == .listening else { return }
-        _ = finishListening()
+    @discardableResult
+    func cancelActiveDictation() -> Bool {
+        guard activeDictation != nil else { return false }
+        if state == .listening { _ = finishListening() }
+        transcriptionTask?.cancel()
+        finishDictation()
+        return true
+    }
+
+    private func finishDictation() {
+        activeDictation = nil
+        transcriptionTask = nil
+        escapeKeys.forEach { $0.unregister() }
+        escapeKeys = []
         state = .ready
     }
 
     private func finishListening() -> Clip {
-        escapeKeys.forEach { $0.unregister() }
-        escapeKeys = []
+        silenceTask?.cancel()
+        silenceTask = nil
         companion.hearing = false
         level = 0
+        noInputDetected = false
         return recorder.stop()
+    }
+}
+
+@MainActor
+private extension Companion {
+    func insertDictation(_ text: String, meant destination: SpeechDestination) {
+        guard destination == speechDestination else {
+            say(text, meant: destination)
+            return
+        }
+        switch destination {
+        case .question:
+            say(text, meant: destination)
+        case .ask, .revise:
+            if let last = draft.last, !last.isWhitespace { draft.append(" ") }
+            draft.append(text)
+            inputOpen = true
+            if windowOpen { requestComposerFocus() }
+        }
     }
 }
 
@@ -285,7 +444,12 @@ final class Recorder: VoiceRecorder {
             level(sink.append(buffer))
         }
         engine.prepare()
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            _ = stop()
+            throw error
+        }
     }
 
     func stop() -> Clip {
@@ -365,9 +529,12 @@ actor Transcriber: VoiceTranscriber {
     }
 
     func transcribe(_ clip: Clip) async throws -> String {
+        try Task.checkCancellation()
         let audio = try Self.resample(clip)
         var decoder = TdtDecoderState.make(decoderLayers: await asr.decoderLayerCount)
+        try Task.checkCancellation()
         let result = try await asr.transcribe(audio, decoderState: &decoder)
+        try Task.checkCancellation()
         var text = result.text
         if let boost,
            let boosted = await boost.rescore(text: text, tokenTimings: result.tokenTimings ?? [], audioSamples: audio)
@@ -422,11 +589,37 @@ enum ContactNames {
     }
 }
 
+@MainActor @Observable
+final class SoundSettings {
+    static let shared = SoundSettings()
+    private static let key = "budSoundsEnabled"
+
+    var enabled = UserDefaults.standard.object(forKey: SoundSettings.key) as? Bool ?? true {
+        didSet { UserDefaults.standard.set(enabled, forKey: Self.key) }
+    }
+}
+
+@MainActor
+enum BudSounds {
+    static var enabled: Bool {
+        get { SoundSettings.shared.enabled }
+        set { SoundSettings.shared.enabled = newValue }
+    }
+
+    static func playMessageSent() {
+        guard SoundSettings.shared.enabled else { return }
+        let sound = NSSound(named: "Tink")
+        sound?.volume = 0.18
+        sound?.play()
+    }
+}
+
 /// Soft ticks when listening starts and stops, so you know without looking.
 enum TalkSound {
     case start, stop
 
     @MainActor func play() {
+        guard SoundSettings.shared.enabled else { return }
         let sound = NSSound(named: self == .start ? "Tink" : "Pop")
         sound?.volume = 0.25
         sound?.play()

@@ -1,6 +1,7 @@
 """Stop the source and drive one recoverable runtime move to a remote Bud."""
 
 import json
+import os
 import plistlib
 import sys
 import time
@@ -64,6 +65,11 @@ def _wait_for_runtime(client: httpx.Client, transfer: str) -> None:
             pass
         time.sleep(0.5)
     raise RuntimeMoveError("The server has not started Bud yet. Check the same move again.")
+
+
+def _report_stage(stage: str) -> None:
+    if os.environ.get("BUD_MOVE_PROGRESS") == "1":
+        print(json.dumps({"stage": stage}), file=sys.stderr, flush=True)
 
 
 def move_runtime(
@@ -144,8 +150,10 @@ def move_runtime(
                     if chatgpt.is_dir() and not chatgpt.is_symlink():
                         locks.enter_context(hold_single_server_lock(chatgpt / "credentials.lock"))
                     archive = Path(folder) / "profile.zip"
+                    _report_stage("packing")
                     pack_runtime(settings, archive)
                     with archive.open("rb") as stream:
+                        _report_stage("uploading")
                         client.put(
                             route,
                             content=stream,
@@ -156,6 +164,7 @@ def move_runtime(
                         ).raise_for_status()
                 state = "staged"
             if state in {"staged", "committed"}:
+                _report_stage("starting")
                 with suppress(httpx.TransportError):
                     client.post(f"{route}/activate").raise_for_status()
                 _wait_for_runtime(client, transfer)

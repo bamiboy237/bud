@@ -2,6 +2,7 @@ import AppKit
 import CoreTransferable
 import Foundation
 import ImageIO
+import Observation
 import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
@@ -75,6 +76,84 @@ struct DraftAttachment: Identifiable, Equatable, Sendable {
                 name: url.lastPathComponent),
             data: data)
     }
+
+    @MainActor
+    static func clipboardPNG(from board: NSPasteboard) -> Data? {
+        clipboardPNG(
+            hasPlainText: board.availableType(from: [.string]) != nil,
+            png: board.data(forType: .png), tiff: board.data(forType: .tiff)
+        ) {
+            guard board.availableType(from: [.fileURL]) == nil else { return nil }
+            return board.readObjects(forClasses: [NSImage.self])?.first as? NSImage
+        }
+    }
+
+    @MainActor
+    static func clipboardPNG(
+        hasPlainText: Bool, png: @autoclosure () -> Data?, tiff: @autoclosure () -> Data?,
+        image: () -> NSImage? = { nil }
+    ) -> Data? {
+        guard !hasPlainText else { return nil }
+        if let png = png(), let source = CGImageSourceCreateWithData(png as CFData, nil),
+           CGImageSourceGetType(source) == UTType.png.identifier as CFString,
+           CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete {
+            return png
+        }
+        if let tiff = tiff(), let bitmap = NSBitmapImageRep(data: tiff),
+           let converted = bitmap.representation(using: .png, properties: [:]) {
+            return converted
+        }
+        guard let cgImage = image()?.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        return NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:])
+    }
+
+    static func stageScreenshot(_ png: Data, existingNames: [String]) throws -> URL {
+        let names = Set(existingNames.map { $0.lowercased() })
+        var index = 1
+        var name = "Screenshot.png"
+        while names.contains(name.lowercased()) {
+            index += 1
+            name = "Screenshot \(index).png"
+        }
+
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let file = directory.appending(path: name)
+        do {
+            try png.write(to: file)
+            return file
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+    }
+}
+
+extension Companion {
+    @MainActor
+    func addPastedImage(_ png: Data) -> Bool {
+        guard inputPurpose == .ask, !readingAttachments, !uploadingAttachments else { return false }
+        let file: URL
+        do {
+            file = try DraftAttachment.stageScreenshot(png, existingNames: draftAttachments.map(\.reference.name))
+        } catch {
+            nudge("Couldn’t prepare the screenshot. Try copying it again.")
+            return true
+        }
+
+        let directory = file.deletingLastPathComponent()
+        addAttachments([file])
+        if readingAttachments {
+            // The file drop reader owns this URL until its asynchronous batch finishes.
+            withObservationTracking { _ = readingAttachments } onChange: {
+                try? FileManager.default.removeItem(at: directory)
+            }
+        } else {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        return true
+    }
 }
 
 struct DroppedAttachment: Transferable {
@@ -108,6 +187,7 @@ extension View {
 struct DraftAttachmentChips: View {
     let files: [DraftAttachment]
     let remove: (String) -> Void
+    var onPreview: ((DraftAttachment) -> Void)? = nil
 
     var body: some View {
         ScrollView(.horizontal) {
@@ -115,11 +195,10 @@ struct DraftAttachmentChips: View {
                 ForEach(files) { file in
                     AttachmentChip(
                         name: file.reference.name,
-                        isImage: file.reference.type?.conforms(to: .image) == true
-                    ) {
-                        remove(file.id)
-                    }
-                    .help(file.reference.name)
+                        isImage: file.reference.type?.conforms(to: .image) == true,
+                        onPreview: onPreview.map { open in { open(file) } },
+                        remove: { remove(file.id) }
+                    )
                 }
             }
         }
@@ -129,17 +208,21 @@ struct DraftAttachmentChips: View {
 struct AttachmentChip: View {
     let name: String
     var isImage = false
+    var onPreview: (() -> Void)? = nil
     var remove: (() -> Void)? = nil
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
         HStack(spacing: 6) {
-            Image(systemName: isImage ? "photo" : "doc")
-                .accessibilityHidden(true)
-            Text(name)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: 180, alignment: .leading)
+            if let onPreview {
+                Button(action: onPreview) { fileLabel }
+                    .buttonStyle(.plain)
+                    .pointerStyle(.link)
+                    .accessibilityLabel("Preview \(name)")
+                    .help("Preview \(name)")
+            } else {
+                fileLabel.help(name)
+            }
             if let remove {
                 Button(action: remove) {
                     Image(systemName: "xmark")
@@ -147,6 +230,7 @@ struct AttachmentChip: View {
                 }
                 .buttonStyle(IconButton(size: 20))
                 .accessibilityLabel("Remove \(name)")
+                .help("Remove \(name)")
             }
         }
         .font(Paper.Typography.callout)
@@ -155,6 +239,18 @@ struct AttachmentChip: View {
         .frame(height: 28)
         .background(Paper.elevated, in: shape)
         .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5).allowsHitTesting(false) }
+    }
+
+    private var fileLabel: some View {
+        HStack(spacing: 6) {
+            Image(systemName: isImage ? "photo" : "doc")
+                .accessibilityHidden(true)
+            Text(name)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: 180, alignment: .leading)
+        }
+        .contentShape(Rectangle())
     }
 }
 

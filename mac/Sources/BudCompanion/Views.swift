@@ -6,6 +6,10 @@ import SwiftUI
 private let appear = Animation.spring(duration: 0.3, bounce: 0)
 private let leave = Animation.easeOut(duration: 0.15)
 
+private final class PetViewLayout: ObservableObject {
+    @Published var inputHeight: CGFloat = 0
+}
+
 /// Everything in the floating panel, anchored to the pet in the bottom-right corner.
 struct PetView: View {
     @Bindable var companion: Companion
@@ -13,24 +17,32 @@ struct PetView: View {
     private let appearance = AppearanceStore.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var pupsHovered = Flag()
+    @StateObject private var layout = PetViewLayout()
 
+    private enum Row: Hashable { case pet, input, reply }
+    private enum PetItem: Hashable { case pet, pups, activity }
+    private static let spacing: CGFloat = 8
     private var anchor: Anchor { companion.anchor }
+    private var showsInput: Bool { companion.inputOpen && !companion.windowOpen }
 
     var body: some View {
         let _ = appearance.revision
-        // The bubble and the field stack away from the pet: up from it, or down from it near
-        // the top of the screen. The pet keeps its corner; everything else lines up with it.
-        VStack(alignment: anchor.left ? .leading : .trailing, spacing: 8) {
-            if anchor.below {
-                petRow
-                if companion.inputOpen && !companion.windowOpen { InputField(companion: companion) }
-                bubble
-                Spacer(minLength: 0)
-            } else {
-                Spacer(minLength: 0)
-                bubble
-                if companion.inputOpen && !companion.windowOpen { InputField(companion: companion) }
-                petRow
+        let rows: [Row] = anchor.below ? [.pet, .input, .reply] : [.reply, .input, .pet]
+        VStack(alignment: anchor.left ? .leading : .trailing, spacing: Self.spacing) {
+            ForEach(rows, id: \.self) { row in
+                switch row {
+                case .pet:
+                    petRow
+                case .input:
+                    if showsInput {
+                        InputField(companion: companion)
+                            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
+                                layout.inputHeight = $0
+                            }
+                    }
+                case .reply:
+                    bubble
+                }
             }
         }
         .padding(PetPanel.inset)
@@ -51,32 +63,36 @@ struct PetView: View {
 
     @ViewBuilder private var bubble: some View {
         if companion.bubbleOpen && !companion.windowOpen {
-            Bubble(companion: companion)
+            let inputSpace = showsInput ? layout.inputHeight + Self.spacing : 0
+            Bubble(companion: companion, maxHeight: max(0, anchor.contentHeight - inputSpace - Self.spacing))
                 .transition(bubbleTransition)
         }
     }
 
     /// The stop button sits on the bubble's side of the pet.
     private var petRow: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            if anchor.left {
-                pet
-                pupStack
-            }
-            if Voice.shared.state == .listening || Voice.shared.state == .transcribing {
-                VoicePill(voice: Voice.shared)
-                    .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: anchor.left ? .leading : .trailing)))
-            } else if companion.running {
-                StopButton(action: companion.stop)
-                    .transition(.opacity)
-            }
-            if !anchor.left {
-                pupStack
-                pet
+        let items: [PetItem] = anchor.left ? [.pet, .pups, .activity] : [.activity, .pups, .pet]
+        return HStack(alignment: .bottom, spacing: 8) {
+            ForEach(items, id: \.self) { item in
+                switch item {
+                case .pet: pet
+                case .pups: pupStack
+                case .activity: activity
+                }
             }
         }
         .animation(.spring(duration: 0.25, bounce: 0), value: Voice.shared.state)
         .animation(.spring(duration: 0.35, bounce: 0), value: companion.activeTasks.isEmpty)
+    }
+
+    @ViewBuilder private var activity: some View {
+        if Voice.shared.state == .listening || Voice.shared.state == .transcribing {
+            VoicePill(voice: Voice.shared)
+                .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: anchor.left ? .leading : .trailing)))
+        } else if companion.running {
+            StopButton(action: companion.stop)
+                .transition(.opacity)
+        }
     }
 
     @ViewBuilder private var pupStack: some View {
@@ -124,23 +140,19 @@ struct PetView: View {
     }
 
     private var pet: some View {
-                PetButton(companion: companion) {
-                    // The release that ends a drag isn't a click.
-                    if companion.dragging { return }
-                    // With the window open, bud talks there: the pet brings it forward.
-                    if companion.windowOpen {
-                        ConversationWindow.shared.show()
-                        return
-                    }
-                    // Something waiting comes first: a click shows it rather than a blank field.
-                    if companion.needsAttention && !companion.bubbleOpen {
-                        companion.bubbleOpen = true
-                        return
-                    }
-                    companion.inputOpen.toggle()
-                    if !companion.inputOpen { companion.inputPurpose = .ask }
-                    if companion.inputOpen { focusPanel() }
-                }
+        PetButton(companion: companion) {
+            if companion.windowOpen {
+                ConversationWindow.shared.show()
+                return
+            }
+            if companion.needsAttention && !companion.bubbleOpen {
+                companion.bubbleOpen = true
+                return
+            }
+            companion.inputOpen.toggle()
+            if !companion.inputOpen { companion.inputPurpose = .ask }
+            if companion.inputOpen { focusPanel() }
+        }
     }
 
     /// Grows out of the pet's corner, so it reads as the pet speaking. Reduced motion: fade only.
@@ -157,36 +169,67 @@ struct PetView: View {
 
 // MARK: Pet
 
+final class PetPress: ObservableObject {
+    enum Phase: Equatable { case idle, pressed, dragging }
+
+    @Published private(set) var phase: Phase = .idle
+
+    func move(_ translation: CGSize) {
+        guard phase != .dragging else { return }
+        let next: Phase = hypot(translation.width, translation.height) >= 4 ? .dragging : .pressed
+        if next != phase { phase = next }
+    }
+
+    func release() -> Phase {
+        let previous = phase
+        if phase != .idle { phase = .idle }
+        return previous
+    }
+}
+
 private struct PetButton: View {
     let companion: Companion
     let action: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateObject private var press = PetPress()
 
     var body: some View {
-        Button(action: action) {
+        Group {
             if let sprite = PetSprite.named(companion.petID) {
                 pet(sprite)
             } else {
                 paw
             }
         }
-        .buttonStyle(PressScale())
-        // Drag the pet to move the whole panel; a few points of slack keep clicks clicks.
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 4, coordinateSpace: .global)
-                .onChanged { _ in
-                    companion.dragging = true
+        .scaleEffect(press.phase == .pressed && !reduceMotion ? 0.94 : 1)
+        .opacity(press.phase == .pressed && reduceMotion ? 0.9 : 1)
+        .animation(reduceMotion || press.phase == .dragging ? nil : .easeOut(duration: 0.1), value: press.phase)
+        .gesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                .onChanged { value in
+                    press.move(value.translation)
+                    guard press.phase == .dragging else { return }
                     companion.carry(pointerX: NSEvent.mouseLocation.x)
                     PetPanel.current?.drag(ended: false)
                 }
-                .onEnded { _ in
-                    PetPanel.current?.drag(ended: true)
-                    companion.setDown()
-                    // Cleared just after the button has seen the release.
-                    Task {
-                        try? await Task.sleep(for: .milliseconds(80))
-                        companion.dragging = false
+                .onEnded { value in
+                    press.move(value.translation)
+                    switch press.release() {
+                    case .pressed: action()
+                    case .dragging: setDown()
+                    case .idle: break
                     }
                 })
+        .onDisappear {
+            if press.release() == .dragging { setDown() }
+        }
+        .focusable(interactions: .activate)
+        .onKeyPress(keys: [.space, .return]) { _ in
+            action()
+            return .handled
+        }
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { action() }
         .accessibilityLabel("bud")
         .accessibilityValue(statusText)
         .accessibilityHint("Ask bud something")
@@ -196,6 +239,11 @@ private struct PetButton: View {
                 companion.bubbleOpen.toggle()
             }
         }
+    }
+
+    private func setDown() {
+        PetPanel.current?.drag(ended: true)
+        companion.setDown()
     }
 
     private var connected: Bool { companion.link == .connected }
@@ -505,7 +553,11 @@ private struct RecoveryBar: View {
 struct RunFailureView: View {
     let failure: RunFailure
     var showTitle = true
+    var onEditAndResend: (@MainActor () -> Void)? = nil
+    var priorExternalSteps: [String] = []
     @Environment(\.openSettings) private var openSettings
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateObject private var showDetails = Flag()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -527,26 +579,64 @@ struct RunFailureView: View {
                 .lineSpacing(showTitle ? 3.5 : 2)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
-            if let detail = failure.detail {
+            if onEditAndResend != nil, !priorExternalSteps.isEmpty {
+                let warning = "Earlier steps may have acted in an external app: \(priorExternalSteps.joined(separator: ", "))."
+                Text(warning)
+                    .font(Paper.Typography.caption)
+                    .foregroundStyle(Paper.inkSecondary)
+                    .lineLimit(1)
+                    .help(warning)
+            }
+            if onEditAndResend != nil || (showTitle && (offersModels || failure.detail != nil)) {
+                HStack(spacing: 6) {
+                    if let onEditAndResend {
+                        Button("Edit and resend", action: onEditAndResend)
+                            .buttonStyle(CardButton(kind: .secondary))
+                    }
+                    if showTitle && offersModels { openModelsButton }
+                    if showTitle && failure.detail != nil { detailsButton }
+                }
+            }
+            if showTitle, showDetails.on, let detail = failure.detail {
                 Text(detail)
                     .font(Paper.Typography.ledgerMeta)
                     .foregroundStyle(Paper.inkMuted)
-                    .lineLimit(showTitle ? nil : 4)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
-            }
-            if showTitle, ["permission", "model_unavailable", "auth", "quota", "context_full"]
-                .contains(failure.kind ?? "") {
-                Button("Open Models") {
-                    SettingsTabState.shared.selected = .models
-                    NSApp.activate()
-                    openSettings()
-                    Task { await SettingsTabState.shared.bringSettingsToFront() }
-                }
-                .buttonStyle(CardButton(kind: .secondary))
+                    .transition(.opacity)
             }
         }
         .fixedSize(horizontal: false, vertical: true)
+        .onChange(of: failure) { _, _ in showDetails.on = false }
+    }
+
+    private var offersModels: Bool {
+        ["permission", "model_unavailable", "auth", "quota", "context_full"].contains(failure.kind ?? "")
+    }
+
+    private var openModelsButton: some View {
+        Button("Open Models") {
+            SettingsTabState.shared.selected = .models
+            NSApp.activate()
+            openSettings()
+            Task { await SettingsTabState.shared.bringSettingsToFront() }
+        }
+        .buttonStyle(CardButton(kind: .secondary))
+    }
+
+    private var detailsButton: some View {
+        let title = showDetails.on ? "Hide details" : "Show details"
+        return Button {
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) {
+                showDetails.on.toggle()
+            }
+        } label: {
+            Image(systemName: "info.circle")
+        }
+        .buttonStyle(IconButton(active: showDetails.on))
+        .help(title)
+        .accessibilityLabel(title)
+        .accessibilityValue(showDetails.on ? "Expanded" : "Collapsed")
     }
 }
 
@@ -554,7 +644,13 @@ struct RunFailureView: View {
 
 private struct Bubble: View {
     @Bindable var companion: Companion
+    let maxHeight: CGFloat
     private let appearance = AppearanceStore.shared
+    @StateObject private var layout = BubbleLayout()
+
+    private final class BubbleLayout: ObservableObject {
+        @Published var contentHeight: CGFloat = 1
+    }
 
     var body: some View {
         let _ = appearance.revision
@@ -563,7 +659,9 @@ private struct Bubble: View {
         let status = state
         let overlaysControls = status == nil
         let topTail = companion.anchor.below ? BubbleShape.tail : 0
-        VStack(alignment: .leading, spacing: 12) {
+        let top = (overlaysControls ? 22 : 14) + topTail
+        let bottom = 16 + (companion.anchor.below ? 0 : BubbleShape.tail)
+        let contents = VStack(alignment: .leading, spacing: 12) {
             if let status {
                 header(status)
             }
@@ -641,13 +739,15 @@ private struct Bubble: View {
                     .transition(.opacity)
             }
         }
+        viewport(contents, height: max(0, maxHeight - top - bottom))
         .foregroundStyle(Paper.inkPrimary)
         .padding(.horizontal, 18)
         // The tail's edge gets its extra room, toward the pet.
-        .padding(.top, (overlaysControls ? 22 : 14) + topTail)
-        .padding(.bottom, 16 + (companion.anchor.below ? 0 : BubbleShape.tail))
-        .frame(width: compact ? nil : 332, alignment: .leading)
-        .frame(minWidth: 132, alignment: .leading)
+        .padding(.top, top)
+        .padding(.bottom, bottom)
+        .frame(width: compact ? nil : companion.anchor.contentWidth, alignment: .leading)
+        .frame(minWidth: min(132, companion.anchor.contentWidth),
+               maxWidth: companion.anchor.contentWidth, alignment: .leading)
         .fixedSize(horizontal: compact, vertical: false)
         .overlay(alignment: .topTrailing) {
             if overlaysControls {
@@ -670,6 +770,21 @@ private struct Bubble: View {
         })
         .animation(.easeOut(duration: 0.15), value: companion.approvals.first?.id)
         .animation(.easeOut(duration: 0.2), value: companion.receipt)
+    }
+
+    @ViewBuilder private func viewport<Content: View>(_ content: Content, height: CGFloat) -> some View {
+        if compact {
+            content
+        } else {
+            ScrollView {
+                content
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { layout.contentHeight = $0 }
+            }
+            .scrollIndicators(.never)
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(height: min(layout.contentHeight, height))
+        }
     }
 
     private func edgeFade(_ more: ReplyMore) -> some View {
@@ -1542,7 +1657,7 @@ private struct InputField: View {
         .padding(.trailing, 8)
         .padding(.vertical, 8)
         .foregroundStyle(Paper.inkPrimary)
-        .frame(width: 332)
+        .frame(width: companion.anchor.contentWidth)
         .surface(
             shape,
             lift: 1,
@@ -1565,7 +1680,10 @@ private struct InputField: View {
                         .lineLimit(1)
                         .allowsHitTesting(false)
                 }
-                ChatInput(title: "", text: $companion.draft, focus: $focused, submit: { companion.send() })
+                ChatInput(
+                    title: "", text: $companion.draft, focus: $focused,
+                    submit: { companion.send() }, onPasteImage: companion.addPastedImage
+                )
                     .font(Paper.Typography.body)
                     .lineLimit(1...5)
                     .onExitCommand {
@@ -1686,7 +1804,26 @@ struct SettingsView: View {
             }
             Tab("Apps", systemImage: "square.grid.2x2", value: .integrations) {
                 pane {
-                    modelSettings { IntegrationKeysPanel(store: store) }
+                    if companion.link == .connected {
+                        let attempt = companion.connectionMachine.attempt
+                        ConnectedAppsSettings(isVisible: tab.selected == .integrations) { method, path, json in
+                            guard companion.link == .connected, companion.connectionMachine.attempt == attempt
+                            else { throw CancellationError() }
+                            let response = try await companion.sendOnboardingRequest(method, path, json: json)
+                            guard companion.link == .connected, companion.connectionMachine.attempt == attempt
+                            else { throw CancellationError() }
+                            return response
+                        }
+                        .id(attempt)
+                    }
+                    modelSettings {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Provider API keys").font(Paper.Typography.h3)
+                                .accessibilityAddTraits(.isHeader)
+                            Rectangle().fill(Paper.hairline).frame(height: 0.5)
+                            IntegrationKeysPanel(store: store)
+                        }
+                    }
                 }
             }
             Tab("Computers", systemImage: "desktopcomputer", value: .computers) {
@@ -1763,10 +1900,234 @@ struct SettingsView: View {
     }
 }
 
+struct ConnectedAppAccount: Identifiable {
+    enum Status: String {
+        case connected = "Connected"
+        case expired = "Expired"
+        case revoked = "Revoked"
+        case needsSignIn = "Needs sign-in"
+
+        init(_ value: String) {
+            switch value.lowercased() {
+            case "active", "connected": self = .connected
+            case "expired": self = .expired
+            case "revoked": self = .revoked
+            default: self = .needsSignIn
+            }
+        }
+    }
+
+    let id: String
+    let name: String
+    let appName: String
+    let status: Status
+
+    init?(_ raw: [String: Any]) {
+        guard let toolkit = raw["toolkit"] as? String, (2...64).contains(toolkit.utf8.count),
+              let first = toolkit.utf8.first, (97...122).contains(first),
+              toolkit.utf8.allSatisfy({ (97...122).contains($0) || (48...57).contains($0) || $0 == 95 }),
+              let value = raw["status"] as? String else { return nil }
+        id = toolkit
+        let appName = switch toolkit {
+        case "gmail": "Gmail"
+        case "calendar", "googlecalendar": "Google Calendar"
+        default: toolkit.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+        self.appName = appName
+        let suppliedName = (raw["display_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        name = suppliedName.flatMap { $0.isEmpty ? nil : $0 } ?? appName
+        status = Status(value)
+    }
+
+    func matches(_ query: String) -> Bool {
+        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return term.isEmpty || [name, appName, id, status.rawValue].contains { $0.localizedStandardContains(term) }
+    }
+
+    static func decode(_ response: [String: Any]) throws -> [Self] {
+        if let rows = response["accounts"] as? [[String: Any]] {
+            return rows.compactMap(Self.init)
+        }
+        // Older Bud servers expose only the built-in apps through the same route.
+        guard let statuses = response["statuses"] as? [String: String] else { throw ConnectionError.notBudServer }
+        return statuses.compactMap { toolkit, value in
+            guard value != "NOT_CONNECTED" else { return nil }
+            return Self(["toolkit": toolkit, "status": value])
+        }
+    }
+}
+
+@MainActor
+final class ConnectedAppsSettingsState: ObservableObject {
+    enum Action: String {
+        case reconnect = "connect"
+        case disconnect
+    }
+
+    @Published var search = ""
+    @Published private(set) var accounts: [ConnectedAppAccount]?
+    @Published private(set) var busy = false
+    @Published private(set) var error: String?
+
+    private let sendRequest: OnboardingStore.Transport
+    private let openBrowser: @MainActor (URL) -> Bool
+
+    init(
+        sendRequest: @escaping OnboardingStore.Transport,
+        openBrowser: @escaping @MainActor (URL) -> Bool = { NSWorkspace.shared.open($0) }
+    ) {
+        self.sendRequest = sendRequest
+        self.openBrowser = openBrowser
+    }
+
+    var filteredAccounts: [ConnectedAppAccount] {
+        (accounts ?? []).filter { $0.matches(search) }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    func refresh() async { await update() }
+
+    func change(_ action: Action, account: ConnectedAppAccount) async {
+        await update {
+            do {
+                let response = try await self.sendRequest("POST", "connections/\(account.id)/\(action.rawValue)", nil)
+                try Task.checkCancellation()
+                if action == .reconnect {
+                    guard let url = CapabilitySetup.signInURL(response["url"] as? String) else {
+                        return "The sign-in link is unavailable. Try again."
+                    }
+                    if !self.openBrowser(url) { return "Could not open your browser. Try again." }
+                }
+                return nil
+            } catch is CancellationError {
+                return nil
+            } catch ConnectionError.http(404, _) where action == .disconnect {
+                return "Update the Bud server to disconnect accounts here."
+            } catch {
+                return action == .reconnect ? "Could not start sign-in. Try again."
+                    : "Could not disconnect \(account.name). Try again."
+            }
+        }
+    }
+
+    private func update(after change: (@MainActor () async -> String?)? = nil) async {
+        guard !busy else { return }
+        busy = true
+        error = nil
+        defer { busy = false }
+
+        let actionError = await change?()
+        guard !Task.isCancelled else { return }
+        do {
+            let response = try await sendRequest("GET", "connections", nil)
+            try Task.checkCancellation()
+            accounts = try ConnectedAppAccount.decode(response)
+            error = actionError
+        } catch is CancellationError {
+            return
+        } catch {
+            accounts = nil
+            self.error = actionError ?? "Could not check connected accounts. Try refreshing."
+        }
+    }
+}
+
+private struct ConnectedAppsSettings: View {
+    let isVisible: Bool
+    @StateObject private var state: ConnectedAppsSettingsState
+
+    init(isVisible: Bool, sendRequest: @escaping OnboardingStore.Transport) {
+        self.isVisible = isVisible
+        _state = StateObject(wrappedValue: ConnectedAppsSettingsState(sendRequest: sendRequest))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Connected accounts").font(Paper.Typography.h3)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer()
+                if state.busy { ProgressView().controlSize(.small) }
+                Button { Task { await state.refresh() } } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(IconButton())
+                .help("Refresh connected accounts")
+                .accessibilityLabel("Refresh connected accounts")
+                .disabled(state.busy)
+            }
+            if let error = state.error {
+                Text(error).font(Paper.Typography.callout).foregroundStyle(Paper.errorInk)
+            }
+            if let accounts = state.accounts {
+                if accounts.isEmpty {
+                    Text("No connected accounts").foregroundStyle(Paper.inkSecondary)
+                } else {
+                    TextField("Search connected accounts", text: $state.search)
+                    Text("Reconnecting replaces the current link immediately.")
+                        .font(Paper.Typography.caption)
+                        .foregroundStyle(Paper.inkMuted)
+                    let matches = state.filteredAccounts
+                    if matches.isEmpty {
+                        Text("No matching accounts").foregroundStyle(Paper.inkSecondary)
+                    } else {
+                        VStack(spacing: 0) {
+                            ForEach(matches) { account in
+                                Rectangle().fill(Paper.hairline).frame(height: 0.5)
+                                row(account)
+                            }
+                            Rectangle().fill(Paper.hairline).frame(height: 0.5)
+                        }
+                    }
+                }
+            }
+        }
+        .font(Paper.Typography.callout)
+        .onChange(of: isVisible, initial: true) { _, visible in
+            if visible { Task { await state.refresh() } }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            if isVisible { Task { await state.refresh() } }
+        }
+    }
+
+    private func row(_ account: ConnectedAppAccount) -> some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(account.name).font(Paper.Typography.label)
+                if account.name.caseInsensitiveCompare(account.appName) != .orderedSame {
+                    Text(account.appName).font(Paper.Typography.caption).foregroundStyle(Paper.inkMuted)
+                }
+            }
+            Spacer(minLength: 6)
+            Text(account.status.rawValue)
+                .font(Paper.Typography.caption)
+                .foregroundStyle(account.status == .connected ? Paper.approveInk : Paper.inkSecondary)
+                .fixedSize()
+            accountButton("Reconnect \(account.name)", icon: "arrow.triangle.2.circlepath", action: .reconnect, account: account)
+            accountButton("Disconnect \(account.name)", icon: "xmark.circle", action: .disconnect, account: account)
+        }
+        .frame(minHeight: 40)
+    }
+
+    private func accountButton(
+        _ title: String, icon: String, action: ConnectedAppsSettingsState.Action, account: ConnectedAppAccount
+    ) -> some View {
+        Button { Task { await state.change(action, account: account) } } label: {
+            Image(systemName: icon)
+        }
+        .buttonStyle(IconButton())
+        .help(title)
+        .accessibilityLabel(title)
+        .disabled(state.busy)
+    }
+}
+
 private struct PaperConnectionPanel: View {
     @Bindable var draft: SettingsDraft
     @Bindable var companion = Companion.shared
     @Bindable var appearance: AppearanceStore
+    @Bindable private var sounds = SoundSettings.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -1780,10 +2141,14 @@ private struct PaperConnectionPanel: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Appearance").font(Paper.Typography.h3)
             hairline
-            appearanceRow("Theme", subtitle: "Stone, Studio, or Paper") {
-                Picker("Theme", selection: $appearance.theme) {
-                    ForEach(BudTheme.allCases) { theme in Text(theme.title).tag(theme) }
+            HStack(spacing: 12) {
+                Text("Theme").font(Paper.Typography.body)
+                Spacer(minLength: 0)
+                HStack(spacing: 8) {
+                    ForEach(BudTheme.allCases) { theme in themeButton(theme) }
                 }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Theme")
             }
             hairline
             appearanceRow("Mode", subtitle: "Follow macOS, or pin Light or Dark") {
@@ -1797,7 +2162,38 @@ private struct PaperConnectionPanel: View {
                     ForEach(BudFont.allCases) { font in Text(font.title).tag(font) }
                 }
             }
+            hairline
+            appearanceRow("Sounds", subtitle: "Subtle chimes for sending and dictation") {
+                Toggle("", isOn: $sounds.enabled)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .accessibilityLabel("Sounds")
+            }
         }
+    }
+
+    private func themeButton(_ theme: BudTheme) -> some View {
+        let selected = appearance.theme == theme
+        let shape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
+        return Button {
+            appearance.theme = theme
+        } label: {
+            HStack(spacing: 6) {
+                ThemeSwatch(theme: theme)
+                Text(theme.title).font(Paper.Typography.captionMedium)
+            }
+            .foregroundStyle(Paper.inkPrimary)
+            .padding(.horizontal, 9)
+            .frame(height: 28)
+        }
+        .buttonStyle(PaperHit(shape: shape, fill: Paper.elevated))
+        .overlay {
+            shape.strokeBorder(selected ? Paper.inkPrimary : Paper.borderSubtle, lineWidth: selected ? 1.5 : 0.5)
+                .allowsHitTesting(false)
+        }
+        .accessibilityLabel("\(theme.title) theme")
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private func appearanceRow<Control: View>(
@@ -1867,6 +2263,39 @@ private struct PaperConnectionPanel: View {
 
     private var hairline: some View {
         Rectangle().fill(Paper.hairline).frame(height: 0.5)
+    }
+}
+
+private struct ThemeSwatch: View {
+    let theme: BudTheme
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        let (dark, light, border): (UInt32, UInt32, UInt32) = switch theme {
+        case .stone: (0x181915, 0xFAF9F7, scheme == .dark ? 0x272825 : 0xE5E3DC)
+        case .studio: (0x141416, 0xFFFFFF, 0xA1A1AA)
+        case .paper: (0x18191D, 0xF7F7F8, scheme == .dark ? 0x3C4048 : 0xE1E3E8)
+        }
+        HStack(spacing: 0) {
+            color(dark)
+            color(light)
+        }
+        .frame(width: 14, height: 14)
+        .clipShape(Circle())
+        .overlay { Circle().strokeBorder(color(border), lineWidth: 0.5) }
+        .overlay(alignment: scheme == .dark ? .leading : .trailing) {
+            if theme == .paper {
+                Circle().fill(color(scheme == .dark ? 0x7BB3EB : 0x1E4E79))
+                    .frame(width: 4, height: 4)
+                    .padding(.horizontal, 2)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private func color(_ hex: UInt32) -> Color {
+        Color(.sRGB, red: Double((hex >> 16) & 0xFF) / 255,
+              green: Double((hex >> 8) & 0xFF) / 255, blue: Double(hex & 0xFF) / 255)
     }
 }
 

@@ -2,9 +2,15 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
+from threading import Lock
+from time import monotonic
 from urllib.parse import urlsplit
 
 from composio import SESSION_PRESET_DIRECT_TOOLS, Composio
+from composio_client.types.connected_account_retrieve_response import (
+    ConnectedAccountRetrieveResponse,
+)
 
 from bud.composio.binding import (
     TOOLKITS,
@@ -14,6 +20,10 @@ from bud.composio.binding import (
     valid_toolkit,
 )
 from bud.config import Settings
+
+PENDING_STATUSES = {"INITIATED", "INITIALIZING"}
+# Composio's hosted link can expire before the connected account status updates.
+SIGN_IN_LIFETIME = timedelta(minutes=10)
 
 
 @contextmanager
@@ -38,6 +48,8 @@ class Connections:
             self.store = BindingStore(self.path)
             self.user_id = self.store.snapshot()[0].owner
         self.binding: AccountBinding | None = None
+        self._link_lock = Lock()
+        self._initial_links: dict[str, tuple[str, str, float]] = {}
 
     def client(self) -> Composio:
         key = self.settings.composio_api_key
@@ -59,30 +71,38 @@ class Connections:
                 raise ConnectionError("This app is already connected.")
             return None
         with safe_errors("Could not recover sign-in. Try again or check the connection."):
-            account = self.client().connected_accounts.get(nanoid=account_id)
-            if (
-                account.id != account_id
-                or account.user_id != binding.owner
-                or binding.owner != self.user_id
-                or account.toolkit.slug != toolkit
-            ):
-                raise ConnectionError("Connection owner or toolkit changed. Reconnect the account.")
-            if account.status == "ACTIVE":
-                raise ConnectionError("This app is already connected.")
-            if account.is_disabled or account.status not in {"INITIATED", "INITIALIZING"}:
-                return None
-            value = account.state.model_dump().get("val", {}).get("redirect_url")
-            if not isinstance(value, str) or urlsplit(value).scheme != "https":
-                raise ConnectionError("The sign-in link is unavailable. Check the connection.")
+            account = self._account(self.client(), binding, toolkit, account_id)
+            status = self._account_status(account)
+            value = None
+            if account is not None and status in PENDING_STATUSES:
+                state = account.state.model_dump().get("val", {})
+                value = state.get("composio_link_redirect_url") or state.get("redirect_url")
+                # Composio can omit the URL while a newly created OAuth link is still unopened.
+                if value is None and status == "INITIALIZING":
+                    with self._link_lock:
+                        cached = self._initial_links.get(toolkit)
+                    if cached is not None:
+                        cached_id, cached_url, expires_at = cached
+                        if cached_id == account_id and monotonic() < expires_at:
+                            value = cached_url
             if self.store.snapshot() != (binding, pending):
                 raise ConnectionError("Connection changed while recovering sign-in. Try again.")
+            if status == "ACTIVE":
+                raise ConnectionError("This app is already connected.")
+            if value is None:
+                return None
+            if not isinstance(value, str):
+                raise ConnectionError("The sign-in link is unavailable. Check the connection.")
+            link = urlsplit(value)
+            if link.scheme != "https" or not link.hostname:
+                raise ConnectionError("The sign-in link is unavailable. Check the connection.")
             return value
 
-    def connect(self, toolkit: str) -> str:
+    def connect(self, toolkit: str, *, replace_active: bool = True) -> str:
         if not valid_toolkit(toolkit):
             raise ConnectionError("Unsupported toolkit name.")
         with safe_errors("Could not start Composio sign-in. Check your key and connection."):
-            attempt = self.store.begin_connect(toolkit)
+            attempt = self.store.begin_connect(toolkit, replace_active=replace_active)
             client = self.client()
             session = client.create(
                 user_id=attempt.binding.owner,
@@ -90,37 +110,73 @@ class Connections:
                 session_preset=SESSION_PRESET_DIRECT_TOOLS,
                 manage_connections=False,
             )
+            issued_at = monotonic()
             request = session.authorize(toolkit)
             if not request.redirect_url:
                 raise ConnectionError("Composio did not return a sign-in link. Check /connections.")
-            self.store.save_pending(attempt, toolkit, request.id)
+            with self._link_lock:
+                self.store.save_pending(attempt, toolkit, request.id)
+                now = monotonic()
+                self._initial_links = {
+                    app: link for app, link in self._initial_links.items() if link[2] > now
+                }
+                self._initial_links[toolkit] = (
+                    request.id,
+                    request.redirect_url,
+                    issued_at + SIGN_IN_LIFETIME.total_seconds(),
+                )
             return request.redirect_url
 
     def statuses(self) -> dict[str, str]:
         return self.refresh()[1]
 
-    def _status(
+    def disconnect(self, toolkit: str) -> bool:
+        with (
+            safe_errors("Could not disconnect this app. Check your connections and try again."),
+            self._link_lock,
+        ):
+            removed = self.store.disconnect(toolkit)
+            self._initial_links.pop(toolkit, None)
+            return removed
+
+    def _account(
         self, client: Composio, binding: AccountBinding, toolkit: str, account_id: str
-    ) -> str:
-        account = client.connected_accounts.get(nanoid=account_id)
+    ) -> ConnectedAccountRetrieveResponse | None:
+        try:
+            account = client.connected_accounts.get(nanoid=account_id)
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 404:
+                return None
+            raise
         if (
             account.id != account_id
             or account.user_id != binding.owner
+            or binding.owner != self.user_id
             or account.toolkit.slug != toolkit
         ):
             raise ConnectionError("Connection owner or toolkit changed. Reconnect the account.")
+        return account
+
+    @staticmethod
+    def _account_status(account: ConnectedAccountRetrieveResponse | None) -> str:
+        if account is None:
+            return "REVOKED"
+        if account.status in {"EXPIRED", "REVOKED"}:
+            return account.status
         if account.is_disabled:
             return "DISABLED"
+        if account.status in PENDING_STATUSES:
+            if getattr(getattr(account.state, "val", None), "status", None) == "EXPIRED":
+                return "EXPIRED"
+            created_at = getattr(account, "created_at", None)
+            if created_at:
+                created = datetime.fromisoformat(created_at)
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=UTC)
+                if datetime.now(UTC) >= created + SIGN_IN_LIFETIME:
+                    return "EXPIRED"
         # Only return known metadata, never arbitrary provider error text or URLs.
-        known = {
-            "ACTIVE",
-            "INITIATED",
-            "INITIALIZING",
-            "INACTIVE",
-            "FAILED",
-            "EXPIRED",
-            "REVOKED",
-        }
+        known = PENDING_STATUSES | {"ACTIVE", "INACTIVE", "FAILED"}
         return account.status if account.status in known else "UNAVAILABLE"
 
     def refresh(self) -> tuple[AccountBinding, dict[str, str]]:
@@ -130,28 +186,63 @@ class Connections:
         binding, so its tools load without a restart; a removal or replacement keeps the
         restart fence.
         """
+        binding, statuses, _ = self._refresh()
+        return binding, statuses
+
+    def inventory(self) -> tuple[dict[str, str], list[dict[str, str]]]:
+        """Refresh and list the app references Bud holds, including retired links."""
+        _, statuses, accounts = self._refresh(include_inactive=True)
+        return statuses, accounts
+
+    def _refresh(
+        self, *, include_inactive: bool = False
+    ) -> tuple[AccountBinding, dict[str, str], list[dict[str, str]]]:
         with safe_errors("Could not verify connections. No account tools were refreshed."):
-            previous, pending = self.store.snapshot()
+            if include_inactive:
+                previous, pending, inactive = self.store.inventory()
+            else:
+                previous, pending = self.store.snapshot()
+                inactive = {}
             references = previous.accounts | {k: v for k, v in pending.items() if v is not None}
+            inventory = inactive | references
             statuses = dict.fromkeys(set(TOOLKITS) | set(references), "NOT_CONNECTED")
             unverifiable: set[str] = set()
+            accounts = []
             try:
-                if references:
+                if inventory:
                     client = self.client()
-                    for toolkit, account_id in references.items():
+                    for toolkit, account_id in sorted(inventory.items()):
+                        account = None
                         try:
-                            statuses[toolkit] = self._status(client, previous, toolkit, account_id)
+                            account = self._account(client, previous, toolkit, account_id)
+                            status = self._account_status(account)
                         except Exception as exc:
-                            if toolkit in previous.accounts or getattr(
-                                exc, "status_code", None
-                            ) in (401, 403):
-                                raise  # an active account in doubt, or a rejected key
-                            # Only an unfinished sign-in is in doubt; it never became an
-                            # account, so it is dropped below without fencing the chat.
-                            statuses[toolkit] = "UNAVAILABLE"
+                            if toolkit in references and (
+                                toolkit in previous.accounts
+                                or getattr(exc, "status_code", None) in (401, 403)
+                            ):
+                                raise
+                            status = "UNAVAILABLE"
                             unverifiable.add(toolkit)
+                        if toolkit in references:
+                            statuses[toolkit] = status
+                        elif status == "ACTIVE":
+                            status = "DISCONNECTED"
+                        if include_inactive:
+                            name = {"gmail": "Gmail", "googlecalendar": "Google Calendar"}.get(
+                                toolkit, toolkit.replace("_", " ").title()
+                            )
+                            accounts.append(
+                                {
+                                    "toolkit": toolkit,
+                                    "account_id": account_id,
+                                    "display_name": getattr(account, "alias", None) or name,
+                                    "status": "connected" if status == "ACTIVE" else status.lower(),
+                                }
+                            )
             except Exception:
-                self.store.retire(previous)
+                if references:
+                    self.store.retire(previous)
                 raise
             for toolkit, account_id in pending.items():
                 if account_id is None:
@@ -162,13 +253,19 @@ class Connections:
                 for k, v in pending.items()
                 if statuses[k] != "ACTIVE" and k not in unverifiable
             }
-            accepted = self.store.accept_verified(previous, pending, active, remaining)
+            accepted = self.store.accept_verified(
+                previous,
+                pending,
+                active,
+                remaining,
+                inactive=inactive if include_inactive else None,
+            )
             # Adding an app cannot redirect an approval that already exists: every earlier
             # account is unchanged. Adopt it so the new app's tools work in this session.
             # A removal or replacement keeps the restart fence.
             if self.binding is not None and self._additive(self.binding, accepted):
                 self.binding = accepted
-            return accepted, statuses
+            return accepted, statuses, accounts
 
     def capture_binding(self) -> AccountBinding:
         if self.binding is not None:
@@ -235,7 +332,8 @@ class Connections:
             if self._fenced(binding, current):
                 raise ConnectionError("Account binding changed. Restart bud and use a new session.")
             try:
-                status = self._status(self.client(), binding, target_toolkit, account_id)
+                account = self._account(self.client(), binding, target_toolkit, account_id)
+                status = self._account_status(account)
             except Exception:
                 self.store.retire(binding)
                 raise
