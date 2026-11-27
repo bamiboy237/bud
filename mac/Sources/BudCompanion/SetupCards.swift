@@ -36,7 +36,7 @@ struct SetupDeck: View {
     @Environment(\.replyType) private var replyType
 
     private var inWindow: Bool {
-        !replyType.compact || companion.windowOpen
+        !replyType.compact
     }
 
     private var limit: CGFloat {
@@ -79,7 +79,7 @@ struct SetupCard: View {
     }
 
     private var inWindow: Bool {
-        !replyType.compact || companion.windowOpen
+        !replyType.compact
     }
 
     var body: some View {

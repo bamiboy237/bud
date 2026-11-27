@@ -62,7 +62,7 @@ struct RoutineMessageCard: View {
     }
 }
 
-private struct RoutineSummary: Decodable, Identifiable {
+struct RoutineSummary: Decodable, Equatable, Identifiable {
     let routineId: String
     let title: String
     let skill: String
@@ -76,7 +76,7 @@ private struct RoutineSummary: Decodable, Identifiable {
     var id: String { routineId }
 }
 
-private struct RoutineRun: Decodable, Identifiable {
+struct RoutineRun: Decodable, Equatable, Identifiable {
     let occurrenceId: String
     let scheduledFor: String
     let executionStatus: String
@@ -86,25 +86,255 @@ private struct RoutineRun: Decodable, Identifiable {
 }
 
 @MainActor
-private final class RoutineInspectorState: ObservableObject {
+final class RoutineInspectorState: ObservableObject {
     @Published var list: [RoutineSummary] = []
     @Published var routine: RoutineSummary?
     @Published var report: String?
     @Published var listing = true
     @Published var pending = true
     @Published var problem: String?
-    @Published var editing = false
+    @Published private(set) var editing = false
     @Published var title = ""
     @Published var prompt = ""
     @Published var schedule = RoutineSchedule(cron: "0 9 * * *")
     @Published var timezone = ""
     @Published var markedRun: String?
     @Published var triggerID = UUID().uuidString
+
+    private var started = false
+    private var editBaseline: [String: String]?
+    private var activeRoutineID: String?
+    private var viewGeneration = 0
+    private var mutating = false
+    private var refreshNeeded = false
+    private var refreshTaskID = 0
+    private var refreshTask: Task<Void, Never>?
+
+    func start(with selection: RoutineSelection) async {
+        started = true
+        if let id = selection.routineID {
+            markedRun = selection.occurrenceID
+            await show(id, using: selection)
+        } else {
+            await loadList(using: selection)
+        }
+    }
+
+    func requestRefresh(using selection: RoutineSelection) {
+        guard started else { return }
+        refreshNeeded = true
+        guard !mutating, refreshTask == nil else { return }
+        startRefreshTask(using: selection)
+    }
+
+    func cancelRefresh(preservingRequest: Bool = false) {
+        refreshNeeded = preservingRequest && (refreshNeeded || refreshTask != nil)
+        refreshTaskID += 1
+        refreshTask?.cancel()
+        refreshTask = nil
+    }
+
+    func waitForRefresh() async {
+        while let task = refreshTask {
+            await task.value
+        }
+    }
+
+    func back(using selection: RoutineSelection) {
+        if report != nil {
+            report = nil
+        } else {
+            markedRun = nil
+            listing = true
+            endEditing()
+            activeRoutineID = nil
+            viewGeneration += 1
+            Task { await loadList(using: selection) }
+        }
+    }
+
+    func loadList(using selection: RoutineSelection) async {
+        cancelRefresh()
+        endEditing()
+        viewGeneration += 1
+        let generation = viewGeneration
+        listing = true
+        activeRoutineID = nil
+        pending = true
+        mutating = true
+        problem = nil
+        refreshNeeded = false
+        do {
+            let response = try await selection.connection.send(
+                "GET", "routines", queryItems: [URLQueryItem(name: "feed_id", value: selection.session)])
+            if generation == viewGeneration {
+                list = try (response["routines"] as? [[String: Any]] ?? []).map(Self.decode)
+            }
+        } catch {
+            if generation == viewGeneration { problem = "\(error)" }
+        }
+        pending = false
+        mutating = false
+        startRefreshTask(using: selection)
+    }
+
+    func show(_ id: String, using selection: RoutineSelection) async {
+        cancelRefresh()
+        endEditing()
+        viewGeneration += 1
+        let generation = viewGeneration
+        listing = false
+        activeRoutineID = id
+        pending = true
+        mutating = true
+        problem = nil
+        refreshNeeded = false
+        do {
+            let response = try await selection.connection.send("GET", "routines/\(id)")
+            if generation == viewGeneration {
+                routine = try Self.decode(response)
+            }
+        } catch {
+            if generation == viewGeneration { problem = "\(error)" }
+        }
+        pending = false
+        mutating = false
+        startRefreshTask(using: selection)
+    }
+
+    func change(
+        _ id: String,
+        path: String = "",
+        method: String = "POST",
+        body: [String: String]? = nil,
+        using selection: RoutineSelection
+    ) async {
+        guard !pending else { return }
+        cancelRefresh()
+        let generation = viewGeneration
+        pending = true
+        mutating = true
+        problem = nil
+        do {
+            _ = try await selection.connection.send(method, "routines/\(id)\(path)", json: body)
+            if path == "/run-now" { triggerID = UUID().uuidString }
+            endEditing()
+            refreshNeeded = false
+            let response = try await selection.connection.send("GET", "routines/\(id)")
+            if generation == viewGeneration {
+                routine = try Self.decode(response)
+            }
+        } catch {
+            if generation == viewGeneration { problem = "\(error)" }
+        }
+        pending = false
+        mutating = false
+        startRefreshTask(using: selection)
+    }
+
+    func beginEditing(_ value: RoutineSummary) {
+        title = value.title
+        prompt = value.prompt
+        schedule = RoutineSchedule(cron: value.cron)
+        timezone = value.timezone
+        editBaseline = draftFields
+        editing = true
+    }
+
+    func endEditing() {
+        editBaseline = nil
+        editing = false
+    }
+
+    func save(using selection: RoutineSelection) async {
+        guard !pending, let editBaseline, let id = activeRoutineID else { return }
+        let changes = draftFields.filter { editBaseline[$0.key] != $0.value }
+        guard !changes.isEmpty else {
+            endEditing()
+            problem = nil
+            return
+        }
+        await change(id, method: "PATCH", body: changes, using: selection)
+    }
+
+    private var draftFields: [String: String] {
+        ["title": title, "prompt": prompt, "cron": schedule.cron, "timezone": timezone]
+    }
+
+    func openReport(_ routineID: String, _ occurrenceID: String, using selection: RoutineSelection) async {
+        cancelRefresh(preservingRequest: true)
+        let generation = viewGeneration
+        pending = true
+        mutating = true
+        problem = nil
+        do {
+            let response = try await selection.connection.send(
+                "GET", "routines/\(routineID)/occurrences/\(occurrenceID)/report")
+            if generation == viewGeneration {
+                report = response["content"] as? String
+            }
+        } catch {
+            if generation == viewGeneration { problem = "\(error)" }
+        }
+        pending = false
+        mutating = false
+        startRefreshTask(using: selection)
+    }
+
+    private func startRefreshTask(using selection: RoutineSelection) {
+        guard !mutating, refreshNeeded, refreshTask == nil else { return }
+        refreshTaskID += 1
+        let taskID = refreshTaskID
+        refreshTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runPendingRefreshes(using: selection, taskID: taskID)
+        }
+    }
+
+    private func runPendingRefreshes(using selection: RoutineSelection, taskID: Int) async {
+        defer {
+            if refreshTaskID == taskID { refreshTask = nil }
+        }
+        while refreshNeeded, !mutating, !Task.isCancelled {
+            refreshNeeded = false
+            await performBackgroundRefresh(using: selection)
+        }
+    }
+
+    private func performBackgroundRefresh(using selection: RoutineSelection) async {
+        let generation = viewGeneration
+        let targetRoutineID = listing ? nil : activeRoutineID
+        do {
+            if let id = targetRoutineID {
+                let response = try await selection.connection.send("GET", "routines/\(id)")
+                guard !Task.isCancelled, !mutating, generation == viewGeneration,
+                      !listing, activeRoutineID == id
+                else { return }
+                routine = try Self.decode(response)
+                if !editing { problem = nil }
+            } else if listing {
+                let response = try await selection.connection.send(
+                    "GET", "routines", queryItems: [URLQueryItem(name: "feed_id", value: selection.session)])
+                guard !Task.isCancelled, !mutating, generation == viewGeneration, listing else { return }
+                list = try (response["routines"] as? [[String: Any]] ?? []).map(Self.decode)
+                problem = nil
+            }
+        } catch {
+            // Keep the last loaded routine or list visible if a background refresh fails transiently.
+        }
+    }
+
+    private static func decode(_ data: [String: Any]) throws -> RoutineSummary {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(RoutineSummary.self, from: JSONSerialization.data(withJSONObject: data))
+    }
 }
 
 @MainActor
 struct RoutineInspector: View {
     let selection: RoutineSelection
+    var refreshRevision = 0
     let close: () -> Void
     @StateObject private var state = RoutineInspectorState()
 
@@ -112,7 +342,7 @@ struct RoutineInspector: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 if state.report != nil || !state.listing {
-                    Button { back() } label: { Image(systemName: "chevron.left") }
+                    Button { state.back(using: selection) } label: { Image(systemName: "chevron.left") }
                         .buttonStyle(IconButton(size: 24))
                         .accessibilityLabel("Back")
                         .disabled(state.pending)
@@ -140,7 +370,7 @@ struct RoutineInspector: View {
                         }
                         ForEach(state.list) { item in
                             Button {
-                                Task { await show(item.id) }
+                                Task { await state.show(item.id, using: selection) }
                             } label: {
                                 HStack {
                                     VStack(alignment: .leading, spacing: 4) {
@@ -170,12 +400,14 @@ struct RoutineInspector: View {
         .background(Paper.canvas)
         .inspectorColumnWidth(min: 270, ideal: 340, max: 470)
         .task {
-            if let id = selection.routineID {
-                state.markedRun = selection.occurrenceID
-                await show(id)
-            } else {
-                await loadList()
-            }
+            await state.start(with: selection)
+        }
+        .onChange(of: refreshRevision) { _, _ in
+            state.requestRefresh(using: selection)
+        }
+        .onDisappear {
+            state.endEditing()
+            state.cancelRefresh()
         }
     }
 
@@ -188,7 +420,7 @@ struct RoutineInspector: View {
     @ViewBuilder
     private func detail(_ value: RoutineSummary) -> some View {
         if state.editing {
-            editor(value)
+            editor
         } else {
             VStack(alignment: .leading, spacing: 4) {
                 Text(value.title)
@@ -223,24 +455,22 @@ struct RoutineInspector: View {
             }
             HStack(spacing: 6) {
                 if value.status == "active" {
-                    Button("Pause") { Task { await change(value.id, path: "/pause") } }
+                    Button("Pause") { Task { await state.change(value.id, path: "/pause", using: selection) } }
                         .buttonStyle(CardButton(kind: .quiet))
                 } else if value.status == "paused", value.pauseReason != "uncertain" {
-                    Button("Resume") { Task { await change(value.id, path: "/resume") } }
+                    Button("Resume") { Task { await state.change(value.id, path: "/resume", using: selection) } }
                         .buttonStyle(CardButton(kind: .primary))
                 }
                 Spacer(minLength: 0)
-                Button("Edit") {
-                    state.title = value.title
-                    state.prompt = value.prompt
-                    state.schedule = RoutineSchedule(cron: value.cron)
-                    state.timezone = value.timezone
-                    state.editing = true
-                }
+                Button("Edit") { state.beginEditing(value) }
                 .buttonStyle(CardButton(kind: .secondary))
                 if value.status == "active" {
                     Button("Run now") {
-                        Task { await change(value.id, path: "/run-now", body: ["trigger_id": state.triggerID]) }
+                        Task {
+                            await state.change(
+                                value.id, path: "/run-now", body: ["trigger_id": state.triggerID],
+                                using: selection)
+                        }
                     }
                     .buttonStyle(CardButton(kind: .primary))
                 }
@@ -257,7 +487,7 @@ struct RoutineInspector: View {
                     Text("\(label(run.executionStatus)) · \(label(run.deliveryStatus))")
                         .font(.caption).foregroundStyle(Paper.inkSecondary)
                     if run.reportPath != nil {
-                        Button("Open report") { Task { await openReport(value.id, run.id) } }
+                        Button("Open report") { Task { await state.openReport(value.id, run.id, using: selection) } }
                             .buttonStyle(.link).disabled(state.pending)
                     }
                 }
@@ -270,7 +500,7 @@ struct RoutineInspector: View {
         }
     }
 
-    private func editor(_ value: RoutineSummary) -> some View {
+    private var editor: some View {
         VStack(alignment: .leading, spacing: 14) {
             section("Title") {
                 TextField("Title", text: $state.title)
@@ -293,11 +523,11 @@ struct RoutineInspector: View {
             HStack(spacing: 8) {
                 Spacer(minLength: 0)
                 Button("Cancel") {
-                    state.editing = false
+                    state.endEditing()
                     state.problem = nil
                 }
                 .buttonStyle(CardButton(kind: .quiet))
-                Button("Save") { Task { await save(value) } }
+                Button("Save") { Task { await state.save(using: selection) } }
                     .buttonStyle(CardButton(kind: .primary))
                     .disabled(!canSave)
                     .opacity(canSave ? 1 : 0.45)
@@ -405,13 +635,6 @@ struct RoutineInspector: View {
         }
     }
 
-    private func save(_ value: RoutineSummary) async {
-        var changes = ["title": state.title, "prompt": state.prompt, "timezone": state.timezone]
-        let cron = state.schedule.cron
-        if cron != RoutineSchedule(cron: value.cron).cron { changes["cron"] = cron }
-        await change(value.id, method: "PATCH", body: changes)
-    }
-
     private func label(_ raw: String) -> String {
         raw.replacingOccurrences(of: "_", with: " ").capitalized
     }
@@ -420,70 +643,5 @@ struct RoutineInspector: View {
         guard let value = (try? Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(raw))
                 ?? (try? Date.ISO8601FormatStyle().parse(raw)) else { return raw }
         return value.formatted(Date.FormatStyle(date: .abbreviated, time: .shortened, timeZone: timezone))
-    }
-
-    private func decode(_ data: [String: Any]) throws -> RoutineSummary {
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        return try decoder.decode(RoutineSummary.self, from: JSONSerialization.data(withJSONObject: data))
-    }
-
-    private func back() {
-        if state.report != nil {
-            state.report = nil
-        } else {
-            state.markedRun = nil
-            state.listing = true
-            state.editing = false
-            Task { await loadList() }
-        }
-    }
-
-    private func loadList() async {
-        state.pending = true
-        state.problem = nil
-        defer { state.pending = false }
-        do {
-            let response = try await selection.connection.send(
-                "GET", "routines", queryItems: [URLQueryItem(name: "feed_id", value: selection.session)])
-            state.list = try (response["routines"] as? [[String: Any]] ?? []).map(decode)
-        } catch { state.problem = "\(error)" }
-    }
-
-    private func show(_ id: String) async {
-        state.listing = false
-        state.pending = true
-        state.problem = nil
-        defer { state.pending = false }
-        do {
-            let response = try await selection.connection.send("GET", "routines/\(id)")
-            state.routine = try decode(response)
-        } catch { state.problem = "\(error)" }
-    }
-
-    private func change(
-        _ id: String, path: String = "", method: String = "POST", body: [String: String]? = nil
-    ) async {
-        guard !state.pending else { return }
-        state.pending = true
-        state.problem = nil
-        defer { state.pending = false }
-        do {
-            _ = try await selection.connection.send(method, "routines/\(id)\(path)", json: body)
-            if path == "/run-now" { state.triggerID = UUID().uuidString }
-            state.editing = false
-            await show(id)
-        } catch { state.problem = "\(error)" }
-    }
-
-    private func openReport(_ routineID: String, _ occurrenceID: String) async {
-        state.pending = true
-        state.problem = nil
-        defer { state.pending = false }
-        do {
-            let response = try await selection.connection.send(
-                "GET", "routines/\(routineID)/occurrences/\(occurrenceID)/report")
-            state.report = response["content"] as? String
-        } catch { state.problem = "\(error)" }
     }
 }

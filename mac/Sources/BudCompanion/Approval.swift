@@ -47,7 +47,7 @@ struct Approval: Identifiable, Equatable {
     let symbol: String
     /// Short facts worth checking before you say yes: subject, time, place.
     let facts: [(label: String, value: String)]
-    /// The text that will go out, when there is one, so you can read before approving.
+    /// The text or plan to review before approving.
     let body: String?
     let questions: [Question]
 
@@ -96,17 +96,20 @@ struct Approval: Identifiable, Equatable {
             || args["thread_id"] != nil || args["draft_id"] != nil
         job = (raw["task_id"] as? Int).flatMap { jobs[$0] }
         questions = Question.parse(args)
-        let words = Self.describe(tool.lowercased(), args)
+        let toolName = tool.lowercased()
+        let words = Self.describe(toolName, args)
         action = tool == "ask_user" ? (questions.first?.text ?? "") : words.title
         verb = words.verb
         symbol = words.symbol
         let review = raw["review"] as? [String: Any] ?? [:]
         // enable_browser's looked-up fact is the caution, which the body already shows.
-        facts = Self.facts(args) + Self.reviewFacts(tool == "enable_browser" ? [:] : review)
+        facts = Self.facts(toolName, args) + Self.reviewFacts(tool == "enable_browser" ? [:] : review)
         if tool == "enable_browser" {
             // Fixed words from the app, never from the model, so the caution cannot be edited.
             // The card shows this line; the full caution sits under "What this allows".
             body = Self.browserSummary
+        } else if toolName == "create_routine" {
+            body = Self.text(args, "prompt").nilIfEmpty
         } else if args["is_html"] as? Bool == true {
             // Approvals saved before previews existed have no proposed text; show the body
             // they carry rather than hiding what will be sent.
@@ -142,6 +145,11 @@ struct Approval: Identifiable, Equatable {
         let named = text(args, "title", "summary")
         if tool == "ask_user" { return ("", "Answer", "questionmark.bubble") }
         if tool == "enable_browser" { return ("Use your Chrome", "Turn on", "globe") }
+        if tool == "create_routine" {
+            let title = text(args, "title").trimmingCharacters(in: .whitespacesAndNewlines)
+            return (title.isEmpty ? "Schedule a routine" : "Schedule \"\(title)\"",
+                    "Schedule", "clock.arrow.circlepath")
+        }
         if tool.hasPrefix("browser_") { return browserStep(String(tool.dropFirst(8)), args) }
         if tool == "open_chrome" { return ("Open Chrome", "Open", "globe") }
         if tool == "open_in_app" {
@@ -239,8 +247,19 @@ struct Approval: Identifiable, Equatable {
         return out
     }
 
-    private static func facts(_ args: [String: Any]) -> [(label: String, value: String)] {
+    private static func facts(_ tool: String, _ args: [String: Any]) -> [(label: String, value: String)] {
         var out: [(String, String)] = []
+        if tool == "create_routine" {
+            let cron = text(args, "cron").trimmingCharacters(in: .whitespacesAndNewlines)
+            let timezone = text(args, "timezone").trimmingCharacters(in: .whitespacesAndNewlines)
+            let skill = text(args, "skill").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cron.isEmpty {
+                let schedule = routineScheduleText(RoutineSchedule(cron: cron))
+                out.append(("Schedule", timezone.isEmpty ? schedule : "\(schedule) (\(timezone))"))
+            }
+            if !skill.isEmpty { out.append(("Skill", skill)) }
+            return out
+        }
         let to = recipients(args)
         if !to.isEmpty { out.append(("To", to)) }
         for (key, label) in [("extra_recipients", "Also to"), ("cc", "Cc"), ("bcc", "Bcc")] {
@@ -257,6 +276,20 @@ struct Approval: Identifiable, Equatable {
             }
         }
         return out
+    }
+
+    private static func routineScheduleText(_ schedule: RoutineSchedule) -> String {
+        let time = schedule.time.formatted(
+            Date.FormatStyle(date: .omitted, time: .shortened, timeZone: .gmt))
+        switch schedule.frequency {
+        case .daily: return "Daily at \(time)"
+        case .weekdays: return "Weekdays at \(time)"
+        case .weekly:
+            let day = RoutineSchedule.clockCalendar.weekdaySymbols[schedule.weekday]
+            return "Every \(day) at \(time)"
+        case .monthly: return "Monthly on day \(schedule.monthDay) at \(time)"
+        case .custom: return "Custom cron: \(schedule.cron)"
+        }
     }
 
     private static func recipients(_ args: [String: Any]) -> String {

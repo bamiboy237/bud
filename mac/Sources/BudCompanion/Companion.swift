@@ -160,6 +160,106 @@ struct Work: Equatable {
     var seconds: Int
 }
 
+/// Safe, structured summary of a failed run built from the server's `reason`, `kind`, and `next`.
+struct RunFailure: Equatable {
+    let title: String
+    let nextStep: String
+    let detail: String?
+    let kind: String?
+
+    init(reason: String? = nil, kind: String? = nil, next: String? = nil) {
+        let cleanKind = Self.clean(kind)
+        let cleanReason = Self.clean(reason)
+        let cleanNext = Self.clean(next)
+
+        self.kind = cleanKind
+        let title = Self.title(for: cleanKind)
+        self.title = title
+        if let modelRecoveryStep = Self.modelRecoveryStep(for: cleanKind, next: cleanNext) {
+            self.nextStep = modelRecoveryStep
+            self.detail = nil
+            return
+        }
+        let nextStep = cleanNext ?? Self.defaultNextStep(for: cleanKind)
+        self.nextStep = nextStep
+        if let cleanReason,
+           cleanReason.caseInsensitiveCompare(title) != .orderedSame,
+           cleanReason.caseInsensitiveCompare(nextStep) != .orderedSame {
+            self.detail = cleanReason
+        } else {
+            self.detail = nil
+        }
+    }
+
+    init(_ data: [String: Any]) {
+        self.init(
+            reason: data["reason"] as? String,
+            kind: data["kind"] as? String,
+            next: data["next"] as? String
+        )
+    }
+
+    private static func clean(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func title(for kind: String?) -> String {
+        switch kind {
+        case "auth": "Sign-in failed"
+        case "permission": "Model access denied"
+        case "rate_limit": "Rate limit reached"
+        case "quota": "Provider credit exhausted"
+        case "network": "Connection failed"
+        case "timeout": "Request timed out"
+        case "service": "Provider error"
+        case "context_full": "Conversation too long"
+        case "content_filter": "Reply blocked"
+        case "budget": "Budget limit reached"
+        case "model_unavailable": "Model unavailable"
+        case "account": "Account connection failed"
+        case "skill": "Skill error"
+        case "recovery": "Run stopped"
+        default: "Couldn’t finish this request"
+        }
+    }
+
+    private static func modelRecoveryStep(for kind: String?, next: String?) -> String? {
+        switch kind {
+        case "permission":
+            return "In Settings → Models, select a model your provider key can use, then resend."
+        case "model_unavailable":
+            return "In Settings → Models, configure the provider key or select another model, then resend."
+        default:
+            guard next?.contains("/model") == true else { return nil }
+            return "In Settings → Models, select another model, then resend."
+        }
+    }
+
+    private static func defaultNextStep(for kind: String?) -> String {
+        switch kind {
+        case "auth": "Sign in to the model provider again, then resend."
+        case "rate_limit": "The provider is rate-limiting; resend in a minute."
+        case "quota": "The provider account is out of credit; top it up or pick another model."
+        case "network": "Check the internet connection, then resend."
+        case "timeout": "The provider took too long; resend, or pick a faster model."
+        case "service": "The provider is having trouble; resend shortly or pick another model."
+        case "context_full": "The conversation is too long for this model; start a new one or pick a model with a larger context."
+        case "content_filter": "The provider refused this content; rephrase the request."
+        case "budget": "Wait for the next UTC day, or raise BUD_DAILY_USD and restart bud."
+        case "account": "Reconnect the account, then resend."
+        case "skill": "Check the skill, then resend."
+        case "recovery": "bud restarted with different code or settings; resend the request."
+        default: "Resend the request. If it fails again, note the time so it can be traced."
+        }
+    }
+}
+
 struct ReplyMore: Equatable {
     var above = false
     var below = false
@@ -235,12 +335,15 @@ final class Companion {
     private(set) var shown = ""
     /// What the latest reply's `[S1]` tags cite, once its run has finished.
     private(set) var replySources: [String: Source] = [:]
+    /// Structured failure details when the latest run failed (live or restored from snapshot).
+    private(set) var runFailure: RunFailure?
     @ObservationIgnored private var replySeq: Int?
     /// The main conversation so far, finished turns only: the reply being written is `shown`.
     private(set) var turns: [Turn] = []
     /// Where a source link pointed in this conversation; the window scrolls there.
     var focus: Focus?
     private(set) var focusRequest = 0
+    private(set) var routineRevision = 0
     private(set) var citedConversations: [SourcePanel] = []
     var citedConversation: SourcePanel? { citedConversations.last }
     private(set) var inspector: InspectorSelection?
@@ -415,6 +518,7 @@ final class Companion {
         reply = ""
         shown = ""
         replySources = [:]
+        runFailure = nil
         replySeq = nil
         replyingTo = nil
         focus = nil
@@ -561,12 +665,29 @@ final class Companion {
     }
 
     func apply(snapshot: [String: Any]) {
-        switch snapshot["status"] as? String {
+        let snapshotStatus = snapshot["status"] as? String
+        let latestRun = (snapshot["recent_runs"] as? [[String: Any]])?.last
+        let latestRunFailed = (latestRun?["status"] as? String) == "failed"
+        switch snapshotStatus {
         case "running", "queued", "stopping":
             activity = .working
             // Joined mid-run: the timer counts from now, not from a start it never saw.
             if runStart == nil { runStart = .now }
-        default: activity = .idle
+            runFailure = nil
+        case "failed":
+            activity = .failed
+            runFailure = RunFailure(latestRun ?? [:])
+        case "paused" where latestRunFailed:
+            activity = .failed
+            runFailure = RunFailure(latestRun ?? [:])
+        default:
+            if snapshotStatus == nil, latestRunFailed {
+                activity = .failed
+                runFailure = RunFailure(latestRun ?? [:])
+            } else {
+                activity = .idle
+                runFailure = nil
+            }
         }
         setOpenApprovals(from: snapshot)
         pendingMessages = (snapshot["queued_messages"] as? [[String: Any]] ?? []).compactMap {
@@ -594,7 +715,7 @@ final class Companion {
         question = turns.last(where: \.fromOwner)?.text ?? ""
         // Only a reply to the latest message: after a newer message, an older reply misleads.
         // It becomes the reply, not a turn: the latest reply is always `reply`, so it's drawn once.
-        if let last = turns.last, !last.fromOwner, last.routine == nil, last.desktopJobID == nil {
+        if runFailure == nil, let last = turns.last, !last.fromOwner, last.routine == nil, last.desktopJobID == nil {
             replySeq = last.seq
             replySources = last.sources
             reply = last.text
@@ -608,6 +729,7 @@ final class Companion {
         showWhole()
         // Something already waiting on you is shown, not left behind the dot.
         if needsAttention { bubbleOpen = true }
+        routineRevision += 1
     }
 
     /// Moves `shown` toward `reply`. The step grows with the backlog, so a long burst eases in
@@ -776,8 +898,12 @@ final class Companion {
                 do {
                     let file = try await Task.detached { try DraftAttachment.read(url) }.value
                     draftAttachments.append(file)
+                } catch DraftAttachment.ReadError.unsupportedFile {
+                    nudge("Can't attach \(url.lastPathComponent). Choose a document or image, not an app, executable, or link.")
+                } catch let error as CocoaError where error.code == .fileReadTooLarge {
+                    nudge("Can't attach \(url.lastPathComponent). Choose a file up to 25 MiB.")
                 } catch {
-                    nudge("Couldn't attach \(url.lastPathComponent). Choose a file up to 25 MiB.")
+                    nudge("Couldn't read \(url.lastPathComponent). Check that you can open the file and try again.")
                 }
             }
         }
@@ -1059,6 +1185,7 @@ final class Companion {
             // The old reply moves into the conversation now, so the bubble clears at once.
             archiveReply()
             reply = ""
+            runFailure = nil
             question = text
             blocks = []
             bubbleOpen = true
@@ -1545,7 +1672,7 @@ final class Companion {
             guard !Task.isCancelled else { return }
             diagnosticsCopied = false
             notices.removeAll { $0.id == notice.id }
-            if openedBubbleHere, !needsAttention, shown.isEmpty, notices.isEmpty, receipt == nil {
+            if openedBubbleHere, !needsAttention, shown.isEmpty, runFailure == nil, notices.isEmpty, receipt == nil {
                 bubbleOpen = false
             }
         }
@@ -1626,6 +1753,7 @@ final class Companion {
             blocks = []
             seenRequests = []
             reply = ""
+            runFailure = nil
             // Job milestones belong to the turn they happened in.
             notices = []
             steps = []
@@ -1635,6 +1763,7 @@ final class Companion {
             bubbleOpen = true
         case "run.started", "run.recovered":
             settle?.cancel()
+            runFailure = nil
             if ["job", "setup"].contains(event.string("trigger")) {
                 archiveReply()
                 reply = ""
@@ -1665,6 +1794,7 @@ final class Companion {
         case "capability.setup", "capability.status":
             receiveSetup(event.data, replacing: event.type == "capability.setup")
         case "run.completed":
+            runFailure = nil
             finish(event)
             closeSteps()
             react(.hop)
@@ -1673,6 +1803,7 @@ final class Companion {
             refreshApprovals()
         case "run.waiting":
             // The run is parked on the owner; the open approvals make the pet say so.
+            runFailure = nil
             finish(event)
             closeSteps()
             activity = .idle
@@ -1709,16 +1840,20 @@ final class Companion {
             }
             refreshApprovals()
         case "run.failed":
-            let reason = event.string("reason")
+            if replySeq != nil { archiveReply() }
+            blocks = []
+            seenRequests = []
             closeSteps()
             replySources = [:]
             replySeq = nil
-            reply = reason.isEmpty ? "The run failed." : "The run failed: \(reason)"
+            reply = ""
             showWhole()
+            runFailure = RunFailure(event.data)
             activity = .failed
             bubbleOpen = true
             refreshApprovals()
         case "run.cancelled":
+            runFailure = nil
             closeSteps()
             activity = .idle
             refreshApprovals()
@@ -1767,6 +1902,7 @@ final class Companion {
             refreshApprovals()
         case "routine.created", "routine.completed", "routine.failed", "routine.cancelled",
              "routine.needs_review":
+            routineRevision += 1
             var data = event.data
             data["kind"] = String(event.type.dropFirst("routine.".count))
             let card = RoutineCard(data)
@@ -1779,6 +1915,9 @@ final class Companion {
                 }
                 turns.append(Turn(fromOwner: false, text: text, seq: event.seq, routine: card))
             }
+        case "routine.updated", "routine.paused", "routine.resumed", "routine.triggered",
+             "routine.delivery_confirmed":
+            routineRevision += 1
         case "background.finished":
             if let jobID = event.data["desktop_job_id"] as? String {
                 if !running {

@@ -103,7 +103,7 @@ struct QuestionCards: View {
     @Environment(\.replyType) private var replyType
 
     private var answers: QuestionAnswers { flow.answers }
-    private var inWindow: Bool { !replyType.compact || companion.windowOpen }
+    private var inWindow: Bool { !replyType.compact }
 
     var body: some View {
         if inWindow {

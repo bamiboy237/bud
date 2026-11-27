@@ -30,6 +30,21 @@ final class ConversationWindow: NSObject, NSWindowDelegate {
         Companion.shared.bubbleOpen = true
     }
 
+    func chooseAttachments(_ add: @escaping ([URL]) -> Void) {
+        guard let window else { return }
+        let panel = NSOpenPanel()
+        panel.prompt = "Attach"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = DraftAttachment.contentTypes
+        panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+        panel.resolvesAliases = false
+        panel.beginSheetModal(for: window) { response in
+            if response == .OK { add(panel.urls) }
+        }
+    }
+
     func togglePin() {
         pinned.toggle()
         UserDefaults.standard.set(pinned, forKey: "windowPinned")
@@ -40,7 +55,7 @@ final class ConversationWindow: NSObject, NSWindowDelegate {
         let companion = Companion.shared
         companion.windowOpen = false
         // Back to the bubble, with whatever bud last said or still needs.
-        companion.bubbleOpen = !companion.shown.isEmpty || companion.needsAttention
+        companion.bubbleOpen = !companion.shown.isEmpty || companion.runFailure != nil || companion.needsAttention
     }
 
     private func make() -> NSWindow {
@@ -114,7 +129,6 @@ private struct ConversationView: View {
             : .scale(scale: 0.96).combined(with: .opacity)
     }
 
-    @StateObject private var pickingAttachments = Flag()
     @StateObject private var droppingAttachments = Flag()
 
     var body: some View {
@@ -128,7 +142,7 @@ private struct ConversationView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        if !companion.turns.isEmpty || !companion.shown.isEmpty || companion.running {
+                        if !companion.turns.isEmpty || !companion.shown.isEmpty || companion.runFailure != nil || companion.running {
                             SessionDateDivider(label: "Today")
                                 .padding(.bottom, 20)
                         }
@@ -147,7 +161,7 @@ private struct ConversationView: View {
                     .frame(maxWidth: .infinity)
                 }
                 .overlay {
-                    if companion.turns.isEmpty, companion.shown.isEmpty {
+                    if companion.turns.isEmpty, companion.shown.isEmpty, companion.runFailure == nil {
                         connectionStatus
                     }
                 }
@@ -242,8 +256,12 @@ private struct ConversationView: View {
                 AttachmentInspector(selection: selection, close: companion.closeInspector)
                     .id(selection.id)
             case .routine(let selection):
-                RoutineInspector(selection: selection, close: companion.closeInspector)
-                    .id(selection.id)
+                RoutineInspector(
+                    selection: selection,
+                    refreshRevision: companion.routineRevision,
+                    close: companion.closeInspector
+                )
+                .id(selection.id)
             case .browser(let selection):
                 BrowserInspector(selection: selection, close: companion.closeInspector)
                     .id(selection.id)
@@ -404,7 +422,7 @@ private struct ConversationView: View {
         VStack(alignment: .leading, spacing: 12) {
             if companion.running, let start = companion.runStart {
                 Working(since: start, steps: companion.steps)
-            } else if let work = companion.lastWork, !companion.shown.isEmpty {
+            } else if let work = companion.lastWork, !companion.shown.isEmpty || companion.runFailure != nil {
                 WorkLine(work: work)
             }
             ForEach(companion.notices) { notice in
@@ -420,6 +438,9 @@ private struct ConversationView: View {
             }
             if !companion.heldMessages.isEmpty {
                 UnsentMessage(companion: companion).frame(maxWidth: 420)
+            }
+            if let failure = companion.runFailure {
+                RunFailureView(failure: failure, showTitle: true)
             }
             if !companion.shown.isEmpty {
                 Reply(
@@ -530,7 +551,7 @@ private struct ConversationView: View {
             // Bottom utility strip: minimal by default, with send/stop action on the right.
             HStack(alignment: .center, spacing: 8) {
                 if companion.inputPurpose == .ask {
-                    Button { pickingAttachments.on = true } label: {
+                    Button { window.chooseAttachments(companion.addAttachments) } label: {
                         Image(systemName: "paperclip")
                     }
                     .buttonStyle(IconButton(size: 26))
@@ -571,10 +592,6 @@ private struct ConversationView: View {
             border: highlighted ? Paper.accent : Paper.borderSubtle,
             borderWidth: dropTargeted ? 2 : highlighted ? 1 : 0.5
         )
-        .fileImporter(isPresented: $pickingAttachments.on, allowedContentTypes: [.item],
-                      allowsMultipleSelection: true) { result in
-            if case .success(let urls) = result { companion.addAttachments(urls) }
-        }
         .animation(.easeOut(duration: 0.15), value: typing)
         .animation(.easeOut(duration: 0.15), value: companion.replyingTo)
         .frame(maxWidth: column)

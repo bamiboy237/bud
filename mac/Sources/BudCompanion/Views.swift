@@ -449,6 +449,44 @@ struct UnsentMessage: View {
     }
 }
 
+/// Legible failure summary for a failed run, reusing the server's safe `kind`, `next`, and `reason`.
+struct RunFailureView: View {
+    let failure: RunFailure
+    var showTitle = true
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            RoundedRectangle(cornerRadius: 1)
+                .fill(Paper.errorInk.opacity(0.55))
+                .frame(width: 2)
+            VStack(alignment: .leading, spacing: 4) {
+                if showTitle {
+                    Text(failure.title)
+                        .font(Paper.Typography.label)
+                        .foregroundStyle(Paper.errorInk)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+                Text(failure.nextStep)
+                    .font(showTitle ? Paper.Typography.body : Paper.Typography.callout)
+                    .foregroundStyle(Paper.inkPrimary)
+                    .lineSpacing(showTitle ? 3.5 : 2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                if let detail = failure.detail {
+                    Text(detail)
+                        .font(Paper.Typography.ledgerMeta)
+                        .foregroundStyle(Paper.inkMuted)
+                        .lineLimit(showTitle ? nil : 4)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
 // MARK: Bubble
 
 private struct Bubble: View {
@@ -490,6 +528,9 @@ private struct Bubble: View {
             }
             if companion.unsentSpeech != nil { UnsentSpeech(companion: companion) }
             if !companion.heldMessages.isEmpty { UnsentMessage(companion: companion) }
+            if let failure = companion.runFailure, companion.setups.isEmpty {
+                RunFailureView(failure: failure, showTitle: false)
+            }
             if !companion.shown.isEmpty, companion.setups.isEmpty {
                 // The bubble hugs its text up to `maxReply`; longer replies scroll. Reading
                 // starts at the top, so streamed text grows below the fold instead of pulling
@@ -568,9 +609,9 @@ private struct Bubble: View {
     }
 
     private var compact: Bool {
-        companion.shown.isEmpty && companion.notices.isEmpty && !companion.needsAttention
-            && companion.receipt == nil && companion.steps.isEmpty && companion.unsentSpeech == nil
-            && companion.heldMessages.isEmpty
+        companion.shown.isEmpty && companion.runFailure == nil && companion.notices.isEmpty
+            && !companion.needsAttention && companion.receipt == nil && companion.steps.isEmpty
+            && companion.unsentSpeech == nil && companion.heldMessages.isEmpty
     }
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -644,7 +685,7 @@ private struct Bubble: View {
     /// Opens the whole conversation in a window, for long replies and earlier messages.
     private var expand: some View {
         chrome("arrow.up.left.and.arrow.down.right", label: "Open in a window", restOpacity: 0.7) {
-            ConversationWindow.shared.show()
+            Task { @MainActor in ConversationWindow.shared.show() }
         }
         .help("Open in a window")
     }
@@ -682,7 +723,7 @@ private struct Bubble: View {
             if companion.approvals.isEmpty { return ("A job needs you", Paper.inkPrimary, false) }
             let asking = companion.hasQuestion
             return (asking ? "Has a question" : "Needs your OK", Paper.inkPrimary, false)
-        case .failed: return ("Couldn't finish", Paper.errorInk, false)
+        case .failed: return (companion.runFailure?.title ?? "Couldn't finish", Paper.errorInk, false)
         case .done: return ("Done", Paper.inkSecondary, false)
         case .idle: return nil
         }
@@ -834,7 +875,7 @@ struct ApprovalCard: View {
     @Environment(\.replyType) private var replyType
 
     private var inWindow: Bool {
-        !replyType.compact || companion.windowOpen
+        !replyType.compact
     }
 
     private var busy: Bool {
