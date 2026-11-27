@@ -555,9 +555,14 @@ class Runner(DBOSConfiguredInstance):
         trigger: str = "message",
     ) -> dict:
         events = self.hub.log.read(session_id)
-        last = next((event for event in reversed(events) if event.type in RUN_END_EVENTS), None)
-        saved = last is not None and bool(
-            last.data.get("conversation_saved") or last.data.get("conversation")
+        endings = [event for event in events if event.type in RUN_END_EVENTS]
+        checkpoint = next(
+            (
+                event
+                for event in reversed(endings)
+                if event.data.get("conversation_saved") or event.data.get("conversation")
+            ),
+            None,
         )
         item = self.work_items.for_session(session_id) if self.work_items is not None else None
         occ = (
@@ -587,8 +592,7 @@ class Runner(DBOSConfiguredInstance):
                 else (text if item is None else item.owner_request)
             )
         )
-        # Inputs name the saved snapshot or a log position instead of copying history, so
-        # each queued run stays small. Both references are immutable once written.
+        # Pin the saved snapshot and any later log slice when the run is queued.
         return {
             "session_id": session_id,
             "run_id": occ.run_id
@@ -614,8 +618,11 @@ class Runner(DBOSConfiguredInstance):
             "destination": (
                 routine.destination.model_dump(mode="json") if routine is not None else None
             ),
-            "conversation_run": last.data["run_id"] if saved and last is not None else None,
-            "history_seq": None if saved else (events[-1].seq if events else 0),
+            "conversation_run": checkpoint.data["run_id"] if checkpoint is not None else None,
+            "conversation_seq": checkpoint.seq if checkpoint is not None else None,
+            "history_seq": None
+            if checkpoint is not None and checkpoint is endings[-1]
+            else (events[-1].seq if events else 0),
             "results": RESULTS.dump_json(results).decode() if results is not None else None,
             "skills": skills,
             "model": self._resolve_run_model(session_id),
@@ -1290,7 +1297,7 @@ class Runner(DBOSConfiguredInstance):
                     end_event.created_at,
                     text,
                 ):
-                    report_path = str(self.workspace / name)
+                    report_path = name
             except OSError as exc:
                 logger.warning("Could not save routine %d report: %s", routine.routine_seq, exc)
         dest_feed = routine.destination.feed_id
@@ -2288,15 +2295,28 @@ class Runner(DBOSConfiguredInstance):
             self._current.reset(token)
 
     def _history(self, run: dict) -> tuple[Conversation | None, list[ModelMessage]]:
+        conversation = None
         if run.get("conversation_run"):
             saved = self.hub.log.conversation(run["session_id"], run["conversation_run"])
             if saved is None:
                 raise RecoveryRefused("The saved conversation for this run is unavailable.")
-            return ConversationTypeAdapter.validate_json(saved), []
-        if run.get("history_seq") is None:
-            return None, []
+            conversation = ConversationTypeAdapter.validate_json(saved)
+        if (history_seq := run.get("history_seq")) is None:
+            return conversation, []
         events = self.hub.log.read(run["session_id"])
-        return None, model_history([event for event in events if event.seq <= run["history_seq"]])
+        checkpoint_seq = run.get("conversation_seq") if conversation is not None else None
+        history = model_history(
+            [
+                event
+                for event in events
+                if event.seq <= history_seq
+                and (checkpoint_seq is None or event.seq > checkpoint_seq)
+            ]
+        )
+        if conversation is not None:
+            conversation.messages.extend(history)
+            return conversation, []
+        return None, history
 
     def _started(self, run: dict) -> None:
         self.hub.publish_once(

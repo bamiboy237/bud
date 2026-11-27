@@ -96,6 +96,8 @@ class RunView(BaseModel):
     run_id: str
     status: str
     reason: str | None = None
+    kind: str | None = None
+    next: str | None = None
     model: str | None = None
     profile: dict[str, str] | None = None
     prompt_version: str | None = None
@@ -370,6 +372,8 @@ def runs(events: list[Event], *, summaries: bool = False) -> list[RunView]:
                     view.loaded_skills = dict(previous.loaded_skills)
             view.status = status
             view.reason = event.data.get("reason")
+            view.kind = event.data.get("kind") if event.type == "run.failed" else None
+            view.next = event.data.get("next") if event.type == "run.failed" else None
             if event.data.get("model") is not None:
                 view.model = event.data["model"]
             if isinstance(event.data.get("profile"), dict):

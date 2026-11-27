@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 from pydantic_ai import models
 from pydantic_ai.exceptions import (
@@ -10,13 +12,22 @@ from pydantic_ai.exceptions import (
     ModelRequestTimeout,
     ModelServerError,
     ModelUnavailableError,
+    UserError,
 )
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.usage import RequestUsage
+from pydantic_ai_harness.compaction import resolve_context_window
 
-from bud.gateway.errors import NoModelAvailable
+from bud.config import get_settings
+from bud.gateway import build_gateway, chatgpt
+from bud.gateway.errors import (
+    NoModelAvailable,
+    WorkingContextBudgetError,
+    error_kind,
+    error_summary,
+)
 from bud.gateway.ledger import Ledger
 from bud.gateway.registry import ModelSpec, Registry
 from bud.gateway.router import Gateway
@@ -49,6 +60,70 @@ def local_spec(name, endpoint="http://localhost:8000/v1"):
 
 def subscription_spec():
     return api_spec("plan", provider="openai-chatgpt", billing="subscription")
+
+
+async def test_chatgpt_catalog_preserves_and_resolves_context_windows(monkeypatch):
+    models = [
+        {"slug": "gpt-6.1-terra", "context_window": 272_000, "max_tokens": 12_000},
+        {"slug": "catalog-length", "context_window": True, "max_context_length": 160_000},
+        {"slug": "catalog-tokens", "context_window": "64000", "max_tokens": 90_000},
+        {"slug": "gpt-5.2", "context_window": -1},
+        {"slug": "gpt-6.2-sol", "max_tokens": 0},
+        {"slug": "unlisted-family", "max_context_length": 1.5},
+    ]
+    client = MagicMock()
+    client.get = AsyncMock(
+        return_value={"models": [dict(row, visibility="list") for row in models]}
+    )
+    provider = MagicMock(client=client)
+    monkeypatch.setattr(chatgpt, "OpenAIChatGPTProvider", lambda **_: provider)
+    settings = get_settings()
+    store = chatgpt.ChatGPTStore(settings.data_dir)
+
+    refreshed = await chatgpt.refresh_models(store)
+    assert store.state()["models"] == refreshed
+    assert [row.get("context_window") for row in refreshed] == [272_000, 160_000, 90_000] + [
+        None
+    ] * 3
+    store.path.touch()
+
+    priced_window = resolve_context_window("openai-chatgpt:gpt-5.2")
+    assert priced_window is not None
+    gateway = build_gateway(settings)
+    try:
+        assert {
+            spec.name: spec.context_window
+            for spec in gateway.registry.models
+            if spec.provider == "openai-chatgpt"
+        } == {
+            "gpt-6.1-terra": 272_000,
+            "catalog-length": 160_000,
+            "catalog-tokens": 90_000,
+            "gpt-5.2": priced_window,
+            "gpt-6.2-sol": 200_000,
+            "unlisted-family": None,
+        }
+        selected = gateway.model("fast", selected="openai-chatgpt:gpt-6.1-terra")
+        assert selected.context_window == 272_000
+    finally:
+        gateway.close()
+
+
+@pytest.mark.parametrize(
+    ("error_type", "kind", "summary"),
+    [
+        (UserError, "unknown", "UserError"),
+        (
+            WorkingContextBudgetError,
+            "context_full",
+            "Recent content or tool definitions exceed Bud's working context budget.",
+        ),
+    ],
+)
+def test_user_error_classification_keeps_messages_private(error_type, kind, summary):
+    error = error_type("Private request contents")
+    assert error_kind(error) == kind
+    assert error_summary(error) == summary
 
 
 @pytest.fixture

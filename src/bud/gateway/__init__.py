@@ -3,7 +3,7 @@
 import re
 
 from bud.config import Settings, get_settings
-from bud.gateway.chatgpt import ChatGPTStore
+from bud.gateway.chatgpt import ChatGPTStore, chatgpt_context_window
 from bud.gateway.ledger import Ledger
 from bud.gateway.registry import ModelConfigurationError, ModelSpec, Registry, load_registry
 from bud.gateway.router import Gateway, NoModelAvailable, provider_model_factory
@@ -31,7 +31,13 @@ def build_gateway(
     state = chatgpt.state() if chatgpt.connected and use_chatgpt else {}
     selected = state.get("selected_model")
     chatgpt_models = [
-        ModelSpec(provider="openai-chatgpt", name=model["slug"], tier=tier, billing="subscription")
+        ModelSpec(
+            provider="openai-chatgpt",
+            name=model["slug"],
+            tier=tier,
+            billing="subscription",
+            context_window=chatgpt_context_window(model),
+        )
         for model in state.get("models", [])
         for tier in ("fast", "frontier")
     ]

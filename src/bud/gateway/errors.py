@@ -17,6 +17,10 @@ class NoModelAvailable(Exception):
     """A requested model has no configured key, provider, or tool support."""
 
 
+class WorkingContextBudgetError(ai.UserError):
+    """The request cannot fit Bud's working context budget."""
+
+
 ErrorKind = Literal[
     "auth",
     "permission",
@@ -66,7 +70,7 @@ def error_kind(exc: BaseException) -> ErrorKind:
         (SpendLimitExceeded, "budget"),
         (ai.ModelQuotaExceededError, "quota"),
         (ai.ModelRateLimitError, "rate_limit"),
-        (ai.ModelContextWindowExceededError, "context_full"),
+        ((ai.ModelContextWindowExceededError, WorkingContextBudgetError), "context_full"),
         (ai.ContentFilterError, "content_filter"),
         (
             (ai.ModelTimeoutError, ai.ModelRequestTimeout, TimeoutError, httpx.TimeoutException),
@@ -114,6 +118,8 @@ def error_summary(exc: BaseException) -> str:
         )
     if isinstance(exc, ai.ContentFilterError):
         return "The model provider's content filter blocked this reply."
+    if isinstance(exc, WorkingContextBudgetError):
+        return "Recent content or tool definitions exceed Bud's working context budget."
     fields = [type(exc).__name__]
     status = getattr(exc, "status_code", None)
     if isinstance(status, int):

@@ -23,7 +23,7 @@ from pydantic_ai_harness.compaction._shared import (
     resolve_token_trigger,
 )
 
-from bud.gateway.errors import error_summary
+from bud.gateway.errors import WorkingContextBudgetError, error_summary
 from bud.gateway.tracked import RequestAttribution, request_attribution, request_session
 from bud.harness.results import SPILL_CHARS, SqliteResultStore, spill_old_results
 
@@ -122,9 +122,19 @@ class BackgroundCompaction(AbstractCapability[None]):
     def _fits_rewritten(
         messages: list[ModelMessage], request: ModelRequestContext, threshold: int
     ) -> bool:
+        # Resolve visibility before counting tools; withheld schemas never reach the model.
+        _, parameters = request.model.prepare_request(
+            request.model_settings, request.model_request_parameters
+        )
+        sent_tools = [
+            tool
+            for tool in parameters.function_tools
+            if parameters.visibility_of(tool.name) != "withheld"
+        ]
+        sent_parameters = replace(parameters, function_tools=sent_tools, tool_visibility=None)
         # Retained responses report the old full input. They cannot anchor a rewritten prefix.
-        schema_tokens = (len(PARAMETERS.dump_json(request.model_request_parameters)) + 3) // 4
-        return estimate_token_count(messages) + schema_tokens <= threshold
+        parameter_tokens = (len(PARAMETERS.dump_json(sent_parameters)) + 3) // 4
+        return estimate_token_count(messages) + parameter_tokens <= threshold
 
     def always_kept(self, messages: list[ModelMessage]) -> list[ModelMessage]:
         """The newest messages, which compaction never summarizes away."""
@@ -149,7 +159,7 @@ class BackgroundCompaction(AbstractCapability[None]):
             )
         request_context = replace(request_context, messages=messages)
         threshold = resolve_token_trigger(
-            None, self.max_fraction, ctx.model, self.fallback_context_window
+            None, self.max_fraction, request_context.model, self.fallback_context_window
         )
         assert threshold is not None
         signature = _signature(request_context)
@@ -218,13 +228,16 @@ class BackgroundCompaction(AbstractCapability[None]):
             preparation_id = None
             self._reserve(ctx)
             compacted = await self._summarize(ctx, request_context)
-        if _digest(compacted) == _digest(messages) or not self._fits_rewritten(
-            compacted, request_context, threshold
+        unchanged = _digest(compacted) == _digest(messages)
+        if not self._fits_rewritten(compacted, request_context, threshold) or (
+            unchanged and find_token_cutoff(messages, self.keep_tokens, None) > 0
         ):
-            raise UserError(
+            raise WorkingContextBudgetError(
                 "Recent content or tool definitions exceed bud's working context budget. "
                 "Use bounded read-back or split the input before continuing."
             )
+        if unchanged:
+            return request_context
         self.record(
             {
                 "session_id": session_id,
