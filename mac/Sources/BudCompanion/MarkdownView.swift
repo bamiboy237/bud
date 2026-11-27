@@ -502,14 +502,44 @@ private struct CodeBlockView: View {
 /// A table in a hairline frame: a recessed header row, row dividers, padded cells, and the
 /// column alignment the markdown asked for. Numbers use tabular digits, so columns line up.
 private struct TableView: View {
+    private final class ScrollEdges: ObservableObject {
+        @Published var hidden: Edge.Set = .trailing
+    }
+
     let table: Markdown.Table
     @Environment(\.replyType) private var type
     @Environment(\.markdownEquations) private var equations
+    @StateObject private var edges = ScrollEdges()
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
             grid.fixedSize(horizontal: true, vertical: true)
-            ScrollView(.horizontal) { grid.fixedSize(horizontal: true, vertical: true) }
+            ScrollView(.horizontal) {
+                grid.fixedSize(horizontal: true, vertical: true)
+            }
+            .onScrollGeometryChange(for: Edge.Set.self) { geometry in
+                var hidden: Edge.Set = []
+                if geometry.visibleRect.minX > 1 { hidden.insert(.leading) }
+                if geometry.visibleRect.maxX < geometry.contentSize.width - 1 {
+                    hidden.insert(.trailing)
+                }
+                return hidden
+            } action: { _, hidden in
+                edges.hidden = hidden
+            }
+            .mask {
+                HStack(spacing: 0) {
+                    if edges.hidden.contains(.leading) {
+                        LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing)
+                            .frame(width: 12)
+                    }
+                    Rectangle()
+                    if edges.hidden.contains(.trailing) {
+                        LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
+                            .frame(width: 12)
+                    }
+                }
+            }
         }
     }
 
@@ -545,6 +575,7 @@ private struct TableView: View {
                 .multilineTextAlignment(alignment.text)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 200, alignment: alignment.frame)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
                 // Fill the column, so dividers and the header tint line up on every row.

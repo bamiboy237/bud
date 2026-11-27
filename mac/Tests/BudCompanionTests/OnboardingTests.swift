@@ -74,6 +74,7 @@ import Testing
             syncNeedsOnboarding: { syncedOnboarding.append($0) }
         )
 
+        store.beginKeyEdit("OPENAI_API_KEY")
         store.keyDrafts["OPENAI_API_KEY"] = "  sk-test-123  "
         await store.saveKey("OPENAI_API_KEY")
 
@@ -83,6 +84,7 @@ import Testing
         let sentKeys = calls[0].2?["keys"] as? [String: Any]
         #expect(sentKeys?["OPENAI_API_KEY"] as? String == "sk-test-123")
         #expect(store.keyDrafts["OPENAI_API_KEY"] == "")
+        #expect(store.replacingKey == nil)
         #expect(store.status.hasModel == true)
         #expect(syncedOnboarding == [false])
 
@@ -92,6 +94,28 @@ import Testing
         #expect(removedKeys?["OPENAI_API_KEY"] is NSNull)
         #expect(store.status.hasModel == false)
         #expect(syncedOnboarding == [false, true])
+    }
+
+    @Test @MainActor func failedKeySaveKeepsEditorOpenUntilCancelled() async {
+        let key = "OPENAI_API_KEY"
+        let store = OnboardingStore(
+            sendRequest: { _, _, _ in throw ConnectionError.unreachable },
+            openURL: { _ in },
+            syncNeedsOnboarding: { _ in }
+        )
+
+        store.beginKeyEdit(key)
+        store.keyDrafts[key] = "sk-test-123"
+        await store.saveKey(key)
+
+        #expect(store.replacingKey == key)
+        #expect(store.keyDrafts[key] == "sk-test-123")
+        #expect(store.error != nil)
+
+        store.cancelKeyEdit()
+
+        #expect(store.replacingKey == nil)
+        #expect(store.keyDrafts[key] == "")
     }
 
     @Test(arguments: [true, false])

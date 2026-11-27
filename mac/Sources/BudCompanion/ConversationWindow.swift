@@ -252,6 +252,11 @@ private struct ConversationView: View {
                     .id(panel.target)
             }
         }
+        .overlay {
+            if droppingAttachments.on && companion.canAddAttachments {
+                attachmentDropOverlay
+            }
+        }
         .ignoresSafeArea(.container, edges: .top)
         .foregroundStyle(Paper.inkPrimary)
         .background {
@@ -312,6 +317,26 @@ private struct ConversationView: View {
         .onChange(of: companion.replyingTo) { _, quote in
             if quote != nil { typing = true }
         }
+    }
+
+    private var attachmentDropOverlay: some View {
+        ZStack {
+            Paper.canvas.opacity(0.92)
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(Paper.borderStrong, style: StrokeStyle(lineWidth: 1.5, dash: [6, 4]))
+                .padding(14)
+            VStack(spacing: 6) {
+                Image(systemName: "arrow.down.doc")
+                    .font(.system(size: 20))
+                    .foregroundStyle(Paper.inkSecondary)
+                    .accessibilityHidden(true)
+                Text("Drop files to attach").font(Paper.Typography.label)
+                Text("Up to 5 files")
+                    .font(Paper.Typography.caption)
+                    .foregroundStyle(Paper.inkMuted)
+            }
+        }
+        .allowsHitTesting(false)
     }
 
     private func historySheet() -> some View {
@@ -505,12 +530,16 @@ private struct ConversationView: View {
                     .id("latest-reply")
             }
             ForEach(companion.pendingMessages) { item in
-                TurnView(
-                    turn: Turn(fromOwner: true, text: item.text),
-                    companion: companion,
-                    focused: false
-                )
-                .opacity(0.75)
+                VStack(alignment: .trailing, spacing: 4) {
+                    TurnView(
+                        turn: Turn(fromOwner: true, text: item.text),
+                        companion: companion,
+                        focused: false
+                    )
+                    Label("Waiting to run", systemImage: "clock")
+                        .font(Paper.Typography.caption)
+                        .foregroundStyle(Paper.inkMuted)
+                }
             }
             if !companion.setups.isEmpty {
                 SetupDeck(companion: companion)
@@ -537,39 +566,36 @@ private struct ConversationView: View {
         let hasText = !companion.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let canSend = hasText || (companion.inputPurpose == .ask && !companion.draftAttachments.isEmpty)
         let canCancel = companion.replyingTo != nil || companion.inputPurpose != .ask
-        let dropTargeted = droppingAttachments.on && companion.canAddAttachments
         let composerShape = RoundedRectangle(cornerRadius: Paper.radiusComposer, style: .continuous)
-        let voice = Voice.shared
+        let prompt = companion.replyingTo != nil && companion.inputPurpose == .ask
+            ? "Reply to this message…" : companion.inputPurpose.prompt
 
         return VStack(alignment: .leading, spacing: 0) {
             if let quote = companion.replyingTo {
-                HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: "arrowshape.turn.up.left")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(Paper.inkSecondary)
-                        .padding(.top, 2)
+                HStack(spacing: 8) {
+                    RoundedRectangle(cornerRadius: 1)
+                        .fill(Paper.borderStrong)
+                        .frame(width: 2)
                     Text(quote)
-                        .font(Paper.Typography.callout)
+                        .font(Paper.Typography.caption)
                         .foregroundStyle(Paper.inkSecondary)
                         .lineLimit(2)
-                        .truncationMode(.tail)
                     Spacer(minLength: 4)
-                    KeybindChip("Esc")
                     Button {
                         companion.replyingTo = nil
                     } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 9, weight: .semibold))
-                            .frame(width: 16, height: 16)
-                            .contentShape(Rectangle())
+                        Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
                     }
-                    .buttonStyle(IconButton(size: 18))
+                    .buttonStyle(IconButton(size: 22))
                     .accessibilityLabel("Don't reply to this")
                 }
-                .padding(.horizontal, 14)
-                .padding(.top, 10)
-                .padding(.bottom, 8)
-                Rectangle().fill(Paper.hairline).frame(height: 0.5)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.leading, 8)
+                .padding(.trailing, 4)
+                .padding(.vertical, 4)
+                .background(Paper.recessed, in: RoundedRectangle(cornerRadius: Paper.radiusSM))
+                .padding(.horizontal, 10)
+                .padding(.top, 8)
             }
 
             if companion.inputPurpose == .ask, !companion.draftAttachments.isEmpty {
@@ -581,7 +607,7 @@ private struct ConversationView: View {
             // Top row: multi-line text input with generous breathing room.
             ZStack(alignment: .topLeading) {
                 if companion.draft.isEmpty {
-                    Text(companion.inputPurpose.prompt)
+                    Text(prompt)
                         .font(Paper.Typography.body)
                         .foregroundStyle(Paper.placeholder)
                         .lineLimit(1)
@@ -591,8 +617,12 @@ private struct ConversationView: View {
                     .font(Paper.Typography.body)
                     .lineLimit(1...6)
                     .onExitCommand {
-                        companion.inputPurpose = .ask
-                        companion.replyingTo = nil
+                        if Voice.shared.state == .listening {
+                            Voice.shared.cancel()
+                        } else {
+                            companion.inputPurpose = .ask
+                            companion.replyingTo = nil
+                        }
                     }
             }
             .padding(.horizontal, 14)
@@ -622,23 +652,7 @@ private struct ConversationView: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 8)
-                if companion.inputPurpose == .ask, !companion.needsOnboarding, voice.state != .off {
-                    let listening = voice.state == .listening
-                    let hint = "Hold \(voice.keyName) to talk to bud"
-                    Button {
-                        if listening {
-                            voice.cancel()
-                        } else {
-                            companion.nudge("\(hint).")
-                        }
-                    } label: {
-                        Image(systemName: listening ? "waveform" : "mic")
-                            .font(.system(size: 12.5, weight: .medium))
-                    }
-                    .buttonStyle(IconButton(size: 26, active: listening))
-                    .help(hint)
-                    .accessibilityLabel("Voice input")
-                }
+                voiceControl
                 if companion.needsOnboarding, companion.inputPurpose == .ask {
                     Button("Add a model…") { OnboardingWindow.shared.show() }
                         .buttonStyle(CardButton(kind: .secondary))
@@ -658,8 +672,8 @@ private struct ConversationView: View {
             composerShape,
             lift: 1,
             fill: Paper.elevated,
-            border: dropTargeted ? Paper.accent : typing ? Paper.borderStrong : Paper.borderSubtle,
-            borderWidth: dropTargeted ? 1.5 : typing ? 1 : 0.5
+            border: typing ? Paper.borderStrong : Paper.borderSubtle,
+            borderWidth: typing ? 1 : 0.5
         )
         .animation(.easeOut(duration: 0.15), value: typing)
         .animation(.easeOut(duration: 0.15), value: companion.replyingTo)
@@ -667,6 +681,29 @@ private struct ConversationView: View {
         .padding(.horizontal, 24)
         .padding(.bottom, 18)
         .padding(.top, 6)
+    }
+
+    @ViewBuilder private var voiceControl: some View {
+        let voice = Voice.shared
+        let listening = voice.state == .listening
+        if voice.state == .transcribing {
+            ProgressView()
+                .controlSize(.mini)
+                .frame(width: 26, height: 26)
+                .accessibilityLabel("Voice input")
+                .accessibilityValue("Transcribing")
+        } else if listening || (companion.inputPurpose == .ask && !companion.needsOnboarding) {
+            Button(action: voice.toggle) {
+                Image(systemName: listening ? "waveform" : "mic")
+                    .font(.system(size: 12.5, weight: .medium))
+            }
+            .buttonStyle(IconButton(size: 26, active: listening))
+            .background(listening ? Paper.fillHover : .clear, in: Capsule())
+            .help(listening
+                ? "Click to stop and send (Esc cancels)"
+                : "Dictate a message (or hold \(voice.keyName))")
+            .accessibilityLabel("Voice input")
+        }
     }
 
     private var windowControls: some View {
@@ -961,23 +998,18 @@ private struct JumpButton: View {
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 5) {
-                Image(systemName: "arrow.down")
-                    .font(.system(size: 10, weight: .semibold))
-                Text("Jump to latest")
-                    .font(Paper.Typography.captionMedium)
-            }
-            .foregroundStyle(hovered.on ? Paper.inkPrimary : Paper.inkSecondary)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .surface(
-                Capsule(),
-                lift: 1.0,
-                fill: hovered.on ? Paper.overlay : Paper.elevated,
-                border: Paper.borderStrong,
-                borderWidth: 0.5
-            )
-            .contentShape(Capsule())
+            Image(systemName: "arrow.down")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(hovered.on ? Paper.inkPrimary : Paper.inkSecondary)
+                .frame(width: 30, height: 30)
+                .surface(
+                    Circle(),
+                    lift: 1.0,
+                    fill: hovered.on ? Paper.overlay : Paper.elevated,
+                    border: Paper.borderStrong,
+                    borderWidth: 0.5
+                )
+                .contentShape(Circle())
         }
         .buttonStyle(.plain)
         .pointerStyle(.link)
@@ -1009,6 +1041,26 @@ private struct SourcePanelView: View {
         return nil
     }
 
+    private var localWorkspaceFile: URL? {
+        guard case .workspace(let path) = panel.target, panel.document != nil,
+              !path.hasPrefix("/"), !path.split(separator: "/").contains("..")
+        else { return nil }
+        let settings = BudSettings.load()
+        guard !settings.savedRemote, let origin = URL(string: settings.url),
+              origin.scheme == "http", BudConnection.safeOrigin(origin)
+        else { return nil }
+        let home = settings.home.isEmpty
+            ? FileManager.default.homeDirectoryForCurrentUser.appending(path: ".bud")
+            : BudConnection.resolvedHomeURL(home: settings.home)
+        let workspace = home.appending(path: "workspace").resolvingSymlinksInPath()
+        let file = workspace.appending(path: path).resolvingSymlinksInPath()
+        guard file.pathComponents.count > workspace.pathComponents.count,
+              file.pathComponents.starts(with: workspace.pathComponents),
+              (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+        else { return nil }
+        return file
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
@@ -1023,6 +1075,18 @@ private struct SourcePanelView: View {
                         .lineLimit(1)
                 }
                 Spacer()
+                if localWorkspaceFile != nil {
+                    Button {
+                        if let file = localWorkspaceFile {
+                            NSWorkspace.shared.activateFileViewerSelecting([file])
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up.right.square").font(.system(size: 12))
+                    }
+                    .buttonStyle(IconButton(size: 26))
+                    .help("Reveal in Finder")
+                    .accessibilityLabel("Reveal in Finder")
+                }
                 Button(action: companion.closeInspector) {
                     Image(systemName: "xmark").font(.system(size: 10, weight: .semibold))
                 }

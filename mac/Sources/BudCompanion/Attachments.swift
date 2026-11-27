@@ -111,14 +111,15 @@ struct DraftAttachmentChips: View {
 
     var body: some View {
         ScrollView(.horizontal) {
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 ForEach(files) { file in
-                    HStack(spacing: 3) {
-                        AttachmentChip(name: file.reference.name)
-                        Button { remove(file.id) } label: { Image(systemName: "xmark") }
-                            .buttonStyle(IconButton(size: 20))
-                            .accessibilityLabel("Remove \(file.reference.name)")
+                    AttachmentChip(
+                        name: file.reference.name,
+                        isImage: file.reference.type?.conforms(to: .image) == true
+                    ) {
+                        remove(file.id)
                     }
+                    .help(file.reference.name)
                 }
             }
         }
@@ -127,17 +128,33 @@ struct DraftAttachmentChips: View {
 
 struct AttachmentChip: View {
     let name: String
+    var isImage = false
+    var remove: (() -> Void)? = nil
 
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous)
-        Label(name, systemImage: "doc")
-            .font(Paper.Typography.callout)
-            .lineLimit(1)
-            .truncationMode(.middle)
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
-            .background(Paper.elevated, in: shape)
-            .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5).allowsHitTesting(false) }
+        let shape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
+        HStack(spacing: 6) {
+            Image(systemName: isImage ? "photo" : "doc")
+                .accessibilityHidden(true)
+            Text(name)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: 180, alignment: .leading)
+            if let remove {
+                Button(action: remove) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                }
+                .buttonStyle(IconButton(size: 20))
+                .accessibilityLabel("Remove \(name)")
+            }
+        }
+        .font(Paper.Typography.callout)
+        .padding(.leading, 9)
+        .padding(.trailing, remove == nil ? 9 : 4)
+        .frame(height: 28)
+        .background(Paper.elevated, in: shape)
+        .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5).allowsHitTesting(false) }
     }
 }
 
@@ -161,7 +178,7 @@ struct SentAttachment: View {
                     .frame(maxWidth: 260, maxHeight: 180)
                     .clipShape(RoundedRectangle(cornerRadius: Paper.radiusMD))
             } else {
-                AttachmentChip(name: file.name)
+                AttachmentChip(name: file.name, isImage: file.type?.conforms(to: .image) == true)
             }
         }
         .buttonStyle(PaperHit(shape: RoundedRectangle(cornerRadius: Paper.radiusMD)))

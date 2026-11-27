@@ -113,7 +113,11 @@ final class BrowserInspectorState: ObservableObject {
             applyStatus(status)
         } catch {
             guard canRefresh(id) else { return }
-            connectionFailed(error)
+            if case ConnectionError.http(404, _) = error {
+                applyStatus(["enabled": false])
+            } else {
+                connectionFailed(error)
+            }
             return
         }
 
@@ -202,6 +206,8 @@ final class BrowserInspectorState: ObservableObject {
                 privateInput = false
                 handoffOpen = false
             }
+        } catch ConnectionError.http(404, _) {
+            applyStatus(["enabled": false])
         } catch {
             problem = "\(error)"
         }

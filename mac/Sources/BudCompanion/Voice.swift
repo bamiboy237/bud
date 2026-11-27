@@ -170,6 +170,14 @@ final class Voice {
 
     // MARK: Talking
 
+    @MainActor func toggle() {
+        if state == .listening {
+            release()
+        } else {
+            press()
+        }
+    }
+
     func press() {
         switch state {
         case .ready:
@@ -373,7 +381,7 @@ actor Transcriber: VoiceTranscriber {
     /// fix it safely, because loosening it lets "bud" replace "but". So the whole word is
     /// swapped back. "body" and "bodega" don't match.
     static func fixName(_ text: String) -> String {
-        text.replacing(/\b[Bb][Oo][Dd]\b/, with: "bud")
+        text.replacing(#/\b[Bb][Oo][Dd]\b/#, with: "bud")
     }
 
     /// The microphone's rate (usually 48 kHz) down to the 16 kHz mono the model expects.

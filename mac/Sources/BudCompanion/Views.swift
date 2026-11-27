@@ -12,6 +12,7 @@ struct PetView: View {
     var focusPanel: () -> Void
     private let appearance = AppearanceStore.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateObject private var pupsHovered = Flag()
 
     private var anchor: Anchor { companion.anchor }
 
@@ -80,24 +81,45 @@ struct PetView: View {
 
     @ViewBuilder private var pupStack: some View {
         if !companion.visiblePups.isEmpty {
-            let overflow = max(0, companion.activeTasks.count - companion.visiblePups.count)
-            HStack(alignment: .bottom, spacing: 4) {
-                ForEach(companion.visiblePups) { task in
-                    ChildPupView(task: task)
-                        .transition(.scale(scale: 0.6).combined(with: .opacity))
+            let count = companion.activeTasks.count
+            let overflow = max(0, count - companion.visiblePups.count)
+            VStack(alignment: anchor.left ? .leading : .trailing, spacing: 2) {
+                if pupsHovered.on, count > 0 {
+                    Button {
+                        ConversationWindow.shared.show()
+                    } label: {
+                        Text("\(count) \(count == 1 ? "job" : "jobs") running ›")
+                            .font(Paper.Typography.caption)
+                            .foregroundStyle(Paper.inkSecondary)
+                            .fixedSize()
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                    }
+                    .buttonStyle(PaperHit(shape: Capsule(), fill: Paper.elevated))
+                    .overlay { Capsule().strokeBorder(Paper.borderSubtle, lineWidth: 0.5).allowsHitTesting(false) }
+                    .help("Open the conversation")
                 }
-                if overflow > 0 {
-                    Text("+\(overflow)")
-                        .font(Paper.Typography.ledgerMeta)
-                        .foregroundStyle(Paper.inkSecondary)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .help("\(overflow) more background job\(overflow == 1 ? "" : "s") running")
-                        .transition(.opacity)
+                HStack(alignment: .bottom, spacing: 4) {
+                    ForEach(companion.visiblePups) { task in
+                        ChildPupView(task: task)
+                            .transition(.scale(scale: 0.6).combined(with: .opacity))
+                    }
+                    if overflow > 0 {
+                        Text("+\(overflow)")
+                            .font(Paper.Typography.ledgerMeta)
+                            .foregroundStyle(Paper.inkSecondary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .help("\(overflow) more background job\(overflow == 1 ? "" : "s") running")
+                            .transition(.opacity)
+                    }
                 }
+                .animation(.spring(duration: 0.35, bounce: 0), value: companion.activeTasks)
             }
-            .animation(.spring(duration: 0.35, bounce: 0), value: companion.activeTasks)
+            .contentShape(Rectangle())
+            .onHover { pupsHovered.on = $0 }
+            .onDisappear { pupsHovered.on = false }
         }
     }
 
@@ -412,20 +434,15 @@ struct UnsentSpeech: View {
     let companion: Companion
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text("“\(companion.unsentSpeech ?? "")”")
-                .font(Paper.Typography.callout)
-                .foregroundStyle(Paper.inkSecondary)
-                .lineLimit(2)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            Button(companion.speechDestination == .ask ? "Send" : "Add to draft") { companion.resendSpeech() }
-                .buttonStyle(CardButton(kind: .secondary))
-            Button { companion.dropSpeech() } label: {
-                Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
-            }
-            .buttonStyle(IconButton(size: 20))
-            .accessibilityLabel("Don't send")
-        }
+        RecoveryBar(
+            status: "Dictation held",
+            statusInk: Paper.inkPrimary,
+            excerpt: companion.unsentSpeech ?? "",
+            actionTitle: companion.speechDestination == .ask ? "Send" : "Add to draft",
+            action: companion.resendSpeech,
+            dismissLabel: "Don't send",
+            dismiss: companion.dropSpeech
+        )
     }
 }
 
@@ -434,22 +451,53 @@ struct UnsentMessage: View {
 
     var body: some View {
         if let message = companion.heldMessages.first {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("“\(message.text)”")
-                    .font(Paper.Typography.callout)
-                    .foregroundStyle(Paper.inkSecondary)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Button("Retry") { companion.retryHeldMessage() }
-                    .buttonStyle(CardButton(kind: .secondary))
-                Button { companion.dropHeldMessage() } label: {
-                    Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
-                }
-                .buttonStyle(IconButton(size: 20))
-                .accessibilityLabel("Discard unsent message")
-            }
+            RecoveryBar(
+                status: "Couldn't send",
+                statusInk: Paper.errorInk,
+                excerpt: message.text,
+                actionTitle: "Retry",
+                action: companion.retryHeldMessage,
+                dismissLabel: "Discard unsent message",
+                dismiss: companion.dropHeldMessage
+            )
             .disabled(companion.retryingHeldMessage)
         }
+    }
+}
+
+private struct RecoveryBar: View {
+    let status: String
+    let statusInk: Color
+    let excerpt: String
+    let actionTitle: String
+    let action: () -> Void
+    let dismissLabel: String
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(status)
+                .font(Paper.Typography.captionMedium)
+                .foregroundStyle(statusInk)
+                .fixedSize()
+            Text("“\(excerpt)”")
+                .foregroundStyle(Paper.inkMuted)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(actionTitle, action: action)
+                .buttonStyle(CardButton(kind: .quiet))
+                .fixedSize()
+            Button(action: dismiss) {
+                Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
+            }
+            .buttonStyle(IconButton(size: 22))
+            .accessibilityLabel(dismissLabel)
+        }
+        .font(Paper.Typography.caption)
+        .padding(.leading, 8)
+        .padding(.trailing, 3)
+        .padding(.vertical, 2)
+        .background(Paper.recessed, in: RoundedRectangle(cornerRadius: Paper.radiusSM))
     }
 }
 
@@ -493,6 +541,7 @@ struct RunFailureView: View {
                     SettingsTabState.shared.selected = .models
                     NSApp.activate()
                     openSettings()
+                    Task { await SettingsTabState.shared.bringSettingsToFront() }
                 }
                 .buttonStyle(CardButton(kind: .secondary))
             }
@@ -1597,6 +1646,23 @@ final class SettingsTabState {
     enum Pane { case connection, models, integrations, computers }
 
     var selected: Pane = .connection
+
+    func bringSettingsToFront() async {
+        try? await Task.sleep(for: .milliseconds(50))
+        let windows = NSApp.windows.filter { $0.title != "bud" }
+        let titles = ["General", "Models", "Apps", "Computers", "Settings"]
+        guard let window = windows.first(where: {
+            $0.identifier?.rawValue.localizedCaseInsensitiveContains("settings") == true
+        }) ?? windows.first(where: { titles.contains($0.title) }) else { return }
+
+        window.collectionBehavior.remove(.canJoinAllSpaces)
+        window.collectionBehavior.insert(.moveToActiveSpace)
+        window.level = ConversationWindow.shared.pinned ? .floating : .normal
+        NSApp.activate(ignoringOtherApps: true)
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+    }
 }
 
 /// Settings: model sign-in, optional integration keys, and server connection details.
@@ -1632,12 +1698,14 @@ struct SettingsView: View {
         .preferredColorScheme(appearance.mode.colorScheme)
         .onAppear {
             draft.settings = BudSettings.load()
+            Task { await tab.bringSettingsToFront() }
             if companion.link == .connected { Task { await store.refresh() } }
         }
         .onChange(of: companion.link) { _, link in
             if link == .connected { Task { await store.refresh() } }
         }
         .onChange(of: tab.selected) { _, pane in
+            Task { await tab.bringSettingsToFront() }
             if pane == .models, companion.link == .connected { Task { await store.refresh() } }
         }
         .sheet(isPresented: Binding(

@@ -130,27 +130,20 @@ struct QuestionCards: View {
     private var windowBody: some View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 12) {
-                HStack(alignment: .center, spacing: 8) {
-                    Text(answers.questions.count > 1
-                        ? "Question \(answers.index + 1) of \(answers.questions.count)"
-                        : "Question")
-                        .font(Paper.Typography.captionMedium)
-                        .foregroundStyle(Paper.inkMuted)
-                    if let job = approval.job {
-                        Text("· \(job)")
-                            .font(Paper.Typography.caption)
-                            .foregroundStyle(Paper.inkMuted)
-                            .lineLimit(1)
+                if answers.questions.count > 1 || approval.job != nil {
+                    HStack(spacing: 6) {
+                        if answers.questions.count > 1 {
+                            Text("\(answers.index + 1) of \(answers.questions.count)")
+                                .fixedSize()
+                                .accessibilityLabel("Question \(answers.index + 1) of \(answers.questions.count)")
+                        }
+                        if let job = approval.job {
+                            Text(answers.questions.count > 1 ? "· \(job)" : job)
+                                .lineLimit(1)
+                        }
                     }
-                    Spacer(minLength: 4)
-                    if answers.questions.count > 1 {
-                        Button { flow.back() } label: { Image(systemName: "chevron.left") }
-                            .buttonStyle(IconButton(size: 22))
-                            .disabled(answers.isFirst)
-                            .opacity(answers.isFirst ? 0.35 : 1)
-                            .accessibilityLabel("Previous question")
-                            .help("Previous question")
-                    }
+                    .font(Paper.Typography.captionMedium)
+                    .foregroundStyle(Paper.inkMuted)
                 }
 
                 WindowQuestionPage(
@@ -176,6 +169,8 @@ struct QuestionCards: View {
                 if answers.questions.count > 1 && !answers.isFirst {
                     Button("Back") { flow.back() }
                         .buttonStyle(CardButton(kind: .quiet))
+                        .accessibilityLabel("Previous question")
+                        .help("Previous question")
                 }
                 Spacer(minLength: 8)
                 Button(answers.isLast ? "Submit" : "Next", action: flow.advance)
@@ -222,8 +217,7 @@ struct QuestionCards: View {
     }
 }
 
-/// Structured question page for the full Conversation Window: bold question title, helper line,
-/// and rounded selectable option rows with left radio/check indicator and right numeric badge.
+/// Question title, instructions, and selectable answers for the full Conversation Window.
 private struct WindowQuestionPage<CustomAnswer: View>: View {
     let question: Question
     let picked: [String]
@@ -248,10 +242,9 @@ private struct WindowQuestionPage<CustomAnswer: View>: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(question.options.enumerated()), id: \.offset) { index, option in
+                    ForEach(Array(question.options.enumerated()), id: \.offset) { _, option in
                         WindowOptionRow(
                             option: option,
-                            index: index + 1,
                             selected: picked.contains(option.label),
                             multiSelect: question.multiSelect,
                             action: { onSelect(option.label) }
@@ -270,7 +263,6 @@ private struct WindowQuestionPage<CustomAnswer: View>: View {
 
 private struct WindowOptionRow: View {
     let option: QuestionOption
-    let index: Int
     let selected: Bool
     let multiSelect: Bool
     let action: () -> Void
@@ -294,18 +286,6 @@ private struct WindowOptionRow: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-                Spacer(minLength: 6)
-                Text("\(index)")
-                    .font(Paper.Typography.ledgerMeta)
-                    .foregroundStyle(selected ? Paper.inkPrimary : Paper.inkMuted)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(
-                        selected ? Paper.fillHover : Paper.recessed,
-                        in: RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous)
-                            .strokeBorder(Paper.borderSubtle, lineWidth: 0.5))
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
@@ -364,17 +344,21 @@ private struct InlineCustomAnswer: View {
     let onSubmit: () -> Void
     let onFocus: (Bool) -> Void
     @Environment(\.replyType) private var replyType
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var focused: Bool
+
+    private var showsInput: Bool { text != nil || !hasOptions }
 
     var body: some View {
         content
+            .animation(replyType.compact || reduceMotion ? nil : .easeOut(duration: 0.16), value: showsInput)
             .onChange(of: focused) { _, active in onFocus(active) }
             .onDisappear { onFocus(false) }
     }
 
     @ViewBuilder private var content: some View {
         let shape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
-        if text != nil || !hasOptions {
+        if showsInput {
             row {
                 ChatInput(
                     title: "Your answer",
@@ -411,7 +395,7 @@ private struct InlineCustomAnswer: View {
             Image(systemName: "pencil")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(Paper.inkSecondary)
-                .frame(width: 15)
+                .frame(width: 15, height: 15)
                 .accessibilityHidden(true)
             content()
         }

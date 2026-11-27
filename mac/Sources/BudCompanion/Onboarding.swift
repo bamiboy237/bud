@@ -146,6 +146,7 @@ final class OnboardingStore {
     var status = OnboardingStatus.empty
     var apiKeysExpanded = false
     var keyDrafts: [String: String] = [:]
+    private(set) var replacingKey: String?
     var loading = false
     var changingModel = false
     var savingKey: String? = nil
@@ -185,6 +186,7 @@ final class OnboardingStore {
         stopPolling()
         status = .empty
         keyDrafts = [:]
+        replacingKey = nil
         apiKeysExpanded = false
         initializedExpansion = false
         clearBanner()
@@ -291,9 +293,21 @@ final class OnboardingStore {
         }
     }
 
+    func beginKeyEdit(_ envName: String) {
+        guard savingKey == nil, replacingKey != envName else { return }
+        cancelKeyEdit()
+        replacingKey = envName
+    }
+
+    func cancelKeyEdit() {
+        guard let replacingKey else { return }
+        keyDrafts[replacingKey] = ""
+        self.replacingKey = nil
+    }
+
     func saveKey(_ envName: String) async {
         let trimmed = (keyDrafts[envName] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard savingKey == nil, !trimmed.isEmpty else { return }
         savingKey = envName
         error = nil
         feedback = nil
@@ -301,6 +315,7 @@ final class OnboardingStore {
         do {
             let raw = try await sendRequest("POST", "onboarding/keys", ["keys": [envName: trimmed]])
             keyDrafts[envName] = ""
+            if replacingKey == envName { replacingKey = nil }
             apply(raw)
             feedback = "Saved and applied."
         } catch {
@@ -309,6 +324,7 @@ final class OnboardingStore {
     }
 
     func removeKey(_ envName: String) async {
+        guard savingKey == nil else { return }
         savingKey = envName
         error = nil
         feedback = nil
@@ -496,7 +512,14 @@ struct ModelSetupPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline) {
-                Text("Default model")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Default model")
+                    if store.status.modelLocked {
+                        Text("Pinned by startup configuration")
+                            .font(Paper.Typography.caption)
+                            .foregroundStyle(Paper.inkMuted)
+                    }
+                }
                 Spacer()
                 if store.status.modelLocked || store.status.models.isEmpty {
                     Text(store.status.activeModel.map(modelLabel) ?? "Not set")
@@ -607,13 +630,12 @@ private struct KeyRowView: View {
         !(store.keyDrafts[key.envName] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private var busy: Bool {
-        store.savingKey == key.envName
-    }
+    private var editing: Bool { store.replacingKey == key.envName }
+    private var busy: Bool { store.savingKey != nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
+            HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(key.label)
                         .font(Paper.Typography.label)
@@ -626,40 +648,75 @@ private struct KeyRowView: View {
                 }
                 Spacer(minLength: 8)
                 if key.configured {
-                    Text("Key saved")
-                        .font(Paper.Typography.caption)
-                        .foregroundStyle(Paper.inkSecondary)
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("Saved").font(Paper.Typography.caption)
+                    }
+                    .foregroundStyle(Paper.approveInk)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Key saved")
+                    keyMenu
+                } else if !editing {
+                    Button("Add key") { store.beginKeyEdit(key.envName) }
+                        .buttonStyle(CardButton(kind: .secondary))
+                        .disabled(busy)
                 }
             }
+            .frame(minHeight: 40)
 
-            HStack(spacing: 8) {
-                PaperFieldBox(focused: focused) {
-                    SecureField(key.configured ? "Replace API key" : "API key", text: draftBinding)
+            if editing {
+                editor
+            }
+        }
+    }
+
+    private var keyMenu: some View {
+        Menu {
+            Button("Replace…") { store.beginKeyEdit(key.envName) }
+            Button("Remove") { Task { await store.removeKey(key.envName) } }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(Paper.inkSecondary)
+                .frame(width: 26, height: 26)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .menuOrder(.fixed)
+        .fixedSize()
+        .disabled(busy || editing)
+        .accessibilityLabel("\(key.label) API key options")
+    }
+
+    private var editor: some View {
+        HStack(spacing: 8) {
+            PaperFieldBox(focused: focused) {
+                SecureField(key.configured ? "Replace API key" : "API key", text: draftBinding)
                     .accessibilityLabel("\(key.label) API key")
                     .focused($focused)
+                    .onAppear { focused = true }
                     .onSubmit {
                         if hasDraft && !busy {
                             Task { await store.saveKey(key.envName) }
                         }
                     }
-                }
-
-                if busy {
-                    ProgressView().controlSize(.small)
-                }
-
-                Button("Save") { Task { await store.saveKey(key.envName) } }
-                    .buttonStyle(CardButton(kind: hasDraft ? .primary : .secondary))
-                    .disabled(!hasDraft || busy)
-
-                if key.configured {
-                    Button("Remove") { Task { await store.removeKey(key.envName) } }
-                        .buttonStyle(CardButton(kind: .quiet))
-                        .disabled(busy)
-                }
             }
+            .disabled(busy)
+
+            if store.savingKey == key.envName {
+                ProgressView().controlSize(.small)
+            }
+
+            Button("Save") { Task { await store.saveKey(key.envName) } }
+                .buttonStyle(CardButton(kind: hasDraft ? .primary : .secondary))
+                .disabled(!hasDraft || busy)
+            Button("Cancel") { store.cancelKeyEdit() }
+                .buttonStyle(CardButton(kind: .quiet))
+                .disabled(busy)
         }
-        .padding(.vertical, 12)
+        .padding(.bottom, 8)
     }
 }
 

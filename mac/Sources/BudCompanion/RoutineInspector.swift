@@ -515,24 +515,57 @@ struct RoutineInspector: View {
                     .padding(.bottom, 6)
                 ForEach(value.recentOccurrences) { run in
                     hairline
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(date(run.scheduledFor)).font(Paper.Typography.callout)
-                        Text("\(label(run.executionStatus)) · \(label(run.deliveryStatus))")
-                            .font(Paper.Typography.caption)
-                            .foregroundStyle(Paper.inkSecondary)
-                        if run.reportPath != nil {
-                            Button("Open report") {
-                                Task { await state.openReport(value.id, run.id, using: selection) }
-                            }
-                            .buttonStyle(.link)
-                            .disabled(state.pending)
-                        }
-                    }
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(run.id == state.markedRun ? Paper.accentFill : .clear)
+                    runHistoryRow(run, routineID: value.id)
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func runHistoryRow(_ run: RoutineRun, routineID: String) -> some View {
+        let timestamp = date(run.scheduledFor)
+        let outcome = runOutcome(run)
+        let hasReport = run.reportPath != nil
+        let shape = RoundedRectangle(cornerRadius: Paper.radiusSM)
+        let row = HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(timestamp)
+                    .font(Paper.Typography.callout)
+                    .foregroundStyle(Paper.inkPrimary)
+                HStack(spacing: 5) {
+                    if outcome.needsReview {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11))
+                            .accessibilityHidden(true)
+                    }
+                    Text(outcome.label)
+                        .font(Paper.Typography.caption)
+                }
+                .foregroundStyle(outcome.needsReview ? Paper.errorInk : Paper.inkSecondary)
+            }
+            Spacer(minLength: 0)
+            if hasReport {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Paper.inkMuted)
+                    .accessibilityHidden(true)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(run.id == state.markedRun ? Paper.accentFill : .clear, in: shape)
+
+        if hasReport {
+            Button {
+                Task { await state.openReport(routineID, run.id, using: selection) }
+            } label: {
+                row
+            }
+            .buttonStyle(PaperHit(shape: shape))
+            .disabled(state.pending)
+            .accessibilityLabel("Open report, \(timestamp), \(outcome.label)")
+        } else {
+            row
         }
     }
 
@@ -672,8 +705,22 @@ struct RoutineInspector: View {
         }
     }
 
-    private func label(_ raw: String) -> String {
-        raw.replacingOccurrences(of: "_", with: " ").capitalized
+    private func runOutcome(_ run: RoutineRun) -> (label: String, needsReview: Bool) {
+        switch (run.executionStatus, run.deliveryStatus) {
+        case ("failed", _): ("Failed, needs review", true)
+        case ("needs_review", _), ("uncertain", _), (_, "needs_review"), (_, "uncertain"):
+            ("Needs review", true)
+        case (_, "failed"): ("Delivery failed, needs review", true)
+        case ("completed", "confirmed"): ("Report delivered", false)
+        case ("completed", _): ("Completed", false)
+        case ("running", _): ("Running", false)
+        case ("pending", _): ("Pending", false)
+        case ("queued", _): ("Queued", false)
+        case ("awaiting_approval", _): ("Waiting for approval", false)
+        case ("cancelled", _): ("Stopped", false)
+        case ("skipped", _): ("Skipped", false)
+        default: ("Status unavailable", false)
+        }
     }
 
     private func date(_ raw: String, timezone: TimeZone = .current) -> String {
