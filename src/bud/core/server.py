@@ -55,7 +55,6 @@ from bud.core.onboarding import (
     onboarding_snapshot,
     reload_settings,
     resolve_config_env_path,
-    selectable_models,
     write_env_updates,
 )
 from bud.core.paired_apps import PairedApps
@@ -765,7 +764,10 @@ def _create_app(
 
     def apply_default_model() -> None:
         choice = None if model_locked else model_choice.read()
-        runner.owner_model = choice if choice and choice in selectable_models(gateway) else None
+        runner.owner_model = None
+        if choice:
+            with contextlib.suppress(NoModelAvailable):
+                runner.owner_model = gateway.validate_model(choice, require_tools=True).id
 
     apply_default_model()
 
@@ -965,8 +967,8 @@ def _create_app(
 
     def _onboarding_payload() -> JSONResponse:
         manager: ChatGPTLoginManager = app.state.chatgpt_login
-        return JSONResponse(
-            onboarding_snapshot(
+        with refresh_lock:
+            payload = onboarding_snapshot(
                 settings,
                 gateway,
                 manager,
@@ -975,9 +977,15 @@ def _create_app(
                 active_model=runner.active_model_id,
                 default_model=runner.owner_model,
                 model_locked=model_locked,
-            ),
-            headers={"Cache-Control": "no-store"},
-        )
+            )
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    def _validate_model(model_id: str | None) -> None:
+        if model_id is not None:
+            try:
+                gateway.validate_model(model_id, require_tools=True)
+            except NoModelAvailable as exc:
+                raise HTTPException(422, str(exc)) from None
 
     @app.get("/onboarding")
     def get_onboarding() -> JSONResponse:
@@ -988,8 +996,7 @@ def _create_app(
         if model_locked:
             raise HTTPException(409, "The server configuration sets the default model.")
         with refresh_lock:
-            if body.model is not None and body.model not in selectable_models(gateway):
-                raise HTTPException(422, "This model isn’t available.")
+            _validate_model(body.model)
             model_choice.write(body.model)
             runner.owner_model = body.model
         return _onboarding_payload()
@@ -1200,32 +1207,16 @@ def _create_app(
 
     @app.get("/models")
     def list_models() -> list[dict]:
-        keys = {
-            "deepseek": settings.deepseek_api_key,
-            "openai": settings.openai_api_key,
-            "meta": settings.muse_api_key,
-            "mistral": settings.mistral_api_key,
-        }
-        out: list[dict] = []
-        seen: set[str] = set()
-        for spec in gateway.registry.models:
-            if spec.id in seen:
-                continue
-            seen.add(spec.id)
-            ready = (
-                spec.billing != "api"
-                or settings.model_api_keys.get(spec.provider) is not None
-                or keys.get(spec.provider) is not None
-            )
-            out.append(
+        with refresh_lock:
+            return [
                 {
-                    "id": spec.id,
-                    "tier": spec.tier,
-                    "billing": spec.billing,
-                    "configured": bool(ready),
+                    "id": status.id,
+                    "tier": status.tier,
+                    "billing": status.billing,
+                    "configured": status.selectable,
                 }
-            )
-        return out
+                for status in gateway.catalog(require_tools=True)
+            ]
 
     def _apply_model(session_id: str, request: NewSession | None) -> None:
         if request is None or request.model is None:
@@ -1244,11 +1235,13 @@ def _create_app(
     @app.post("/sessions/primary")
     def primary_session(request: NewSession | None = None) -> dict[str, str]:
         require_current_binding()
-        try:
-            session_id = log.primary_session(request.session_id if request else None)
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from None
-        _apply_model(session_id, request)
+        with refresh_lock:
+            _validate_model(request.model if request else None)
+            try:
+                session_id = log.primary_session(request.session_id if request else None)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+            _apply_model(session_id, request)
         hub.wake(session_id)
         return {"session_id": session_id}
 
@@ -1258,18 +1251,21 @@ def _create_app(
         session_id = (request.session_id if request else None) or uuid4().hex
         # A transport persists its chosen ID before this request. A lost HTTP
         # response must not create a second conversation on retry.
-        if (
-            log.append_once(session_id, "session.created", key=f"session-created:{session_id}")
-            is not None
-        ):
+        with refresh_lock:
+            _validate_model(request.model if request else None)
+            created = log.append_once(
+                session_id, "session.created", key=f"session-created:{session_id}"
+            )
+            _apply_model(session_id, request)
+        if created is not None:
             hub.wake(session_id)
-        _apply_model(session_id, request)
         return {"session_id": session_id}
 
     @app.post("/sessions/{session_id}/model")
     def set_session_model(session_id: str, request: NewSession) -> dict[str, str]:
         require_session(session_id)
-        _apply_model(session_id, request)
+        with refresh_lock:
+            _apply_model(session_id, request)
         hub.wake(session_id)
         return {"session_id": session_id, "model": request.model or ""}
 

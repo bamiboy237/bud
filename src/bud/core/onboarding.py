@@ -26,7 +26,6 @@ from bud.gateway.chatgpt import (
     _wait_for_listener,
     refresh_models,
 )
-from bud.gateway.router import NoModelAvailable
 from bud.release.backup import _atomic_write_bytes
 
 _ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=.*$")
@@ -50,14 +49,7 @@ class DefaultModelChoice:
 
 
 def selectable_models(gateway: Gateway) -> list[str]:
-    choices: list[str] = []
-    for name in dict.fromkeys(spec.id for spec in gateway.registry.models):
-        try:
-            gateway.model("frontier", require_tools=True, selected=name)
-        except NoModelAvailable:
-            continue
-        choices.append(name)
-    return choices
+    return gateway.selectable_models(require_tools=True)
 
 
 @dataclass(frozen=True)

@@ -103,10 +103,40 @@ async def test_unconfigured_server_starts_and_hot_reloads_keys_in_place(
     _clear_managed_env(monkeypatch)
     bud_home = tmp_path / "bud_home"
     data_dir = bud_home / "data"
+    models_file = tmp_path / "models.toml"
+    models_file.write_text(
+        """
+[[models]]
+provider = "openai"
+name = "gpt-5"
+tier = "fast"
+input = 0
+output = 0
+cached = 0
+
+[[models]]
+provider = "local"
+name = "text-only"
+tier = "frontier"
+billing = "local"
+base_url = "http://localhost:1/v1"
+protocol = "chat"
+supports_tools = false
+allow_accounts = true
+
+[[models]]
+provider = "openai-chatgpt"
+name = "signed-out"
+tier = "frontier"
+billing = "subscription"
+""",
+        encoding="utf-8",
+    )
     settings = Settings(
         _env_file=None,
         data_dir=data_dir,
         workspace_dir=bud_home / "workspace",
+        models_file=models_file,
         approval_review=True,
     )
     found = _mock_connections(data_dir, settings)
@@ -133,6 +163,50 @@ async def test_unconfigured_server_starts_and_hot_reloads_keys_in_place(
             assert (await client.get("/onboarding")).status_code == 401
 
             headers = {"Authorization": f"Bearer {token}"}
+            available = "openai:gpt-5"
+            session_id = (await client.post("/sessions", headers=headers)).json()["session_id"]
+
+            async def assert_model_choices(expected: list[str]) -> None:
+                catalog = await client.get("/models", headers=headers)
+                assert catalog.status_code == 200
+                rows = catalog.json()
+                assert [row["id"] for row in rows] == [
+                    available,
+                    "local:text-only",
+                    "openai-chatgpt:signed-out",
+                ]
+                assert all(row.keys() == {"id", "tier", "billing", "configured"} for row in rows)
+                assert [row["id"] for row in rows if row["configured"]] == expected
+                onboarding = await client.get("/onboarding", headers=headers)
+                assert onboarding.json()["models"] == expected
+                # Exercise the durable model table without starting the global DBOS runtime.
+                with monkeypatch.context() as patch:
+                    patch.setattr(runner, "durable", True)
+                    _, registered = runner._build_models()
+                assert list(registered) == expected
+
+            async def assert_rejected(model: str, reason: str) -> None:
+                rejected_session = "a" * 32
+                for method, path in (
+                    ("PUT", "/onboarding/model"),
+                    ("POST", f"/sessions/{session_id}/model"),
+                    ("POST", "/sessions"),
+                    ("POST", "/sessions/primary"),
+                ):
+                    body = {"model": model}
+                    if path == "/sessions":
+                        body["session_id"] = rejected_session
+                    response = await client.request(method, path, headers=headers, json=body)
+                    assert response.status_code == 422
+                    assert reason in response.json()["detail"]
+                missing = await client.get(f"/sessions/{rejected_session}", headers=headers)
+                assert missing.status_code == 404
+
+            await assert_model_choices([])
+            await assert_rejected(available, "not configured")
+            await assert_rejected("local:text-only", "does not support tools")
+            await assert_rejected("openai-chatgpt:signed-out", "not configured")
+
             runtime_before = await client.get("/runtime", headers=headers)
             assert runtime_before.status_code == 200
             assert runtime_before.json()["has_model"] is False
@@ -186,22 +260,35 @@ async def test_unconfigured_server_starts_and_hot_reloads_keys_in_place(
             assert found.settings.composio_api_key is not None
             assert found.settings.composio_api_key.get_secret_value() == secret_composio
 
-            assert updated["models"]
-            available = updated["models"][-1]
+            assert updated["models"] == [available]
+            await assert_model_choices([available])
+            primary = await client.post(
+                "/sessions/primary",
+                headers=headers,
+                json={"session_id": session_id, "model": available},
+            )
+            assert primary.status_code == 200
+            assert primary.json() == {"session_id": session_id}
+            switched = await client.post(
+                f"/sessions/{session_id}/model", headers=headers, json={"model": available}
+            )
+            assert switched.json() == {"session_id": session_id, "model": available}
             selected = await client.put(
                 "/onboarding/model", headers=headers, json={"model": available}
             )
             assert selected.status_code == 200
             assert selected.json()["default_model"] == available
             assert runner._inputs("example", "new message")["owner_model"] == available
-            invalid = await client.put(
-                "/onboarding/model", headers=headers, json={"model": "nonexistent:model"}
-            )
-            assert invalid.status_code == 422
+            await assert_rejected("nonexistent:model", "Unknown model")
+            await assert_rejected("local:text-only", "does not support tools")
+            assert runner.session_models[session_id] == available
             assert (data_dir / "default-model").read_text() == available
             automatic = await client.put("/onboarding/model", headers=headers, json={"model": None})
             assert automatic.json()["default_model"] is None
             assert runner._inputs("example", "another message")["owner_model"] is None
+            assert (
+                await client.put("/onboarding/model", headers=headers, json={"model": available})
+            ).status_code == 200
 
             remove_resp = await client.post(
                 "/onboarding/keys",
@@ -211,6 +298,9 @@ async def test_unconfigured_server_starts_and_hot_reloads_keys_in_place(
             assert remove_resp.status_code == 200
             assert remove_resp.json()["has_model"] is False
             assert remove_resp.json()["needs_onboarding"] is True
+            assert remove_resp.json()["default_model"] is None
+            await assert_model_choices([])
+            await assert_rejected(available, "not configured")
             assert runner.is_configured is False
             assert runner.harness.reviewer is None
             assert runner.harness._guards[0].reviewer is None

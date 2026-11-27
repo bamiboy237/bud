@@ -94,6 +94,43 @@ import Testing
         #expect(syncedOnboarding == [false, true])
     }
 
+    @Test(arguments: [true, false])
+    @MainActor func rejectedModelSelectionRefreshesAndShowsSafeError(refreshSucceeds: Bool) async {
+        let staleModel = "openai:gpt-5"
+        let availableModel = "deepseek:deepseek-chat"
+        let rejectionMessage = "That model is unavailable. Choose another model, sign in to ChatGPT, "
+            + "or add its API key."
+        var calls: [String] = []
+        weak var observedStore: OnboardingStore?
+        let store = OnboardingStore(
+            sendRequest: { method, path, body in
+                calls.append("\(method) \(path)")
+                if method == "PUT" {
+                    #expect(body?["model"] as? String == staleModel)
+                    throw ConnectionError.http(422, "private provider detail")
+                }
+                if calls.count > 1 {
+                    #expect(observedStore?.status.models.isEmpty == true)
+                    #expect(observedStore?.error == rejectionMessage)
+                    if !refreshSucceeds { throw ConnectionError.unreachable }
+                }
+                return ["models": calls.count == 1 ? [staleModel] : [availableModel]]
+            },
+            openURL: { _ in },
+            syncNeedsOnboarding: { _ in }
+        )
+        observedStore = store
+
+        await store.refresh()
+        #expect(store.status.models == [staleModel])
+        await store.chooseModel(staleModel)
+
+        #expect(calls == ["GET onboarding", "PUT onboarding/model", "GET onboarding"])
+        #expect(store.status.models == (refreshSucceeds ? [availableModel] : []))
+        #expect(store.error == rejectionMessage)
+        #expect(!store.changingModel)
+    }
+
     @Test @MainActor func chatGPTLoginOpensURLAndLogoutResetsStatus() async {
         var opened: [URL] = []
         let store = OnboardingStore(

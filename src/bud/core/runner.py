@@ -347,19 +347,15 @@ class Runner(DBOSConfiguredInstance):
         ).hexdigest()
 
     def _build_models(self) -> tuple[Model, dict[str, Model]]:
-        # A Model instance cannot cross the DBOS step boundary, so durable runners
-        # register every buildable registry model up front — ledger-tracked, like
-        # the agent's default — and agent.run() receives the registered key, not an
-        # instance. Built only for durable runners: building also acquires the
-        # cross-process ChatGPT lock, which non-durable runners must not take.
+        # DBOS passes model IDs across step boundaries. Register selectable models
+        # up front only for durable runners, since building can take the ChatGPT lock.
         runtime_models: dict[str, Model] = {}
         if self.durable:
-            for spec in self.gateway.registry.models:
-                built = self.gateway.build_model(spec)
-                if built is not None:
-                    runtime_models[spec.id] = TrackedModel(
-                        built,
-                        spec,
+            for status in self.gateway.catalog(require_tools=True):
+                if status.selectable and status.model is not None:
+                    runtime_models[status.id] = TrackedModel(
+                        status.model,
+                        status.spec,
                         self.gateway.ledger,
                         steer_signal=self._steer_signal,
                         workspace=self.workspace,
@@ -390,8 +386,8 @@ class Runner(DBOSConfiguredInstance):
 
     @property
     def is_configured(self) -> bool:
-        """True once at least one usable model is configured for default runs."""
-        return not isinstance(self.agent.model, _UnconfiguredModel)
+        """True when default runs have an automatic or owner-selected model."""
+        return self.owner_model is not None or not isinstance(self.agent.model, _UnconfiguredModel)
 
     @property
     def active_model_id(self) -> str | None:
@@ -720,8 +716,10 @@ class Runner(DBOSConfiguredInstance):
         if model_id is None:
             self.session_models.pop(session_id, None)
             return
-        if not any(spec.id == model_id for spec in self.gateway.registry.models):
-            raise ValueError(f"Unknown model: {model_id}.")
+        try:
+            self.gateway.validate_model(model_id, require_tools=True)
+        except NoModelAvailable as exc:
+            raise ValueError(str(exc)) from None
         self.session_models[session_id] = model_id
 
     @staticmethod

@@ -30,7 +30,7 @@ from bud.gateway.errors import (
 )
 from bud.gateway.ledger import Ledger
 from bud.gateway.registry import ModelSpec, Registry
-from bud.gateway.router import Gateway
+from bud.gateway.router import Gateway, provider_model_factory
 
 
 def api_spec(name, **changes):
@@ -66,7 +66,8 @@ async def test_chatgpt_catalog_preserves_and_resolves_context_windows(monkeypatc
     models = [
         {"slug": "gpt-6.1-terra", "context_window": 272_000, "max_tokens": 12_000},
         {"slug": "catalog-length", "context_window": True, "max_context_length": 160_000},
-        {"slug": "catalog-tokens", "context_window": "64000", "max_tokens": 90_000},
+        {"slug": "catalog-input-tokens", "context_window": "64000", "max_input_tokens": 90_000},
+        {"slug": "catalog-output-only", "max_tokens": 32_768},
         {"slug": "gpt-5.2", "context_window": -1},
         {"slug": "gpt-6.2-sol", "max_tokens": 0},
         {"slug": "unlisted-family", "max_context_length": 1.5},
@@ -84,7 +85,7 @@ async def test_chatgpt_catalog_preserves_and_resolves_context_windows(monkeypatc
     assert store.state()["models"] == refreshed
     assert [row.get("context_window") for row in refreshed] == [272_000, 160_000, 90_000] + [
         None
-    ] * 3
+    ] * 4
     store.path.touch()
 
     priced_window = resolve_context_window("openai-chatgpt:gpt-5.2")
@@ -98,13 +99,19 @@ async def test_chatgpt_catalog_preserves_and_resolves_context_windows(monkeypatc
         } == {
             "gpt-6.1-terra": 272_000,
             "catalog-length": 160_000,
-            "catalog-tokens": 90_000,
+            "catalog-input-tokens": 90_000,
+            "catalog-output-only": None,
             "gpt-5.2": priced_window,
             "gpt-6.2-sol": 200_000,
             "unlisted-family": None,
         }
         selected = gateway.model("fast", selected="openai-chatgpt:gpt-6.1-terra")
         assert selected.context_window == 272_000
+        status = next(row for row in gateway.catalog() if row.id == "openai-chatgpt:gpt-6.1-terra")
+        assert status.configured and status.selectable
+        assert status.context_window == selected.context_window
+        store.path.unlink()
+        assert not gateway.selectable_models()
     finally:
         gateway.close()
 
@@ -164,6 +171,69 @@ def gateway_factory(tmp_path, monkeypatch):
         return gateway
 
     return make, calls, builds, ledger
+
+
+def test_catalog_and_validation_use_the_same_routes(gateway_factory):
+    make, calls, builds, _ = gateway_factory
+    ready = api_spec("ready")
+    text_only = api_spec("text-only")
+    unavailable = api_spec("unavailable")
+    gateway = make(
+        [ready, text_only, ready.model_copy(update={"tier": "frontier"}), unavailable],
+        unavailable={unavailable.id},
+        tool_less={text_only.id},
+    )
+
+    catalog = gateway.catalog()
+    assert builds == [ready.id, text_only.id, unavailable.id]
+    assert [row.id for row in catalog] == builds
+    assert [(row.configured, row.supports_tools, row.selectable) for row in catalog] == [
+        (True, True, True),
+        (True, False, False),
+        (False, False, False),
+    ]
+    assert gateway.selectable_models() == [ready.id]
+    assert gateway.selectable_models(require_tools=False) == [ready.id, text_only.id]
+    assert gateway.validate_model(ready.id) == ready
+    assert gateway.validate_model(text_only.id, require_tools=False) == text_only
+    for model_id, reason in (
+        (text_only.id, "does not support tools"),
+        (unavailable.id, "not configured"),
+        ("unknown", "Unknown model"),
+    ):
+        with pytest.raises(NoModelAvailable, match=reason):
+            gateway.validate_model(model_id)
+    assert not calls
+
+
+def test_model_build_error_is_reported_without_provider_details(gateway_factory):
+    _, _, _, ledger = gateway_factory
+    spec = api_spec("failed")
+
+    def build(_):
+        raise ModelHTTPError(401, spec.id, body="private provider detail")
+
+    gateway = Gateway(Registry(models=[spec]), ledger, build)
+    assert not gateway.catalog()[0].configured
+    with pytest.raises(NoModelAvailable, match="not configured") as error:
+        gateway.validate_model(spec.id)
+    assert "private provider detail" not in str(error.value)
+
+
+def test_cached_local_provider_does_not_configure_api_route(gateway_factory):
+    _, _, _, ledger = gateway_factory
+    settings = get_settings()
+    local = local_spec("local-model")
+    api = local.model_copy(update={"name": "api-model", "billing": "api"})
+    gateway = Gateway(
+        Registry(models=[local, api]),
+        ledger,
+        provider_model_factory(settings, chatgpt.ChatGPTStore(settings.data_dir)),
+    )
+
+    assert gateway.selectable_models() == [local.id]
+    with pytest.raises(NoModelAvailable, match="not configured"):
+        gateway.validate_model(api.id)
 
 
 async def ask(gateway, *, streaming=False, **selection):

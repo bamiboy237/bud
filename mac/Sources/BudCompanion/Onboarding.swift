@@ -43,7 +43,7 @@ struct OnboardingStatus: Equatable, Sendable {
     let needsOnboarding: Bool
     let activeModel: String?
     let defaultModel: String?
-    let models: [String]
+    var models: [String]
     let modelLocked: Bool
     let configPath: String
     let chatgpt: ChatGPTAuthStatus
@@ -187,18 +187,19 @@ final class OnboardingStore {
         clearBanner()
     }
 
-    func refresh() async {
+    func refresh(preservingError: String? = nil) async {
         loading = true
-        error = nil
+        error = preservingError
         defer { loading = false }
         let generation = serverGeneration
         do {
             let raw = try await sendRequest("GET", "onboarding", nil)
             guard generation == serverGeneration else { return }
             apply(raw)
+            if let preservingError { error = preservingError }
         } catch {
             guard generation == serverGeneration else { return }
-            self.error = "\(error)"
+            self.error = preservingError ?? "\(error)"
         }
     }
 
@@ -235,6 +236,13 @@ final class OnboardingStore {
             let response = try await sendRequest("PUT", "onboarding/model", ["model": value])
             guard generation == serverGeneration else { return }
             apply(response)
+        } catch ConnectionError.http(422, _) {
+            guard generation == serverGeneration else { return }
+            status.models.removeAll { $0 == model }
+            await refresh(
+                preservingError: "That model is unavailable. Choose another model, sign in to ChatGPT, "
+                    + "or add its API key."
+            )
         } catch {
             guard generation == serverGeneration else { return }
             self.error = "Couldn’t change the default model."
