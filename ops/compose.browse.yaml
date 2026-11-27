@@ -1,0 +1,15 @@
+services:
+  bud:
+    environment:
+      BUD_BROWSE_PEER_IP: ${BUD_BROWSE_PEER_IP:?Set the server's private IPv4 address}
+      OPENCODE_BROWSER_HOME: /home/bud/.bud/browse
+      OPENCODE_BROWSER_PORT: 19989
+    command:
+      - sh
+      - -ec
+      - |
+        python -c 'import os; from bud.core.browser_computers import private_peer; assert private_peer(os.environ["BUD_BROWSE_PEER_IP"]), "Browse requires a private IPv4 address"'
+        browse set hostname 0.0.0.0
+        exec bud serve
+    ports:
+      - "${BUD_BROWSE_PEER_IP:?Set the server's private IPv4 address}:19989:19989"

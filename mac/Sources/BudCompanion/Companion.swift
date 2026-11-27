@@ -42,6 +42,7 @@ enum InspectorSelection {
     case attachment(AttachmentSelection)
     case routine(RoutineSelection)
     case browser(BrowserSelection)
+    case report(URL)
     case delivery(DesktopDeliverySelection)
     case source(SourcePanel, request: UUID)
 
@@ -49,6 +50,7 @@ enum InspectorSelection {
         case attachment(session: String, file: String)
         case routine(session: String, routine: String?, occurrence: String?)
         case browser
+        case report(URL)
         case delivery(session: String, job: String)
         case source(SourceTarget)
     }
@@ -61,6 +63,8 @@ enum InspectorSelection {
             .routine(session: selection.session, routine: selection.routineID, occurrence: selection.occurrenceID)
         case .browser:
             .browser
+        case .report(let file):
+            .report(file)
         case .delivery(let selection):
             .delivery(session: selection.session, job: selection.jobID)
         case .source(let panel, _):
@@ -82,6 +86,19 @@ struct HeldMessage: Identifiable {
 struct PendingMessage: Identifiable, Equatable {
     let id: String
     var text: String
+}
+
+private struct TurnDraft {
+    let text: String
+    let quote: String?
+    let attachments: [DraftAttachment]
+    let seq: Int
+}
+
+private struct StopRequest {
+    let runID: String?
+    var acknowledged = false
+    var runFinished: Bool
 }
 
 /// A short job milestone, with the saved report behind a "finished" one.
@@ -160,6 +177,106 @@ struct Work: Equatable {
     var seconds: Int
 }
 
+/// Safe, structured summary of a failed run built from the server's `reason`, `kind`, and `next`.
+struct RunFailure: Equatable {
+    let title: String
+    let nextStep: String
+    let detail: String?
+    let kind: String?
+
+    init(reason: String? = nil, kind: String? = nil, next: String? = nil) {
+        let cleanKind = Self.clean(kind)
+        let cleanReason = Self.clean(reason)
+        let cleanNext = Self.clean(next)
+
+        self.kind = cleanKind
+        let title = Self.title(for: cleanKind)
+        self.title = title
+        if let modelRecoveryStep = Self.modelRecoveryStep(for: cleanKind, next: cleanNext) {
+            self.nextStep = modelRecoveryStep
+            self.detail = nil
+            return
+        }
+        let nextStep = cleanNext ?? Self.defaultNextStep(for: cleanKind)
+        self.nextStep = nextStep
+        if let cleanReason,
+           cleanReason.caseInsensitiveCompare(title) != .orderedSame,
+           cleanReason.caseInsensitiveCompare(nextStep) != .orderedSame {
+            self.detail = cleanReason
+        } else {
+            self.detail = nil
+        }
+    }
+
+    init(_ data: [String: Any]) {
+        self.init(
+            reason: data["reason"] as? String,
+            kind: data["kind"] as? String,
+            next: data["next"] as? String
+        )
+    }
+
+    private static func clean(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func title(for kind: String?) -> String {
+        switch kind {
+        case "auth": "Sign-in failed"
+        case "permission": "Model access denied"
+        case "rate_limit": "Rate limit reached"
+        case "quota": "Provider credit exhausted"
+        case "network": "Connection failed"
+        case "timeout": "Request timed out"
+        case "service": "Provider error"
+        case "context_full": "Conversation too long"
+        case "content_filter": "Reply blocked"
+        case "budget": "Budget limit reached"
+        case "model_unavailable": "Model unavailable"
+        case "account": "Account connection failed"
+        case "skill": "Skill error"
+        case "recovery": "Run stopped"
+        default: "Couldn’t finish this request"
+        }
+    }
+
+    private static func modelRecoveryStep(for kind: String?, next: String?) -> String? {
+        switch kind {
+        case "permission":
+            return "In Settings → Models, select a model your provider key can use, then resend."
+        case "model_unavailable":
+            return "In Settings → Models, configure the provider key or select another model, then resend."
+        default:
+            guard next?.contains("/model") == true else { return nil }
+            return "In Settings → Models, select another model, then resend."
+        }
+    }
+
+    private static func defaultNextStep(for kind: String?) -> String {
+        switch kind {
+        case "auth": "Sign in to the model provider again, then resend."
+        case "rate_limit": "The provider is rate-limiting; resend in a minute."
+        case "quota": "The provider account is out of credit; top it up or pick another model."
+        case "network": "Check the internet connection, then resend."
+        case "timeout": "The provider took too long; resend, or pick a faster model."
+        case "service": "The provider is having trouble; resend shortly or pick another model."
+        case "context_full": "The conversation is too long for this model; start a new one or pick a model with a larger context."
+        case "content_filter": "The provider refused this content; rephrase the request."
+        case "budget": "Wait for the next UTC day, or raise BUD_DAILY_USD and restart bud."
+        case "account": "Reconnect the account, then resend."
+        case "skill": "Check the skill, then resend."
+        case "recovery": "bud restarted with different code or settings; resend the request."
+        default: "Resend the request. If it fails again, note the time so it can be traced."
+        }
+    }
+}
+
 struct ReplyMore: Equatable {
     var above = false
     var below = false
@@ -198,6 +315,10 @@ final class Companion {
     /// Whether a run is in progress. Stop and the live work views gate on this, not on
     /// `status`: a job's approval turns the pet to "needs you" while the main run still works.
     private(set) var running = false
+    private(set) var stopping = false
+    private(set) var stopError: String?
+    @ObservationIgnored private var stopRequest: StopRequest?
+    @ObservationIgnored private var runID: String?
     /// What bud is doing, from run events.
     @ObservationIgnored private var activity: PetStatus = .idle {
         didSet { showStatus() }
@@ -235,16 +356,30 @@ final class Companion {
     private(set) var shown = ""
     /// What the latest reply's `[S1]` tags cite, once its run has finished.
     private(set) var replySources: [String: Source] = [:]
+    /// Structured failure details when the latest run failed (live or restored from snapshot).
+    private(set) var runFailure: RunFailure?
+    private var turnDraft: TurnDraft?
+    private var turnExternalSteps: [String] = []
+    @ObservationIgnored private var externalToolCalls: [String: [String]] = [:]
+    @ObservationIgnored private var sentAttachments: [String: [DraftAttachment]] = [:]
+
+    var canEditAndResendFailedTurn: Bool {
+        runFailure != nil && turnDraft != nil && !readingAttachments && !uploadingAttachments
+    }
+
+    var failedTurnExternalSteps: [String] { runFailure == nil ? [] : turnExternalSteps }
     @ObservationIgnored private var replySeq: Int?
     /// The main conversation so far, finished turns only: the reply being written is `shown`.
     private(set) var turns: [Turn] = []
     /// Where a source link pointed in this conversation; the window scrolls there.
     var focus: Focus?
     private(set) var focusRequest = 0
-    private(set) var citedConversations: [SourcePanel] = []
-    var citedConversation: SourcePanel? { citedConversations.last }
+    private(set) var routineRevision = 0
     private(set) var inspector: InspectorSelection?
-    var draftAttachments: [DraftAttachment] = []
+    var draftAttachments: [DraftAttachment] = [] {
+        didSet { if draftAttachments.isEmpty { clearAttachmentDropSummary() } }
+    }
+    private(set) var attachmentDropSummary: String? = nil
     private(set) var readingAttachments = false
     private(set) var uploadingAttachments = false
     /// What you last asked, shown faded above the reply so the answer keeps its context.
@@ -262,6 +397,7 @@ final class Companion {
     @ObservationIgnored private var hearingSince = Date.now
     /// While the conversation window is open, it is where bud talks: the bubble stays shut.
     var windowOpen = false
+    var focusComposerNonce: Int = 0
     /// What's waiting on the owner, oldest first, with enough detail to decide in the bubble.
     private(set) var approvals: [Approval] = []
     private(set) var setups: [CapabilitySetup] = [] {
@@ -272,6 +408,7 @@ final class Companion {
     }
     @ObservationIgnored private var setupMonitor: Task<Void, Never>?
     private(set) var updatingSetups: Set<String> = []
+    private(set) var openedSetups: Set<String> = []
     private(set) var setupProblems: [String: String] = [:]
     var needsAttention: Bool { !approvals.isEmpty || !setups.isEmpty || stalledCount > 0 }
     /// How many things wait on you: decisions, setups, and stalled jobs. The pet's badge.
@@ -341,6 +478,7 @@ final class Companion {
     /// A message that failed to send, kept with its id so resending it can't run it twice.
     @ObservationIgnored private(set) var unsent: HeldMessage?
     @ObservationIgnored private(set) var sendTask: Task<Void, Never>?
+    @ObservationIgnored private(set) var stopTask: Task<Void, Never>?
 
     func connectForTesting(_ connection: BudConnection, session: String = "s1") {
         self.connection = connection
@@ -350,17 +488,26 @@ final class Companion {
     func sendOnboardingRequest(
         _ method: String, _ path: String, json: [String: Any]? = nil
     ) async throws -> [String: Any] {
-        let active = try connection ?? BudConnection(settings: BudSettings.load())
-        let req = active.request(method, path, json: json)
-        return try await active.send(req)
+        guard let connection else { throw ConnectionError.unreachable }
+        let request = connection.request(method, path, json: json)
+        return try await connection.send(request)
     }
+
+    func conversationHistory(offset: Int) async throws -> Data {
+        guard let connection else { throw ConnectionError.unreachable }
+        let response = try await connection.send(
+            "GET", "sessions", queryItems: [URLQueryItem(name: "offset", value: String(offset))])
+        guard let conversations = response["conversations"] else { throw ConnectionError.notBudServer }
+        return try JSONSerialization.data(withJSONObject: conversations)
+    }
+
     @ObservationIgnored private var blocks: [(id: String, text: String)] = []
     /// Model requests already streamed. A second text.reset for one means bud is replaying that
     /// step after a restart, so its partial text is dropped instead of shown twice.
     @ObservationIgnored private var seenRequests: Set<String> = []
     @ObservationIgnored private var retry: Task<Void, Never>?
     @ObservationIgnored private var sentAt: ContinuousClock.Instant?
-    @ObservationIgnored private var settle: Task<Void, Never>?
+    @ObservationIgnored private var finishGesture: Task<Void, Never>?
     @ObservationIgnored private var pacer: Task<Void, Never>?
     /// True while the pet is being dragged, so letting go doesn't count as a click.
     @ObservationIgnored var dragging = false
@@ -395,9 +542,70 @@ final class Companion {
         startConnection(resetBackoff: true)
     }
 
+    func switchServer() {
+        sendTask?.cancel()
+        OnboardingStore.shared.reset()
+        turns = []
+        steps = []
+        lastSteps = []
+        lastWork = nil
+        question = ""
+        reply = ""
+        shown = ""
+        replySources = [:]
+        runFailure = nil
+        clearTurnDraft()
+        sentAttachments = [:]
+        runID = nil
+        finishStop()
+        replySeq = nil
+        replyingTo = nil
+        focus = nil
+        pendingMessages = []
+        draftAttachments = []
+        notices = []
+        needsOnboarding = false
+        activity = .idle
+        MacActionWorker.shared.start()
+        start()
+    }
+
+    private func connectRuntime(
+        settings: BudSettings, startLocalIfNeeded: Bool
+    ) async throws -> (BudConnection, [String: Any]) {
+        func connect() async throws -> (BudConnection, [String: Any]) {
+            let connection = try BudConnection(settings: settings)
+            return (connection, try await connection.send("GET", "runtime"))
+        }
+
+        do {
+            return try await connect()
+        } catch let error as ConnectionError {
+            guard startLocalIfNeeded, settings.localService != nil else { throw error }
+            switch error {
+            case .unreachable, .noToken: break
+            default: throw error
+            }
+        }
+
+        try Task.checkCancellation()
+        try await LocalBudService.start()
+        for _ in 0..<20 {
+            try await Task.sleep(for: .milliseconds(250))
+            do {
+                return try await connect()
+            } catch ConnectionError.unreachable {
+                continue
+            } catch ConnectionError.noToken {
+                continue
+            }
+        }
+        throw ConnectionError.localStartupFailed
+    }
+
     private func startConnection(resetBackoff: Bool) {
+        if stopping { finishStop(error: "Connection changed before bud confirmed Stop.") }
         closeInspector()
-        citedConversations = []
         setupMonitor?.cancel()
         setupMonitor = nil
         fastPollRemaining = 0
@@ -405,6 +613,7 @@ final class Companion {
         approvalDeck.reset()
         setups = []
         updatingSetups = []
+        openedSetups = []
         setupProblems = [:]
         activeTasks = []
         connection = nil
@@ -423,10 +632,12 @@ final class Companion {
                 retry?.cancel()
                 approvalPoll?.cancel()
             case .beginHandshake(let mine):
+                let startLocalIfNeeded = connectionMachine.backoffAttempt == 0
                 handshake = Task {
                     do {
-                        var connection = try BudConnection(settings: BudSettings.load())
-                        let runtime = try await connection.send("GET", "runtime")
+                        let (initialConnection, runtime) = try await connectRuntime(
+                            settings: BudSettings.load(), startLocalIfNeeded: startLocalIfNeeded)
+                        var connection = initialConnection
                         connection.scope = runtime["scope"] as? String ?? ""
                         let runtimeVersion = runtime["version"] as? String
                         let needsSetup = (runtime["needs_onboarding"] as? Bool) ?? false
@@ -443,9 +654,6 @@ final class Companion {
                         self.session = session
                         seenSeq = 0
                         apply(snapshot: snapshot)
-                        if needsSetup {
-                            OnboardingWindow.shared.showIfNeeded()
-                        }
                         let startSeq = snapshot["last_seq"] as? Int ?? 0
                         for next in nextEffects {
                             if case .startStream(let attempt) = next {
@@ -497,12 +705,32 @@ final class Companion {
     }
 
     func apply(snapshot: [String: Any]) {
-        switch snapshot["status"] as? String {
+        let snapshotStatus = snapshot["status"] as? String
+        let latestRun = (snapshot["recent_runs"] as? [[String: Any]])?.last
+        let latestRunID = latestRun?["run_id"] as? String
+        let hasActiveRun = ["queued", "running", "stopping", "awaiting_approval"].contains(snapshotStatus ?? "")
+        runID = hasActiveRun ? latestRunID : nil
+        let latestRunFailed = (latestRun?["status"] as? String) == "failed"
+        switch snapshotStatus {
         case "running", "queued", "stopping":
             activity = .working
             // Joined mid-run: the timer counts from now, not from a start it never saw.
             if runStart == nil { runStart = .now }
-        default: activity = .idle
+            runFailure = nil
+        case "failed":
+            activity = .failed
+            runFailure = RunFailure(latestRun ?? [:])
+        case "paused" where latestRunFailed:
+            activity = .failed
+            runFailure = RunFailure(latestRun ?? [:])
+        default:
+            if snapshotStatus == nil, latestRunFailed {
+                activity = .failed
+                runFailure = RunFailure(latestRun ?? [:])
+            } else {
+                activity = .idle
+                runFailure = nil
+            }
         }
         setOpenApprovals(from: snapshot)
         pendingMessages = (snapshot["queued_messages"] as? [[String: Any]] ?? []).compactMap {
@@ -528,9 +756,16 @@ final class Companion {
                 desktopJobID: turn["desktop_job_id"] as? String)
         }
         question = turns.last(where: \.fromOwner)?.text ?? ""
+        if let turnDraft, turns.last(where: \.fromOwner)?.seq != turnDraft.seq {
+            clearTurnDraft()
+        }
+        if !hasActiveRun {
+            if runFailure == nil { clearTurnDraft() }
+            confirmRunFinished(id: latestRunID)
+        }
         // Only a reply to the latest message: after a newer message, an older reply misleads.
         // It becomes the reply, not a turn: the latest reply is always `reply`, so it's drawn once.
-        if let last = turns.last, !last.fromOwner, last.routine == nil, last.desktopJobID == nil {
+        if runFailure == nil, let last = turns.last, !last.fromOwner, last.routine == nil, last.desktopJobID == nil {
             replySeq = last.seq
             replySources = last.sources
             reply = last.text
@@ -544,6 +779,7 @@ final class Companion {
         showWhole()
         // Something already waiting on you is shown, not left behind the dot.
         if needsAttention { bubbleOpen = true }
+        routineRevision += 1
     }
 
     /// Moves `shown` toward `reply`. The step grows with the backlog, so a long burst eases in
@@ -575,7 +811,16 @@ final class Companion {
     private func showStatus() {
         running = activity == .working
         let stalled = activeTasks.contains { $0.status == "stalled" }
-        status = openApprovals.isEmpty && setups.isEmpty && !stalled ? activity : .needsYou
+        let waiting = !openApprovals.isEmpty || !setups.isEmpty || stalled
+        if activity != .done || waiting {
+            finishGesture?.cancel()
+            finishGesture = nil
+        }
+        if waiting, activity == .done {
+            activity = .idle
+            return
+        }
+        status = waiting ? .needsYou : activity
     }
 
     /// The snapshot's pending list is the authority. Events alone can't tell: a parked
@@ -591,6 +836,7 @@ final class Companion {
             setup.url = setup.status == "failed" ? nil : setup.url ?? previous[setup.id]?.url
             return setup
         }
+        openedSetups.formIntersection(setups.lazy.filter { $0.status != "failed" }.map(\.id))
         setupProblems = setupProblems.filter { key, _ in setups.contains { $0.id == key } }
         let pending = snapshot["pending_approvals"] as? [[String: Any]] ?? []
         var jobs: [Int: String] = [:]
@@ -647,6 +893,31 @@ final class Companion {
 
     // MARK: Actions
 
+    func requestComposerFocus() {
+        if self === Self.shared { ConversationWindow.shared.show() }
+        focusComposerNonce += 1
+    }
+
+    func editAndResendFailedTurn() {
+        guard canEditAndResendFailedTurn, let turnDraft else { return }
+        if inputPurpose != .ask { write(.ask) }
+        draft = turnDraft.text
+        draftAttachments = turnDraft.attachments
+        clearAttachmentDropSummary()
+        replyingTo = turnDraft.quote
+        runFailure = nil
+        clearTurnDraft()
+        activity = .idle
+        inputOpen = true
+        requestComposerFocus()
+    }
+
+    private func clearTurnDraft() {
+        turnDraft = nil
+        turnExternalSteps = []
+        externalToolCalls = [:]
+    }
+
     /// Opens a cited message or a workspace file. Returns false for other links.
     func openSource(_ url: URL) -> Bool {
         guard let target = Citations.target(url) else { return false }
@@ -655,7 +926,6 @@ final class Companion {
         let mine = generation
         let requested = SourcePanel(target: target)
         if let focus = chatFocus(for: requested) {
-            citedConversations.removeAll()
             closeInspector()
             highlight(focus)
             return true
@@ -681,16 +951,7 @@ final class Companion {
                 inspector = .source(SourcePanel(target: target, problem: unavailable), request: request)
                 return
             }
-            if panel.citedTurn != nil {
-                closeInspector()
-                if let index = citedConversations.firstIndex(where: { $0.target == panel.target }) {
-                    citedConversations.removeLast(citedConversations.count - index - 1)
-                } else {
-                    citedConversations.append(panel)
-                }
-            } else {
-                inspector = .source(panel, request: request)
-            }
+            inspector = .source(panel, request: request)
         }
         return true
     }
@@ -702,25 +963,76 @@ final class Companion {
 
     func addAttachments(_ urls: [URL]) {
         guard inputPurpose == .ask, !readingAttachments, !uploadingAttachments, !urls.isEmpty else { return }
-        let available = DraftAttachment.maxCount - draftAttachments.count
-        if urls.count > available { nudge("You can attach up to five files per message.") }
-        guard available > 0 else { return }
+        clearAttachmentDropSummary()
+        guard draftAttachments.count < DraftAttachment.maxCount else {
+            let skipped = urls.map { $0.lastPathComponent.isEmpty ? $0.absoluteString : $0.lastPathComponent }
+            attachmentDropSummary = "Skipped \(skipped.map { "\($0) (attachment limit)" }.joined(separator: ", "))."
+            nudge("You can attach up to five files per message.")
+            return
+        }
         readingAttachments = true
+        let mine = generation
         Task {
             defer { readingAttachments = false }
-            for url in urls.prefix(available) {
+            var skipped: [String] = []
+            var singleOversized = false
+            for url in urls {
+                let name = url.lastPathComponent.isEmpty ? url.absoluteString : url.lastPathComponent
+                guard draftAttachments.count < DraftAttachment.maxCount else {
+                    skipped.append("\(name) (attachment limit)")
+                    continue
+                }
                 do {
                     let file = try await Task.detached { try DraftAttachment.read(url) }.value
+                    guard mine == generation else { return }
                     draftAttachments.append(file)
+                } catch DraftAttachment.ReadError.unsupportedFile {
+                    skipped.append("\(name) (unsupported)")
+                } catch let error as CocoaError where error.code == .fileReadTooLarge {
+                    skipped.append("\(name) (over 25 MiB)")
+                    if urls.count == 1 { singleOversized = true }
                 } catch {
-                    nudge("Couldn't attach \(url.lastPathComponent). Choose a file up to 25 MiB.")
+                    skipped.append("\(name) (couldn’t read)")
                 }
+            }
+            guard mine == generation, !skipped.isEmpty else { return }
+            attachmentDropSummary = "Skipped \(skipped.joined(separator: ", "))."
+            if singleOversized {
+                nudge("Files can be up to 25 MiB.")
             }
         }
     }
 
+    func clearAttachmentDropSummary() {
+        attachmentDropSummary = nil
+    }
+
     func removeAttachment(_ id: String) {
         draftAttachments.removeAll { $0.id == id }
+    }
+
+    func attachPastedImage(_ pngData: Data) -> Bool {
+        guard inputPurpose == .ask, !pngData.isEmpty else { return false }
+        guard canAddAttachments else {
+            if draftAttachments.count >= DraftAttachment.maxCount {
+                nudge("You can attach up to five files per message.")
+            }
+            return false
+        }
+        guard pngData.count <= DraftAttachment.limit else {
+            nudge("Choose an image up to 25 MiB.")
+            return false
+        }
+        do {
+            let file = try DraftAttachment.stageScreenshot(
+                pngData, existingNames: draftAttachments.map(\.reference.name))
+            defer { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
+            draftAttachments.append(try DraftAttachment.read(file))
+            return true
+        } catch {
+            nudge("Couldn’t prepare the screenshot. Try copying it again.")
+            return false
+        }
     }
 
     func selection(for file: ChatAttachment, in sourceSession: String? = nil) -> AttachmentSelection? {
@@ -756,6 +1068,11 @@ final class Companion {
         toggleInspector(.browser(BrowserSelection(connection: connection)))
     }
 
+    func openReport(_ file: URL) {
+        if self === Self.shared { ConversationWindow.shared.show() }
+        inspector = .report(file)
+    }
+
     @discardableResult
     func toggleInspector(_ selection: InspectorSelection) -> Bool {
         inspector = inspector?.target == selection.target ? nil : selection
@@ -788,27 +1105,27 @@ final class Companion {
         focusRequest += 1
     }
 
-    func backFromCitation() {
-        _ = citedConversations.popLast()
-        closeInspector()
-    }
-
     func receiveSetup(_ data: [String: Any], replacing: Bool = false) {
         guard var incoming = CapabilitySetup(data) else { return }
         if ["connected", "cancelled", "rejected", "dismissed"].contains(incoming.status) {
             setups.removeAll { $0.id == incoming.id }
             updatingSetups.remove(incoming.id)
+            openedSetups.remove(incoming.id)
             setupProblems.removeValue(forKey: incoming.id)
             return
         }
-        if let index = setups.firstIndex(where: { $0.id == incoming.id }) {
-            if !replacing {
-                var current = setups[index]
-                current.status = incoming.status
-                current.reason = incoming.reason
-                incoming = current
-            }
-            if incoming.status == "failed" { incoming.url = nil }
+        let index = setups.firstIndex(where: { $0.id == incoming.id })
+        if let index, !replacing {
+            var current = setups[index]
+            current.status = incoming.status
+            current.reason = incoming.reason
+            incoming = current
+        }
+        if incoming.status == "failed" {
+            incoming.url = nil
+            openedSetups.remove(incoming.id)
+        }
+        if let index {
             setups[index] = incoming
         } else {
             setups.append(incoming)
@@ -819,42 +1136,45 @@ final class Companion {
 
     @ObservationIgnored var fastPollRemaining = 0
 
-    func connectSetup(_ setup: CapabilitySetup) {
-        guard let connection, !updatingSetups.contains(setup.id) else { return }
+    func connectSetup(
+        _ setup: CapabilitySetup,
+        openBrowser: @escaping @MainActor (URL) -> Bool = { NSWorkspace.shared.open($0) }
+    ) {
+        guard let connection, !updatingSetups.contains(setup.id),
+              let current = setups.first(where: { $0.id == setup.id }) else { return }
         setupProblems.removeValue(forKey: setup.id)
-        if let url = setups.first(where: { $0.id == setup.id })?.url {
-            if !NSWorkspace.shared.open(url) {
-                setupProblems[setup.id] = "Could not open your browser. Try again."
-            } else {
+        func open(_ url: URL) {
+            if openBrowser(url) {
+                openedSetups.insert(setup.id)
                 triggerFastPolling()
+            } else {
+                setupProblems[setup.id] = "Could not open your browser. Try again."
             }
+        }
+        if let url = current.url {
+            open(url)
             return
         }
         updatingSetups.insert(setup.id)
         let mine = generation
         Task {
+            defer { if mine == generation { updatingSetups.remove(setup.id) } }
             do {
                 let result = try await connection.send(
                     "POST", "connections/\(setup.id)/connect", json: ["resume": true])
-                guard mine == generation else { return }
+                guard mine == generation,
+                      let index = setups.firstIndex(where: { $0.id == setup.id }),
+                      setups[index].status != "failed" || current.status == "failed" else { return }
                 guard let url = CapabilitySetup.signInURL(result["url"] as? String) else {
                     setupProblems[setup.id] = "The sign-in link is unavailable. Try again."
-                    updatingSetups.remove(setup.id)
                     return
                 }
-                if let index = setups.firstIndex(where: { $0.id == setup.id }) {
-                    setups[index].url = url
-                    if !NSWorkspace.shared.open(url) {
-                        setupProblems[setup.id] = "Could not open your browser. Try again."
-                    } else {
-                        triggerFastPolling()
-                    }
-                }
+                setups[index].url = url
+                open(url)
             } catch {
-                guard mine == generation else { return }
+                guard mine == generation, setups.contains(where: { $0.id == setup.id }) else { return }
                 setupProblems[setup.id] = "\(error)"
             }
-            updatingSetups.remove(setup.id)
         }
     }
 
@@ -966,12 +1286,18 @@ final class Companion {
         }
         switch inputPurpose {
         case .revise(let id):
+            clearAttachmentDropSummary()
             respond(to: id, path: "revise", body: [
                 "text": text, "message_id": UUID().uuidString.replacingOccurrences(of: "-", with: ""),
             ])
             return
         case .ask:
             break
+        }
+        if needsOnboarding {
+            if spoken != nil { holdSpeech(text, because: "Add a model to send messages.") }
+            OnboardingWindow.shared.show()
+            return
         }
         if spoken == nil {
             draft = ""
@@ -990,6 +1316,7 @@ final class Companion {
             // The old reply moves into the conversation now, so the bubble clears at once.
             archiveReply()
             reply = ""
+            runFailure = nil
             question = text
             blocks = []
             bubbleOpen = true
@@ -1000,13 +1327,18 @@ final class Companion {
         let destination = session
         // A typed message waiting for its retry keeps its id; speech never clears it.
         if spoken == nil { unsent = nil }
-        if !files.isEmpty { uploadingAttachments = true }
+        if !files.isEmpty {
+            uploadingAttachments = true
+            sentAttachments[messageID] = files
+        }
         sendTask = Task {
             defer { if !files.isEmpty { uploadingAttachments = false } }
             do {
                 try await connection.postMessage(
                     message, id: messageID, session: destination, attachments: files)
             } catch {
+                guard !Task.isCancelled else { return }
+                sentAttachments.removeValue(forKey: messageID)
                 pendingMessages.removeAll { $0.id == messageID }
                 // Keep what was typed: put it back in the field so one Return resends it. The
                 // request may have arrived before the error, so the resend reuses its id and
@@ -1031,6 +1363,9 @@ final class Companion {
                 }
             }
         }
+        if spoken == nil, Bundle.main.bundleURL.pathExtension == "app" {
+            BudSounds.playMessageSent()
+        }
     }
 
     func retryHeldMessage() {
@@ -1040,12 +1375,14 @@ final class Companion {
             return
         }
         retryingHeldMessage = true
+        if !held.attachments.isEmpty { sentAttachments[held.id] = held.attachments }
         sendTask = Task {
             do {
                 try await connection.postMessage(
                     held.payload, id: held.id, session: held.session, attachments: held.attachments)
                 heldMessages.removeAll { $0.id == held.id }
             } catch {
+                sentAttachments.removeValue(forKey: held.id)
                 nudge("Couldn't send: \(error)")
             }
             retryingHeldMessage = false
@@ -1127,10 +1464,104 @@ final class Companion {
         bubbleOpen = true
     }
 
+    func dismissTransientNotices(ifLatest id: Notice.ID) {
+        guard notices.last(where: { $0.report == nil })?.id == id else { return }
+        notices.removeAll { $0.report == nil }
+    }
+
+    func editQueuedMessage(id: String, text: String) async -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        guard let connection else {
+            nudge("That message already started running.")
+            return false
+        }
+        let original = pendingMessages.first(where: { $0.id == id })
+        let mine = generation
+        do {
+            _ = try await connection.send(
+                "PATCH", "sessions/\(session)/queue/\(id)", json: ["text": trimmed])
+            guard mine == generation else { return false }
+            if let original, let index = pendingMessages.firstIndex(of: original) {
+                pendingMessages[index].text = trimmed
+            }
+            return true
+        } catch {
+            guard mine == generation else { return false }
+            if case ConnectionError.http(409, "Message is no longer queued") = error {
+                pendingMessages.removeAll { $0.id == id }
+            }
+            nudge("That message already started running.")
+            return false
+        }
+    }
+
+    func cancelQueuedMessage(id: String) async -> Bool {
+        guard let connection else { return false }
+        let mine = generation
+        guard let result = try? await connection.send("DELETE", "sessions/\(session)/queue/\(id)"),
+              mine == generation, let cancelled = result["cancelled"] as? Bool else { return false }
+        pendingMessages.removeAll { $0.id == id }
+        if cancelled { sentAttachments.removeValue(forKey: id) }
+        return cancelled
+    }
+
     func stop() {
-        batchTask?.cancel()
-        guard let connection else { return }
-        Task { _ = try? await connection.send("POST", "sessions/\(session)/stop", json: [:]) }
+        stopResponse()
+    }
+
+    func stopResponse() {
+        requestStop(allWork: false)
+    }
+
+    func stopAllWork() {
+        requestStop(allWork: true)
+    }
+
+    private func requestStop(allWork: Bool) {
+        guard !stopping else { return }
+        guard let connection else {
+            stopError = "Connect to bud to stop work."
+            return
+        }
+        if allWork { batchTask?.cancel() }
+        stopping = true
+        stopError = nil
+        stopRequest = StopRequest(runID: runID, runFinished: !running && runID == nil)
+        let mine = generation
+        let endpoint = allWork ? "stop" : "stop-response"
+        let path = "sessions/\(session)/\(endpoint)"
+        stopTask = Task {
+            do {
+                let result = try await connection.send("POST", path, json: [:])
+                guard mine == generation, stopRequest != nil else { return }
+                guard let requested = result["stop_requested"] as? Bool else {
+                    finishStop(error: "Bud did not confirm Stop.")
+                    return
+                }
+                stopRequest?.acknowledged = true
+                if !requested || stopRequest?.runFinished == true { finishStop() }
+            } catch {
+                guard mine == generation, stopRequest != nil else { return }
+                if !allWork, case ConnectionError.http(404, _) = error {
+                    finishStop(error: "This server can only stop all work.")
+                } else {
+                    finishStop(error: "Couldn’t stop: \(error)")
+                }
+            }
+        }
+    }
+
+    private func confirmRunFinished(id: String?) {
+        guard let request = stopRequest, request.runID == nil || request.runID == id else { return }
+        stopRequest?.runFinished = true
+        if request.acknowledged { finishStop() }
+    }
+
+    private func finishStop(error: String? = nil) {
+        stopRequest = nil
+        stopping = false
+        stopError = error
     }
 
     // MARK: The pet's body language
@@ -1141,7 +1572,7 @@ final class Companion {
         PetPose(
             status: PetMove.of(status), statusSince: statusSince, walk: walk,
             listeningSince: hearing ? hearingSince : nil, reaction: reaction,
-            reactionAtStatusStart: reactionAtStatusStart)
+            reactionAtStatusStart: reactionAtStatusStart, isRunFinish: status == .done)
     }
 
     /// Plays `move` once over the status, unless the pet is busy being carried.
@@ -1152,7 +1583,7 @@ final class Companion {
 
     /// A wave when you point at the pet, but only when it has nothing else to show.
     func greet() {
-        guard status == .idle || status == .done else { return }
+        guard status == .idle else { return }
         if let reaction, Date.now < reaction.since + 2 { return }
         react(.wave)
     }
@@ -1187,18 +1618,12 @@ final class Companion {
         respond(to: approval.id, path: nil, body: ApprovalDecision.always.body)
     }
 
-    func approveAll(for approval: Approval) {
-        let batch = approval.batch(in: approvals)
-        guard batch.count > 1 else { return }
-        approve(batch)
-    }
-
     func failedApprovals(for approval: Approval) -> [Approval] {
         approval.retryBatch(in: approvals, failures: approvalFailures)
     }
 
     func retryFailed(for approval: Approval) {
-        approve(failedApprovals(for: approval))
+        approveBatch(failedApprovals(for: approval))
     }
 
     func selectPreviousApproval() {
@@ -1213,8 +1638,8 @@ final class Companion {
         approvalDeck.setAnimating(animating)
     }
 
-    private func approve(_ batch: [Approval]) {
-        let ids = batch.map(\.id)
+    func approveBatch(_ approvals: [Approval]) {
+        let ids = approvals.filter { !$0.isQuestion }.map(\.id)
         guard let connection, let attempt = approvalDeck.beginBatch(ids: ids) else { return }
         let route = "sessions/\(session)/approvals/"
         let mine = generation
@@ -1475,7 +1900,7 @@ final class Companion {
             guard !Task.isCancelled else { return }
             diagnosticsCopied = false
             notices.removeAll { $0.id == notice.id }
-            if openedBubbleHere, !needsAttention, shown.isEmpty, notices.isEmpty, receipt == nil {
+            if openedBubbleHere, !needsAttention, shown.isEmpty, runFailure == nil, notices.isEmpty, receipt == nil {
                 bubbleOpen = false
             }
         }
@@ -1539,23 +1964,34 @@ final class Companion {
         case "message.cancelled", "message.dispatched":
             let id = event.string("message_id")
             pendingMessages.removeAll { $0.id == id }
+            if event.type == "message.cancelled" { sentAttachments.removeValue(forKey: id) }
         case "user.message":
             // A new turn, from this app or any other interface: the old reply no longer applies.
-            settle?.cancel()
             let messageID = event.string("message_id")
             if !messageID.isEmpty { pendingMessages.removeAll { $0.id == messageID } }
             // The previous reply joins the conversation, and the new message follows it.
             archiveReply()
             let said = event.string("text")
-            question = Self.unquoted(said).text
+            let prompt = Self.unquoted(said)
+            question = prompt.text
             let files = ChatAttachment.decode(event.data["attachments"])
+            let sent = sentAttachments.removeValue(forKey: messageID)
+                ?? heldMessages.first(where: { $0.id == messageID })?.attachments
+                ?? (unsent?.id == messageID ? unsent?.attachments : nil)
+                ?? []
+            let attachments = sent.filter { files.contains($0.reference) }
+            if event.data["steered"] as? Bool != true { clearTurnDraft() }
             if !said.isEmpty || !files.isEmpty {
                 turns.append(Turn(fromOwner: true, text: said, seq: event.seq, attachments: files))
+            }
+            if !prompt.text.isEmpty || !attachments.isEmpty {
+                turnDraft = TurnDraft(text: prompt.text, quote: prompt.quote, attachments: attachments, seq: event.seq)
             }
             runStart = .now
             blocks = []
             seenRequests = []
             reply = ""
+            runFailure = nil
             // Job milestones belong to the turn they happened in.
             notices = []
             steps = []
@@ -1563,9 +1999,14 @@ final class Companion {
             stepsExpanded = false
             activity = .working
             bubbleOpen = true
+        case "run.queued":
+            runID = event.data["run_id"] as? String
+            if ["job", "setup"].contains(event.string("trigger")) { clearTurnDraft() }
         case "run.started", "run.recovered":
-            settle?.cancel()
+            runID = event.data["run_id"] as? String
+            runFailure = nil
             if ["job", "setup"].contains(event.string("trigger")) {
+                clearTurnDraft()
                 archiveReply()
                 reply = ""
                 showWhole()
@@ -1578,6 +2019,9 @@ final class Companion {
             }
             if runStart == nil { runStart = .now }
             activity = .working
+        case "run.stop_requested":
+            runID = event.data["run_id"] as? String
+            activity = .working
         case "text.reset":
             let request = event.string("request")
             if !seenRequests.insert(request).inserted {
@@ -1585,24 +2029,48 @@ final class Companion {
                 reply = blocks.map(\.text).joined(separator: "\n\n")
             }
         case "tool.call":
-            addSteps(call: event.string("call_id"), tool: event.string("tool"),
-                     args: event.data["args"] as? [String: Any] ?? [:])
+            let call = event.string("call_id")
+            let tool = event.string("tool")
+            let args = event.data["args"] as? [String: Any] ?? [:]
+            addSteps(call: call, tool: tool, args: args)
+            if let labels = Self.externalStepLabels(tool: tool, args: args) {
+                externalToolCalls[call] = labels
+            }
+        case "action.decided":
+            let call = event.string("call_id")
+            switch event.string("outcome") {
+            case "allowed", "auto-allow", "approved":
+                // Nested Code Mode tools can have a decision without a separate tool.call event.
+                if externalToolCalls[call] == nil, let labels = Self.externalStepLabels(tool: event.string("tool")) {
+                    recordExternalSteps(labels)
+                }
+            case "denied", "asked":
+                externalToolCalls.removeValue(forKey: call)
+            default:
+                break
+            }
         case "tool.result":
-            let call = event.string("call_id") + ":"
-            for index in steps.indices where steps[index].id.hasPrefix(call) { steps[index].done = true }
+            let call = event.string("call_id")
+            for index in steps.indices where steps[index].id.hasPrefix(call + ":") { steps[index].done = true }
+            if let labels = externalToolCalls.removeValue(forKey: call), event.string("outcome") != "retried" {
+                recordExternalSteps(labels)
+            }
         case "text.delta":
             appendDelta(block: event.string("block"), text: event.string("text"))
         case "capability.setup", "capability.status":
             receiveSetup(event.data, replacing: event.type == "capability.setup")
         case "run.completed":
+            confirmRunFinished(id: event.data["run_id"] as? String)
+            runID = nil
+            runFailure = nil
+            clearTurnDraft()
             finish(event)
             closeSteps()
-            react(.hop)
-            activity = .done
-            settleToIdle()
+            playFinishGesture()
             refreshApprovals()
         case "run.waiting":
             // The run is parked on the owner; the open approvals make the pet say so.
+            runFailure = nil
             finish(event)
             closeSteps()
             activity = .idle
@@ -1639,16 +2107,25 @@ final class Companion {
             }
             refreshApprovals()
         case "run.failed":
-            let reason = event.string("reason")
+            confirmRunFinished(id: event.data["run_id"] as? String)
+            runID = nil
+            if replySeq != nil { archiveReply() }
+            blocks = []
+            seenRequests = []
             closeSteps()
             replySources = [:]
             replySeq = nil
-            reply = reason.isEmpty ? "The run failed." : "The run failed: \(reason)"
+            reply = ""
             showWhole()
+            runFailure = RunFailure(event.data)
             activity = .failed
             bubbleOpen = true
             refreshApprovals()
         case "run.cancelled":
+            confirmRunFinished(id: event.data["run_id"] as? String)
+            runID = nil
+            runFailure = nil
+            clearTurnDraft()
             closeSteps()
             activity = .idle
             refreshApprovals()
@@ -1697,6 +2174,7 @@ final class Companion {
             refreshApprovals()
         case "routine.created", "routine.completed", "routine.failed", "routine.cancelled",
              "routine.needs_review":
+            routineRevision += 1
             var data = event.data
             data["kind"] = String(event.type.dropFirst("routine.".count))
             let card = RoutineCard(data)
@@ -1709,6 +2187,9 @@ final class Companion {
                 }
                 turns.append(Turn(fromOwner: false, text: text, seq: event.seq, routine: card))
             }
+        case "routine.updated", "routine.paused", "routine.resumed", "routine.triggered",
+             "routine.delivery_confirmed":
+            routineRevision += 1
         case "background.finished":
             if let jobID = event.data["desktop_job_id"] as? String {
                 if !running {
@@ -1726,6 +2207,24 @@ final class Companion {
             react(.hop)
         default:
             break
+        }
+    }
+
+    private static func externalStepLabels(tool: String, args: [String: Any] = [:]) -> [String]? {
+        let name = tool.lowercased()
+        let external = (tool != name && tool == tool.uppercased() && tool.contains("_"))
+            || ["email", "thread", "draft", "event", "calendar", "contact", "todo"].contains { name.contains($0) }
+            || ["browser_", "music_", "notes_", "reminders_"].contains { name.hasPrefix($0) }
+            || ["open_app", "open_in_app", "open_chrome", "mark_read",
+                "add_task", "list_tasks", "complete_task"].contains(name)
+        guard external else { return nil }
+        let labels = Activity.steps(tool: tool, args: args)
+        return labels.isEmpty ? [tool.replacingOccurrences(of: "_", with: " ").capitalized] : labels
+    }
+
+    private func recordExternalSteps(_ labels: [String]) {
+        for label in labels where !turnExternalSteps.contains(label) {
+            turnExternalSteps.append(label)
         }
     }
 
@@ -1831,11 +2330,20 @@ final class Companion {
         bubbleOpen = true
     }
 
-    private func settleToIdle() {
-        settle?.cancel()
-        settle = Task {
-            try? await Task.sleep(for: .seconds(6))
-            if !Task.isCancelled, activity == .done { activity = .idle }
+    private func playFinishGesture() {
+        reaction = nil
+        activity = .done
+        guard status == .done else { return }
+        finishGesture?.cancel()
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let duration = PetSprite.named(petID)?.finishDuration(reduceMotion: reduceMotion)
+            ?? .milliseconds(PetSprite.finishHoldMs)
+        statusSince = .now
+        let deadline = ContinuousClock.now + duration
+        finishGesture = Task { [weak self] in
+            try? await Task.sleep(until: deadline, clock: .continuous)
+            guard !Task.isCancelled else { return }
+            self?.activity = .idle
         }
     }
 

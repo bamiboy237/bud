@@ -2,11 +2,25 @@ import asyncio
 from collections import deque
 
 import pytest
-from pydantic_ai.exceptions import ModelRequestTimeout
+from pydantic_ai import Conversation, ConversationTypeAdapter
+from pydantic_ai.exceptions import ModelRequestTimeout, ModelServerError, UserError
+from pydantic_ai.messages import (
+    CompactionPart,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelResponse,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.usage import RunUsage
 
 from bud.core.runner import DecisionRejected, UnknownApproval
-from tests.runner_support import create_note, reply, running_bud
+from bud.gateway.errors import NEXT_STEP
+from bud.gateway.registry import Registry
+from bud.gateway.router import Gateway
+from tests.runner_support import create_note, reply, running_bud, scripted_model
 
 
 def responses(*items):
@@ -20,6 +34,149 @@ def responses(*items):
         return response
 
     return respond
+
+
+def configure_model_choices(bud, *, alternate=True, primary_offline=False, pin_primary=False):
+    old = bud.runner.gateway
+    primary = old.registry.models[0]
+    secondary = primary.model_copy(update={"name": "alternate"})
+
+    def respond(messages, info):
+        if primary_offline:
+            raise ModelServerError(primary.name, "Unavailable")
+        return reply("Primary model")
+
+    models = {
+        primary.id: scripted_model(respond),
+        secondary.id: scripted_model(lambda *_: reply("Alternate model")) if alternate else None,
+    }
+    bud.runner.reload_gateway(
+        Gateway(
+            Registry(models=[primary, secondary]),
+            old.ledger,
+            lambda spec: models[spec.id],
+            selected_model=primary.id if pin_primary else None,
+        )
+    )
+    return primary.id, secondary.id
+
+
+@pytest.mark.parametrize("alternate_available", [True, False])
+async def test_session_model_survives_restart_or_uses_default(tmp_path, alternate_available):
+    async with running_bud(tmp_path, responses()) as bud:
+        primary, alternate = configure_model_choices(bud)
+        bud.log.append("owner", "session.created")
+        bud.runner.set_model("owner", alternate)
+
+    async with running_bud(tmp_path, responses()) as bud:
+        configure_model_choices(bud, alternate=alternate_available)
+        await bud.runner.recover()
+        assert bud.runner.snapshot("owner").model == alternate
+        bud.runner.start("owner", "Which model is running?", "first")
+        await bud.settle()
+        state = bud.runner.snapshot("owner")
+        assert state.transcript[-1].text == (
+            "Alternate model" if alternate_available else "Primary model"
+        )
+        assert state.recent_runs[-1].model == (alternate if alternate_available else primary)
+        bud.runner.set_model("owner", None)
+
+    async with running_bud(tmp_path, responses()) as bud:
+        configure_model_choices(bud)
+        await bud.runner.recover()
+        assert bud.runner.snapshot("owner").model is None
+        bud.runner.start("owner", "Which model is running after reset?", "second")
+        await bud.settle()
+        assert bud.runner.snapshot("owner").transcript[-1].text == "Primary model"
+
+
+async def test_new_runs_prefer_session_then_settings_over_gateway_default(tmp_path):
+    async with running_bud(tmp_path, responses()) as bud:
+        primary, alternate = configure_model_choices(bud, pin_primary=True)
+        bud.log.append("owner", "session.created")
+        bud.runner.owner_model = alternate
+        bud.runner.set_model("owner", primary)
+
+        async def assert_run(message_id, model, reply_text):
+            bud.runner.start("owner", "Which model is running?", message_id)
+            await bud.settle()
+            state = bud.runner.snapshot("owner")
+            assert state.recent_runs[-1].model == model
+            assert state.transcript[-1].text == reply_text
+
+        await assert_run("first", primary, "Primary model")
+        bud.runner.set_model("owner", None)
+        await assert_run("second", alternate, "Alternate model")
+        bud.runner.owner_model = None
+        await assert_run("third", primary, "Primary model")
+
+
+@pytest.mark.parametrize("selection", ["automatic", "session", "default"])
+async def test_enqueued_run_keeps_its_model_after_a_switch(tmp_path, selection):
+    async with running_bud(tmp_path, responses()) as bud:
+        primary, alternate = configure_model_choices(bud)
+        bud.log.append("owner", "session.created")
+        if selection == "session":
+            bud.runner.set_model("owner", alternate)
+        elif selection == "default":
+            bud.runner.owner_model = alternate
+        pinned = primary if selection == "automatic" else alternate
+        replacement = alternate if pinned == primary else primary
+
+        bud.runner.start("owner", "Use the queued model", "first")
+        assert bud.log.pending_runs()[0]["model"] == pinned
+        bud.runner.owner_model = replacement
+        bud.runner.set_model("owner", replacement)
+        await bud.settle()
+
+        state = bud.runner.snapshot("owner")
+        assert state.recent_runs[-1].model == pinned
+        assert state.transcript[-1].text == (
+            "Primary model" if pinned == primary else "Alternate model"
+        )
+
+
+async def test_enqueued_automatic_run_keeps_its_fallback(tmp_path):
+    async with running_bud(tmp_path, responses()) as bud:
+        primary, alternate = configure_model_choices(bud, primary_offline=True)
+        bud.log.append("owner", "session.created")
+        bud.runner.start("owner", "Try the automatic route", "first")
+        assert bud.log.pending_runs()[0]["model"] == primary
+        await bud.settle()
+        assert bud.runner.snapshot("owner").transcript[-1].text == "Alternate model"
+        assert {entry["model"] for entry in bud.runner.gateway.ledger.session_models("owner")} == {
+            primary,
+            alternate,
+        }
+
+
+@pytest.mark.parametrize("pinned_available", [True, False])
+async def test_recovery_keeps_the_enqueued_model_or_fails_safely(
+    tmp_path, monkeypatch, pinned_available
+):
+    async with running_bud(tmp_path, responses()) as bud:
+        primary, alternate = configure_model_choices(bud)
+        bud.log.append("owner", "session.created")
+        bud.runner.set_model("owner", alternate)
+        with monkeypatch.context() as patch:
+            patch.setattr(bud.runner, "_launch", lambda run: None)
+            bud.runner.start("owner", "Recover on the queued model", "first")
+        assert bud.log.pending_runs()[0]["model"] == alternate
+        bud.runner.set_model("owner", primary)
+
+    async with running_bud(tmp_path, responses()) as bud:
+        configure_model_choices(bud, alternate=pinned_available)
+        await bud.runner.recover()
+        await bud.settle()
+        state = bud.runner.snapshot("owner")
+        assert state.model == primary
+        if pinned_available:
+            assert state.recent_runs[-1].model == alternate
+            assert state.transcript[-1].text == "Alternate model"
+        else:
+            assert state.recent_runs[-1].status == "failed"
+            assert state.recent_runs[-1].kind == "model_unavailable"
+            assert not bud.runner.gateway.ledger.session_models("owner")
 
 
 @pytest.mark.parametrize("edit", [True, False], ids=["edit", "cancel"])
@@ -123,7 +280,7 @@ async def test_duplicate_message_is_noop_and_changed_content_is_rejected(tmp_pat
 
 
 async def test_stop_retires_pending_permission_and_does_not_write(tmp_path):
-    async with running_bud(tmp_path, responses(create_note())) as bud:
+    async with running_bud(tmp_path, responses(create_note(), reply("Recovered"))) as bud:
         bud.log.append("owner", "session.created")
         bud.runner.start("owner", "Create note.txt", "message-1")
         await bud.settle()
@@ -134,6 +291,9 @@ async def test_stop_retires_pending_permission_and_does_not_write(tmp_path):
         await bud.settle()
         assert bud.runner.snapshot("owner").recent_runs[-1].status == "cancelled"
         assert not bud.runner.snapshot("owner").pending_approvals
+        bud.runner.start("owner", "Leave the file as it is", "message-2")
+        await bud.settle()
+        assert bud.runner.snapshot("owner").recent_runs[-1].status == "completed"
         assert not (bud.root / "note.txt").exists()
         assert not bud.claims.exists()
 
@@ -147,13 +307,101 @@ async def test_model_failure_pauses_queue_then_new_message_can_recover(tmp_path)
         await bud.settle()
         state = bud.runner.snapshot("owner")
         assert state.recent_runs[-1].status == "failed"
+        assert state.recent_runs[-1].kind == "timeout"
+        assert state.recent_runs[-1].next == NEXT_STEP["timeout"]
         assert state.queue_paused
         assert not bud.claims.exists()
         bud.runner.start("owner", "Try again", "message-2")
         await bud.settle()
         state = bud.runner.snapshot("owner")
         assert state.recent_runs[-1].status == "completed"
+        assert state.recent_runs[-1].kind is None
+        assert state.recent_runs[-1].next is None
         assert not state.queue_paused
+
+
+async def test_failed_run_snapshot_keeps_safe_structured_fields_without_leaking_message(tmp_path):
+    secret = "raw internal detail sk-secret-12345"
+    async with running_bud(tmp_path, responses(UserError(secret))) as bud:
+        bud.log.append("owner", "session.created")
+        bud.runner.start("owner", "Create a routine every Monday", "message-1")
+        await bud.settle()
+        state = bud.runner.snapshot("owner")
+        latest = state.recent_runs[-1]
+        assert state.status == "paused"
+        assert state.queue_paused
+        assert latest.status == "failed"
+        assert latest.reason == "UserError"
+        assert latest.kind == "unknown"
+        assert latest.next == NEXT_STEP["unknown"]
+        assert secret not in (latest.reason or "")
+        assert secret not in (latest.next or "")
+
+
+@pytest.mark.parametrize(("terminal", "inline"), [("run.failed", False), ("run.cancelled", True)])
+async def test_retry_continues_from_the_saved_conversation(tmp_path, terminal, inline):
+    received = []
+
+    def respond(messages, info):
+        received.extend(part for message in messages for part in message.parts)
+        return reply("Recovered")
+
+    session = "owner"
+    summary = ModelRequest(parts=[CompactionPart(content="Compacted inbox history")])
+    call = ModelResponse(parts=[ToolCallPart("workspace_create", {}, tool_call_id="late-approved")])
+    result = ToolReturnPart("workspace_create", "Created the note", tool_call_id="late-approved")
+    late_result = ModelRequest(parts=[result])
+    saved = Conversation(
+        conversation_id=session,
+        messages=[summary, call, late_result, reply("Note created")],
+        usage=RunUsage(tool_calls=4),
+    )
+    async with running_bud(tmp_path, respond) as bud:
+        bud.log.append(session, "session.created")
+        bud.log.finish_run(
+            session,
+            "old",
+            "run.completed",
+            {
+                "run_id": "old",
+                "messages": ModelMessagesTypeAdapter.dump_python([reply("Old body")], mode="json"),
+            },
+            [],
+        )
+        data = {
+            "run_id": "late",
+            "messages": ModelMessagesTypeAdapter.dump_python(
+                [late_result, reply("Note created")], mode="json"
+            ),
+            "conversation": ConversationTypeAdapter.dump_json(saved).decode(),
+        }
+        if inline:
+            bud.log.append_once(session, "run.completed", data, key="late:terminal")
+        else:
+            bud.log.finish_run(session, "late", "run.completed", data, [])
+        for index, kind in enumerate(("run.failed", terminal)):
+            run_id = f"attempt-{index}"
+            bud.log.append(session, "run.queued", {"run_id": run_id, "text": run_id})
+            bud.log.finish_run(session, run_id, kind, {"run_id": run_id, "reason": run_id}, [])
+
+        bud.runner.start(session, "Retry", "retry")
+        await bud.settle()
+        latest = bud.runner.snapshot(session).recent_runs[-1]
+        assert latest.status == "completed"
+        assert summary.parts[0] in received
+        assert call.parts[0] in received
+        assert received.count(result) == 1
+        assert reply("Old body").parts[0] not in received
+        notes = [
+            part.content
+            for part in received
+            if isinstance(part, UserPromptPart) and isinstance(part.content, str)
+        ]
+        for index in range(2):
+            assert sum(f"The user had said: attempt-{index}" in note for note in notes) == 1
+        checkpoint = bud.log.conversation(session, latest.run_id)
+        assert checkpoint is not None
+        assert ConversationTypeAdapter.validate_json(checkpoint).usage.tool_calls == 4
 
 
 async def test_failed_run_does_not_silently_dispatch_waiting_messages(tmp_path):

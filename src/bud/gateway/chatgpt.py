@@ -4,11 +4,13 @@ import asyncio
 import fcntl
 import json
 import os
+import re
 import tempfile
 import webbrowser
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, NotRequired, TextIO, TypedDict
 from uuid import uuid4
 
 from pydantic_ai.providers.openai_chatgpt import (
@@ -17,6 +19,9 @@ from pydantic_ai.providers.openai_chatgpt import (
     OpenAIChatGPTOAuthFlow,
     OpenAIChatGPTProvider,
 )
+from pydantic_ai_harness.compaction import DEFAULT_CONTEXT_WINDOW, resolve_context_window
+
+from bud.config import MOVE_FENCE
 
 LOGIN_TIMEOUT_SECONDS = 300
 CALLBACK_PORT = 1455
@@ -24,6 +29,33 @@ CALLBACK_PORT = 1455
 
 class ChatGPTError(Exception):
     """A safe, user-facing sign-in or local-storage error."""
+
+
+class ChatGPTModel(TypedDict):
+    slug: str
+    display_name: str
+    context_window: NotRequired[int]
+
+
+def _catalog_context_window(model: Mapping[str, Any]) -> int | None:
+    for field in ("context_window", "max_context_length", "context_length", "max_input_tokens"):
+        value = model.get(field)
+        if type(value) is int and value > 0:
+            return value
+    return None
+
+
+def chatgpt_context_window(model: Mapping[str, Any]) -> int | None:
+    window = _catalog_context_window(model)
+    if window is not None:
+        return window
+    name = model["slug"]
+    window = resolve_context_window(f"openai-chatgpt:{name}") or resolve_context_window(
+        f"openai:{name}"
+    )
+    if window is None and re.match(r"^gpt-[56](?:[.-]|$)", name):
+        return DEFAULT_CONTEXT_WINDOW
+    return window
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -81,6 +113,9 @@ class ChatGPTStore(OpenAIChatGPTCredentialSource):
                 "Another bud process is using ChatGPT. Stop it before signing in, "
                 "listing ChatGPT models, or starting another ChatGPT process."
             ) from None
+        if (self.folder.parent / MOVE_FENCE).exists():
+            lock.close()
+            raise ChatGPTError("This Bud runtime is stopped for a move to another server.")
         self._lock = lock
 
     def close(self) -> None:
@@ -129,18 +164,22 @@ class ChatGPTStore(OpenAIChatGPTCredentialSource):
             self.close()
 
 
-async def refresh_models(store: ChatGPTStore) -> list[dict[str, str]]:
+async def refresh_models(store: ChatGPTStore) -> list[ChatGPTModel]:
     """Use the provider's authenticated client so catalog reads also refresh stale tokens."""
     store.acquire()
     provider = OpenAIChatGPTProvider(credential_source=store)
     try:
         async with provider:
             catalog = await provider.client.get("/models", cast_to=dict[str, Any])
-        models = [
-            {"slug": model["slug"], "display_name": model.get("display_name", model["slug"])}
-            for model in catalog.get("models", [])
-            if model.get("visibility") == "list" and isinstance(model.get("slug"), str)
-        ]
+        models: list[ChatGPTModel] = []
+        for model in catalog.get("models", []):
+            slug = model.get("slug")
+            if model.get("visibility") != "list" or not isinstance(slug, str):
+                continue
+            entry = ChatGPTModel(slug=slug, display_name=model.get("display_name", slug))
+            if (window := _catalog_context_window(model)) is not None:
+                entry["context_window"] = window
+            models.append(entry)
         if not models:
             raise ChatGPTError("ChatGPT returned no selectable models for this account.")
         state = store.state()

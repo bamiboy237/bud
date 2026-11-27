@@ -40,9 +40,93 @@ Create a local signing certificate named `bud companion (local)` in Keychain Acc
 
 ## Models & connected accounts
 
-- **In `Bud.app`:** launches a guided onboarding window on first run for ChatGPT sign-in and API keys, and applies edits in **Settings...** (`Cmd+,`) live with zero restart.
+- **In `Bud.app`:** select **Add a model** in the conversation. To change your model credentials later, open **Settings → Models**.
 - **In the CLI:** run `bud login chatgpt`, or set `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `MUSE_API_KEY`, `MISTRAL_API_KEY` in `~/.bud/config.env` or `.env`. Web search (`search_web` / `read_webpage`) uses `EXA_API_KEY`.
 - **Gmail & Calendar (Composio):** set `COMPOSIO_API_KEY`, then run `bud connect gmail` / `bud connect calendar` or trigger `setup_capability` in chat. New connections hot-reload on the next message. Switching or disconnecting an account automatically denies any pending approvals scoped to the old account.
+
+## Connect to your Bud server
+
+Open **Settings → General → Connect to a server**. Enter the server's HTTPS address and owner access token. Bud checks the connection before switching and stores the token in Keychain. To open the on-device conversation again, select **Use This Mac**.
+
+### Run Bud on a Linux server
+
+Use a Linux VM, such as an Azure VM, with Docker Compose. Point a DNS name at it and allow HTTPS on port 443 and certificate validation on port 80. Run this from the Bud checkout on the VM:
+
+```sh
+BUD_DOMAIN=bud.example.com docker compose up -d
+```
+
+Caddy issues the TLS certificate. Only Caddy publishes ports. Bud stores its database, workspace, settings, and access token in the `bud-data` volume. To connect the Mac app, get the token in a private terminal on the VM:
+
+```sh
+BUD_DOMAIN=bud.example.com docker compose exec bud cat /home/bud/.bud/data/auth/owner.token
+```
+
+Enter the address and token in Mac Settings. Add a model API key in **Models**. This server does not need the Mac app to stay open.
+
+### Host Bud on Azure
+
+The [`ops/azure/main.bicep`](../ops/azure/main.bicep) template creates an Ubuntu
+VM, a DNS name, and a firewall. It starts Bud and Caddy on reboot and keeps their
+volumes on the managed OS disk.
+
+1. Use a public Linux container image for this Bud build, pinned by digest.
+2. Compile the template with `az bicep build --file ops/azure/main.bicep`.
+3. In Azure, open **Deploy a custom template** and load the generated `main.json`.
+   Enter your SSH public key, your SSH source IP with `/32`, and the image reference.
+4. Leave `receiveMove` on to move your existing Bud. Turn it off to start with a fresh Bud.
+5. Review Azure's resources and costs before you deploy. Use the deployment's `budURL`
+   and `sshCommand` outputs to connect and retrieve the access token:
+
+   ```sh
+   cd /opt/bud
+   sudo docker compose exec bud cat /home/bud/.bud/data/auth/owner.token
+   ```
+
+### Move Bud to a server
+
+Start a fresh Linux server in move mode. For a server you host with Compose:
+
+```sh
+BUD_DOMAIN=bud.example.com BUD_RECEIVE_MOVE=true docker compose up -d
+```
+
+Then move your local Bud:
+
+1. Open **Settings → General → Move Bud to a server**.
+2. Select the local Bud folder. If its workspace is separate, select that folder too.
+3. Enter the address and access token for the server you prepared.
+4. Select **Move Bud**. Bud stops the local service, stages its data on the server, and switches the app after Bud starts on the server.
+
+Chats, memory, workspace files, skills, routines, portable model keys, and
+supported sign-ins move together. Finish pending work and approvals before the
+move. Pair browsers and desktops again on the new server.
+
+If the connection drops, reopen **Move Bud** and select **Continue move**.
+The local runtime stays stopped. Select **Cancel move** to start it on this Mac
+again. The server must confirm that it did not activate the move before Bud can
+resume on this Mac.
+
+### Pair this Mac for app actions
+
+When Bud runs on a Linux server, open **Settings → Computers → Add a computer →
+Pair this Mac**. Keep the Bud Mac app open. The local assistant service can stay off.
+Bud can find and create notes, list and add reminders, and control Music. macOS asks
+for Automation permission the first time Bud uses each app. Bud can also open a
+workspace document on that Mac. App changes and document opens require approval
+in chat. Select **Remove** to block future actions from this server. This does
+not stop an action the Mac already accepted.
+
+### Add a Daytona browser
+
+Put the Bud server and the Daytona computer on the same private network. For Docker Compose, enable the Browse port on the server's private IPv4 address:
+
+```sh
+BUD_DOMAIN=bud.example.com BUD_BROWSE_PEER_IP=100.64.1.2 \
+  docker compose -f compose.yaml -f ops/compose.browse.yaml up -d
+```
+
+Open **Settings → Computers → Add a computer → Daytona**. In the Daytona desktop, open Chromium with the Browse extension and choose **Pair with a code**. Enter the relay address and pairing code from Settings. Name that browser **Daytona** in the extension to distinguish it from Chrome in Bud's Browser panel.
 
 ## iMessage (Photon v2)
 

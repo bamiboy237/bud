@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 import Carbon.HIToolbox
 import Foundation
@@ -54,6 +55,13 @@ struct VoiceTests {
     actor FakeTranscriber: VoiceTranscriber {
         var result: Result<String, Error> = .success("hello bud")
         private(set) var calls: [Clip] = []
+        private let pause: Bool
+        private var paused: CheckedContinuation<Void, Never>?
+        nonisolated let (started, startedEvents) = AsyncStream<Void>.makeStream()
+
+        init(pause: Bool = false) {
+            self.pause = pause
+        }
 
         func setResult(_ next: Result<String, Error>) {
             result = next
@@ -61,7 +69,18 @@ struct VoiceTests {
 
         func transcribe(_ clip: Clip) async throws -> String {
             calls.append(clip)
+            if pause {
+                await withCheckedContinuation {
+                    paused = $0
+                    startedEvents.yield(())
+                }
+            }
             return try result.get()
+        }
+
+        func finish() {
+            paused?.resume()
+            paused = nil
         }
     }
 
@@ -121,6 +140,10 @@ struct VoiceTests {
         transcriber: FakeTranscriber = FakeTranscriber(),
         isDownloaded: Bool = false,
         micAllowed: Bool = true,
+        micAuthorization: Box<AVAuthorizationStatus> = Box(.authorized),
+        hasMicrophone: Box<Bool> = Box(true),
+        notificationCenter: NotificationCenter = NotificationCenter(),
+        silenceThreshold: Duration = .milliseconds(2_500),
         allowTalkKey: Bool = true,
         rightOptionAllowed: Bool = true,
         loadError: Error? = nil
@@ -144,6 +167,10 @@ struct VoiceTests {
             },
             isDownloaded: { isDownloaded },
             requestMicAccess: { micAllowed },
+            microphoneAuthorization: { micAuthorization.value },
+            hasMicrophone: { hasMicrophone.value },
+            notificationCenter: notificationCenter,
+            silenceThreshold: silenceThreshold,
             loadContacts: { _ in [] },
             loadTranscriber: { _, progress in
                 if let loadError { throw loadError }
@@ -196,7 +223,7 @@ struct VoiceTests {
 
     @Test
     func setupHandlesDeniedMicAndModelLoadFailure() async {
-        let denied = makeVoice(micAllowed: false)
+        let denied = makeVoice(micAllowed: false, micAuthorization: Box(.denied))
         denied.voice.setUp()
         await denied.voice.setupTask?.value
         guard case .failed(let micMessage) = denied.voice.state else {
@@ -204,6 +231,8 @@ struct VoiceTests {
             return
         }
         #expect(micMessage.contains("Microphone access is off"))
+        #expect(denied.voice.microphoneDenied)
+        #expect(!denied.voice.microphoneUnavailable)
 
         let failedLoad = makeVoice(loadError: RecorderError.noMicrophone)
         failedLoad.voice.setUp()
@@ -237,7 +266,7 @@ struct VoiceTests {
     }
 
     @Test
-    func pressHandlesRecorderFailureCleanly() async {
+    func recorderReportsMicrophoneDisconnectionAndCanRetry() async {
         let env = makeVoice(isDownloaded: true)
         env.recorder.startError = RecorderError.noMicrophone
         env.voice.start()
@@ -246,7 +275,66 @@ struct VoiceTests {
         env.voice.press()
         #expect(env.voice.state == .ready)
         #expect(!env.companion.hearing)
-        #expect(env.companion.notices.last?.text == "bud couldn't use the microphone.")
+        #expect(!env.voice.microphoneDenied)
+        #expect(env.voice.microphoneUnavailable)
+        #expect(env.companion.notices.last?.text == "No microphone is available. Connect a microphone and try again.")
+
+        env.recorder.startError = nil
+        env.voice.press()
+        #expect(!env.voice.microphoneUnavailable)
+        #expect(env.voice.state == .listening)
+        #expect(env.voice.cancelActiveDictation())
+    }
+
+    @Test(arguments: [AVAuthorizationStatus.denied, .restricted])
+    func activationRechecksPermissionAndSeparatesDenialFromMissingHardware(
+        unavailableAuthorization: AVAuthorizationStatus
+    ) async {
+        let permission = Box(unavailableAuthorization)
+        let available = Box(false)
+        let notifications = NotificationCenter()
+        let env = makeVoice(
+            isDownloaded: true, micAuthorization: permission, hasMicrophone: available,
+            notificationCenter: notifications)
+        env.voice.start()
+        await env.voice.setupTask?.value
+
+        env.voice.press()
+        #expect(env.voice.microphoneDenied)
+        #expect(!env.voice.microphoneUnavailable)
+        #expect(env.recorder.startCount == 0)
+        #expect(env.companion.notices.last?.text.contains("Microphone access is off") == true)
+
+        permission.value = .authorized
+        notifications.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        #expect(!env.voice.microphoneDenied)
+        #expect(env.voice.microphoneUnavailable)
+        env.voice.press()
+        #expect(env.recorder.startCount == 0)
+        #expect(env.companion.notices.last?.text.contains("Connect a microphone") == true)
+
+        available.value = true
+        notifications.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        #expect(!env.voice.microphoneUnavailable)
+        env.voice.press()
+        #expect(env.voice.state == .listening)
+        #expect(env.voice.cancelActiveDictation())
+    }
+
+    @Test
+    func grantingPermissionInSettingsRestoresSetup() async {
+        let permission = Box(AVAuthorizationStatus.denied)
+        let notifications = NotificationCenter()
+        let env = makeVoice(
+            micAllowed: false, micAuthorization: permission, notificationCenter: notifications)
+        env.voice.setUp()
+        await env.voice.setupTask?.value
+        #expect(env.voice.microphoneDenied)
+
+        permission.value = .authorized
+        notifications.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        #expect(env.voice.state == .off)
+        #expect(!env.voice.microphoneDenied)
     }
 
     @Test
@@ -338,8 +426,102 @@ struct VoiceTests {
         #expect(await env.transcriber.calls.isEmpty)
 
         // Cancelling when already ready is a no-op.
-        env.voice.cancel()
+        env.voice.release()
+        #expect(!env.voice.cancelActiveDictation())
         #expect(env.recorder.stopCount == 1)
+    }
+
+    @Test(arguments: [false, true])
+    func escapeCancelsTranscriptionAndIgnoresItsLateCompletion(fails: Bool) async throws {
+        let transcriber = FakeTranscriber(pause: true)
+        await transcriber.setResult(fails ? .failure(RecorderError.noMicrophone) : .success("late words"))
+        let env = makeVoice(transcriber: transcriber, isDownloaded: true)
+        env.companion.draft = "typed text"
+        env.voice.start()
+        await env.voice.setupTask?.value
+        env.voice.press()
+        env.voice.release()
+        let task = try #require(env.voice.transcriptionTask)
+        var started = transcriber.started.makeAsyncIterator()
+        _ = await started.next()
+        #expect(env.voice.state == .transcribing)
+
+        let escape = try #require(env.tokens.value.first { $0.key == kVK_Escape && $0.modifiers == 0 })
+        #expect(!escape.unregistered)
+        escape.onPress()
+        #expect(task.isCancelled)
+        #expect(env.voice.state == .ready)
+        #expect(env.voice.transcriptionTask == nil)
+        #expect(escape.unregistered)
+
+        env.voice.press()
+        await transcriber.finish()
+        await task.value
+        #expect(env.voice.state == .listening)
+        #expect(env.companion.hearing)
+        #expect(env.companion.draft == "typed text")
+        #expect(env.companion.unsentSpeech == nil)
+        #expect(env.companion.notices.isEmpty)
+        #expect(env.voice.cancelActiveDictation())
+    }
+
+    @Test
+    func silenceClearsOnSpeechAndCanBeDetectedAgain() async {
+        let env = makeVoice(isDownloaded: true, silenceThreshold: .milliseconds(80))
+        env.voice.start()
+        await env.voice.setupTask?.value
+
+        env.voice.press()
+        #expect(!env.voice.noInputDetected)
+        env.recorder.emitLevel(0.01)
+        #expect(await waitUntil { env.voice.noInputDetected })
+
+        env.recorder.emitLevel(0.7)
+        #expect(await waitUntil { !env.voice.noInputDetected })
+        #expect(env.voice.level > 0)
+
+        env.recorder.emitLevel(0)
+        #expect(await waitUntil { env.voice.noInputDetected })
+        env.voice.release()
+        #expect(!env.voice.noInputDetected)
+        #expect(env.voice.level == 0)
+        await env.voice.transcriptionTask?.value
+    }
+
+    @Test
+    func meterSmoothsLevelAndDropsSamplesFromThePreviousRecording() async {
+        let env = makeVoice(isDownloaded: true)
+        env.voice.start()
+        await env.voice.setupTask?.value
+        env.voice.press()
+
+        env.recorder.emitLevel(2)
+        #expect(await waitUntil { env.voice.level > 0 })
+        let first = env.voice.level
+        #expect(first < 1)
+        env.recorder.emitLevel(1)
+        #expect(await waitUntil { env.voice.level > first })
+        let peak = env.voice.level
+        #expect(peak < 1)
+        env.recorder.emitLevel(-1)
+        #expect(await waitUntil { env.voice.level < peak })
+        #expect(env.voice.level > 0)
+
+        env.recorder.emitLevel(1)
+        #expect(env.voice.cancelActiveDictation())
+        env.voice.press()
+        env.recorder.emitLevel(0)
+        try? await Task.sleep(for: .milliseconds(10))
+        #expect(env.voice.level == 0)
+        #expect(env.voice.cancelActiveDictation())
+    }
+
+    private func waitUntil(_ condition: () -> Bool) async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(1)
+        while !condition(), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        return condition()
     }
 
     @Test
@@ -368,12 +550,16 @@ struct VoiceTests {
 
     // MARK: - Routing & Draft / Retry ID Preservation
 
-    @Test
-    func spokenMessageRoutesToBubbleAndPreservesTypedDraft() async {
+    @Test(arguments: [
+        ("", "check my calendar"),
+        ("Here is a draft", "Here is a draft check my calendar"),
+        ("Here is a draft\n", "Here is a draft\ncheck my calendar"),
+    ])
+    func spokenMessageAppendsToComposerDraftWithoutSending(initial: String, expected: String) async {
         let transport = StubTransport()
         let companion = Companion()
         companion.connectForTesting(transport.makeConnection(), session: "sess-42")
-        companion.draft = "half-written typed message"
+        companion.draft = initial
 
         let env = makeVoice(companion: companion, isDownloaded: true)
         await env.transcriber.setResult(.success("check my calendar"))
@@ -385,14 +571,28 @@ struct VoiceTests {
         await env.voice.transcriptionTask?.value
         await companion.sendTask?.value
 
-        #expect(companion.draft == "half-written typed message")
-        #expect(companion.question == "check my calendar")
-        #expect(companion.bubbleOpen)
-        #expect(transport.requests.count == 1)
-        #expect(transport.requests[0].method == "POST")
-        #expect(transport.requests[0].path == "/sessions/sess-42/messages")
-        #expect(transport.requests[0].body["text"] as? String == "check my calendar")
-        #expect((transport.requests[0].body["message_id"] as? String)?.isEmpty == false)
+        #expect(companion.draft == expected)
+        #expect(companion.inputOpen)
+        #expect(companion.unsentSpeech == nil)
+        #expect(transport.requests.isEmpty)
+    }
+
+    @Test
+    func spokenRevisionAppendsToDraftWhileDisconnected() async {
+        let env = makeVoice(isDownloaded: true)
+        env.companion.write(.revise("approval-1"))
+        env.companion.draft = "please"
+        await env.transcriber.setResult(.success("use the other file"))
+        env.voice.start()
+        await env.voice.setupTask?.value
+
+        env.voice.press()
+        env.voice.release()
+        await env.voice.transcriptionTask?.value
+
+        #expect(env.companion.inputPurpose == .revise("approval-1"))
+        #expect(env.companion.draft == "please use the other file")
+        #expect(env.companion.unsentSpeech == nil)
     }
 
     @Test

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -98,6 +99,14 @@ def add_parsers(commands: argparse._SubParsersAction) -> None:
     backup_p.add_argument("target", nargs="?", help="backup name or path for restore")
     backup_p.add_argument("--label", default="manual", help="label for `backup create`")
     backup_p.add_argument("--home", help="Bud home directory (default: ~/.bud)")
+
+    move_p = commands.add_parser(
+        "move-runtime", help="move the stopped Bud runtime to a prepared server (token on stdin)"
+    )
+    move_p.add_argument("source", type=Path)
+    move_p.add_argument("destination")
+    move_p.add_argument("workspace", type=Path, nargs="?")
+    move_p.add_argument("--cancel", action="store_true")
 
 
 def _install(args: argparse.Namespace) -> None:
@@ -293,6 +302,17 @@ def _backup(args: argparse.Namespace) -> None:
 
 def handle_command(args: argparse.Namespace) -> bool:
     """Execute release CLI commands if selected; return False otherwise."""
+    if args.command == "move-runtime":
+        from bud.release.runtime_move_client import move_runtime
+
+        token = sys.stdin.readline(257).strip()
+        if not token or len(token) > 256:
+            raise ReleaseError("Enter the destination access token on stdin.")
+        result = move_runtime(
+            args.source, args.destination, token, workspace=args.workspace, cancel=args.cancel
+        )
+        print(json.dumps(result))
+        return True
     if args.command == "install":
         _install(args)
         return True

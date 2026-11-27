@@ -1,6 +1,5 @@
 """A paired worker can deliver a selected file through an explicitly configured web form."""
 
-import asyncio
 import base64
 import binascii
 import hashlib
@@ -41,8 +40,8 @@ class BrowserForm(BaseModel):
         loopback = parts.hostname in {"127.0.0.1", "localhost", "::1"}
         if (
             not parts.hostname
-            or parts.username
-            or parts.password
+            or parts.username is not None
+            or parts.password is not None
             or parts.query
             or parts.fragment
             or parts.scheme not in ({"http", "https"} if loopback else {"https"})
@@ -113,7 +112,7 @@ async def _inspect(view: BrowserView, path: Path, tab: str, body: LocalBrowserSt
     raw = await view._command(path, "execute", cmd, f"--tab={tab}", timeout=15)
     # The CLI can add tab diagnostics before its JSON result.
     for line in reversed(raw.decode("utf-8", "replace").splitlines()):
-        with suppress(ValueError, AttributeError, TypeError):
+        with suppress(ValueError, AttributeError, TypeError, RecursionError):
             value = json.loads(line).get("state")
             if value in ("ready", "sign_in", "delivered", "other_page", "invalid_form"):
                 return value
@@ -127,20 +126,27 @@ async def _inspect_existing(view: BrowserView, path: Path, tab: str, body: Local
         return "unavailable"
 
 
+def _receipt_state(state: str) -> dict[str, str]:
+    return {"state": state if state in ("delivered", "unavailable") else "uncertain"}
+
+
 def local_routes(view: BrowserView) -> APIRouter:
     router = APIRouter()
 
     @router.post("/browser/desktop-delivery")
     async def local_step(body: LocalBrowserStep):
         """The local worker calls its own Bud server using the local owner credential."""
-        path = view._enabled_path()
         tab = f"delivery-{body.step}"
         async with view.lock:
             if view.private:
                 return {"state": "sign_in"}
+            path = view._enabled_path()
             if body.action == "check":
-                state = await _inspect_existing(view, path, tab, body)
-                return {"state": "delivered" if state == "delivered" else "uncertain"}
+                try:
+                    target = await view._available_tab(path, tab)
+                except HTTPException as exc:
+                    return {"state": "uncertain" if exc.status_code == 404 else "unavailable"}
+                return _receipt_state(await _inspect_existing(view, path, target, body))
             if body.action == "prepare":
                 try:
                     browsers = (await view._inventory(path))["browsers"]
@@ -163,10 +169,9 @@ def local_routes(view: BrowserView) -> APIRouter:
                     return {"state": "unavailable"}
                 state = await _inspect_existing(view, path, tab, body)
                 if state in ("sign_in", "other_page"):
-                    view.enter()
                     # Alternate sign-in pages can be opened by the owner in another tab
                     # on this profile. No sign-in inputs go through the worker.
-                    view.handoff = asyncio.create_task(view.bring_forward(path, tab))
+                    await view.start_handoff(path, tab)
                     return {"state": "sign_in"}
                 return {"state": state}
             if body.data is None or body.file is None or body.sha256 is None:
@@ -177,16 +182,18 @@ def local_routes(view: BrowserView) -> APIRouter:
                 raise HTTPException(422, "Invalid file encoding.") from None
             if len(data) > ATTACHMENT_BYTES or hashlib.sha256(data).hexdigest() != body.sha256:
                 raise HTTPException(422, "The file does not match the approved copy.")
+            if body.file.name in {".", ".."} or "\0" in body.file.name:
+                raise HTTPException(422, "Invalid file name.")
             state = await _inspect_existing(view, path, tab, body)
             if state != "ready":
-                return {"state": "delivered" if state == "delivered" else "uncertain"}
+                return _receipt_state(state)
             try:
                 # Browse includes /tmp on Unix, even if Bud and the relay use different TMPDIRs.
                 with TemporaryDirectory(
                     dir="/tmp" if os.name == "posix" else None, prefix="bud-delivery-"
                 ) as folder:
                     copy = Path(folder) / body.file.name
-                    if copy.parent != Path(folder) or body.file.name in {".", ".."}:
+                    if copy.parent != Path(folder):
                         raise HTTPException(422, "Invalid file name.")
                     copy.write_bytes(data)
                     await view._tab_command(
@@ -199,7 +206,7 @@ def local_routes(view: BrowserView) -> APIRouter:
                     )
                     state = await _inspect_existing(view, path, tab, body)
                     if state != "ready":
-                        return {"state": "delivered" if state == "delivered" else "uncertain"}
+                        return _receipt_state(state)
                     await view._tab_command(
                         path,
                         "upload",
@@ -219,7 +226,6 @@ def local_routes(view: BrowserView) -> APIRouter:
                         )
             except (OSError, RuntimeError, TimeoutError):
                 pass
-            state = await _inspect_existing(view, path, tab, body)
-            return {"state": "delivered" if state == "delivered" else "uncertain"}
+            return _receipt_state(await _inspect_existing(view, path, tab, body))
 
     return router

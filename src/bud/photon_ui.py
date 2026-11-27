@@ -1,6 +1,7 @@
 """Conversational iMessage presentation; permission mechanics stay server-side."""
 
 import json
+import re
 from pathlib import Path
 
 from bud.harness.ask import question_lines
@@ -12,6 +13,31 @@ def _value(value) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False)
+
+
+def _routine_schedule(cron: str) -> str:
+    fields = cron.lower().split()
+    fallback = f"Custom cron: {cron}"
+    if len(fields) != 5:
+        return fallback
+    minute, hour, day, month, weekday = fields
+    if month != "*" or not re.fullmatch(r"[0-9]{1,2} [0-9]{1,2}", f"{hour} {minute}"):
+        return fallback
+    if int(hour) > 23 or int(minute) > 59:
+        return fallback
+    time = f"{int(hour):02d}:{int(minute):02d}"
+    if day == "*" and weekday == "*":
+        return f"Daily at {time}"
+    if day == "*" and weekday in ("1-5", "mon-fri", "1,2,3,4,5"):
+        return f"Weekdays at {time}"
+    if day == "*":
+        weekdays = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+        for number, name in enumerate(weekdays):
+            if weekday in (str(number), name[:3].lower()) or (number == 0 and weekday == "7"):
+                return f"Every {name} at {time}"
+    if weekday == "*" and re.fullmatch(r"[0-9]{1,2}", day) and 1 <= int(day) <= 31:
+        return f"Monthly on day {int(day)} at {time}"
+    return fallback
 
 
 def action_preview(approval: dict, *, decision: bool = True) -> str:
@@ -51,9 +77,20 @@ def action_preview(approval: dict, *, decision: bool = True) -> str:
         "list_local_folder": f"Can I look in {Path(str(target or '')).name or 'a folder'}?",
     }
     title = titles.get(tool, "Can I " + tool.replace("_", " ").lower() + "?")
+    details = []
+    if tool == "create_routine":
+        args = {
+            key: value for key, value in args.items() if isinstance(value, str) and value.strip()
+        }
+        name = args.pop("title", "").strip()
+        title = f"Can I schedule “{name}”?" if name else "Can I schedule a routine?"
+        cron = args.pop("cron", "").strip()
+        timezone = args.pop("timezone", "").strip()
+        if cron:
+            zone = f" ({timezone})" if timezone else ""
+            details.append(f"Schedule: {_routine_schedule(cron)}{zone}")
     if approval.get("reference"):
         title = f"Task {approval['reference']}: {title}"
-    details = []
     for key, value in args.items():
         # Preconditions prevent races; they do not describe a user-visible change.
         # Their full values remain bound to the proposal and available in terminal status.

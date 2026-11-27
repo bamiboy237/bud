@@ -17,6 +17,13 @@ class NoModelAvailable(Exception):
     """A requested model has no configured key, provider, or tool support."""
 
 
+class WorkingContextBudgetError(ai.UserError):
+    """The request cannot fit Bud's working context budget."""
+
+
+CONTEXT_FULL_MESSAGE = "The request is too large for the selected model."
+
+
 ErrorKind = Literal[
     "auth",
     "permission",
@@ -45,8 +52,8 @@ NEXT_STEP: dict[ErrorKind, str] = {
     "network": "Check the internet connection, then resend.",
     "timeout": "The provider took too long; resend, or pick a faster model.",
     "service": "The provider is having trouble; resend shortly or pick another model.",
-    "context_full": "The conversation is too long for this model; start a new one or pick "
-    "a model with a larger context.",
+    "context_full": "Shorten your input, start a new conversation, or pick a model that can "
+    "handle longer conversations.",
     "content_filter": "The provider refused this content; rephrase the request.",
     "budget": "Wait for the next UTC day, or raise BUD_DAILY_USD and restart bud.",
     "model_unavailable": "Configure that model's key, or pick another model (/model).",
@@ -66,7 +73,7 @@ def error_kind(exc: BaseException) -> ErrorKind:
         (SpendLimitExceeded, "budget"),
         (ai.ModelQuotaExceededError, "quota"),
         (ai.ModelRateLimitError, "rate_limit"),
-        (ai.ModelContextWindowExceededError, "context_full"),
+        ((ai.ModelContextWindowExceededError, WorkingContextBudgetError), "context_full"),
         (ai.ContentFilterError, "content_filter"),
         (
             (ai.ModelTimeoutError, ai.ModelRequestTimeout, TimeoutError, httpx.TimeoutException),
@@ -114,6 +121,10 @@ def error_summary(exc: BaseException) -> str:
         )
     if isinstance(exc, ai.ContentFilterError):
         return "The model provider's content filter blocked this reply."
+    if isinstance(exc, WorkingContextBudgetError):
+        return "Recent content or tool definitions exceed Bud's working context budget."
+    if isinstance(exc, ai.ModelContextWindowExceededError):
+        return CONTEXT_FULL_MESSAGE
     fields = [type(exc).__name__]
     status = getattr(exc, "status_code", None)
     if isinstance(status, int):

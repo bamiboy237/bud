@@ -1,0 +1,3 @@
+{$BUD_DOMAIN} {
+	reverse_proxy bud:8420
+}

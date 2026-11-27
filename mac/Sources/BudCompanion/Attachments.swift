@@ -2,6 +2,7 @@ import AppKit
 import CoreTransferable
 import Foundation
 import ImageIO
+import Observation
 import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
@@ -32,15 +33,37 @@ struct ChatAttachment: Codable, Identifiable, Equatable, Sendable {
 struct DraftAttachment: Identifiable, Equatable, Sendable {
     static let limit = 25 * 1024 * 1024
     static let maxCount = 5
+    private static let extensions: Set<String> = [
+        "txt", "text", "md", "markdown", "log", "json", "yaml", "yml", "csv", "tsv",
+        "pdf", "rtf", "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub",
+        "png", "jpg", "jpeg", "webp", "gif", "heic", "heif", "tiff", "tif", "bmp",
+    ]
+
+    static var contentTypes: [UTType] {
+        extensions.sorted().compactMap { UTType(filenameExtension: $0) }
+    }
+
+    enum ReadError: Error {
+        case unsupportedFile
+    }
+
     let reference: ChatAttachment
     let data: Data
     var id: String { reference.id }
 
     static func read(_ url: URL) throws -> Self {
+        guard url.isFileURL, extensions.contains(url.pathExtension.lowercased()) else {
+            throw ReadError.unsupportedFile
+        }
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-        guard values.isRegularFile == true, let size = values.fileSize, size <= limit else {
+        let values = try url.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .isAliasFileKey, .isExecutableKey, .fileSizeKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true,
+              values.isAliasFile != true, values.isExecutable != true else {
+            throw ReadError.unsupportedFile
+        }
+        guard let size = values.fileSize, size <= limit else {
             throw CocoaError(.fileReadTooLarge)
         }
         let file = try FileHandle(forReadingFrom: url)
@@ -52,6 +75,84 @@ struct DraftAttachment: Identifiable, Equatable, Sendable {
                 id: UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased(),
                 name: url.lastPathComponent),
             data: data)
+    }
+
+    @MainActor
+    static func clipboardPNG(from board: NSPasteboard) -> Data? {
+        clipboardPNG(
+            hasPlainText: board.availableType(from: [.string]) != nil,
+            png: board.data(forType: .png), tiff: board.data(forType: .tiff)
+        ) {
+            guard board.availableType(from: [.fileURL]) == nil else { return nil }
+            return board.readObjects(forClasses: [NSImage.self])?.first as? NSImage
+        }
+    }
+
+    @MainActor
+    static func clipboardPNG(
+        hasPlainText: Bool, png: @autoclosure () -> Data?, tiff: @autoclosure () -> Data?,
+        image: () -> NSImage? = { nil }
+    ) -> Data? {
+        guard !hasPlainText else { return nil }
+        if let png = png(), let source = CGImageSourceCreateWithData(png as CFData, nil),
+           CGImageSourceGetType(source) == UTType.png.identifier as CFString,
+           CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete {
+            return png
+        }
+        if let tiff = tiff(), let bitmap = NSBitmapImageRep(data: tiff),
+           let converted = bitmap.representation(using: .png, properties: [:]) {
+            return converted
+        }
+        guard let cgImage = image()?.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        return NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:])
+    }
+
+    static func stageScreenshot(_ png: Data, existingNames: [String]) throws -> URL {
+        let names = Set(existingNames.map { $0.lowercased() })
+        var index = 1
+        var name = "Screenshot.png"
+        while names.contains(name.lowercased()) {
+            index += 1
+            name = "Screenshot \(index).png"
+        }
+
+        let directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        let file = directory.appending(path: name)
+        do {
+            try png.write(to: file)
+            return file
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+    }
+}
+
+extension Companion {
+    @MainActor
+    func addPastedImage(_ png: Data) -> Bool {
+        guard inputPurpose == .ask, !readingAttachments, !uploadingAttachments else { return false }
+        let file: URL
+        do {
+            file = try DraftAttachment.stageScreenshot(png, existingNames: draftAttachments.map(\.reference.name))
+        } catch {
+            nudge("Couldn’t prepare the screenshot. Try copying it again.")
+            return true
+        }
+
+        let directory = file.deletingLastPathComponent()
+        addAttachments([file])
+        if readingAttachments {
+            // The file drop reader owns this URL until its asynchronous batch finishes.
+            withObservationTracking { _ = readingAttachments } onChange: {
+                try? FileManager.default.removeItem(at: directory)
+            }
+        } else {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        return true
     }
 }
 
@@ -86,17 +187,18 @@ extension View {
 struct DraftAttachmentChips: View {
     let files: [DraftAttachment]
     let remove: (String) -> Void
+    var onPreview: ((DraftAttachment) -> Void)? = nil
 
     var body: some View {
         ScrollView(.horizontal) {
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 ForEach(files) { file in
-                    HStack(spacing: 3) {
-                        AttachmentChip(name: file.reference.name)
-                        Button { remove(file.id) } label: { Image(systemName: "xmark") }
-                            .buttonStyle(IconButton(size: 20))
-                            .accessibilityLabel("Remove \(file.reference.name)")
-                    }
+                    AttachmentChip(
+                        name: file.reference.name,
+                        isImage: file.reference.type?.conforms(to: .image) == true,
+                        onPreview: onPreview.map { open in { open(file) } },
+                        remove: { remove(file.id) }
+                    )
                 }
             }
         }
@@ -105,15 +207,50 @@ struct DraftAttachmentChips: View {
 
 struct AttachmentChip: View {
     let name: String
+    var isImage = false
+    var onPreview: (() -> Void)? = nil
+    var remove: (() -> Void)? = nil
 
     var body: some View {
-        Label(name, systemImage: "doc")
-            .font(Paper.Typography.callout)
-            .lineLimit(1)
-            .truncationMode(.middle)
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
-            .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusMD))
+        let shape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
+        HStack(spacing: 6) {
+            if let onPreview {
+                Button(action: onPreview) { fileLabel }
+                    .buttonStyle(.plain)
+                    .pointerStyle(.link)
+                    .accessibilityLabel("Preview \(name)")
+                    .help("Preview \(name)")
+            } else {
+                fileLabel.help(name)
+            }
+            if let remove {
+                Button(action: remove) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                }
+                .buttonStyle(IconButton(size: 20))
+                .accessibilityLabel("Remove \(name)")
+                .help("Remove \(name)")
+            }
+        }
+        .font(Paper.Typography.callout)
+        .padding(.leading, 9)
+        .padding(.trailing, remove == nil ? 9 : 4)
+        .frame(height: 28)
+        .background(Paper.elevated, in: shape)
+        .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5).allowsHitTesting(false) }
+    }
+
+    private var fileLabel: some View {
+        HStack(spacing: 6) {
+            Image(systemName: isImage ? "photo" : "doc")
+                .accessibilityHidden(true)
+            Text(name)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: 180, alignment: .leading)
+        }
+        .contentShape(Rectangle())
     }
 }
 
@@ -137,7 +274,7 @@ struct SentAttachment: View {
                     .frame(maxWidth: 260, maxHeight: 180)
                     .clipShape(RoundedRectangle(cornerRadius: Paper.radiusMD))
             } else {
-                AttachmentChip(name: file.name)
+                AttachmentChip(name: file.name, isImage: file.type?.conforms(to: .image) == true)
             }
         }
         .buttonStyle(PaperHit(shape: RoundedRectangle(cornerRadius: Paper.radiusMD)))
@@ -191,7 +328,8 @@ struct AttachmentInspector: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
                 Text(selection.file.name)
-                    .font(Paper.Typography.callout)
+                    .font(Paper.Typography.label)
+                    .foregroundStyle(Paper.inkPrimary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(selection.file.name)
@@ -199,7 +337,7 @@ struct AttachmentInspector: View {
                 Button { state.showDesktops.toggle() } label: {
                     Image(systemName: "desktopcomputer.and.arrow.down")
                 }
-                .buttonStyle(IconButton(size: 24))
+                .buttonStyle(IconButton(size: 26))
                 .help("Send to paired desktops")
                 .accessibilityLabel("Send to paired desktops")
                 .popover(isPresented: $state.showDesktops, arrowEdge: .bottom) {
@@ -210,16 +348,18 @@ struct AttachmentInspector: View {
                         ? "arrow.down.right.and.arrow.up.left"
                         : "arrow.up.left.and.arrow.down.right")
                 }
-                .buttonStyle(IconButton(size: 24))
+                .buttonStyle(IconButton(size: 26))
                 .help(state.expanded ? "Narrow preview" : "Expand preview")
                 .accessibilityLabel(state.expanded ? "Narrow preview" : "Expand preview")
                 Button(action: close) { Image(systemName: "xmark") }
-                    .buttonStyle(IconButton(size: 24))
+                    .buttonStyle(IconButton(size: 26))
                     .help("Close preview")
                     .accessibilityLabel("Close preview")
             }
-            .padding(12)
-            Divider()
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 14)
+            .frame(height: 40)
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
             switch state.content {
             case .pdf(let document):
                 PDFPreview(document: document)
@@ -245,6 +385,7 @@ struct AttachmentInspector: View {
                 Spacer()
             }
         }
+        .background(Paper.canvas)
         .inspectorColumnWidth(min: state.expanded ? 480 : 240, ideal: state.expanded ? 580 : 320, max: 900)
         .task(id: selection.id) { await load() }
     }

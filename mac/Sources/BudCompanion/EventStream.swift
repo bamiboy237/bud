@@ -30,7 +30,16 @@ enum StreamSignal: Sendable {
 }
 
 /// No cookies, cache or credential store: the owner token is the only credential, sent per request.
-let budSession = URLSession(configuration: .ephemeral)
+let budSession = URLSession(configuration: .ephemeral, delegate: BudSessionDelegate(), delegateQueue: nil)
+
+private final class BudSessionDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession, task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest
+    ) async -> URLRequest? {
+        nil
+    }
+}
 
 /// Follows a session's events forever: reconnects with exponential backoff and bounded jitter,
 /// resuming after the last stored event it saw, so a dropped connection or a server restart

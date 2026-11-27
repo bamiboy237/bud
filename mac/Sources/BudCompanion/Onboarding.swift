@@ -3,27 +3,6 @@ import Foundation
 import Observation
 import SwiftUI
 
-enum OnboardingStep: Int, CaseIterable, Identifiable, Equatable, Sendable {
-    case model = 1
-    case integrations = 2
-
-    var id: Int { rawValue }
-
-    var title: String {
-        switch self {
-        case .model: "Model"
-        case .integrations: "Integrations"
-        }
-    }
-
-    var indexLabel: String {
-        switch self {
-        case .model: "1 of 2 · Model"
-        case .integrations: "2 of 2 · Optional keys"
-        }
-    }
-}
-
 struct ManagedKeyStatus: Identifiable, Equatable, Sendable {
     let envName: String
     let label: String
@@ -63,6 +42,9 @@ struct OnboardingStatus: Equatable, Sendable {
     let hasModel: Bool
     let needsOnboarding: Bool
     let activeModel: String?
+    let defaultModel: String?
+    var models: [String]
+    let modelLocked: Bool
     let configPath: String
     let chatgpt: ChatGPTAuthStatus
     let keys: [ManagedKeyStatus]
@@ -71,6 +53,9 @@ struct OnboardingStatus: Equatable, Sendable {
         hasModel: false,
         needsOnboarding: false,
         activeModel: nil,
+        defaultModel: nil,
+        models: [],
+        modelLocked: false,
         configPath: "~/.bud/config.env",
         chatgpt: .empty,
         keys: []
@@ -140,6 +125,9 @@ struct OnboardingStatus: Equatable, Sendable {
             hasModel: hasModel,
             needsOnboarding: needsOnboarding,
             activeModel: activeModel,
+            defaultModel: raw["default_model"] as? String,
+            models: raw["models"] as? [String] ?? [],
+            modelLocked: raw["model_locked"] as? Bool ?? false,
             configPath: configPath,
             chatgpt: chatgpt,
             keys: parsedKeys
@@ -156,11 +144,12 @@ final class OnboardingStore {
     static let shared = OnboardingStore()
 
     var status = OnboardingStatus.empty
-    var step: OnboardingStep = .model
-    var stepDirection: CGFloat = 1
     var apiKeysExpanded = false
     var keyDrafts: [String: String] = [:]
+    private(set) var keyErrors: [String: String] = [:]
+    private(set) var replacingKey: String?
     var loading = false
+    var changingModel = false
     var savingKey: String? = nil
     var busyChatGPT = false
     var feedback: String? = nil
@@ -169,25 +158,23 @@ final class OnboardingStore {
     @ObservationIgnored private let sendRequest: Transport
     @ObservationIgnored private let openURL: URLOpener
     @ObservationIgnored private let syncNeedsOnboarding: NeedsOnboardingSink
+    @ObservationIgnored private let isRunning: @MainActor () -> Bool
     @ObservationIgnored private var pollTask: Task<Void, Never>?
     @ObservationIgnored private var initializedExpansion = false
+    @ObservationIgnored private var serverGeneration = 0
 
     init(
         sendRequest: @escaping Transport = { method, path, json in
             try await Companion.shared.sendOnboardingRequest(method, path, json: json)
         },
         openURL: @escaping URLOpener = { NSWorkspace.shared.open($0) },
-        syncNeedsOnboarding: @escaping NeedsOnboardingSink = { Companion.shared.needsOnboarding = $0 }
+        syncNeedsOnboarding: @escaping NeedsOnboardingSink = { Companion.shared.needsOnboarding = $0 },
+        isRunning: @escaping @MainActor () -> Bool = { Companion.shared.running }
     ) {
         self.sendRequest = sendRequest
         self.openURL = openURL
         self.syncNeedsOnboarding = syncNeedsOnboarding
-    }
-
-    func go(to next: OnboardingStep) {
-        guard step != next else { return }
-        stepDirection = next.rawValue >= step.rawValue ? 1 : -1
-        step = next
+        self.isRunning = isRunning
     }
 
     func clearBanner() {
@@ -195,15 +182,34 @@ final class OnboardingStore {
         feedback = nil
     }
 
-    func refresh() async {
+    func reset() {
+        serverGeneration += 1
+        stopPolling()
+        status = .empty
+        keyDrafts = [:]
+        keyErrors = [:]
+        replacingKey = nil
+        apiKeysExpanded = false
+        initializedExpansion = false
+        clearBanner()
+    }
+
+    func refresh(preservingError: String? = nil) async {
         loading = true
-        error = nil
+        error = preservingError
         defer { loading = false }
+        let generation = serverGeneration
         do {
             let raw = try await sendRequest("GET", "onboarding", nil)
+            guard generation == serverGeneration else { return }
             apply(raw)
+            if status.chatgpt.status == "waiting", pollTask == nil {
+                beginPolling()
+            }
+            if let preservingError { error = preservingError }
         } catch {
-            self.error = "\(error)"
+            guard generation == serverGeneration else { return }
+            self.error = preservingError ?? "\(error)"
         }
     }
 
@@ -226,6 +232,31 @@ final class OnboardingStore {
             }
         } catch {
             self.error = "\(error)"
+        }
+    }
+
+    func chooseModel(_ model: String) async {
+        guard !changingModel else { return }
+        changingModel = true
+        defer { changingModel = false }
+        let generation = serverGeneration
+        clearBanner()
+        do {
+            let value: Any = model.isEmpty ? NSNull() : model
+            let response = try await sendRequest("PUT", "onboarding/model", ["model": value])
+            guard generation == serverGeneration else { return }
+            apply(response)
+            feedback = isRunning() ? "Default updated for new runs." : "Default model updated."
+        } catch ConnectionError.http(422, _) {
+            guard generation == serverGeneration else { return }
+            status.models.removeAll { $0 == model }
+            await refresh(
+                preservingError: "That model is unavailable. Choose another model, sign in to ChatGPT, "
+                    + "or add its API key."
+            )
+        } catch {
+            guard generation == serverGeneration else { return }
+            self.error = "Couldn’t change the default model."
         }
     }
 
@@ -264,24 +295,56 @@ final class OnboardingStore {
         }
     }
 
+    func beginKeyEdit(_ envName: String) {
+        guard savingKey == nil, replacingKey != envName else { return }
+        cancelKeyEdit()
+        replacingKey = envName
+    }
+
+    func cancelKeyEdit() {
+        guard let replacingKey else { return }
+        keyDrafts[replacingKey] = ""
+        keyErrors[replacingKey] = nil
+        self.replacingKey = nil
+    }
+
+    func updateKeyDraft(_ value: String, for id: String) {
+        guard value != (keyDrafts[id] ?? "") else { return }
+        keyDrafts[id] = value
+        keyErrors[id] = nil
+    }
+
     func saveKey(_ envName: String) async {
         let trimmed = (keyDrafts[envName] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard savingKey == nil, !trimmed.isEmpty else { return }
+        let generation = serverGeneration
         savingKey = envName
+        keyErrors[envName] = nil
         error = nil
         feedback = nil
         defer { savingKey = nil }
         do {
             let raw = try await sendRequest("POST", "onboarding/keys", ["keys": [envName: trimmed]])
+            guard generation == serverGeneration else { return }
             keyDrafts[envName] = ""
+            if replacingKey == envName { replacingKey = nil }
             apply(raw)
             feedback = "Saved and applied."
+        } catch ConnectionError.unreachable {
+            guard generation == serverGeneration else { return }
+            keyErrors[envName] = "Couldn’t reach Bud. Try again."
+        } catch ConnectionError.http(422, let detail)
+            where !detail.isEmpty && detail.count <= 120 && !detail.hasPrefix("[") && !detail.contains(trimmed) {
+            guard generation == serverGeneration else { return }
+            keyErrors[envName] = detail
         } catch {
-            self.error = "\(error)"
+            guard generation == serverGeneration else { return }
+            keyErrors[envName] = "Couldn’t save the API key. Try again."
         }
     }
 
     func removeKey(_ envName: String) async {
+        guard savingKey == nil else { return }
         savingKey = envName
         error = nil
         feedback = nil
@@ -304,11 +367,12 @@ final class OnboardingStore {
     private func beginPolling() {
         stopPolling()
         pollTask = Task {
-            while !Task.isCancelled {
+            while true {
                 try? await Task.sleep(for: .milliseconds(1500))
-                guard !Task.isCancelled else { break }
+                guard !Task.isCancelled else { return }
                 do {
                     let raw = try await sendRequest("GET", "onboarding", nil)
+                    guard !Task.isCancelled else { return }
                     apply(raw)
                     if status.chatgpt.status == "connected" {
                         feedback = "Connected to ChatGPT."
@@ -324,6 +388,7 @@ final class OnboardingStore {
                         break
                     }
                 } catch {
+                    guard !Task.isCancelled else { return }
                     self.error = "\(error)"
                     break
                 }
@@ -352,16 +417,8 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
     static let shared = OnboardingWindow()
 
     @ObservationIgnored private var window: NSWindow?
-    @ObservationIgnored private var autoShownThisLaunch = false
 
-    func showIfNeeded() {
-        guard !autoShownThisLaunch else { return }
-        autoShownThisLaunch = true
-        show(startingAt: .model)
-    }
-
-    func show(startingAt step: OnboardingStep = .model) {
-        OnboardingStore.shared.step = step
+    func show() {
         let window = self.window ?? make()
         self.window = window
         Task { await OnboardingStore.shared.refresh() }
@@ -381,55 +438,90 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
 
     private func make() -> NSWindow {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 540, height: 490),
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 365),
             styleMask: [.titled, .closable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
-        window.title = "Set up bud"
+        window.title = "Add a model"
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isReleasedWhenClosed = false
         window.backgroundColor = NSColor(Paper.canvas)
         window.delegate = self
         window.contentView = NSHostingView(
-            rootView: OnboardingView(store: OnboardingStore.shared, window: self)
+            rootView: AddModelView(store: OnboardingStore.shared, close: close) { [weak window] in
+                window?.backgroundColor = NSColor(Paper.canvas)
+            }
         )
         return window
     }
 }
 
-struct BudFaceAvatar: View {
-    var size: CGFloat = 46
+private struct APIKeyEditorFocus: FocusedValueKey {
+    typealias Value = Bool
+}
 
-    private var iconImage: NSImage? {
-        if let appIcon = Bundle.main.image(forResource: "AppIcon") {
-            return appIcon
-        }
-        if let current = NSApp.applicationIconImage {
-            return current
-        }
-        return PetSprite.named(Companion.shared.petID)?.icon(height: size)
+extension FocusedValues {
+    fileprivate var apiKeyEditorFocused: Bool? {
+        get { self[APIKeyEditorFocus.self] }
+        set { self[APIKeyEditorFocus.self] = newValue }
     }
+}
+
+private struct AddModelView: View {
+    @Bindable var store: OnboardingStore
+    let close: () -> Void
+    let updateBackground: () -> Void
+    @FocusedValue(\.apiKeyEditorFocused) private var apiKeyEditorFocused
+    private let appearance = AppearanceStore.shared
 
     var body: some View {
-        Group {
-            if let image = iconImage {
-                Image(nsImage: image)
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fit)
-            } else {
-                Image(systemName: "pawprint.fill")
-                    .font(.system(size: size * 0.45, weight: .semibold))
-                    .foregroundStyle(Paper.inkPrimary)
-                    .frame(width: size, height: size)
-                    .surface(RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous), lift: 1)
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Add a model")
+                .font(Paper.Typography.h2)
+                .padding(.horizontal, 24)
+                .padding(.top, 38)
+                .padding(.bottom, 12)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    if let error = store.error {
+                        Text(error)
+                            .font(Paper.Typography.callout)
+                            .foregroundStyle(Paper.errorInk)
+                    } else if let feedback = store.feedback {
+                        StatusStrip(text: feedback, isError: false) { store.clearBanner() }
+                    }
+                    ModelSetupPanel(store: store)
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 12)
             }
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
+            HStack {
+                Spacer()
+                if store.status.hasModel {
+                    Button("Start chatting") {
+                        close()
+                        Companion.shared.requestComposerFocus()
+                    }
+                    .buttonStyle(CardButton(kind: .primary))
+                    .keyboardShortcut(apiKeyEditorFocused == true ? nil : .defaultAction)
+                } else {
+                    Button("Close", action: close)
+                        .buttonStyle(CardButton(kind: .secondary))
+                        .keyboardShortcut(.cancelAction)
+                }
+            }
+            .padding(16)
         }
-        .frame(width: size, height: size)
-        .shadow(color: .black.opacity(0.12), radius: 4, y: 2)
-        .accessibilityHidden(true)
+        .frame(width: 500, height: 365)
+        .background(Paper.canvas)
+        .preferredColorScheme(appearance.mode.colorScheme)
+        .onExitCommand(perform: close)
+        .onChange(of: appearance.revision, initial: true) { _, _ in
+            updateBackground()
+        }
     }
 }
 
@@ -456,349 +548,126 @@ struct PaperFieldBox<Content: View>: View {
     }
 }
 
-struct OnboardingView: View {
-    @Bindable var store: OnboardingStore
-    let window: OnboardingWindow
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    private var stepAnimation: Animation {
-        reduceMotion ? .easeOut(duration: 0.14) : .easeOut(duration: 0.2)
-    }
-
-    private var bannerAnimation: Animation {
-        reduceMotion ? .easeOut(duration: 0.14) : .easeOut(duration: 0.18)
-    }
-
-    private var bannerKey: String {
-        store.error ?? store.feedback ?? ""
-    }
-
-    private var stepTransition: AnyTransition {
-        if reduceMotion {
-            return .opacity
-        }
-        return .asymmetric(
-            insertion: .offset(x: 10 * store.stepDirection).combined(with: .opacity),
-            removal: .offset(x: -10 * store.stepDirection).combined(with: .opacity)
-        )
-    }
-
-    private var bannerTransition: AnyTransition {
-        reduceMotion
-            ? .opacity
-            : .opacity.combined(with: .scale(scale: 0.985, anchor: .top))
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            header
-            Rectangle().fill(Paper.hairline).frame(height: 0.5)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    banner
-                    Group {
-                        switch store.step {
-                        case .model:
-                            ModelSetupPanel(store: store, showHero: true)
-                        case .integrations:
-                            IntegrationKeysPanel(store: store)
-                        }
-                    }
-                    .id(store.step)
-                    .transition(stepTransition)
-                }
-                .padding(.horizontal, 24)
-                .padding(.vertical, 20)
-            }
-            .animation(bannerAnimation, value: bannerKey)
-            Rectangle().fill(Paper.hairline).frame(height: 0.5)
-            footer
-        }
-        .frame(width: 540, height: 490)
-        .background(Paper.canvas)
-    }
-
-    private var header: some View {
-        HStack(spacing: 10) {
-            Text("bud")
-                .font(Paper.Typography.wordmark)
-                .foregroundStyle(Paper.inkPrimary)
-            Spacer(minLength: 8)
-            wayfindingBar
-        }
-        .padding(.leading, 74)
-        .padding(.trailing, 20)
-        .frame(height: 46)
-    }
-
-    private var wayfindingBar: some View {
-        let pillShape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
-        let trackShape = RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous)
-        return HStack(spacing: 3) {
-            ForEach(OnboardingStep.allCases) { item in
-                let active = store.step == item
-                let completed = item == .model && store.status.hasModel
-                Button {
-                    withAnimation(stepAnimation) {
-                        store.go(to: item)
-                    }
-                } label: {
-                    HStack(spacing: 5) {
-                        if completed {
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(Paper.approveInk)
-                        } else {
-                            Text("\(item.rawValue)")
-                                .font(Paper.Typography.ledgerMeta)
-                                .foregroundStyle(active ? Paper.inkPrimary : Paper.inkMuted)
-                        }
-                        Text(item.title)
-                            .font(Paper.Typography.captionMedium)
-                            .foregroundStyle(active ? Paper.inkPrimary : Paper.inkMuted)
-                    }
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 4)
-                }
-                .buttonStyle(PaperHit(shape: pillShape, fill: active ? Paper.elevated : .clear))
-                .overlay {
-                    if active {
-                        pillShape
-                            .strokeBorder(Paper.borderSubtle, lineWidth: 0.5)
-                            .allowsHitTesting(false)
-                    }
-                }
-                .accessibilityLabel("Step \(item.rawValue): \(item.title)")
-                .accessibilityValue(active ? "Current" : (completed ? "Configured" : ""))
-            }
-        }
-        .padding(3)
-        .background(Paper.recessed, in: trackShape)
-        .overlay(trackShape.strokeBorder(Paper.hairline, lineWidth: 0.5))
-    }
-
-    @ViewBuilder
-    private var banner: some View {
-        if let err = store.error, !err.isEmpty {
-            StatusStrip(text: err, isError: true) { store.clearBanner() }
-                .transition(bannerTransition)
-        } else if let ok = store.feedback, !ok.isEmpty {
-            StatusStrip(text: ok, isError: false) { store.clearBanner() }
-                .transition(bannerTransition)
-        }
-    }
-
-    private var footer: some View {
-        HStack(spacing: 10) {
-            if store.step == .model {
-                Button("Skip for now") { window.close() }
-                    .buttonStyle(CardButton(kind: .quiet))
-                Spacer(minLength: 8)
-                if !store.status.hasModel {
-                    Text("You can set a model later")
-                        .font(Paper.Typography.caption)
-                        .foregroundStyle(Paper.inkMuted)
-                }
-                Button("Continue") {
-                    withAnimation(stepAnimation) {
-                        store.go(to: .integrations)
-                    }
-                }
-                .buttonStyle(CardButton(kind: store.status.hasModel ? .primary : .secondary))
-            } else {
-                Button("Back") {
-                    withAnimation(stepAnimation) {
-                        store.go(to: .model)
-                    }
-                }
-                .buttonStyle(CardButton(kind: .quiet))
-                Spacer(minLength: 8)
-                Button("Start using bud") {
-                    window.close()
-                    ConversationWindow.shared.show()
-                }
-                .buttonStyle(CardButton(kind: .primary))
-            }
-        }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 12)
-        .background(Paper.recessed.opacity(0.6))
-    }
-}
-
 struct ModelSetupPanel: View {
     @Bindable var store: OnboardingStore
-    var showHero = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            if showHero {
-                HStack(alignment: .center, spacing: 14) {
-                    BudFaceAvatar(size: 56)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Meet bud")
-                            .font(Paper.Typography.h1)
-                            .tracking(Paper.Typography.h1Tracking)
-                            .foregroundStyle(Paper.inkPrimary)
-                        Text("Connect ChatGPT or an API key to get started. Changes apply live.")
-                            .font(Paper.Typography.callout)
-                            .foregroundStyle(Paper.inkSecondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                .modifier(Stagger(index: 0))
-            } else {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Models")
-                        .font(Paper.Typography.h2)
-                        .tracking(Paper.Typography.h2Tracking)
-                        .foregroundStyle(Paper.inkPrimary)
-                    Text("Use your ChatGPT subscription or paste an API key. Changes apply live without restarting bud.")
-                        .font(Paper.Typography.callout)
-                        .foregroundStyle(Paper.inkSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            chatGPTCard
-                .modifier(Stagger(index: showHero ? 1 : 0))
-
-            apiKeysCard
-                .modifier(Stagger(index: showHero ? 2 : 1))
-        }
-    }
-
-    private var chatGPTCard: some View {
-        let cg = store.status.chatgpt
-        let shape = RoundedRectangle(cornerRadius: Paper.radiusLG, style: .continuous)
-        return VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("ChatGPT Subscription")
-                        .font(Paper.Typography.h3)
-                        .tracking(Paper.Typography.h3Tracking)
-                        .foregroundStyle(Paper.inkPrimary)
-                    if let selected = cg.selectedModel, cg.connected {
-                        Text("Active model: openai-chatgpt:\(selected)")
-                            .font(Paper.Typography.ledgerMeta)
-                            .foregroundStyle(Paper.inkMuted)
-                    } else {
-                        Text("Use your ChatGPT Plus or Pro plan via browser sign-in.")
-                            .font(Paper.Typography.callout)
-                            .foregroundStyle(Paper.inkSecondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                Spacer(minLength: 8)
-                SetupPill(
-                    text: cg.status == "waiting"
-                        ? "Waiting..."
-                        : (cg.connected ? "Connected" : "Recommended"),
-                    active: cg.connected,
-                    accent: !cg.connected && cg.status != "waiting"
-                )
-            }
-
-            HStack(spacing: 8) {
-                if cg.status == "waiting" {
-                    Button("Open sign-in page") { store.openPendingChatGPTURL() }
-                        .buttonStyle(CardButton(kind: .secondary))
-                        .disabled(cg.url == nil)
-                    Button("Cancel") { Task { await store.cancelChatGPTLogin() } }
-                        .buttonStyle(CardButton(kind: .quiet))
-                        .disabled(store.busyChatGPT)
-                    Spacer(minLength: 8)
-                    ProgressView().controlSize(.small)
-                    Text("Waiting for browser sign-in...")
-                        .font(Paper.Typography.caption)
-                        .foregroundStyle(Paper.inkMuted)
-                } else if cg.connected {
-                    Button("Sign out") { Task { await store.logoutChatGPT() } }
-                        .buttonStyle(CardButton(kind: .secondary))
-                        .disabled(store.busyChatGPT)
-                    Spacer(minLength: 8)
-                    if store.busyChatGPT {
-                        ProgressView().controlSize(.small)
-                    }
-                } else {
-                    Button("Sign in with ChatGPT") { Task { await store.startChatGPTLogin() } }
-                        .buttonStyle(CardButton(kind: .primary))
-                        .disabled(store.busyChatGPT)
-                    Spacer(minLength: 8)
-                    if store.busyChatGPT {
-                        ProgressView().controlSize(.small)
-                    }
-                }
-            }
-        }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .surface(shape, lift: 1, fill: Paper.elevated, border: Paper.borderStrong, borderWidth: 0.5)
-        .animation(.easeOut(duration: 0.18), value: cg.status)
-    }
-
-    private var apiKeysCard: some View {
-        let shape = RoundedRectangle(cornerRadius: Paper.radiusLG, style: .continuous)
-        let configuredCount = store.status.modelKeys.filter(\.configured).count
-        let toggleAnimation: Animation = reduceMotion ? .easeOut(duration: 0.14) : .easeOut(duration: 0.2)
-        let revealTransition: AnyTransition = reduceMotion
-            ? .opacity
-            : .opacity.combined(with: .scale(scale: 0.985, anchor: .top))
-
-        return VStack(spacing: 0) {
-            Button {
-                withAnimation(toggleAnimation) {
-                    store.apiKeysExpanded.toggle()
-                }
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(Paper.inkMuted)
-                        .rotationEffect(.degrees(store.apiKeysExpanded ? 90 : 0))
-                        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: store.apiKeysExpanded)
-                        .frame(width: 12)
-                    Text("Or use an API key")
-                        .font(Paper.Typography.label)
-                        .foregroundStyle(Paper.inkPrimary)
-                    Spacer(minLength: 8)
-                    if configuredCount > 0 {
-                        SetupPill(text: "\(configuredCount) configured", active: true)
-                    } else {
-                        Text("OpenAI, DeepSeek, Mistral, Meta")
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Default model")
+                    if store.status.modelLocked {
+                        Text("Pinned by startup configuration")
                             .font(Paper.Typography.caption)
                             .foregroundStyle(Paper.inkMuted)
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 12)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                Spacer()
+                if store.status.modelLocked || store.status.models.isEmpty {
+                    Text(store.status.activeModel.map(modelLabel) ?? "Not set")
+                        .foregroundStyle(Paper.inkSecondary)
+                } else {
+                    modelPicker
+                }
             }
-            .buttonStyle(PaperHit(shape: Rectangle(), fill: .clear))
-
-            if store.apiKeysExpanded {
+            .font(Paper.Typography.body)
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
+            chatGPTRow
+            if !store.status.modelKeys.isEmpty {
                 Rectangle().fill(Paper.hairline).frame(height: 0.5)
-                VStack(spacing: 0) {
-                    let items = store.status.modelKeys
-                    ForEach(Array(items.enumerated()), id: \.element.id) { index, key in
-                        if index > 0 {
-                            Rectangle().fill(Paper.hairline).frame(height: 0.5)
-                        }
+                DisclosureGroup("Use an API key", isExpanded: $store.apiKeysExpanded) {
+                    ForEach(store.status.modelKeys) { key in
                         KeyRowView(key: key, store: store)
                     }
-                    if items.isEmpty {
-                        Text(store.loading ? "Loading providers..." : "No API key providers listed yet.")
-                            .font(Paper.Typography.callout)
-                            .foregroundStyle(Paper.inkMuted)
-                            .padding(14)
-                    }
                 }
-                .transition(revealTransition)
+                .font(Paper.Typography.body)
             }
         }
-        .clipShape(shape)
-        .surface(shape, lift: 1, fill: Paper.elevated, border: Paper.borderStrong, borderWidth: 0.5)
+    }
+
+    private var modelPicker: some View {
+        let chatGPTPrefix = "openai-chatgpt:"
+        let chatGPTModels = store.status.models.filter { $0.hasPrefix(chatGPTPrefix) }
+        let apiModels = store.status.models.filter { !$0.hasPrefix(chatGPTPrefix) }
+        let activeLabel = store.status.activeModel.map(modelLabel) ?? "Not set"
+        return Picker("Default model", selection: Binding(
+            get: { store.status.defaultModel ?? "" },
+            set: { model in Task { await store.chooseModel(model) } }
+        )) {
+            Text(store.status.defaultModel == nil ? "Automatic (\(activeLabel))" : "Automatic").tag("")
+            if !chatGPTModels.isEmpty {
+                Section("ChatGPT") {
+                    ForEach(chatGPTModels, id: \.self) { model in
+                        Text(verbatim: String(model.dropFirst(chatGPTPrefix.count))).tag(model)
+                    }
+                }
+            }
+            if !apiModels.isEmpty {
+                Section("API Keys") {
+                    ForEach(apiModels, id: \.self) { model in apiModelLabel(model).tag(model) }
+                }
+            }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .fixedSize()
+        .disabled(store.changingModel)
+    }
+
+    private func modelLabel(_ id: String) -> String {
+        let parts = id.split(separator: ":", maxSplits: 1)
+        guard parts.count == 2 else { return id }
+        return parts[0] == "openai-chatgpt" ? "\(parts[1]) (ChatGPT)" : String(parts[1])
+    }
+
+    private func apiModelLabel(_ id: String) -> Text {
+        let parts = id.split(separator: ":", maxSplits: 1)
+        guard parts.count == 2 else { return Text(verbatim: id) }
+        let provider: String = switch parts[0] {
+        case "openai": "OpenAI"
+        case "deepseek": "DeepSeek"
+        case "mistral": "Mistral"
+        case "meta": "Meta"
+        default: parts[0].capitalized
+        }
+        let suffix = Text(verbatim: provider).foregroundColor(Paper.inkSecondary)
+        return Text("\(String(parts[1])) · \(suffix)")
+    }
+
+    private var chatGPTRow: some View {
+        let cg = store.status.chatgpt
+        return HStack(spacing: 10) {
+            Text(cg.status == "waiting" ? "Waiting for sign-in…" : "ChatGPT")
+                .font(Paper.Typography.body)
+            Spacer()
+            if store.busyChatGPT || cg.status == "waiting" {
+                ProgressView().controlSize(.small)
+            }
+            if cg.status == "waiting" {
+                Button("Open sign-in page", action: store.openPendingChatGPTURL)
+                    .buttonStyle(CardButton(kind: .secondary))
+                    .disabled(cg.url == nil)
+                    .opacity(cg.url == nil ? 0.55 : 1)
+                Button("Cancel") { Task { await store.cancelChatGPTLogin() } }
+                    .buttonStyle(CardButton(kind: .quiet))
+                    .disabled(store.busyChatGPT)
+                    .opacity(store.busyChatGPT ? 0.55 : 1)
+            } else if cg.connected {
+                Text("Connected").foregroundStyle(Paper.inkSecondary)
+                Button("Sign out") { Task { await store.logoutChatGPT() } }
+                    .buttonStyle(CardButton(kind: .quiet))
+                    .disabled(store.busyChatGPT)
+                    .opacity(store.busyChatGPT ? 0.55 : 1)
+            } else if URL(string: BudSettings.load().url)?.scheme != "https" {
+                let canStart = !store.busyChatGPT && store.status != .empty
+                Button("Sign in with ChatGPT") { Task { await store.startChatGPTLogin() } }
+                    .buttonStyle(CardButton(kind: .primary))
+                    .disabled(!canStart)
+                    .opacity(canStart ? 1 : 0.55)
+            } else {
+                Text("Use an API key for this server").foregroundStyle(Paper.inkSecondary)
+            }
+        }
     }
 }
 
@@ -806,46 +675,13 @@ struct IntegrationKeysPanel: View {
     @Bindable var store: OnboardingStore
 
     var body: some View {
-        let shape = RoundedRectangle(cornerRadius: Paper.radiusLG, style: .continuous)
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Optional integrations")
-                    .font(Paper.Typography.h2)
-                    .tracking(Paper.Typography.h2Tracking)
-                    .foregroundStyle(Paper.inkPrimary)
-                Text("Both keys are optional. Saving takes effect immediately without restarting bud.")
-                    .font(Paper.Typography.callout)
-                    .foregroundStyle(Paper.inkSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            VStack(spacing: 0) {
-                let items = store.status.integrationKeys
-                ForEach(Array(items.enumerated()), id: \.element.id) { index, key in
-                    if index > 0 {
-                        Rectangle().fill(Paper.hairline).frame(height: 0.5)
-                    }
-                    KeyRowView(key: key, store: store)
+        VStack(spacing: 0) {
+            ForEach(store.status.integrationKeys) { key in
+                if key.id != store.status.integrationKeys.first?.id {
+                    Rectangle().fill(Paper.hairline).frame(height: 0.5)
                 }
-                if items.isEmpty {
-                    Text(store.loading ? "Loading integrations..." : "No integration keys listed yet.")
-                        .font(Paper.Typography.callout)
-                        .foregroundStyle(Paper.inkMuted)
-                        .padding(14)
-                }
+                KeyRowView(key: key, store: store)
             }
-            .clipShape(shape)
-            .surface(shape, lift: 1, fill: Paper.elevated, border: Paper.borderStrong, borderWidth: 0.5)
-
-            Text("After adding Composio, ask bud to check Gmail or Calendar and it will open a sign-in card right in chat.")
-                .font(Paper.Typography.callout)
-                .foregroundStyle(Paper.inkSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Text("Saved to \(store.status.configPath)")
-                .font(Paper.Typography.ledgerMeta)
-                .foregroundStyle(Paper.inkMuted)
-                .textSelection(.enabled)
         }
     }
 }
@@ -858,7 +694,7 @@ private struct KeyRowView: View {
     private var draftBinding: Binding<String> {
         Binding(
             get: { store.keyDrafts[key.envName] ?? "" },
-            set: { store.keyDrafts[key.envName] = $0 }
+            set: { store.updateKeyDraft($0, for: key.id) }
         )
     }
 
@@ -866,13 +702,12 @@ private struct KeyRowView: View {
         !(store.keyDrafts[key.envName] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private var busy: Bool {
-        store.savingKey == key.envName
-    }
+    private var editing: Bool { store.replacingKey == key.envName }
+    private var busy: Bool { store.savingKey != nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
+            HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(key.label)
                         .font(Paper.Typography.label)
@@ -884,67 +719,92 @@ private struct KeyRowView: View {
                     }
                 }
                 Spacer(minLength: 8)
-                SetupPill(text: key.configured ? "Configured" : "Not set", active: key.configured)
-            }
-
-            HStack(spacing: 8) {
-                PaperFieldBox(focused: focused) {
-                    SecureField(
-                        key.configured ? "Paste new \(key.envName) to replace" : key.envName,
-                        text: draftBinding
-                    )
-                    .focused($focused)
-                    .onSubmit {
-                        if hasDraft && !busy {
-                            Task { await store.saveKey(key.envName) }
-                        }
-                    }
-                }
-
-                if busy {
-                    ProgressView().controlSize(.small)
-                }
-
-                Button("Save") { Task { await store.saveKey(key.envName) } }
-                    .buttonStyle(CardButton(kind: hasDraft ? .primary : .secondary))
-                    .disabled(!hasDraft || busy)
-
                 if key.configured {
-                    Button("Remove") { Task { await store.removeKey(key.envName) } }
-                        .buttonStyle(CardButton(kind: .quiet))
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text("Saved").font(Paper.Typography.caption)
+                    }
+                    .foregroundStyle(Paper.approveInk)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Key saved")
+                    keyMenu
+                } else if !editing {
+                    Button("Add key") { store.beginKeyEdit(key.envName) }
+                        .buttonStyle(CardButton(kind: .secondary))
                         .disabled(busy)
                 }
             }
+            .frame(minHeight: 40)
+
+            if editing {
+                editor
+            }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-    }
-}
-
-private struct SetupPill: View {
-    let text: String
-    let active: Bool
-    var accent: Bool = false
-
-    private var ink: Color {
-        if active { return Paper.approveInk }
-        if accent { return Paper.accent }
-        return Paper.inkMuted
     }
 
-    private var fill: Color {
-        if active { return Paper.approveFill }
-        if accent { return Paper.accentFill }
-        return Paper.fillSubtle
+    private var keyMenu: some View {
+        Menu {
+            Button("Replace…") { store.beginKeyEdit(key.envName) }
+            Button("Remove") { Task { await store.removeKey(key.envName) } }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(Paper.inkSecondary)
+                .frame(width: 26, height: 26)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .menuOrder(.fixed)
+        .fixedSize()
+        .disabled(busy || editing)
+        .accessibilityLabel("\(key.label) API key options")
     }
 
-    var body: some View {
-        Text(text)
-            .font(Paper.Typography.ledgerMeta)
-            .foregroundStyle(ink)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(Capsule(style: .continuous).fill(fill))
+    private var editor: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                PaperFieldBox(focused: focused) {
+                    SecureField(key.configured ? "Replace API key" : "API key", text: draftBinding)
+                        .accessibilityLabel("\(key.label) API key")
+                        .focused($focused)
+                        .focusedValue(\.apiKeyEditorFocused, true)
+                        .onAppear { focused = true }
+                        .onSubmit {
+                            if hasDraft && !busy {
+                                save()
+                            }
+                        }
+                }
+                .disabled(busy)
+
+                if store.savingKey == key.envName {
+                    ProgressView().controlSize(.small)
+                }
+
+                Button("Save", action: save)
+                    .buttonStyle(CardButton(kind: hasDraft ? .primary : .secondary))
+                    .disabled(!hasDraft || busy)
+                Button("Cancel") { store.cancelKeyEdit() }
+                    .buttonStyle(CardButton(kind: .quiet))
+                    .disabled(busy)
+            }
+            if let error = store.keyErrors[key.id] {
+                Text(error)
+                    .font(Paper.Typography.caption)
+                    .foregroundStyle(Paper.errorInk)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.bottom, 8)
+    }
+
+    private func save() {
+        Task {
+            await store.saveKey(key.id)
+            if store.keyErrors[key.id] != nil { focused = true }
+        }
     }
 }
 

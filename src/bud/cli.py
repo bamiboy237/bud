@@ -324,6 +324,22 @@ def _main(argv: list[str] | None = None) -> None:
         )
         mode = "simulated tools" if args.simulate else "real accounts"
         print(f"Starting bud with {mode} at http://{host}:{port}.", flush=True)
+        if settings.receive_move and settings.received_move_id is None:
+
+            def restart_after_commit() -> None:
+                receiver.should_exit = True
+
+            receiver_app = create_app(simulate=args.simulate, activate_move=restart_after_commit)
+            receiver = uvicorn.Server(
+                uvicorn.Config(
+                    receiver_app, host=host, port=port, timeout_graceful_shutdown=SHUTDOWN_SECONDS
+                )
+            )
+            receiver.run()
+            get_settings.cache_clear()
+            settings = get_settings()
+            if settings.received_move_id is None:
+                return
         with tracing(settings):
             app = create_app(simulate=args.simulate, model_id=args.model, operating_profile=profile)
             # Event streams never end on their own; without a limit, one connected client (TUI,

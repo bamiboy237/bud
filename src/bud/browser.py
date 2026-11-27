@@ -25,12 +25,15 @@ import json
 import logging
 import os
 import re
+import select
 import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
+from tempfile import NamedTemporaryFile, TemporaryFile
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
@@ -143,6 +146,35 @@ class Relay:
             env=self.env(),
         ).stdout
 
+    async def command(self, path: Path, *args: str, timeout: float) -> bytes:
+        # A child of the CLI can inherit stdout. A file lets us wait on the CLI alone.
+        self.home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with TemporaryFile() as stdout:
+            process = await asyncio.create_subprocess_exec(
+                str(path), *args, env=self.env(), stdout=stdout, stderr=subprocess.DEVNULL
+            )
+            try:
+                await asyncio.wait_for(process.wait(), timeout)
+            finally:
+                if process.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        process.kill()
+                    await process.wait()
+            stdout.seek(0)
+            limit = 8 * 1024 * 1024
+            output = stdout.read(limit + 1)
+        if len(output) > limit:
+            raise RuntimeError("Browse returned too much data.")
+        if process.returncode:
+            # Browse exits with 1 after a handoff that did not complete.
+            if process.returncode == 1 and args[0] == "handoff":
+                with contextlib.suppress(ValueError, TypeError, KeyError, RecursionError):
+                    outcome = json.loads(output.partition(b"\n")[0])["outcome"]
+                    if outcome in ("timeout", "closed", "cancelled"):
+                        return json.dumps({"outcome": outcome}).encode()
+            raise RuntimeError("Browse could not perform the requested action.")
+        return output
+
 
 class Consent:
     """Whether the owner turned the browser on, kept across restarts."""
@@ -157,9 +189,15 @@ class Consent:
             return False
 
     def set(self, on: bool) -> None:
-        partial = self.path.with_suffix(".tmp")
-        partial.write_text(json.dumps({"on": on}))
-        os.replace(partial, self.path)
+        partial = None
+        try:
+            with NamedTemporaryFile(mode="w", dir=self.path.parent, delete=False) as temporary:
+                partial = Path(temporary.name)
+                json.dump({"on": on}, temporary)
+            os.replace(partial, self.path)
+        finally:
+            if partial is not None:
+                partial.unlink(missing_ok=True)
 
 
 def allow_tools(policy: Policy) -> None:
@@ -274,7 +312,13 @@ class BrowseTools(AbstractToolset[None]):
     def _connect(self) -> AbstractToolset[None]:
         self.relay.home.mkdir(parents=True, exist_ok=True, mode=0o700)
         remote = MCPToolset(
-            StdioTransport(str(self.path), ["mcp"], env=self.relay.env()),
+            StdioTransport(
+                str(self.path),
+                ["mcp"],
+                env=self.relay.env(),
+                keep_alive=False,
+                log_file=Path(os.devnull),
+            ),
             init_timeout=30,
             read_timeout=180,
             max_retries=0,
@@ -317,8 +361,10 @@ class BrowseTools(AbstractToolset[None]):
                     tab, message = tool_args.get("tab"), tool_args.get("message")
                     if not isinstance(tab, (int, str)) or not isinstance(message, str):
                         return "Pass the tab id and a message for the owner."
-                    return await self.view.request_handoff(self.path, str(tab), message)
-                return await self._call(name, tool_args, ctx)
+                    handoff = await self.view.request_handoff(self.path, str(tab), message)
+                else:
+                    return await self._call(name, tool_args, ctx)
+            return await handoff if handoff is not None else {"outcome": "unavailable"}
 
     async def _call(self, name: str, tool_args: dict[str, Any], ctx: RunContext[None]) -> Any:
         try:
@@ -333,7 +379,9 @@ class BrowseTools(AbstractToolset[None]):
                         self.view.active_tab = tab
                 return result
         except ToolFailed:
-            raise  # Browse's own error message, which the model sees and can act on
+            raise ToolFailed(
+                f"Browse could not complete {name}. Check the connection and refresh the tab."
+            ) from None
         except Exception as exc:
             logger.warning("browse mcp failed during %s: %s", name, type(exc).__name__)
             return "Browse could not be reached, so nothing was done. Call browser_status."
@@ -367,31 +415,26 @@ def toolset(
 def _site(url: object) -> str:
     """A page's scheme, host, and path, without the query or fragment where pages put
     tracking data or injected text, on one short line."""
-    parts = urlsplit(str(url))
-    shown = f"{parts.scheme}://{parts.netloc}{parts.path}" if parts.netloc else "an unknown page"
+    try:
+        parts = urlsplit(str(url))
+        host = parts.netloc.rsplit("@", 1)[-1]
+    except ValueError:
+        return "an unknown page"
+    shown = f"{parts.scheme}://{host}{parts.path}" if host else "an unknown page"
     return " ".join(shown.split())[:160]
 
 
 async def _tabs(path: Path, relay: Relay) -> list[dict[str, Any]]:
     """Browse's tab list, without blocking Bud while Browse answers."""
-    relay.home.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
-        process = await asyncio.create_subprocess_exec(
-            str(path),
-            "tabs",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=relay.env(),
-        )
-        try:
-            out, _ = await asyncio.wait_for(process.communicate(), timeout=5)
-        except TimeoutError:
-            process.kill()
-            await process.wait()
-            return []
+        out = await relay.command(path, "tabs", timeout=5)
         tabs = json.loads(out).get("tabs", [])
-        return [tab for tab in tabs if isinstance(tab, dict)] if isinstance(tabs, list) else []
-    except (OSError, ValueError, AttributeError):
+        return (
+            [tab for tab in tabs if isinstance(tab, dict) and tab.get("handoff") is None]
+            if isinstance(tabs, list)
+            else []
+        )
+    except (OSError, ValueError, AttributeError, RuntimeError):
         return []
 
 
@@ -404,7 +447,7 @@ const el = ref(%s);
 return await el.evaluate(e => {
   const a = e.closest("a[href]");
   const raw = a ? (a.getAttribute("href") || "").trim() : null;
-  const label = (e.getAttribute("aria-label") || e.innerText || e.value || "").trim();
+  const label = (e.getAttribute("aria-label") || e.innerText || "").trim();
   return {
     tag: e.tagName.toLowerCase(),
     role: e.getAttribute("role"),
@@ -427,26 +470,18 @@ async def _element(path: Path, relay: Relay, tab: object, ref: str) -> str | Non
     if not REF.fullmatch(ref):
         return None
     try:
-        process = await asyncio.create_subprocess_exec(
-            str(path),
+        out = await relay.command(
+            path,
             "execute",
             ELEMENT_SCRIPT % json.dumps(ref),
             f"--tab={tab}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=relay.env(),
+            timeout=5,
         )
-        try:
-            out, _ = await asyncio.wait_for(process.communicate(), timeout=5)
-        except TimeoutError:
-            process.kill()
-            await process.wait()
-            return None
-    except OSError:
+    except (OSError, RuntimeError):
         return None
     found: dict[str, Any] | None = None
     for line in reversed(out.decode("utf-8", "replace").splitlines()):
-        with contextlib.suppress(ValueError):
+        with contextlib.suppress(ValueError, RecursionError):
             data = json.loads(line)
             if isinstance(data, dict) and "tag" in data:
                 found = data
@@ -496,6 +531,11 @@ def _page_text(value: object, limit: int) -> str:
 def _address(href: str) -> str:
     """A link's address, whole when short; a long one keeps its start and its end, where an
     action like /delete would be."""
+    try:
+        parts = urlsplit(href)
+    except ValueError:
+        return "an unknown page"
+    href = parts._replace(netloc=parts.netloc.rsplit("@", 1)[-1]).geturl()
     href = _page_text(href, 2000).replace(" ", "%20")
     return href if len(href) <= 300 else f"{href[:180]}...{href[-110:]}"
 
@@ -627,43 +667,36 @@ async def connected_now(path: Path, relay: Relay) -> bool:
     """Whether the extension is connected, asked without blocking Bud and given up after a
     few seconds."""
     try:
-        process = await asyncio.create_subprocess_exec(
-            str(path),
-            "status",
-            "--json",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=relay.env(),
-        )
-        try:
-            out, _ = await asyncio.wait_for(process.communicate(), timeout=5)
-        except TimeoutError:
-            process.kill()
-            await process.wait()
-            return False
-        return bool(json.loads(out).get("extension", {}).get("connected"))
-    except (OSError, ValueError, AttributeError):
+        out = await relay.command(path, "status", "--json", timeout=5)
+        return json.loads(out).get("extension", {}).get("connected") is True
+    except (OSError, ValueError, AttributeError, RuntimeError):
         return False
 
 
 def connected(path: Path, relay: Relay) -> bool:
     try:
         status = json.loads(relay.run(path, "status", "--json", timeout=10))
-        return bool(status.get("extension", {}).get("connected"))
-    except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+        return status.get("extension", {}).get("connected") is True
+    except (OSError, ValueError, AttributeError, RecursionError, subprocess.SubprocessError):
         return False
 
 
 def _first_line(process: subprocess.Popen, timeout: float) -> str:
     """The process's first output line, or "" if it prints nothing in time."""
-    lines: list[str] = []
-    reader = threading.Thread(
-        target=lambda: lines.append(process.stdout.readline() if process.stdout else ""),
-        daemon=True,
-    )
-    reader.start()
-    reader.join(timeout)
-    return lines[0] if lines else ""
+    if process.stdout is None:
+        return ""
+    fd = process.stdout.fileno()
+    deadline = time.monotonic() + timeout
+    data = b""
+    with contextlib.suppress(OSError, UnicodeError):
+        while len(data) < 128:
+            if not select.select([fd], [], [], max(0.0, deadline - time.monotonic()))[0]:
+                break
+            chunk = os.read(fd, 128 - len(data))
+            data += chunk
+            if b"\n" in data or not chunk:
+                return data.partition(b"\n")[0].decode("ascii")
+    return ""
 
 
 class Pairing:
@@ -679,20 +712,19 @@ class Pairing:
         the setup card shows as a failed sign-in."""
         with self._lock:
             self._stop()
-            self.relay.home.mkdir(parents=True, exist_ok=True, mode=0o700)
             try:
+                self.relay.home.mkdir(parents=True, exist_ok=True, mode=0o700)
                 self._process = subprocess.Popen(
                     [str(path), "pair", "--wait-seconds", "600"],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
-                    text=True,
                     env=self.relay.env(),
                 )
-            except OSError as exc:
-                raise ConnectionError("Browse could not start. Try again.") from exc
+            except OSError:
+                raise ConnectionError("Browse could not start. Try again.") from None
             first = _first_line(self._process, timeout=15)
             code = first.removeprefix("Pairing code:").strip()
-            if not first.startswith("Pairing code:") or not code:
+            if not first.startswith("Pairing code:") or not re.fullmatch(r"[A-Z0-9-]{6,32}", code):
                 self._stop()
                 raise ConnectionError("Browse did not start pairing. Try again.")
             return code
@@ -709,7 +741,8 @@ class Pairing:
     def _stop(self) -> None:
         if self._process is None:
             return
-        self._process.kill()
+        with contextlib.suppress(ProcessLookupError):
+            self._process.kill()
         self._process.wait()
         if self._process.stdout is not None:
             with contextlib.suppress(OSError):

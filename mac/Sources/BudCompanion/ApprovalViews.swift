@@ -71,11 +71,12 @@ struct ApprovalDeck: View {
     }
 
     private var headerBar: some View {
-        HStack(alignment: .center, spacing: 8) {
+        HStack(alignment: .center, spacing: 6) {
             Label {
                 Text("Approval \(min(safeIndex + 1, totalCount)) of \(totalCount)")
                     .font(Paper.Typography.ledgerMeta)
                     .foregroundStyle(Paper.inkSecondary)
+                    .lineLimit(1)
             } icon: {
                 Image(systemName: "doc.on.doc.fill")
                     .font(.system(size: 11, weight: .medium))
@@ -101,7 +102,8 @@ struct ApprovalDeck: View {
             }
 
             if let batch = currentBatch {
-                batchButton(batch)
+                BatchApprovalButton(companion: companion, batch: batch)
+                    .id(batch.id)
             }
         }
         .padding(.horizontal, 2)
@@ -117,28 +119,6 @@ struct ApprovalDeck: View {
             items: items,
             failed: current.retryBatch(in: companion.approvals, failures: companion.approvalFailures)
         )
-    }
-
-    private func batchButton(_ batch: PendingBatch) -> some View {
-        let failed = batch.failed
-        return Button {
-            if failed.isEmpty {
-                companion.approveAll(for: batch.approval)
-            } else {
-                companion.retryFailed(for: batch.approval)
-            }
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 11))
-                Text(companion.approvingBatch ? "Approving…" :
-                        failed.isEmpty ? "All (\(batch.items.count))" : "Retry (\(failed.count))")
-                    .font(Paper.Typography.captionMedium)
-            }
-        }
-        .buttonStyle(CardButton(kind: .secondary))
-        .disabled(!companion.deciding.isEmpty || companion.approvingBatch || companion.link != .connected)
-        .help(failed.isEmpty ? "Approve all actions in this request" : "Retry only failed actions")
     }
 
     /// Room below the front card for the cards behind it to show.
@@ -239,6 +219,108 @@ private struct PendingBatch: Identifiable {
     let approval: Approval
     let items: [Approval]
     let failed: [Approval]
+}
+
+private final class BatchReviewState: ObservableObject {
+    @Published var items: [Approval]?
+}
+
+private struct BatchApprovalButton: View {
+    @Bindable var companion: Companion
+    let batch: PendingBatch
+    @StateObject private var review = BatchReviewState()
+
+    private var unavailable: Bool {
+        !companion.deciding.isEmpty || companion.approvingBatch || companion.link != .connected
+    }
+
+    var body: some View {
+        Button {
+            if batch.failed.isEmpty {
+                review.items = batch.items
+            } else {
+                companion.retryFailed(for: batch.approval)
+            }
+        } label: {
+            Text(companion.approvingBatch ? "Approving…" :
+                    batch.failed.isEmpty ? "Review \(batch.items.count) actions" :
+                        "Retry (\(batch.failed.count))")
+                .font(Paper.Typography.captionMedium)
+                .lineLimit(1)
+                .fixedSize()
+        }
+        .buttonStyle(CardButton(kind: .secondary))
+        .disabled(unavailable)
+        .popover(isPresented: Binding(
+            get: { review.items != nil },
+            set: { if !$0 { review.items = nil } }
+        ), arrowEdge: .bottom) {
+            if let items = review.items {
+                reviewPopover(items)
+            }
+        }
+        .help(batch.failed.isEmpty ? "Review the actions in this request" : "Retry only failed actions")
+    }
+
+    private func reviewPopover(_ items: [Approval]) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Review actions")
+                .font(Paper.Typography.label)
+                .padding(.horizontal, 16)
+                .padding(.top, 16)
+            ViewThatFits(in: .vertical) {
+                reviewRows(items)
+                ScrollView { reviewRows(items) }
+            }
+            .frame(maxHeight: 280)
+            HStack(spacing: 8) {
+                Spacer()
+                Button("Cancel") { review.items = nil }
+                    .buttonStyle(CardButton(kind: .quiet))
+                Button("Approve these \(items.count)") {
+                    review.items = nil
+                    companion.approveBatch(items)
+                }
+                .buttonStyle(CardButton(kind: .primary))
+                .disabled(unavailable)
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 16)
+        }
+        .foregroundStyle(Paper.inkPrimary)
+        .frame(width: 340)
+        .background(Paper.canvas)
+    }
+
+    private func reviewRows(_ items: [Approval]) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(items) { approval in
+                Rectangle().fill(Paper.hairline).frame(height: 0.5)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(approval.action)
+                        .font(Paper.Typography.label)
+                        .foregroundStyle(Paper.inkPrimary)
+                    ForEach(Array(approval.facts.enumerated()), id: \.offset) { _, fact in
+                        Text("\(fact.label): \(fact.value)")
+                            .lineLimit(2)
+                    }
+                    if let subject = approval.emailPreview?.subject,
+                       !approval.facts.contains(where: { $0.label == "Subject" }) {
+                        Text("Subject: \(subject)").lineLimit(2)
+                    }
+                    if let summary = approval.body {
+                        Text(summary).lineLimit(2)
+                    }
+                }
+                .font(Paper.Typography.callout)
+                .foregroundStyle(Paper.inkSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 8)
+            }
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
+        }
+        .padding(.horizontal, 16)
+    }
 }
 
 /// A peek card that sits behind the front card, establishing depth on elevated paper.

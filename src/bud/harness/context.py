@@ -10,21 +10,30 @@ from time import monotonic
 
 from pydantic import TypeAdapter
 from pydantic_ai import RunContext
-from pydantic_ai.capabilities import AbstractCapability, durable_operation
-from pydantic_ai.exceptions import UserError
-from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
-from pydantic_ai.models import ModelRequestContext, ModelRequestParameters
+from pydantic_ai.capabilities import AbstractCapability, WrapModelRequestHandler, durable_operation
+from pydantic_ai.exceptions import ModelContextWindowExceededError, RetryModelRequest, UserError
+from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter, ModelResponse
+from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters
+from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.usage import RunUsage, UsageLimits
-from pydantic_ai_harness import ClearToolResults, SummarizingCompaction, TieredCompaction
-from pydantic_ai_harness.compaction import drain_summary_events, estimate_token_count
-from pydantic_ai_harness.compaction._shared import (
-    exceeds,
-    find_token_cutoff,
-    resolve_token_trigger,
+from pydantic_ai_harness import ClearToolResults, SummarizingCompaction
+from pydantic_ai_harness.compaction import (
+    drain_summary_events,
+    estimate_context_tokens,
+    estimate_token_count,
+    resolve_context_window,
 )
+from pydantic_ai_harness.compaction._shared import find_token_cutoff
 
-from bud.gateway.errors import error_summary
-from bud.gateway.tracked import RequestAttribution, request_attribution, request_session
+from bud.gateway.errors import CONTEXT_FULL_MESSAGE, WorkingContextBudgetError, error_summary
+from bud.gateway.tracked import (
+    RequestAttribution,
+    TrackedModel,
+    context_overflow_retry,
+    request_attribution,
+    request_session,
+)
 from bud.harness.results import SPILL_CHARS, SqliteResultStore, spill_old_results
 
 PARAMETERS = TypeAdapter(ModelRequestParameters)
@@ -61,11 +70,37 @@ def _digest(messages: list[ModelMessage]) -> str:
     return sha256(ModelMessagesTypeAdapter.dump_json(messages)).hexdigest()
 
 
+def _unwrap(model: Model) -> Model:
+    while isinstance(model, WrapperModel) and not isinstance(model, TrackedModel):
+        model = model.wrapped
+    return model
+
+
+def _matches_response(model: Model, response: ModelResponse) -> bool:
+    model = _unwrap(model)
+    if isinstance(model, TrackedModel):
+        response_id = (response.metadata or {}).get("bud_model_id")
+        if isinstance(response_id, str):
+            return response_id.strip().casefold() == model.spec.id.casefold()
+        provider, name = model.spec.provider, model.spec.name
+    else:
+        provider, name = model.system, model.model_name
+    return (response.provider_name or "").strip().casefold() == provider.casefold() and (
+        response.model_name or ""
+    ).strip().casefold() == name.casefold()
+
+
+def _last_response(messages: list[ModelMessage]) -> ModelResponse | None:
+    return next(
+        (message for message in reversed(messages) if isinstance(message, ModelResponse)), None
+    )
+
+
 def _signature(request: ModelRequestContext) -> str:
     parameters = json.loads(PARAMETERS.dump_json(request.model_request_parameters))
+    model = _unwrap(request.model)
     value = [
-        request.model.system,
-        request.model.model_name,
+        model.spec.id if isinstance(model, TrackedModel) else model.model_id,
         request.model_settings,
         parameters,
     ]
@@ -118,13 +153,37 @@ class BackgroundCompaction(AbstractCapability[None]):
         if self.max_age_seconds <= 0 or self.max_preparations < 1:
             raise ValueError("Preparation lifetime and capacity must be positive")
 
+    def _threshold(self, model: Model, output_limit: int | None) -> int:
+        model = _unwrap(model)
+        if isinstance(model, FallbackModel):
+            return min(self._threshold(candidate, output_limit) for candidate in model.models)
+        if isinstance(model, TrackedModel) and model.spec.max_output_tokens is not None:
+            output_limit = model.spec.max_output_tokens
+        window = resolve_context_window(model) or self.fallback_context_window
+        reserve = min(output_limit or 0, window // 4)
+        return min(max(1, int(window * self.max_fraction)), window - reserve)
+
     @staticmethod
-    def _fits_rewritten(
-        messages: list[ModelMessage], request: ModelRequestContext, threshold: int
-    ) -> bool:
-        # Retained responses report the old full input. They cannot anchor a rewritten prefix.
-        schema_tokens = (len(PARAMETERS.dump_json(request.model_request_parameters)) + 3) // 4
-        return estimate_token_count(messages) + schema_tokens <= threshold
+    def _estimate_request(messages: list[ModelMessage], request: ModelRequestContext) -> int:
+        # Withheld schemas never reach the model.
+        _, parameters = request.model.prepare_request(
+            request.model_settings, request.model_request_parameters
+        )
+        sent_tools = [
+            tool
+            for tool in parameters.function_tools
+            if parameters.visibility_of(tool.name) != "withheld"
+        ]
+        sent_parameters = replace(parameters, function_tools=sent_tools, tool_visibility=None)
+        parameter_tokens = (len(PARAMETERS.dump_json(sent_parameters)) + 3) // 4
+        return estimate_token_count(messages) + parameter_tokens
+
+    def _request_tokens(self, request: ModelRequestContext, last: ModelResponse | None) -> int:
+        if last is not None and last.usage.input_tokens and _matches_response(request.model, last):
+            return estimate_context_tokens(
+                request.messages, model_request_parameters=request.model_request_parameters
+            )
+        return self._estimate_request(request.messages, request)
 
     def always_kept(self, messages: list[ModelMessage]) -> list[ModelMessage]:
         """The newest messages, which compaction never summarizes away."""
@@ -148,10 +207,9 @@ class BackgroundCompaction(AbstractCapability[None]):
                 self.result_store, messages, ctx.run_id, spill_chars=self.history_spill_chars
             )
         request_context = replace(request_context, messages=messages)
-        threshold = resolve_token_trigger(
-            None, self.max_fraction, ctx.model, self.fallback_context_window
+        threshold = self._threshold(
+            request_context.model, (request_context.model_settings or {}).get("max_tokens")
         )
-        assert threshold is not None
         signature = _signature(request_context)
         session_id = ctx.conversation_id
         run_id = ctx.run_id
@@ -174,22 +232,13 @@ class BackgroundCompaction(AbstractCapability[None]):
             await self.discard(session_id)
             prepared = None
 
-        if not exceeds(
-            messages,
-            None,
-            threshold,
-            None,
-            model_request_parameters=request_context.model_request_parameters,
-        ):
+        last = _last_response(messages)
+        request_tokens = self._request_tokens(request_context, last)
+        if request_tokens <= threshold:
             if (
                 prepared is None
-                and exceeds(
-                    messages,
-                    None,
-                    int(threshold * self.background_fraction),
-                    None,
-                    model_request_parameters=request_context.model_request_parameters,
-                )
+                and request_tokens > int(threshold * self.background_fraction)
+                and (last is None or _matches_response(request_context.model, last))
                 and find_token_cutoff(messages, self.keep_tokens, None) > 0
             ):
                 self._reserve(ctx)
@@ -211,25 +260,42 @@ class BackgroundCompaction(AbstractCapability[None]):
                 compacted = [*compacted, *messages[prepared.count :]]
                 source = "background"
                 preparation_id = prepared.id
-                if not self._fits_rewritten(compacted, request_context, threshold):
+                if self._estimate_request(compacted, request_context) > threshold:
                     compacted = None
         if compacted is None:
             source = "foreground"
             preparation_id = None
             self._reserve(ctx)
             compacted = await self._summarize(ctx, request_context)
-        if _digest(compacted) == _digest(messages) or not self._fits_rewritten(
-            compacted, request_context, threshold
+        unchanged = _digest(compacted) == _digest(messages)
+        if self._estimate_request(compacted, request_context) > threshold or (
+            unchanged and find_token_cutoff(messages, self.keep_tokens, None) > 0
         ):
-            raise UserError(
+            raise WorkingContextBudgetError(
                 "Recent content or tool definitions exceed bud's working context budget. "
                 "Use bounded read-back or split the input before continuing."
             )
+        if unchanged:
+            return request_context
+        self._record_compaction(ctx, messages, compacted, source, preparation_id)
+        return replace(request_context, messages=compacted)
+
+    def _record_compaction(
+        self,
+        ctx: RunContext[None],
+        messages: list[ModelMessage],
+        compacted: list[ModelMessage],
+        source: str,
+        preparation_id: str | None = None,
+    ) -> None:
+        event_id = f"{ctx.run_id}:{ctx.run_step}"
+        if source == "overflow":
+            event_id += ":overflow"
         self.record(
             {
-                "session_id": session_id,
-                "run_id": run_id,
-                "id": f"{run_id}:{ctx.run_step}",
+                "session_id": ctx.conversation_id,
+                "run_id": ctx.run_id,
+                "id": event_id,
                 "stage": "compacted",
                 "source": source,
                 "preparation_id": preparation_id,
@@ -237,7 +303,60 @@ class BackgroundCompaction(AbstractCapability[None]):
                 "after_messages": len(compacted),
             }
         )
-        return replace(request_context, messages=compacted)
+
+    async def wrap_model_request(
+        self,
+        ctx: RunContext[None],
+        *,
+        request_context: ModelRequestContext,
+        handler: WrapModelRequestHandler,
+    ) -> ModelResponse:
+        token = context_overflow_retry.set(False)
+        try:
+            return await handler(request_context)
+        finally:
+            context_overflow_retry.reset(token)
+
+    async def on_model_request_error(
+        self, ctx: RunContext[None], *, request_context: ModelRequestContext, error: Exception
+    ) -> ModelResponse:
+        if not isinstance(error, ModelContextWindowExceededError):
+            raise error
+        if request_context.attempt != 1:
+            raise WorkingContextBudgetError(CONTEXT_FULL_MESSAGE) from None
+        context_overflow_retry.set(True)
+        raise RetryModelRequest() from None
+
+    async def prepare_model_request(
+        self, ctx: RunContext[None], request_context: ModelRequestContext
+    ) -> ModelRequestContext:
+        if not context_overflow_retry.get():
+            return request_context
+        context_overflow_retry.set(False)
+        if ctx.conversation_id is not None:
+            await self.discard(ctx.conversation_id)
+        self._reserve(ctx)
+        compacted = await self._compact_overflow(ctx, request_context)
+        # Keep any request-only changes out of the saved conversation.
+        if ctx.messages == request_context.messages:
+            ctx.messages[:] = compacted.messages
+        return compacted
+
+    @durable_operation("compact_overflow")
+    async def _compact_overflow(
+        self, ctx: RunContext[None], request: ModelRequestContext
+    ) -> ModelRequestContext:
+        try:
+            compacted = await self._summarize(ctx, request, forced=True)
+        except ModelContextWindowExceededError:
+            raise WorkingContextBudgetError(CONTEXT_FULL_MESSAGE) from None
+        before = self._estimate_request(request.messages, request)
+        after = self._estimate_request(compacted, request)
+        threshold = self._threshold(request.model, (request.model_settings or {}).get("max_tokens"))
+        if after >= before or after > threshold:
+            raise WorkingContextBudgetError(CONTEXT_FULL_MESSAGE)
+        self._record_compaction(ctx, request.messages, compacted, "overflow")
+        return replace(request, messages=compacted)
 
     @staticmethod
     def _reserve(ctx: RunContext[None]) -> None:
@@ -287,6 +406,7 @@ class BackgroundCompaction(AbstractCapability[None]):
         request: ModelRequestContext,
         *,
         attribution: RequestAttribution | None = None,
+        forced: bool = False,
     ) -> list[ModelMessage]:
         session_id, run_id = ctx.conversation_id, ctx.run_id
         assert session_id is not None and run_id is not None
@@ -302,36 +422,52 @@ class BackgroundCompaction(AbstractCapability[None]):
             conversation_id=session_id,
             messages=request.messages,
         )
-        threshold = resolve_token_trigger(
-            None, self.max_fraction, request.model, self.fallback_context_window
-        )
-        assert threshold is not None
-        # Clear old results before paying for a summary; leave headroom below the trigger.
-        summarizer = TieredCompaction(
-            tiers=[
-                ClearToolResults(
-                    max_tokens=1,  # Bypassed inside TieredCompaction; the target decides.
-                    keep_pairs=self.clear_keep_pairs,
-                    # The owner's own answers are not re-fetchable: never blank them.
-                    exclude_tools=frozenset({"ask_user"}),
-                    # Small savings do not justify invalidating the prompt cache.
-                    min_clear_tokens=self.clear_min_tokens,
-                ),
-                SummarizingCompaction(
+        event_id = f"{run_id}:{ctx.run_step}"
+        if forced:
+            event_id += ":overflow"
+        event = {"session_id": session_id, "run_id": run_id, "id": event_id}
+        try:
+            compacted = request.messages
+            keep_tokens: int | None = self.keep_tokens
+            if forced:
+                keep_tokens = min(keep_tokens, max(1, estimate_token_count(compacted) // 2))
+                if not find_token_cutoff(compacted, keep_tokens, None):
+                    # A large old turn can fill the token floor by itself. Keep the newest turn.
+                    keep_tokens = None
+                needs_summary = True
+            else:
+                threshold = self._threshold(
+                    request.model, (request.model_settings or {}).get("max_tokens")
+                )
+                target = max(1, int(threshold * self.compacted_target))
+                before = self._request_tokens(request, _last_response(compacted))
+                needs_summary = before > target
+                if needs_summary:
+                    clearer = ClearToolResults(
+                        max_tokens=target,
+                        keep_pairs=self.clear_keep_pairs,
+                        exclude_tools=frozenset({"ask_user"}),
+                        min_clear_tokens=self.clear_min_tokens,
+                    )
+                    compacted = await clearer.compact(compacted, summary_ctx)
+                    reclaimed = estimate_token_count(request.messages) - estimate_token_count(
+                        compacted
+                    )
+                    needs_summary = (
+                        max(before - reclaimed, self._estimate_request(compacted, request)) > target
+                    )
+            if needs_summary:
+                summarizer = SummarizingCompaction(
                     max_fraction=self.max_fraction,
-                    keep_tokens=self.keep_tokens,
+                    keep_messages=1,
+                    keep_tokens=keep_tokens,
                     preserve_first_user_message=False,
                     summary_prompt=SUMMARY_PROMPT,
                     model_settings={"max_tokens": self.summary_max_tokens},
                     event_stream_handler=drain_summary_events,
                     tool_return_max_chars=self.summary_tool_return_max_chars,
-                ),
-            ],
-            target_tokens=int(threshold * self.compacted_target),
-        )
-        event = {"session_id": session_id, "run_id": run_id, "id": f"{run_id}:{ctx.run_step}"}
-        try:
-            compacted = await summarizer.compact(request.messages, summary_ctx)
+                )
+                compacted = await summarizer.compact(compacted, summary_ctx)
         except Exception as exc:
             self.record({**event, "stage": "failed", "reason": error_summary(exc)})
             raise

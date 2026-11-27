@@ -19,27 +19,28 @@ from typing import Annotated, Any, TextIO
 from uuid import uuid4
 
 from dbos import DBOS
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
-from pydantic_ai import ModelRetry
+from pydantic_ai import ModelRetry, Tool
 from pydantic_ai.toolsets import AbstractToolset, CombinedToolset, FunctionToolset
 
 from bud import __version__, browser
 from bud.apps import CHANGES as APP_CHANGES
 from bud.apps import GUIDANCE as APP_GUIDANCE
-from bud.apps import OPEN_IN_APP, quiet_open
+from bud.apps import OPEN_IN_APP, AppDispatch, quiet_open
 from bud.apps import READS as APP_READS
 from bud.apps import available as apps_available
 from bud.apps import build_tools as build_app_tools
 from bud.composio.binding import AccountBinding, valid_toolkit
 from bud.composio.connection import ConnectionError, Connections
-from bud.config import Settings, get_settings
+from bud.config import MOVE_FENCE, Settings, get_settings
 from bud.core.auth import OwnerAuthentication, owner_token
 from bud.core.background import GUIDANCE as BACKGROUND_GUIDANCE
 from bud.core.background import STARTS as BACKGROUND_STARTS
 from bud.core.background import TOOLS as BACKGROUND_TOOLS
 from bud.core.background import Background
+from bud.core.browser_computers import BrowserComputers
 from bud.core.browser_delivery import local_routes
 from bud.core.browser_view import BrowserView
 from bud.core.composition import compose_runner, compose_world_harness
@@ -49,12 +50,14 @@ from bud.core.hub import Hub
 from bud.core.log import EventLog, QueueFull
 from bud.core.onboarding import (
     ChatGPTLoginManager,
+    DefaultModelChoice,
     OnboardingError,
     onboarding_snapshot,
     reload_settings,
     resolve_config_env_path,
     write_env_updates,
 )
+from bud.core.paired_apps import PairedApps
 from bud.core.profiles import Mode, ProfileStore, apply_mode, as_mode, mode_summary
 from bud.core.projection import (
     Attachment,
@@ -66,6 +69,7 @@ from bud.core.projection import (
 )
 from bud.core.routines import (
     DEFAULT_APPROVAL_EXPIRY_SECONDS,
+    RECENT_RUN_LIMIT,
     MissedRunPolicy,
     OverlapPolicy,
     RoutineConflictError,
@@ -80,6 +84,7 @@ from bud.core.runner import (
     StaleApproval,
     UnknownApproval,
 )
+from bud.core.runtime_receiver import create_receiver
 from bud.core.setup import (
     SetupJournal,
     SetupRegistry,
@@ -88,8 +93,9 @@ from bud.core.setup import (
     setup_registry,
 )
 from bud.core.workspace_home import display_path, workspace_home
-from bud.gateway import NoModelAvailable, build_gateway
+from bud.gateway import Gateway, NoModelAvailable, build_gateway
 from bud.gateway.chatgpt import ChatGPTError
+from bud.gateway.router import provider_model_factory
 from bud.harness.actions import Policy, load_policy
 from bud.harness.agent import Harness
 from bud.harness.ask import MAX_QUESTIONS, AskAnswer
@@ -106,6 +112,7 @@ from bud.harness.taint import KnownAddresses
 from bud.limits import MAX_MESSAGE_CHARS
 from bud.logs import guard_logs
 from bud.photon_config import PhotonConfig
+from bud.release.move_archive import RuntimeMoveError
 from bud.shell import GUIDANCE as SHELL_GUIDANCE
 from bud.shell import NETWORK_TOOL, SHELL_TOOLS, NetworkGrants
 from bud.shell import available as shell_available
@@ -153,6 +160,10 @@ class OnboardingKeysRequest(BaseModel):
     keys: dict[str, str | None] = Field(default_factory=dict)
 
 
+class DefaultModelRequest(BaseModel):
+    model: str | None
+
+
 class NewMessage(BaseModel):
     text: str = Field(max_length=MAX_MESSAGE_CHARS)
     attachments: list[Attachment] = Field(default_factory=list, max_length=5)
@@ -188,6 +199,7 @@ class Answer(BaseModel):
 
 class ConnectRequest(BaseModel):
     resume: bool = False
+    refresh: bool = True
 
 
 class NewRoutine(BaseModel):
@@ -234,7 +246,8 @@ class ConfirmDeliveryRequest(BaseModel):
 def sse_frame(event: Event) -> str:
     # Live text has no stored position; only stored events move the reconnect cursor.
     cursor = "" if event.live else f"id: {event.seq}\n"
-    return f"{cursor}event: {event.type}\ndata: {event.model_dump_json()}\n\n"
+    payload = event.model_dump_json(exclude={"data": {"model_fallbacks"}})
+    return f"{cursor}event: {event.type}\ndata: {payload}\n\n"
 
 
 def hold_single_server_lock(path: Path) -> TextIO:
@@ -266,11 +279,17 @@ def workspace_tools(
     reviewer: Callable[[], ToolReviewer | None],
     private: Sequence[Path] = (),
     background: Background | None = None,
+    app_dispatch: AppDispatch | None = None,
 ) -> FunctionToolset[None]:
     """File tools, and on macOS the sandboxed shell, whose network checks use `reviewer`.
     Shell commands cannot read `private` folders, such as Bud's data and its .env."""
     grants = NetworkGrants(state_dir / "network-grants.json")
     shell = build_shell_tools(root, grants, reviewer, private) if shell_available() else []
+    apps = (
+        build_app_tools(root, state_dir / "open-copies", dispatch=app_dispatch)
+        if apps_available() or app_dispatch is not None
+        else []
+    )
     return FunctionToolset(
         [
             *build_workspace_tools(root, state_dir / "workspace-dispatches.jsonl"),
@@ -278,7 +297,7 @@ def workspace_tools(
             *local_tools(local_blocked(Path.home(), list(private), root)),
             *shell,
             *(background.tools() if background is not None else []),
-            *(build_app_tools(root, state_dir / "open-copies") if apps_available() else []),
+            *apps,
         ]
     )
 
@@ -381,6 +400,7 @@ def create_app(
     simulate: bool = False,
     model_id: str | None = None,
     operating_profile: OperatingProfile | None = None,
+    activate_move: Callable[[], None] | None = None,
 ) -> FastAPI:
     settings = get_settings()
     token = owner_token(settings)
@@ -391,6 +411,12 @@ def create_app(
         None if simulate else hold_single_server_lock(settings.data_dir / "live-server.lock")
     )
     try:
+        if (settings.data_dir / MOVE_FENCE).exists():
+            raise RuntimeMoveError("This Bud runtime is stopped for a move to another server.")
+        if settings.receive_move and settings.received_move_id is None:
+            if live_lock is None:
+                raise RuntimeMoveError("A simulated server cannot receive a Bud runtime.")
+            return create_receiver(settings, token, live_lock, activate_move)
         return _create_app(
             settings,
             token,
@@ -439,6 +465,16 @@ def _create_app(
     account_toolset: (
         Callable[[AccountBinding | None, Path | None], CombinedToolset[None]] | None
     ) = None
+    paired_apps: PairedApps
+
+    def paired_macs() -> list[dict]:
+        """List paired Macs and their IDs. Use the exact ID in each Mac app action."""
+        return paired_apps.devices()
+
+    async def remote_app_action(
+        mac: str | None, action: str, args: list[str], file: bytes | None
+    ) -> dict:
+        return await paired_apps.dispatch(mac, action, args, file)
 
     # The approval mode applies to the harness policy after composition (the
     # Harness unions memory/skill rules in), one seam for every tool class.
@@ -448,6 +484,20 @@ def _create_app(
         settings.operating_profile,
         store=OperatingProfileStore(settings.data_dir / "operating-profile.json"),
     )
+
+    def build_runtime_gateway(current: Settings) -> Gateway:
+        providers = (
+            None if simulate else {"openai-chatgpt", "openai", "meta", "mistral", "deepseek"}
+        )
+        if model_id is not None or current.default_model is None:
+            return build_gateway(current, providers=providers, model_id=model_id)
+        # Keep the full catalog for Settings and use DEFAULT_MODEL only as the default route.
+        candidate = build_gateway(
+            current.model_copy(update={"default_model": None}), providers=providers
+        )
+        candidate.selected_model = current.default_model
+        return candidate
+
     retention = (
         timedelta(hours=settings.tool_result_retention_hours)
         if settings.tool_result_retention_hours != 24
@@ -488,14 +538,14 @@ def _create_app(
         db_path = session_dir / "bud.db"
         workspace = workspace_home(settings)
         background = build_background(workspace, session_dir, private_folders(settings))
-        gateway = build_gateway(
-            settings,
-            providers={"openai-chatgpt", "openai", "meta", "mistral", "deepseek"},
-            model_id=model_id,
-        )
+        gateway = build_runtime_gateway(settings)
         tools_policy = policy()
         tools_policy.tools.update(dict.fromkeys(WEB_READ_TOOLS, "allow"))
         allow_file_tools(tools_policy)
+        use_paired_mac = not apps_available()
+        if use_paired_mac:
+            tools_policy.tools.update({"paired_macs": "allow", "open_app": "ask"})
+            tools_policy.always_ask |= APP_CHANGES | {"open_app", OPEN_IN_APP}
         tools_policy.tools["setup_capability"] = "allow"
         browsing = settings.browser_tools
         consent = browser.Consent(settings.data_dir / "browser-consent.json")
@@ -533,7 +583,9 @@ def _create_app(
                         lambda: harness.reviewer,
                         private_folders(settings),
                         background,
+                        app_dispatch=remote_app_action if use_paired_mac else None,
                     ),
+                    *([FunctionToolset([Tool(paired_macs)])] if use_paired_mac else []),
                     build_setup_toolset(setup, setup_journal, refresh=refresh_tools),
                     *browser_toolsets(browse),
                 ]
@@ -580,6 +632,13 @@ def _create_app(
             "connection is ready on the next message; no restart is needed."
             + WEB_GUIDANCE
             + file_guidance()
+            + (
+                "\nMac app actions run on a paired Mac. Call paired_macs to get the Mac's ID. "
+                "Specify that ID in every app action. If a result is uncertain, verify what "
+                "happened instead of repeating it.\n"
+                if use_paired_mac
+                else ""
+            )
             + (browser.GUIDANCE if browsing else "")
             + f"Your workspace is the folder {display_path(workspace)} on the machine running "
             "the Bud server. Local file paths resolve on that machine, even when the person "
@@ -600,6 +659,18 @@ def _create_app(
         )
         harness.known = KnownAddresses(session_dir / "known-addresses")
         tools_policy = harness.policy
+        if use_paired_mac:
+
+            def describe_mac(args: dict) -> str:
+                name = next(
+                    (mac["name"] for mac in paired_apps.devices() if mac["id"] == args.get("mac")),
+                    None,
+                )
+                return f"On {name}" if name else "No paired Mac selected"
+
+            harness.describers.update(
+                dict.fromkeys(APP_CHANGES | {"open_app", OPEN_IN_APP}, describe_mac)
+            )
         if browsing:
             harness.describers.update(browser.describers(relay, view=browser_view))
             harness.harmless.update(browser.harmless(consent))
@@ -616,7 +687,7 @@ def _create_app(
         db_path = settings.data_dir / "bud.db"
         workspace = workspace_root(settings.data_dir)
         background = build_background(workspace, settings.data_dir, private_folders(settings))
-        gateway = build_gateway(settings, model_id=model_id)
+        gateway = build_runtime_gateway(settings)
         world = World(settings.data_dir / "world.db")
         tools_policy = load_policy()
         allow_file_tools(tools_policy)
@@ -649,7 +720,8 @@ def _create_app(
         )
         harness_ref.append(harness)
     # The card names the real file a local read opens, which a link cannot disguise.
-    harness.harmless[OPEN_IN_APP] = quiet_open
+    if apps_available():
+        harness.harmless[OPEN_IN_APP] = quiet_open
     outside = local_blocked(Path.home(), private_folders(settings), workspace)
     harness.describers.update(
         dict.fromkeys(LOCAL_TOOLS, lambda tool_args: describe_local(tool_args, outside))
@@ -657,7 +729,12 @@ def _create_app(
     harness.refuses.update(
         dict.fromkeys(LOCAL_TOOLS, lambda tool_args: local_refusal(tool_args, outside))
     )
-    reviewer = build_reviewer(settings)
+
+    def review_model():
+        return runner.decision_model()
+
+    review_provider = review_model if gateway.selectable_models(require_tools=True) else None
+    reviewer = build_reviewer(settings, model_provider=review_provider)
     has_reviewer = reviewer is not None
     # Standing permissions the owner granted from an approval card. The policy reads them on
     # every call, so a new grant or a revoke applies without a restart.
@@ -701,35 +778,98 @@ def _create_app(
         allow_unconfigured=allow_unconfigured,
     )
     config_env_path = resolve_config_env_path(settings)
+    model_choice = DefaultModelChoice(settings.data_dir / "default-model")
+    model_locked = bool(model_id or active_profile.model.model_id)
 
-    def reload_runtime_config(*, cleared_keys: set[str] | None = None) -> None:
+    def default_model_for(candidate: Gateway) -> str | None:
+        choice = None if model_locked else model_choice.read()
+        if choice:
+            with contextlib.suppress(NoModelAvailable):
+                return candidate.validate_model(choice, require_tools=True).id
+        return None
+
+    runner.owner_model = default_model_for(gateway)
+
+    def reload_runtime_config(
+        *, cleared_keys: set[str] | None = None, chatgpt_auth_changed: bool = False
+    ) -> None:
         nonlocal settings, gateway, has_reviewer, config_env_path
         with refresh_lock:
-            new_settings = reload_settings(settings, config_env_path, cleared_keys=cleared_keys)
-            gateway.close()
-            new_gateway = build_gateway(
-                new_settings,
-                providers={"openai-chatgpt", "openai", "meta", "mistral", "deepseek"}
-                if not simulate
-                else None,
-                model_id=model_id,
-            )
-            new_reviewer = build_reviewer(new_settings)
+            old_gateway = gateway
+            new_gateway = None
+            try:
+                new_settings = reload_settings(settings, config_env_path, cleared_keys=cleared_keys)
+                new_gateway = build_runtime_gateway(new_settings)
+                chatgpt = old_gateway.chatgpt
+                if (
+                    chatgpt is not None
+                    and new_gateway.chatgpt is not None
+                    and chatgpt.folder == new_gateway.chatgpt.folder
+                ):
+                    # Reuse the live store's credential lock while validating the candidate.
+                    new_gateway.chatgpt = chatgpt
+                    new_gateway.build_model = provider_model_factory(new_settings, chatgpt)
+                provider = (
+                    review_model if new_gateway.selectable_models(require_tools=True) else None
+                )
+                current_reviewer = harness.reviewer
+                if (
+                    current_reviewer is not None
+                    and new_settings.openai_api_key == settings.openai_api_key
+                    and current_reviewer.model_provider is provider
+                ):
+                    new_reviewer = current_reviewer
+                else:
+                    new_reviewer = build_reviewer(new_settings, model_provider=provider)
+                new_config_env_path = resolve_config_env_path(new_settings)
+                policy = harness.policy.model_copy(update={"tools": harness.policy.tools.copy()})
+                apply_mode(policy, live_mode["mode"], reviewer=new_reviewer is not None)
+                runner.reload_gateway(
+                    new_gateway,
+                    reviewer=new_reviewer,
+                    owner_model=default_model_for(new_gateway),
+                    policy_tools=policy.tools,
+                    settings=new_settings,
+                )
+            except Exception:
+                if new_gateway is not None and new_gateway is not old_gateway:
+                    new_gateway.close(preserve_chatgpt=old_gateway.chatgpt)
+                raise OnboardingError("Bud could not reload the model configuration.") from None
             settings = new_settings
             gateway = new_gateway
             has_reviewer = new_reviewer is not None
-            config_env_path = resolve_config_env_path(new_settings)
-            runner.reload_gateway(new_gateway, reviewer=new_reviewer)
-            apply_mode(harness.policy, live_mode["mode"], reviewer=has_reviewer)
+            config_env_path = new_config_env_path
+            if old_gateway is not new_gateway:
+                old_gateway.close(preserve_chatgpt=new_gateway.chatgpt)
             if connections is not None and account_toolset is not None:
                 connections.settings = new_settings
                 current_binding = connections.binding or connections.stored()
                 harness.swap_tools(account_toolset(current_binding, loaded.get("browse")))
+            if chatgpt_auth_changed:
+                try:
+                    choice = model_choice.read()
+                    connected = new_gateway.chatgpt is not None and new_gateway.chatgpt.connected
+                    if not connected and choice and choice.startswith("openai-chatgpt:"):
+                        model_choice.write(None)
+                    elif connected and not model_locked and choice is None:
+                        selected = next(
+                            (
+                                model
+                                for model in new_gateway.selectable_models(require_tools=True)
+                                if model.startswith("openai-chatgpt:")
+                            ),
+                            None,
+                        )
+                        if selected is not None:
+                            model_choice.write(selected)
+                            runner.owner_model = selected
+                except OSError:
+                    raise OnboardingError("Bud could not save the default model.") from None
 
     chatgpt_login = ChatGPTLoginManager(
         settings.data_dir,
         on_before_auth=lambda: gateway.close(),
-        on_complete=reload_runtime_config,
+        on_complete=lambda: reload_runtime_config(chatgpt_auth_changed=True),
     )
     if setup_journal is not None:
         # The setup toolset was built before the log, hub, and runner existed; one seam
@@ -854,9 +994,14 @@ def _create_app(
     app.state.reload_runtime_config = reload_runtime_config
     if browser_view is not None:
         app.include_router(browser_view.routes())
+        app.include_router(
+            BrowserComputers(browser_view, pairing, settings.browse_peer_ip).routes()
+        )
         app.include_router(local_routes(browser_view))
     handoffs = DesktopHandoffs(db_path.with_suffix(".handoff.db"), workspace, hub)
     app.include_router(handoffs.routes())
+    paired_apps = PairedApps(handoffs)
+    app.include_router(paired_apps.routes())
     app.add_middleware(
         OwnerAuthentication, token=token, scope_id=scope_id, desktop_worker=handoffs.authorized
     )
@@ -879,6 +1024,7 @@ def _create_app(
                 "version": __version__,
                 "mode": "simulate" if simulate else "accounts",
                 "scope": scope_id,
+                "received_move_id": settings.received_move_id,
                 "has_model": has_model,
                 "needs_onboarding": not simulate and not has_model,
                 "restart_required": connections is not None and connections.restart_required(),
@@ -891,20 +1037,38 @@ def _create_app(
 
     def _onboarding_payload() -> JSONResponse:
         manager: ChatGPTLoginManager = app.state.chatgpt_login
-        return JSONResponse(
-            onboarding_snapshot(
+        with refresh_lock:
+            payload = onboarding_snapshot(
                 settings,
                 gateway,
                 manager,
                 has_model=runner.is_configured,
                 simulate=simulate,
                 active_model=runner.active_model_id,
-            ),
-            headers={"Cache-Control": "no-store"},
-        )
+                default_model=runner.owner_model,
+                model_locked=model_locked,
+            )
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    def _validate_model(model_id: str | None) -> None:
+        if model_id is not None:
+            try:
+                gateway.validate_model(model_id, require_tools=True)
+            except NoModelAvailable as exc:
+                raise HTTPException(422, str(exc)) from None
 
     @app.get("/onboarding")
     def get_onboarding() -> JSONResponse:
+        return _onboarding_payload()
+
+    @app.put("/onboarding/model")
+    def select_default_model(body: DefaultModelRequest) -> JSONResponse:
+        if model_locked:
+            raise HTTPException(409, "The server configuration sets the default model.")
+        with refresh_lock:
+            _validate_model(body.model)
+            model_choice.write(body.model)
+            runner.owner_model = body.model
         return _onboarding_payload()
 
     @app.post("/onboarding/keys")
@@ -953,15 +1117,17 @@ def _create_app(
         target = as_mode(body.mode)
         if target is None:
             raise HTTPException(400, "Unknown mode; one of strict/auto.")
-        profile_store.save(target)
-        overlay = apply_mode(harness.policy, target, reviewer=has_reviewer)
-        live_mode["mode"] = target
+        with refresh_lock:
+            profile_store.save(target)
+            overlay = apply_mode(harness.policy, target, reviewer=has_reviewer)
+            live_mode["mode"] = target
+            summary = mode_summary(target, reviewer=has_reviewer)
         auto = sum(1 for action in overlay.values() if action == "review")
         return JSONResponse(
             {
                 "mode": target,
                 "auto_writes": auto,
-                "summary": mode_summary(target, reviewer=has_reviewer),
+                "summary": summary,
             },
             headers={"Cache-Control": "no-store"},
         )
@@ -976,7 +1142,7 @@ def _create_app(
     def connection_status() -> JSONResponse:
         current = live_connections()
         try:
-            statuses = current.statuses()
+            statuses, accounts = current.inventory()
             refresh_tools()  # any change, a reconnect included, loads in this chat
             restart_required = current.restart_required()
         except ConnectionError as exc:
@@ -984,31 +1150,58 @@ def _create_app(
         return JSONResponse(
             {
                 "statuses": {"gmail": statuses["gmail"], "calendar": statuses["googlecalendar"]},
+                "accounts": accounts,
                 "restart_required": restart_required,
                 "refresh_boundary": "process_restart" if restart_required else "next_message",
             },
             headers={"Cache-Control": "no-store"},
         )
 
-    @app.post("/connections/{toolkit}/connect")
-    def connect_account(toolkit: str, request: ConnectRequest | None = None) -> JSONResponse:
-        current = live_connections()
+    def connection_toolkit(toolkit: str) -> str:
         name = {"calendar": "googlecalendar"}.get(toolkit, toolkit)
         if not valid_toolkit(name):
             raise HTTPException(400, "Use a valid app id.")
+        return name
+
+    @app.post("/connections/{toolkit}/connect")
+    def connect_account(toolkit: str, request: ConnectRequest | None = None) -> JSONResponse:
+        current = live_connections()
+        name = connection_toolkit(toolkit)
+        resume = bool(request and request.resume)
         try:
-            url = current.pending_url(name) if request is not None and request.resume else None
-            if url is None:
+            url = current.pending_url(name) if resume else None
+            if not resume:
                 url = current.connect(name)
+            elif url is None and request and request.refresh:
+                url = current.connect(name, replace_active=False)
             refresh_tools()  # a reconnect retires the old account at once, in place
             restart_required = current.restart_required()
         except ConnectionError as exc:
             raise HTTPException(503, str(exc)) from None
-        # The sign-in link exists only in this immediate authenticated response,
-        # not in session events, model input/history, status metadata or logs.
+        # Keep sign-in links out of session events, model history, status metadata and logs.
         return JSONResponse(
             {
                 "url": url,
+                "expired": url is None,
+                "restart_required": restart_required,
+                "refresh_boundary": "process_restart" if restart_required else "next_message",
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post("/connections/{toolkit}/disconnect")
+    def disconnect_account(toolkit: str) -> JSONResponse:
+        current = live_connections()
+        name = connection_toolkit(toolkit)
+        try:
+            removed = current.disconnect(name)
+            refresh_tools()
+            restart_required = current.restart_required()
+        except ConnectionError as exc:
+            raise HTTPException(503, str(exc)) from None
+        return JSONResponse(
+            {
+                "disconnected": removed,
                 "restart_required": restart_required,
                 "refresh_boundary": "process_restart" if restart_required else "next_message",
             },
@@ -1113,49 +1306,40 @@ def _create_app(
 
     @app.get("/models")
     def list_models() -> list[dict]:
-        keys = {
-            "deepseek": settings.deepseek_api_key,
-            "openai": settings.openai_api_key,
-            "meta": settings.muse_api_key,
-            "mistral": settings.mistral_api_key,
-        }
-        out: list[dict] = []
-        seen: set[str] = set()
-        for spec in gateway.registry.models:
-            if spec.id in seen:
-                continue
-            seen.add(spec.id)
-            ready = (
-                spec.billing != "api"
-                or settings.model_api_keys.get(spec.provider) is not None
-                or keys.get(spec.provider) is not None
-            )
-            out.append(
+        with refresh_lock:
+            return [
                 {
-                    "id": spec.id,
-                    "tier": spec.tier,
-                    "billing": spec.billing,
-                    "configured": bool(ready),
+                    "id": status.id,
+                    "tier": status.tier,
+                    "billing": status.billing,
+                    "configured": status.selectable,
                 }
-            )
-        return out
+                for status in gateway.catalog(require_tools=True)
+            ]
 
-    def _apply_model(session_id: str, request: NewSession | None) -> None:
-        if request is None or request.model is None:
-            return
+    def _apply_model(session_id: str, model_id: str | None) -> None:
         try:
-            runner.set_model(session_id, request.model)
+            runner.set_model(session_id, model_id)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
+
+    @app.get("/sessions")
+    def conversation_history(offset: int = 0) -> dict:
+        if offset < 0:
+            raise HTTPException(422, "Invalid history page.")
+        return {"conversations": log.conversation_history(offset)}
 
     @app.post("/sessions/primary")
     def primary_session(request: NewSession | None = None) -> dict[str, str]:
         require_current_binding()
-        try:
-            session_id = log.primary_session(request.session_id if request else None)
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from None
-        _apply_model(session_id, request)
+        with refresh_lock:
+            _validate_model(request.model if request else None)
+            try:
+                session_id = log.primary_session(request.session_id if request else None)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from None
+            if request is not None and request.model is not None:
+                _apply_model(session_id, request.model)
         hub.wake(session_id)
         return {"session_id": session_id}
 
@@ -1165,19 +1349,23 @@ def _create_app(
         session_id = (request.session_id if request else None) or uuid4().hex
         # A transport persists its chosen ID before this request. A lost HTTP
         # response must not create a second conversation on retry.
-        if (
-            log.append_once(session_id, "session.created", key=f"session-created:{session_id}")
-            is not None
-        ):
+        with refresh_lock:
+            _validate_model(request.model if request else None)
+            created = log.append_once(
+                session_id, "session.created", key=f"session-created:{session_id}"
+            )
+            if request is not None and request.model is not None:
+                _apply_model(session_id, request.model)
+        if created is not None:
             hub.wake(session_id)
-        _apply_model(session_id, request)
         return {"session_id": session_id}
 
     @app.post("/sessions/{session_id}/model")
     def set_session_model(session_id: str, request: NewSession) -> dict[str, str]:
         require_session(session_id)
-        _apply_model(session_id, request)
-        hub.wake(session_id)
+        if "model" in request.model_fields_set:
+            with refresh_lock:
+                _apply_model(session_id, request.model)
         return {"session_id": session_id, "model": request.model or ""}
 
     @app.get("/sessions/{session_id}")
@@ -1333,6 +1521,11 @@ def _create_app(
         background.stop_commands(session_id)
         return await runner.stop_session(session_id)
 
+    @app.post("/sessions/{session_id}/stop-response", status_code=202)
+    async def stop_session_response(session_id: str) -> dict:
+        require_session(session_id)
+        return await runner.stop_session(session_id, include_children=False)
+
     @app.post("/sessions/{session_id}/approvals/{approval_id}")
     def decide(session_id: str, approval_id: str, decision: Decision) -> dict[str, bool]:
         require_session(session_id)
@@ -1454,13 +1647,38 @@ def _create_app(
         return {"routines": [view.model_dump() for view in store.views(feed_id)]}
 
     @app.get("/routines/{routine_id}")
-    def get_routine(routine_id: str) -> dict[str, Any]:
+    def get_routine(
+        routine_id: str,
+        offset: Annotated[int, Query(ge=0, le=2**63 - 1)] = 0,
+        limit: Annotated[int, Query(ge=1, le=100)] = RECENT_RUN_LIMIT,
+    ) -> dict[str, Any]:
         store = _require_routines()
         try:
             routine = store.get(routine_id)
         except RoutineNotFoundError as exc:
             raise HTTPException(404, str(exc)) from None
-        return store.view(routine).model_dump()
+        recent, has_more = store.occurrence_page(routine_id, limit=limit, offset=offset)
+        return {
+            **store.view(routine, recent=recent, offset=offset).model_dump(),
+            "has_more": has_more,
+        }
+
+    @app.get("/routines/{routine_id}/occurrences")
+    def list_routine_occurrences(
+        routine_id: str,
+        offset: Annotated[int, Query(ge=0, le=2**63 - 1)] = 0,
+        limit: Annotated[int, Query(ge=1, le=100)] = RECENT_RUN_LIMIT,
+    ) -> dict[str, Any]:
+        store = _require_routines()
+        try:
+            store.get(routine_id)
+        except RoutineNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        occurrences, has_more = store.occurrence_page(routine_id, limit=limit, offset=offset)
+        return {
+            "occurrences": [store.run_view(occ).model_dump() for occ in occurrences],
+            "has_more": has_more,
+        }
 
     @app.get("/routines/{routine_id}/occurrences/{occurrence_id}/report")
     def get_routine_report(routine_id: str, occurrence_id: str) -> dict[str, str]:
@@ -1471,10 +1689,12 @@ def _create_app(
             raise HTTPException(404, "Unknown routine run.") from None
         if occurrence.routine_id != routine_id or not occurrence.report_path:
             raise HTTPException(404, "No report for this routine run.")
-        try:
-            relative = Path(occurrence.report_path).relative_to(workspace)
-        except ValueError:
-            raise HTTPException(404, "Report is outside Bud's workspace.") from None
+        relative = Path(occurrence.report_path)
+        if relative.is_absolute():
+            try:
+                relative = relative.relative_to(workspace)
+            except ValueError:
+                raise HTTPException(404, "Report is outside Bud's workspace.") from None
         found = read_workspace_text(workspace, relative.as_posix())
         if found is None:
             raise HTTPException(404, "The saved report is unavailable.")
@@ -1497,7 +1717,7 @@ def _create_app(
 
     @app.post("/routines/{routine_id}/run-now", status_code=202)
     def run_routine_now(routine_id: str, body: RunNowRequest | None = None) -> dict[str, Any]:
-        _require_routines()
+        store = _require_routines()
         require_current_binding()
         try:
             occ = runner.run_routine_now(routine_id, trigger_id=body.trigger_id if body else None)
@@ -1505,16 +1725,25 @@ def _create_app(
             raise HTTPException(404, str(exc)) from None
         except RoutineConflictError as exc:
             raise HTTPException(409, str(exc)) from None
-        return occ.to_view().model_dump()
+        return store.run_view(occ).model_dump()
 
     @app.post("/routines/{routine_id}/pause")
-    def pause_routine(routine_id: str) -> dict[str, Any]:
+    async def pause_routine(routine_id: str) -> dict[str, Any]:
         store = _require_routines()
         try:
-            routine = runner.pause_routine(routine_id)
+            sessions = store.pause_for_stop(routine_id, now=runner._clock_utc())
         except RoutineNotFoundError as exc:
             raise HTTPException(404, str(exc)) from None
-        return store.view(routine).model_dump()
+        runner.wake_routines()
+        for session_id in sessions:
+            await runner.stop_session(session_id)
+        active = store.active_occurrences(routine_id=routine_id)
+        return {
+            **store.view(store.get(routine_id)).model_dump(),
+            "stop_requested": bool(sessions),
+            "active_run_stopped": bool(sessions)
+            and all(occ.session_id not in sessions for occ in active),
+        }
 
     @app.post("/routines/{routine_id}/resume")
     def resume_routine(routine_id: str, body: ResumeRoutineRequest | None = None) -> dict[str, Any]:
@@ -1555,7 +1784,7 @@ def _create_app(
             )
         except RoutineNotFoundError as exc:
             raise HTTPException(404, str(exc)) from None
-        return updated.to_view().model_dump()
+        return store.run_view(updated).model_dump()
 
     @app.get("/sessions/{session_id}/events")
     async def stream_events(

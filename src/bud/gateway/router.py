@@ -1,10 +1,12 @@
 """Provider clients and per-request fallback; tools never run inside a retry."""
 
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
 from pydantic_ai.exceptions import (
+    ModelAPIError,
     ModelConnectionError,
     ModelHTTPError,
     ModelQuotaExceededError,
@@ -12,18 +14,21 @@ from pydantic_ai.exceptions import (
     ModelRequestTimeout,
     ModelServerError,
     ModelUnavailableError,
+    UserError,
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings, OpenAIResponsesModel
+from pydantic_ai.profiles.mistral import mistral_model_profile
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.deepseek import DeepSeekProvider
 from pydantic_ai.providers.meta import MetaProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.openai_chatgpt import OpenAIChatGPTProvider
+from pydantic_ai_harness.compaction import resolve_context_window
 
 from bud.config import Settings
-from bud.gateway.chatgpt import ChatGPTStore
+from bud.gateway.chatgpt import ChatGPTError, ChatGPTStore
 from bud.gateway.errors import NoModelAvailable
 from bud.gateway.ledger import Ledger
 from bud.gateway.registry import ModelSpec, Registry, Tier
@@ -31,6 +36,57 @@ from bud.gateway.tracked import TrackedModel
 
 REQUEST_TIMEOUT_SECONDS = 120
 ModelFactory = Callable[[ModelSpec], Model | None]
+
+
+def _supports_tools(model: Model) -> bool:
+    return model.profile.get("supports_tools", True)
+
+
+@dataclass(frozen=True)
+class ModelStatus:
+    spec: ModelSpec
+    model: Model | None = field(repr=False)
+    require_tools: bool
+
+    @property
+    def id(self) -> str:
+        return self.spec.id
+
+    @property
+    def tier(self) -> Tier:
+        return self.spec.tier
+
+    @property
+    def billing(self) -> str:
+        return self.spec.billing
+
+    @property
+    def provider(self) -> str:
+        return self.spec.provider
+
+    @property
+    def configured(self) -> bool:
+        return self.model is not None
+
+    @property
+    def supports_tools(self) -> bool:
+        return (
+            _supports_tools(self.model)
+            if self.model is not None
+            else self.spec.supports_tools is True
+        )
+
+    @property
+    def selectable(self) -> bool:
+        return self.configured and (not self.require_tools or self.supports_tools)
+
+    @property
+    def context_window(self) -> int | None:
+        return (
+            resolve_context_window(self.model)
+            if self.model is not None
+            else self.spec.context_window
+        )
 
 
 class EndpointProvider(OpenAIProvider):
@@ -57,6 +113,16 @@ class EndpointProvider(OpenAIProvider):
         )
 
 
+class MistralChatProvider(EndpointProvider):
+    @property
+    def name(self) -> str:
+        return "mistral"
+
+    @staticmethod
+    def model_profile(model_name: str) -> OpenAIModelProfile:
+        return {**EndpointProvider.model_profile(model_name), **mistral_model_profile(model_name)}
+
+
 def should_fall_back(exc: Exception, *, subscription: bool = False) -> bool:
     """Plan routes only fall back on availability; API routes retain rate/quota fallback."""
     code = getattr(exc, "provider_error_code", None) or ""
@@ -75,19 +141,20 @@ def provider_model_factory(settings: Settings, chatgpt: ChatGPTStore) -> ModelFa
     providers = {}
 
     def build(spec: ModelSpec) -> Model | None:
+        if spec.provider == "openai-chatgpt" and not chatgpt.connected:
+            return None
+        secret = settings.model_api_keys.get(spec.provider) if spec.base_url else None
+        if spec.base_url and spec.billing == "api" and secret is None:
+            return None
         key = (spec.provider, spec.base_url)
         if key not in providers:
             if spec.base_url:
-                secret = settings.model_api_keys.get(spec.provider)
-                if spec.billing == "api" and secret is None:
-                    return None
-                providers[key] = EndpointProvider(
+                endpoint = MistralChatProvider if spec.provider == "mistral" else EndpointProvider
+                providers[key] = endpoint(
                     base_url=spec.base_url,
                     api_key=secret.get_secret_value() if secret else "local-no-key",
                 )
             elif spec.provider == "openai-chatgpt":
-                if not chatgpt.connected:
-                    return None
                 chatgpt.acquire()
                 providers[key] = OpenAIChatGPTProvider(credential_source=chatgpt)
             elif spec.provider == "deepseek":
@@ -107,7 +174,7 @@ def provider_model_factory(settings: Settings, chatgpt: ChatGPTStore) -> ModelFa
             elif spec.provider == "mistral":
                 if not settings.mistral_api_key:
                     return None
-                providers[key] = EndpointProvider(
+                providers[key] = MistralChatProvider(
                     base_url="https://api.mistral.ai/v1",
                     api_key=settings.mistral_api_key.get_secret_value(),
                 )
@@ -154,6 +221,7 @@ class Gateway:
         selected_model: str | None = None,
         chatgpt: ChatGPTStore | None = None,
         fallback: bool = True,
+        explicit_models: frozenset[str] = frozenset(),
     ) -> None:
         self.registry = registry
         self.ledger = ledger
@@ -161,10 +229,47 @@ class Gateway:
         self.selected_model = selected_model
         self.chatgpt = chatgpt
         self.fallback = fallback
+        self.explicit_models = explicit_models
 
-    def close(self) -> None:
-        if self.chatgpt is not None:
+    def close(self, *, preserve_chatgpt: ChatGPTStore | None = None) -> None:
+        if self.chatgpt is not None and self.chatgpt is not preserve_chatgpt:
             self.chatgpt.close()
+
+    def _model_status(self, spec: ModelSpec, *, require_tools: bool) -> ModelStatus:
+        try:
+            model = self.build_model(spec)
+        except (ChatGPTError, ModelAPIError, NoModelAvailable, OSError, UserError, ValueError):
+            model = None
+        return ModelStatus(spec, model, require_tools)
+
+    def catalog(self, require_tools: bool = True) -> list[ModelStatus]:
+        """Check each model ID once, in registry order."""
+        statuses: dict[str, ModelStatus] = {}
+        for spec in self.registry.models:
+            if spec.id not in statuses:
+                statuses[spec.id] = self._model_status(spec, require_tools=require_tools)
+        return list(statuses.values())
+
+    def selectable_models(self, *, require_tools: bool = True) -> list[str]:
+        return [
+            status.id for status in self.catalog(require_tools=require_tools) if status.selectable
+        ]
+
+    def validate_model(self, model_id: str, *, require_tools: bool = True) -> ModelSpec:
+        spec = next((spec for spec in self.registry.models if spec.id == model_id), None)
+        if spec is None:
+            raise NoModelAvailable("Unknown model. Select a model from the available list.")
+        status = self._model_status(spec, require_tools=require_tools)
+        if not status.configured:
+            raise NoModelAvailable(
+                f"{spec.id} is not configured or available. Check its API key, "
+                "ChatGPT sign-in, or endpoint settings."
+            )
+        if not status.selectable:
+            raise NoModelAvailable(
+                f"{spec.id} does not support tools. Select a tool-capable model."
+            )
+        return spec
 
     def model(
         self,
@@ -173,13 +278,26 @@ class Gateway:
         *,
         require_tools: bool = False,
         selected: str | None = None,
+        fallback_ids: list[str] | None = None,
         workspace: Path | None = None,
     ) -> Model:
         target = selected or self.selected_model
-        if target:
+        if target and fallback_ids:
+            by_id = {spec.id: spec for spec in self.registry.tier(tier)}
+            specs = (
+                [
+                    by_id[target],
+                    *(by_id[model_id] for model_id in fallback_ids if model_id in by_id),
+                ]
+                if target in by_id
+                else []
+            )
+        elif target:
             specs = [spec for spec in self.registry.models if spec.id == target][:1]
         else:
-            specs = self.registry.tier(tier)
+            specs = [
+                spec for spec in self.registry.tier(tier) if spec.id not in self.explicit_models
+            ]
         chain: list[TrackedModel] = []
         for spec in specs:
             if (
@@ -188,16 +306,24 @@ class Gateway:
                 and spec.base_url != chain[0].spec.base_url
             ):
                 break
-            model = self.build_model(spec)
+            if chain and target:
+                status = self._model_status(spec, require_tools=require_tools)
+                if not status.selectable:
+                    continue
+                model = status.model
+            else:
+                model = self.build_model(spec)
+                if model is None and target:
+                    break
             if model is not None:
-                if require_tools and not model.profile.get("supports_tools", True):
+                if require_tools and not _supports_tools(model):
                     raise NoModelAvailable(
                         f"{spec.id} does not support tools. Select a tool-capable model."
                     )
                 chain.append(
                     TrackedModel(model, spec, self.ledger, session_id, workspace=workspace)
                 )
-                if not self.fallback or target:
+                if not self.fallback or (target and not fallback_ids):
                     break
         if not chain:
             target = target or f"tier {tier!r}"

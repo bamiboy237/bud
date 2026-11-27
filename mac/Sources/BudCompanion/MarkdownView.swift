@@ -2,35 +2,145 @@ import AppKit
 import Markdown
 import SwiftUI
 
-/// A reply drawn from its markdown tree: one view per block, so paragraphs get space between
-/// them and list items hang off their markers. Inline styling (bold, code, links) becomes an
-/// attributed string inside each block, so text wraps and links stay clickable.
-///
-/// Changed text is parsed afresh, so an unfinished construct settles as soon as it closes.
-/// Unchanged replies reuse their parse when the conversation is rebuilt.
+/// A reply with selectable runs of prose and native views for rich blocks.
 struct MarkdownView: View {
+    struct Segment: Identifiable {
+        let id: Int
+        let nativeBlock: (any Markup)?
+        let range: NSRange
+        fileprivate let document: SelectableMarkdown
+
+        func localRange(for match: NSRange) -> NSRange? {
+            let overlap = NSIntersectionRange(range, match)
+            guard overlap.length > 0 else { return nil }
+            return NSRange(location: overlap.location - range.location, length: overlap.length)
+        }
+    }
+
     private let parsed: ParsedMarkdown.Entry
     let rich: Bool
+    var selection: ReplyTextSelection?
+    var query: String
+    var activeRange: NSRange?
+    var onQuote: ((String) -> Void)?
     @Environment(\.replyType) private var type
+    @Bindable private var appearance = AppearanceStore.shared
 
-    init(_ text: String, rich: Bool = false) {
+    init(
+        _ text: String, rich: Bool = false, selection: ReplyTextSelection? = nil,
+        query: String = "", activeRange: NSRange? = nil, onQuote: ((String) -> Void)? = nil
+    ) {
         self.rich = rich
+        self.selection = selection
+        self.query = query
+        self.activeRange = activeRange
+        self.onQuote = onQuote
         parsed = ParsedMarkdown.parse(text)
     }
 
+    static func selectableText(_ text: String) -> String {
+        ParsedMarkdown.parse(text).richLayout.text
+    }
+
+    private var layout: SelectableLayout { rich ? parsed.richLayout : parsed.plainLayout }
+    var segments: [Segment] { layout.segments }
+
     var body: some View {
-        // Links and citations take the one accent, scoped here so pickers elsewhere keep theirs.
-        Blocks(blocks: parsed.blocks, spacing: type.blockSpacing, rich: rich)
+        content
             .environment(\.markdownEquations, parsed.equations)
             .tint(Paper.accent)
+    }
+
+    @ViewBuilder private var content: some View {
+        if let selection, let onQuote {
+            let matches = ChatFindMatch.ranges(in: layout.text, query: query)
+            VStack(alignment: .leading, spacing: type.blockSpacing) {
+                ForEach(segments) { segment in
+                    let localMatches = matches.compactMap { segment.localRange(for: $0) }
+                    let activeMatch = activeRange.flatMap { segment.localRange(for: $0) }
+                    if let block = segment.nativeBlock {
+                        Block(markup: block, first: segment.id == 0, rich: rich)
+                            .overlay {
+                                if !localMatches.isEmpty {
+                                    RoundedRectangle(cornerRadius: Paper.radiusSM)
+                                        .strokeBorder(Paper.accent.opacity(activeMatch == nil ? 0.24 : 0.8))
+                                        .allowsHitTesting(false)
+                                }
+                            }
+                    } else {
+                        SelectableReplyView(
+                            document: segment.document, type: type, appearanceRevision: appearance.revision,
+                            matches: localMatches, activeRange: activeMatch, selection: selection, quote: onQuote)
+                    }
+                }
+            }
+        } else {
+            Blocks(blocks: parsed.blocks, spacing: type.blockSpacing, rich: rich)
+        }
+    }
+}
+
+@MainActor
+private struct SelectableLayout {
+    let segments: [MarkdownView.Segment]
+    let text: String
+
+    init(blocks: [any Markup], equations: [Character: MarkdownEquation], rich: Bool) {
+        var segments: [MarkdownView.Segment] = []
+        var text = ""
+        var offset = 0
+
+        func append(_ blocks: ArraySlice<any Markup>, nativeBlock: (any Markup)? = nil) {
+            let document = SelectableMarkdown(blocks: Array(blocks), equations: equations)
+            guard !document.isEmpty else { return }
+            if !segments.isEmpty {
+                text += "\n\n"
+                offset += 2
+            }
+            let length = document.string.utf16.count
+            segments.append(.init(id: blocks.startIndex, nativeBlock: nativeBlock,
+                                  range: NSRange(location: offset, length: length), document: document))
+            text += document.string
+            offset += length
+        }
+
+        var proseStart = blocks.startIndex
+        for (index, block) in blocks.enumerated() {
+            guard Self.isNative(block, equations: equations, rich: rich) else { continue }
+            if proseStart < index { append(blocks[proseStart..<index]) }
+            append(blocks[index...index], nativeBlock: block)
+            proseStart = index + 1
+        }
+        if proseStart < blocks.endIndex { append(blocks[proseStart...]) }
+        self.segments = segments
+        self.text = text
+    }
+
+    private static func isNative(_ block: any Markup, equations: [Character: MarkdownEquation], rich: Bool) -> Bool {
+        switch block {
+        case is CodeBlock, is Markdown.Table:
+            return true
+        case let paragraph as Paragraph:
+            if rich, StandaloneWebCard(paragraph) != nil { return true }
+            guard !equations.isEmpty else { return false }
+            return MarkdownMath.paragraphParts(inline(paragraph), equations: equations).contains {
+                if case .equation = $0 { return true }
+                return false
+            }
+        default:
+            return false
+        }
     }
 }
 
 @MainActor
 private enum ParsedMarkdown {
+    @MainActor
     final class Entry {
         let blocks: [any Markup]
         let equations: [Character: MarkdownEquation]
+        lazy var richLayout = SelectableLayout(blocks: blocks, equations: equations, rich: true)
+        lazy var plainLayout = SelectableLayout(blocks: blocks, equations: equations, rich: false)
 
         init(_ text: String) {
             let document = Document(parsing: text)
@@ -60,6 +170,387 @@ private enum ParsedMarkdown {
     }
 }
 
+@MainActor
+fileprivate final class SelectableMarkdown {
+    private enum Style {
+        case prose, heading(Int), code(String?), table
+    }
+
+    private struct BlockText {
+        let text: AttributedString
+        let style: Style
+        let indent: Int
+        let separator: String
+    }
+
+    private let blocks: [BlockText]
+    private let equations: [Character: MarkdownEquation]
+    let string: String
+    var isEmpty: Bool { blocks.isEmpty }
+
+    init(blocks: [any Markup], equations: [Character: MarkdownEquation]) {
+        self.equations = equations
+        self.blocks = Self.flatten(blocks, equations: equations, indent: 0, separator: "\n\n")
+        string = self.blocks.enumerated().map { index, block in
+            (index == 0 ? "" : block.separator) + String(block.text.characters)
+        }.joined()
+    }
+
+    private static func flatten(
+        _ blocks: [any Markup], equations: [Character: MarkdownEquation], indent: Int, separator: String
+    ) -> [BlockText] {
+        blocks.flatMap { block -> [BlockText] in
+            switch block {
+            case let quote as BlockQuote:
+                return flatten(Array(quote.children), equations: equations, indent: indent + 1, separator: separator)
+            case let list as OrderedList:
+                return listText(Array(list.listItems), start: Int(list.startIndex), equations: equations, indent: indent)
+            case let list as UnorderedList:
+                return listText(Array(list.listItems), start: nil, equations: equations, indent: indent)
+            case let code as CodeBlock:
+                let source = code.code.hasSuffix("\n") ? String(code.code.dropLast()) : code.code
+                return [.init(text: AttributedString(source), style: .code(code.language), indent: indent, separator: separator)]
+            case let heading as Heading:
+                return [.init(text: inlineText(heading, equations: equations), style: .heading(heading.level),
+                              indent: indent, separator: separator)]
+            case let table as Markdown.Table:
+                let rows = [table.head.children] + table.body.children.map(\.children)
+                let text = rows.map { row in
+                    row.map { String(inlineText($0, equations: equations).characters) }.joined(separator: "   |   ")
+                }.joined(separator: "\n")
+                return [.init(text: AttributedString(text), style: .table, indent: indent, separator: separator)]
+            case is ThematicBreak:
+                return [.init(text: AttributedString("────────"), style: .prose, indent: indent, separator: separator)]
+            case is Paragraph:
+                return [.init(text: inlineText(block, equations: equations), style: .prose,
+                              indent: indent, separator: separator)]
+            default:
+                return [.init(text: AttributedString(block.format()), style: .prose, indent: indent, separator: separator)]
+            }
+        }
+    }
+
+    private static func listText(
+        _ items: [ListItem], start: Int?, equations: [Character: MarkdownEquation], indent: Int
+    ) -> [BlockText] {
+        items.enumerated().flatMap { index, item -> [BlockText] in
+            var blocks = flatten(Array(item.children), equations: equations, indent: indent + 1, separator: "\n")
+            guard let first = blocks.first else { return [] }
+            let marker: String
+            if let checkbox = item.checkbox {
+                marker = checkbox == .checked ? "☑ " : "☐ "
+            } else if let start {
+                marker = "\(start + index). "
+            } else {
+                marker = "• "
+            }
+            blocks[0] = .init(text: AttributedString(marker) + first.text, style: first.style,
+                              indent: first.indent, separator: index == 0 ? "\n\n" : "\n")
+            return blocks
+        }
+    }
+
+    private static func inlineText(
+        _ markup: any Markup, equations: [Character: MarkdownEquation]
+    ) -> AttributedString {
+        let text = inline(markup)
+        guard !equations.isEmpty else { return text }
+        var result = AttributedString()
+        var start = text.startIndex
+        for index in text.characters.indices {
+            let marker = text.characters[index]
+            guard let equation = equations[marker] else { continue }
+            result += AttributedString(text[start..<index])
+            var formula = AttributedString(equation.source)
+            formula[EquationRun.self] = marker
+            result += formula
+            start = text.characters.index(after: index)
+        }
+        result += AttributedString(text[start...])
+        return result
+    }
+
+    func attributed(type: ReplyType) -> NSAttributedString {
+        let output = NSMutableAttributedString(string: "")
+        for (index, block) in blocks.enumerated() {
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineSpacing = type.lineSpacing
+            paragraph.firstLineHeadIndent = CGFloat(block.indent) * 14
+            paragraph.headIndent = paragraph.firstLineHeadIndent
+            var size = type.scaledSize
+            var weight = Fonts.OpticalWeight.regular
+            var content = block.text
+            var mono = false
+            var codeText: String?
+            switch block.style {
+            case .prose:
+                break
+            case .heading(let level):
+                size += level == 1 ? 6 : level == 2 ? 2.5 : level == 3 ? 0.5 : 0
+                weight = level == 1 ? Fonts.OpticalWeight.bold : Fonts.OpticalWeight.semibold
+                paragraph.lineSpacing = 1.5
+            case .code(let language):
+                let source = String(content.characters)
+                codeText = source
+                content = Syntax.highlight(source, language: language)
+                mono = true
+                size = type.codeSize
+                paragraph.lineSpacing = type.codeLineSpacing
+            case .table:
+                mono = true
+                size = type.codeSize
+            }
+            let bodyFont = Self.proseFont(size: size, weight: weight)
+            if index > 0 {
+                output.append(NSAttributedString(
+                    string: block.separator, attributes: [.font: bodyFont, .paragraphStyle: paragraph]))
+            }
+            for run in content.runs {
+                let intent = run.inlinePresentationIntent ?? []
+                let isCode = run[CodeRun.self] == true
+                var font = mono || isCode || run[CitationRun.self] == true
+                    ? Fonts.monoNSFont(size: isCode ? type.codeSize : size)
+                    : (intent.contains(.stronglyEmphasized)
+                        ? Self.proseFont(size: size, weight: Fonts.OpticalWeight.bold) : bodyFont)
+                if intent.contains(.emphasized) { font = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask) }
+                var attributes: [NSAttributedString.Key: Any] = [
+                    .font: font, .paragraphStyle: paragraph,
+                    .foregroundColor: NSColor(run.foregroundColor ?? Paper.inkPrimary),
+                ]
+                if isCode || codeText != nil { attributes[.backgroundColor] = NSColor(Paper.codeChipFill) }
+                if let codeText { attributes[.replyCode] = codeText }
+                if let marker = run[EquationRun.self] { attributes[.replyEquation] = String(marker) }
+                if let link = run.link {
+                    attributes[.link] = link
+                    attributes[.foregroundColor] = NSColor(Paper.accent)
+                    attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                }
+                if intent.contains(.strikethrough) { attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
+                output.append(NSAttributedString(string: String(content[run.range].characters), attributes: attributes))
+            }
+        }
+        return output
+    }
+
+    func renderEquations(in text: NSMutableAttributedString, type: ReplyType) {
+        guard !equations.isEmpty else { return }
+        var formulas: [(MarkdownEquation, NSRange)] = []
+        text.enumerateAttribute(.replyEquation, in: NSRange(location: 0, length: text.length)) { marker, range, _ in
+            if let marker = (marker as? String)?.first, let equation = equations[marker] {
+                formulas.append((equation, range))
+            }
+        }
+        let ink = NSColor(Paper.inkPrimary)
+        for (equation, range) in formulas.reversed() {
+            let size = equation.display ? type.scaledSize + 2 : type.scaledSize
+            guard let glyph = MathTypesetter.glyph(equation, size: size, display: equation.display) else { continue }
+            let image = NSImage(size: glyph.image.size, flipped: false) { bounds in
+                guard let context = NSGraphicsContext.current?.cgContext else { return false }
+                context.beginTransparencyLayer(auxiliaryInfo: nil)
+                glyph.image.draw(in: bounds)
+                ink.setFill()
+                bounds.fill(using: .sourceAtop)
+                context.endTransparencyLayer()
+                return true
+            }
+            let attachment = NSTextAttachment()
+            attachment.attachmentCell = NSTextAttachmentCell(imageCell: image)
+            let formula = NSMutableAttributedString(attachment: attachment)
+            let formulaRange = NSRange(location: 0, length: 1)
+            var attributes = text.attributes(at: range.location, effectiveRange: nil)
+            attributes[.replyEquation] = equation
+            attributes[.baselineOffset] = -glyph.descent
+            text.enumerateAttribute(.backgroundColor, in: range) { color, _, stop in
+                if let color {
+                    attributes[.backgroundColor] = color
+                    stop.pointee = true
+                }
+            }
+            formula.addAttributes(attributes, range: formulaRange)
+            text.replaceCharacters(in: range, with: formula)
+        }
+    }
+
+    private static func proseFont(size: CGFloat, weight: CGFloat) -> NSFont {
+        let font = Fonts.sansNSFont(size: size, weight: weight)
+        guard AppearanceStore.activeFont == .editorial else { return font }
+        return font.fontDescriptor.withDesign(.serif).flatMap { NSFont(descriptor: $0, size: size) } ?? font
+    }
+}
+
+private extension NSAttributedString.Key {
+    static let replyCode = Self("bud.replyCode")
+    static let replyEquation = Self("bud.replyEquation")
+}
+
+private enum EquationRun: AttributedStringKey {
+    typealias Value = Character
+    static let name = "bud.replyEquation"
+}
+
+@MainActor
+final class ReplyTextSelection: ObservableObject {
+    fileprivate weak var view: ReplyTextView?
+    var text: String? { view?.selectedText }
+}
+
+private struct SelectableReplyView: NSViewRepresentable {
+    let document: SelectableMarkdown
+    let type: ReplyType
+    let appearanceRevision: Int
+    let matches: [NSRange]
+    let activeRange: NSRange?
+    let selection: ReplyTextSelection
+    let quote: (String) -> Void
+    @Environment(\.openURL) private var openURL
+
+    func makeNSView(context: Context) -> ReplyTextView { ReplyTextView() }
+
+    func updateNSView(_ view: ReplyTextView, context: Context) {
+        view.replySelection = selection
+        view.onQuote = quote
+        view.onLink = { openURL($0) }
+        view.update(document: document, type: type, appearanceRevision: appearanceRevision,
+                    matches: matches, activeRange: activeRange)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: ReplyTextView, context: Context) -> CGSize? {
+        guard let width = proposal.width, width.isFinite, width > 0 else { return nil }
+        return CGSize(width: width, height: nsView.height(fitting: width))
+    }
+}
+
+@MainActor
+final class ReplyTextView: NSTextView, NSTextViewDelegate {
+    var onQuote: ((String) -> Void)?
+    var onLink: ((URL) -> Void)?
+    fileprivate weak var replySelection: ReplyTextSelection?
+    private var contentKey: ContentKey?
+
+    private struct ContentKey: Equatable {
+        let document: ObjectIdentifier
+        let type: ReplyType
+        let appearance: Int
+        let matches: [NSRange]
+        let activeRange: NSRange?
+    }
+
+    init() {
+        let storage = NSTextStorage()
+        let layout = NSLayoutManager()
+        let container = NSTextContainer(size: CGSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
+        storage.addLayoutManager(layout)
+        layout.addTextContainer(container)
+        super.init(frame: .zero, textContainer: container)
+        delegate = self
+        isEditable = false
+        isSelectable = true
+        isVerticallyResizable = false
+        isHorizontallyResizable = false
+        drawsBackground = false
+        textContainerInset = .zero
+        container.lineFragmentPadding = 0
+        container.widthTracksTextView = false
+        linkTextAttributes = [:]
+        setAccessibilityLabel("Assistant reply")
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    fileprivate func update(
+        document: SelectableMarkdown, type: ReplyType, appearanceRevision: Int,
+        matches: [NSRange], activeRange: NSRange?
+    ) {
+        let key = ContentKey(document: ObjectIdentifier(document), type: type, appearance: appearanceRevision,
+                             matches: matches, activeRange: activeRange)
+        guard contentKey != key, let textStorage else { return }
+        let text = NSMutableAttributedString(attributedString: document.attributed(type: type))
+        let matchColor = NSColor(Paper.fillSubtle)
+        let activeColor = NSColor(Paper.accent.opacity(0.24))
+        for range in matches {
+            text.addAttribute(.backgroundColor, value: range == activeRange ? activeColor : matchColor, range: range)
+        }
+        document.renderEquations(in: text, type: type)
+        let range = selectedRange()
+        textStorage.setAttributedString(text)
+        if NSMaxRange(range) <= text.length { setSelectedRange(range) }
+        contentKey = key
+        needsLayout = true
+        invalidateIntrinsicContentSize()
+    }
+
+    func height(fitting width: CGFloat) -> CGFloat {
+        guard let textContainer, let layoutManager else { return 0 }
+        if textContainer.size.width != width {
+            textContainer.size = CGSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+        }
+        layoutManager.ensureLayout(for: textContainer)
+        return ceil(layoutManager.usedRect(for: textContainer).maxY)
+    }
+
+    func textViewDidChangeSelection(_ notification: Notification) {
+        guard window?.firstResponder === self else { return }
+        replySelection?.view = self
+    }
+
+    var selectedText: String? {
+        let range = selectedRange()
+        guard let textStorage, range.length > 0, NSMaxRange(range) <= textStorage.length else { return nil }
+        let text = textStorage.string as NSString
+        var selection = ""
+        textStorage.enumerateAttribute(.replyEquation, in: range) { equation, part, _ in
+            if let equation = equation as? MarkdownEquation {
+                selection += equation.source
+            } else {
+                selection += text.substring(with: part)
+            }
+        }
+        return selection
+    }
+
+    @objc func quoteSelection(_ sender: Any?) {
+        if let selectedText { onQuote?(selectedText) }
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let menu = super.menu(for: event) ?? NSMenu()
+        if selectedText != nil {
+            let item = menu.insertItem(withTitle: "Quote in Reply", action: #selector(quoteSelection(_:)),
+                                       keyEquivalent: "", at: 0)
+            item.target = self
+        }
+        let location = characterIndexForInsertion(at: convert(event.locationInWindow, from: nil))
+        if let textStorage, location < textStorage.length {
+            if let code = textStorage.attribute(.replyCode, at: location, effectiveRange: nil) as? String {
+                addCopyItem("Copy code", text: code, menu: menu)
+            }
+            if let equation = textStorage.attribute(.replyEquation, at: location, effectiveRange: nil) as? MarkdownEquation {
+                addCopyItem("Copy LaTeX", text: equation.latex, menu: menu)
+            }
+        }
+        return menu
+    }
+
+    private func addCopyItem(_ title: String, text: String, menu: NSMenu) {
+        let item = menu.addItem(withTitle: title, action: #selector(copyText(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = text
+    }
+
+    @objc private func copyText(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        guard let url = link as? URL else { return false }
+        onLink?(url)
+        return true
+    }
+}
+
 private struct MarkdownEquationsKey: EnvironmentKey {
     static let defaultValue: [Character: MarkdownEquation] = [:]
 }
@@ -71,10 +562,8 @@ private extension EnvironmentValues {
     }
 }
 
-/// One type scale for replies, built on bundled Inter Variable + IBM Plex Mono from a single
-/// body size: the bubble reads at 13 pt, the conversation window at 14 pt. Headings, lists,
-/// tables, and code all derive from it, so nothing in a reply picks its own typeface or size.
-struct ReplyType {
+/// One type scale for replies. The bubble reads at 13 pt and the conversation window at 14 pt.
+struct ReplyType: Equatable {
     var size: CGFloat = 13
     var lineSpacing: CGFloat = 3
     /// Space between blocks, and between list items.
@@ -82,25 +571,27 @@ struct ReplyType {
     var itemSpacing: CGFloat = 4
     /// The floating bubble: code wraps instead of scrolling sideways.
     var compact: Bool = true
+    var zoom: CGFloat = 0
 
-    var body: Font { Fonts.sans(size: size, weight: Fonts.OpticalWeight.regular) }
+    var scaledSize: CGFloat { size + zoom }
+    var body: Font { Fonts.prose(size: scaledSize) }
     var title: Font {
-        Fonts.sans(size: size >= 14 ? 20 : size + 5.5, weight: Fonts.OpticalWeight.bold)
+        Fonts.prose(size: (size >= 14 ? 20 : size + 5.5) + zoom, weight: Fonts.OpticalWeight.bold)
     }
     var heading: Font {
-        Fonts.sans(size: size >= 14 ? 16.5 : size + 2.5, weight: Fonts.OpticalWeight.semibold)
+        Fonts.prose(size: (size >= 14 ? 16.5 : size + 2.5) + zoom, weight: Fonts.OpticalWeight.semibold)
     }
     var section: Font {
-        Fonts.sans(size: size >= 14 ? 14.5 : size + 1, weight: Fonts.OpticalWeight.semibold)
+        Fonts.prose(size: (size >= 14 ? 14.5 : size + 1) + zoom, weight: Fonts.OpticalWeight.semibold)
     }
-    var minor: Font { Fonts.sans(size: size, weight: Fonts.OpticalWeight.medium) }
+    var minor: Font { Fonts.prose(size: scaledSize, weight: Fonts.OpticalWeight.medium) }
     var marker: Font {
-        Fonts.sans(size: size - 0.5, weight: Fonts.OpticalWeight.regular, tabularDigits: true)
+        Fonts.sans(size: scaledSize - 0.5, weight: Fonts.OpticalWeight.regular, tabularDigits: true)
     }
     var table: Font {
-        Fonts.sans(size: size - 1.5, weight: Fonts.OpticalWeight.regular, tabularDigits: true)
+        Fonts.sans(size: scaledSize - 1.5, weight: Fonts.OpticalWeight.regular, tabularDigits: true)
     }
-    var codeSize: CGFloat { size >= 14 ? 12.5 : (size * 0.88).rounded() }
+    var codeSize: CGFloat { (size >= 14 ? 12.5 : (size * 0.88).rounded()) + zoom }
     var code: Font { Fonts.mono(size: codeSize) }
     var codeLineSpacing: CGFloat { compact ? 2 : 2.5 }
     var meta: Font { Paper.Typography.ledgerMeta }
@@ -170,12 +661,8 @@ private struct Block: View {
             }
             .padding(.top, first ? 0 : heading.level <= 2 ? type.blockSpacing * 0.6 : 2)
         case let paragraph as Paragraph:
-            if rich, paragraph.childCount == 1, let link = paragraph.child(at: 0) as? Markdown.Link,
-               let url = SafePreviewURL(link.destination) {
-                WebLinkCard(url: url.value, title: String(inline(link).characters))
-            } else if rich, paragraph.childCount == 1, let image = paragraph.child(at: 0) as? Markdown.Image,
-                      let url = SafePreviewURL(image.source) {
-                WebImageCard(url: url.value, title: String(inline(image).characters))
+            if rich, let card = StandaloneWebCard(paragraph) {
+                card
             } else {
                 paragraphText(inline(paragraph, code: type.code))
             }
@@ -215,12 +702,7 @@ private struct Block: View {
                     case .prose(let content):
                         Prose(text: content)
                     case .equation(let equation):
-                        let formula = MathTypesetter.text(equation, size: type.size + 2, display: true)
-                        ViewThatFits(in: .horizontal) {
-                            formula.fixedSize()
-                            ScrollView(.horizontal) { formula.fixedSize() }
-                        }
-                        .frame(maxWidth: .infinity)
+                        DisplayMathView(equation: equation)
                     }
                 }
             }
@@ -237,6 +719,57 @@ private struct Block: View {
     }
 }
 
+private struct StandaloneWebCard: View {
+    let url: URL
+    let title: String
+    let isImage: Bool
+
+    init?(_ paragraph: Paragraph) {
+        guard paragraph.childCount == 1, let child = paragraph.child(at: 0) else { return nil }
+        let image = child as? Markdown.Image
+        let link = child as? Markdown.Link
+        guard let preview = SafePreviewURL(image?.source ?? link?.destination) else { return nil }
+        url = preview.value
+        title = String(inline(child).characters)
+        isImage = image != nil
+    }
+
+    var body: some View {
+        if isImage {
+            WebImageCard(url: url, title: title)
+        } else {
+            WebLinkCard(url: url, title: title)
+        }
+    }
+}
+
+private struct DisplayMathView: View {
+    let equation: MarkdownEquation
+    @Environment(\.replyType) private var type
+    @StateObject private var hover = Flag()
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
+        let formula = MathTypesetter.text(equation, size: type.scaledSize + 2, display: true)
+        ViewThatFits(in: .horizontal) {
+            formula.fixedSize()
+            ScrollView(.horizontal) { formula.fixedSize() }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 12) // Reserve room for the copy button on both sides to keep the equation centered.
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(Paper.recessed, in: shape)
+        .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5).allowsHitTesting(false) }
+        .overlay(alignment: .topTrailing) {
+            MarkdownCopyButton(source: equation.latex, label: "Copy LaTeX", revealed: hover.on)
+                .padding(6)
+        }
+        .contentShape(shape)
+        .onHover { hover.on = $0 }
+    }
+}
+
 /// Text in the reply typeface, wrapped and selectable, with inline code and citations drawn as chips.
 private struct Prose: View {
     let text: AttributedString
@@ -247,15 +780,14 @@ private struct Prose: View {
     @Environment(\.markdownEquations) private var equations
 
     var body: some View {
-        chipped(text, equations: equations, size: type.size)
+        chipped(text, equations: equations, size: type.scaledSize)
             .font(font ?? type.body)
             .tracking(tracking)
             .lineSpacing(spacing ?? type.lineSpacing)
             .textRenderer(InlinePillRenderer(
                 codeFill: Paper.codeChipFill,
                 codeBorder: Paper.codeChipBorder,
-                citationFill: Paper.citationFill,
-                citationBorder: Paper.citationBorder))
+                citationFill: Paper.fillSubtle))
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -328,14 +860,13 @@ private struct InlinePillRenderer: TextRenderer {
     let codeFill: Color
     let codeBorder: Color
     let citationFill: Color
-    let citationBorder: Color
 
     func draw(layout: SwiftUI.Text.Layout, in context: inout GraphicsContext) {
         for line in layout {
             drawPills(in: line, context: &context, isCitation: false, fill: codeFill, border: codeBorder)
             drawPills(
                 in: line, context: &context, isCitation: true,
-                fill: citationFill, border: citationBorder)
+                fill: citationFill, border: nil)
             for run in line { context.draw(run) }
         }
     }
@@ -410,7 +941,7 @@ private struct ListBlock: View {
     private var markerWidth: CGFloat {
         guard let start else { return Metrics.marker }
         let digits = String(start + max(items.count - 1, 0)).count
-        return max(Metrics.marker, CGFloat(digits) * type.size * 0.58 + 5)
+        return max(Metrics.marker, CGFloat(digits) * type.scaledSize * 0.58 + 5)
     }
 
     @ViewBuilder
@@ -430,13 +961,10 @@ private struct ListBlock: View {
 }
 
 /// A code block on recessed paper with a hairline edge and a persistent quiet 26pt header bar.
-/// In the window, long lines scroll sideways so code keeps its shape; in the bubble they wrap.
 private struct CodeBlockView: View {
     let code: String
     let language: String?
     @Environment(\.replyType) private var type
-    @StateObject private var copyHovered = Flag()
-    @StateObject private var copied = Flag()
 
     private var source: String { code.hasSuffix("\n") ? String(code.dropLast()) : code }
 
@@ -467,78 +995,170 @@ private struct CodeBlockView: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 4)
-            Button {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(source, forType: .string)
-                copied.on = true
-                Task { @MainActor in
-                    try? await Task.sleep(for: .seconds(1.2))
-                    copied.on = false
-                }
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: copied.on ? "checkmark" : "doc.on.doc")
-                        .font(.system(size: 10, weight: .medium))
-                    if copied.on {
-                        Text("Copied")
-                            .font(type.meta)
-                    }
-                }
-                .foregroundStyle(copied.on || copyHovered.on ? Paper.inkPrimary : Paper.inkMuted)
-                .padding(.horizontal, 6)
-                .frame(height: 18)
-                .background(
-                    copyHovered.on ? Paper.fillHover : .clear,
-                    in: RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
-            }
-            .buttonStyle(.plain)
-            .pointerStyle(.link)
-            .onHover { copyHovered.on = $0 }
-            .help(copied.on ? "Copied" : "Copy code")
-            .accessibilityLabel("Copy code")
+            MarkdownCopyButton(source: source, label: "Copy code")
         }
         .padding(.horizontal, 10)
         .frame(height: Metrics.codeHeaderHeight)
     }
 
-    @ViewBuilder
     private var content: some View {
-        let text = Text(Syntax.highlight(source, language: language))
+        Text(Syntax.highlight(source, language: language))
             .font(type.code)
             .lineSpacing(type.codeLineSpacing)
             .foregroundStyle(Paper.inkPrimary)
+            .fixedSize(horizontal: false, vertical: true)
             .textSelection(.enabled)
-        if type.compact {
-            text.fixedSize(horizontal: false, vertical: true)
-        } else {
-            ScrollView(.horizontal, showsIndicators: false) {
-                text.fixedSize()
+    }
+}
+
+private struct MarkdownCopyButton: View {
+    let source: String
+    let label: String
+    var revealed = true
+    @StateObject private var copied = Flag()
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(source, forType: .string)
+            copied.on = true
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(1.2))
+                copied.on = false
+            }
+        } label: {
+            Image(systemName: copied.on ? "checkmark" : "doc.on.doc")
+                .font(.system(size: 11, weight: .medium))
+                .opacity(revealed || focused || copied.on ? 1 : 0)
+        }
+        .buttonStyle(IconButton(size: 22, active: copied.on))
+        .focused($focused)
+        .help(copied.on ? "Copied" : label)
+        .accessibilityLabel(copied.on ? "Copied" : label)
+    }
+}
+
+enum MarkdownTableLayout {
+    static func overflows(_ width: CGFloat, available: CGFloat) -> Bool {
+        width > available + 1
+    }
+
+    static func pinOffset(origin: CGPoint, header: Bool, firstColumn: Bool) -> CGSize {
+        CGSize(width: firstColumn ? max(0, -origin.x) : 0, height: header ? max(0, -origin.y) : 0)
+    }
+}
+
+private struct TableExpandButton: View {
+    let expand: () -> Void
+
+    var body: some View {
+        Button(action: expand) {
+            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                .font(.system(size: 10, weight: .medium))
+        }
+        .buttonStyle(IconButton(size: 24))
+        .help("Expand table")
+        .accessibilityLabel("Expand table")
+    }
+}
+
+private struct TableView: View {
+    private final class ScrollEdges: ObservableObject {
+        @Published var hidden: Edge.Set = .trailing
+    }
+
+    let table: Markdown.Table
+    @StateObject private var edges = ScrollEdges()
+    @StateObject private var expanded = Flag()
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 4) {
+            ViewThatFits(in: .horizontal) {
+                TableGrid(table: table).fixedSize()
+                scrollableGrid
+            }
+            TableExpandButton { expanded.on = true }
+        }
+        .sheet(isPresented: $expanded.on) { TableReader(table: table) }
+    }
+
+    private var scrollableGrid: some View {
+        ScrollView(.horizontal) {
+            TableGrid(table: table).fixedSize()
+        }
+        .onScrollGeometryChange(for: Edge.Set.self) { geometry in
+            var hidden: Edge.Set = []
+            if geometry.visibleRect.minX > 1 { hidden.insert(.leading) }
+            if MarkdownTableLayout.overflows(geometry.contentSize.width, available: geometry.visibleRect.maxX) {
+                hidden.insert(.trailing)
+            }
+            return hidden
+        } action: { _, hidden in
+            edges.hidden = hidden
+        }
+        .mask {
+            HStack(spacing: 0) {
+                if edges.hidden.contains(.leading) {
+                    LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing)
+                        .frame(width: 12)
+                }
+                Rectangle()
+                if edges.hidden.contains(.trailing) {
+                    LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
+                        .frame(width: 12)
+                }
             }
         }
     }
 }
 
-/// A table in a hairline frame: a recessed header row, row dividers, padded cells, and the
-/// column alignment the markdown asked for. Numbers use tabular digits, so columns line up.
-private struct TableView: View {
+private struct TableReader: View {
     let table: Markdown.Table
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Table")
+                    .font(Paper.Typography.label)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer()
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark").font(.system(size: 10, weight: .medium))
+                }
+                .buttonStyle(IconButton(size: 24))
+                .keyboardShortcut(.cancelAction)
+                .help("Close table")
+                .accessibilityLabel("Close table")
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 40)
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
+            ScrollView([.horizontal, .vertical]) {
+                TableGrid(table: table, pinned: true).fixedSize()
+            }
+            .padding(14)
+        }
+        .frame(width: 760, height: 460)
+        .foregroundStyle(Paper.inkPrimary)
+        .background(Paper.canvas)
+    }
+}
+
+/// A hairline grid with the column alignments from the Markdown source.
+private struct TableGrid: View {
+    let table: Markdown.Table
+    var pinned = false
     @Environment(\.replyType) private var type
     @Environment(\.markdownEquations) private var equations
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            grid.fixedSize(horizontal: true, vertical: true)
-            ScrollView(.horizontal) { grid.fixedSize(horizontal: true, vertical: true) }
-        }
-    }
-
-    private var grid: some View {
+        let rows = Array(table.body.children)
         Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
-            GridRow { cells(Array(table.head.children), header: true) }
-                .background(Paper.recessed)
-            ForEach(Array(table.body.children.enumerated()), id: \.offset) { _, row in
-                Rectangle().fill(Paper.borderSubtle).frame(height: 0.5).gridCellUnsizedAxes(.horizontal)
-                GridRow { cells(Array(row.children), header: false) }
+            GridRow { cells(Array(table.head.children), header: true, divider: !rows.isEmpty) }
+            ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                GridRow { cells(Array(row.children), header: false, divider: index < rows.count - 1) }
             }
         }
         .font(type.table)
@@ -549,31 +1169,42 @@ private struct TableView: View {
     }
 
     @ViewBuilder
-    private func cells(_ cells: [any Markup], header: Bool) -> some View {
+    private func cells(_ cells: [any Markup], header: Bool, divider: Bool) -> some View {
         ForEach(Array(cells.enumerated()), id: \.offset) { index, cell in
             let alignment = alignment(index)
+            let pinHeader = pinned && header
+            let pinColumn = pinned && index == 0
             chipped(
                 inline(cell, code: Fonts.mono(size: max(10, type.codeSize - 1))),
-                equations: equations, size: type.size - 1.5)
+                equations: equations, size: type.scaledSize - 1.5)
                 .textRenderer(InlinePillRenderer(
                     codeFill: Paper.codeChipFill,
                     codeBorder: Paper.codeChipBorder,
-                    citationFill: Paper.citationFill,
-                    citationBorder: Paper.citationBorder))
+                    citationFill: Paper.fillSubtle))
                 .fontWeight(header ? .semibold : .regular)
                 .foregroundStyle(header ? Paper.inkSecondary : Paper.inkPrimary)
                 .multilineTextAlignment(alignment.text)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 200, alignment: alignment.frame)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
                 // Fill the column, so dividers and the header tint line up on every row.
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: alignment.frame)
-                // A full grid, as in an editor: a hairline between columns too.
-                .overlay(alignment: .leading) {
-                    if index > 0 { Rectangle().fill(Paper.borderSubtle).frame(width: 0.5) }
+                .background(header ? Paper.recessed : pinColumn ? Paper.canvas : .clear)
+                .overlay(alignment: .trailing) {
+                    if index < cells.count - 1 { Rectangle().fill(Paper.borderSubtle).frame(width: 0.5) }
+                }
+                .overlay(alignment: .bottom) {
+                    if divider { Rectangle().fill(Paper.borderSubtle).frame(height: 0.5) }
                 }
                 .gridColumnAlignment(alignment.horizontal)
+                .visualEffect { content, geometry in
+                    content.offset(MarkdownTableLayout.pinOffset(
+                        origin: geometry.frame(in: .scrollView).origin,
+                        header: pinHeader, firstColumn: pinColumn))
+                }
+                .zIndex((pinHeader ? 2 : 0) + (pinColumn ? 1 : 0))
         }
     }
 
@@ -639,9 +1270,9 @@ private func inline(
             if let destination = link.destination, let url = URL(string: destination) {
                 run.link = url
                 if url.scheme == Citations.scheme {
-                    // Citations render as high-contrast 11pt mono micro-pills.
+                    // Citations use compact mono text inside their chips.
                     run.font = Paper.Typography.ledgerMeta
-                    run.foregroundColor = Paper.citationInk
+                    run.foregroundColor = Paper.inkSecondary
                     run[CitationRun.self] = true
                     if nextStartsWithPunctuation { run[TightTrailingRun.self] = true }
                     if let lastChar = out.characters.last, !lastChar.isWhitespace,
@@ -655,6 +1286,7 @@ private func inline(
                             : ChipMetrics.gap
                     }
                 } else {
+                    run.foregroundColor = Paper.accent
                     run.underlineStyle = .single
                 }
             }

@@ -74,6 +74,7 @@ import Testing
             syncNeedsOnboarding: { syncedOnboarding.append($0) }
         )
 
+        store.beginKeyEdit("OPENAI_API_KEY")
         store.keyDrafts["OPENAI_API_KEY"] = "  sk-test-123  "
         await store.saveKey("OPENAI_API_KEY")
 
@@ -83,6 +84,7 @@ import Testing
         let sentKeys = calls[0].2?["keys"] as? [String: Any]
         #expect(sentKeys?["OPENAI_API_KEY"] as? String == "sk-test-123")
         #expect(store.keyDrafts["OPENAI_API_KEY"] == "")
+        #expect(store.replacingKey == nil)
         #expect(store.status.hasModel == true)
         #expect(syncedOnboarding == [false])
 
@@ -92,6 +94,74 @@ import Testing
         #expect(removedKeys?["OPENAI_API_KEY"] is NSNull)
         #expect(store.status.hasModel == false)
         #expect(syncedOnboarding == [false, true])
+    }
+
+    @Test @MainActor func failedKeySaveKeepsDraftAndOnlyAnEditClearsItsError() async {
+        let key = "OPENAI_API_KEY"
+        let other = "DEEPSEEK_API_KEY"
+        let store = OnboardingStore(
+            sendRequest: { _, _, _ in throw ConnectionError.unreachable },
+            openURL: { _ in },
+            syncNeedsOnboarding: { _ in }
+        )
+
+        store.updateKeyDraft("test-draft", for: other)
+        await store.saveKey(other)
+        store.beginKeyEdit(key)
+        store.updateKeyDraft("sk-test-123", for: key)
+        await store.saveKey(key)
+
+        #expect(store.replacingKey == key)
+        #expect(store.keyDrafts[key] == "sk-test-123")
+        #expect(store.error == nil)
+        #expect(store.keyErrors[key] == "Couldn’t reach Bud. Try again.")
+        store.updateKeyDraft("sk-test-123", for: key)
+        #expect(store.keyErrors[key] != nil)
+        store.updateKeyDraft("sk-test-edited", for: key)
+        #expect(store.keyErrors[key] == nil)
+        #expect(store.keyErrors[other] != nil)
+
+        store.cancelKeyEdit()
+
+        #expect(store.replacingKey == nil)
+        #expect(store.keyDrafts[key] == "")
+    }
+
+    @Test(arguments: [true, false])
+    @MainActor func rejectedModelSelectionRefreshesAndShowsSafeError(refreshSucceeds: Bool) async {
+        let staleModel = "openai:gpt-5"
+        let availableModel = "deepseek:deepseek-chat"
+        let rejectionMessage = "That model is unavailable. Choose another model, sign in to ChatGPT, "
+            + "or add its API key."
+        var calls: [String] = []
+        weak var observedStore: OnboardingStore?
+        let store = OnboardingStore(
+            sendRequest: { method, path, body in
+                calls.append("\(method) \(path)")
+                if method == "PUT" {
+                    #expect(body?["model"] as? String == staleModel)
+                    throw ConnectionError.http(422, "private provider detail")
+                }
+                if calls.count > 1 {
+                    #expect(observedStore?.status.models.isEmpty == true)
+                    #expect(observedStore?.error == rejectionMessage)
+                    if !refreshSucceeds { throw ConnectionError.unreachable }
+                }
+                return ["models": calls.count == 1 ? [staleModel] : [availableModel]]
+            },
+            openURL: { _ in },
+            syncNeedsOnboarding: { _ in }
+        )
+        observedStore = store
+
+        await store.refresh()
+        #expect(store.status.models == [staleModel])
+        await store.chooseModel(staleModel)
+
+        #expect(calls == ["GET onboarding", "PUT onboarding/model", "GET onboarding"])
+        #expect(store.status.models == (refreshSucceeds ? [availableModel] : []))
+        #expect(store.error == rejectionMessage)
+        #expect(!store.changingModel)
     }
 
     @Test @MainActor func chatGPTLoginOpensURLAndLogoutResetsStatus() async {
@@ -141,5 +211,58 @@ import Testing
         await store.logoutChatGPT()
         #expect(store.status.chatgpt.status == "idle")
         #expect(store.status.chatgpt.connected == false)
+    }
+
+    @Test @MainActor func refreshResumesPollingForWaitingChatGPTLogin() async throws {
+        var requests = 0
+        let store = OnboardingStore(
+            sendRequest: { method, path, _ in
+                #expect(method == "GET")
+                #expect(path == "onboarding")
+                requests += 1
+                let connected = requests > 1
+                return ["chatgpt": [
+                    "connected": connected,
+                    "status": connected ? "connected" : "waiting",
+                ]]
+            },
+            openURL: { _ in },
+            syncNeedsOnboarding: { _ in }
+        )
+        defer { store.stopPolling() }
+
+        await store.refresh()
+        #expect(store.status.chatgpt.status == "waiting")
+
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(5)
+        while !store.status.chatgpt.connected, clock.now < deadline {
+            try await clock.sleep(for: .milliseconds(25))
+        }
+
+        #expect(requests == 2)
+        #expect(store.status.chatgpt.status == "connected")
+        #expect(store.feedback == "Connected to ChatGPT.")
+    }
+
+    @Test(arguments: [true, false])
+    @MainActor func modelSelectionConfirmsUpdate(running: Bool) async {
+        let model = "openai:gpt-5"
+        let store = OnboardingStore(
+            sendRequest: { method, path, body in
+                #expect(method == "PUT")
+                #expect(path == "onboarding/model")
+                #expect(body?["model"] as? String == model)
+                return ["default_model": model, "models": [model]]
+            },
+            openURL: { _ in },
+            syncNeedsOnboarding: { _ in },
+            isRunning: { running }
+        )
+
+        await store.chooseModel(model)
+
+        #expect(store.status.defaultModel == model)
+        #expect(store.feedback == (running ? "Default updated for new runs." : "Default model updated."))
     }
 }

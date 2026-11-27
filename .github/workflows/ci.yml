@@ -105,6 +105,13 @@ jobs:
             "$venv/bin/bud" --help
             echo "::endgroup::"
           done
+      - name: Check the Linux server image
+        env:
+          BUD_DOMAIN: bud.example.test
+        run: |
+          docker compose --project-name bud-relaunch-test build bud
+          docker run --rm -i --network none --entrypoint python bud-server:local - \
+            < ops/smoke_server.py
 
   tui:
     runs-on: ubuntu-latest

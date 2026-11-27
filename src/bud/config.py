@@ -14,6 +14,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 HOST = "127.0.0.1"
 PORT = 8420
 LOCAL_URL = f"http://{HOST}:{PORT}"
+MOVE_DIRECTORY = ".runtime-move"
+MOVE_FENCE = ".runtime-move-source.json"
 
 
 def default_bud_home() -> Path:
@@ -62,6 +64,8 @@ class Settings(BaseSettings):
     composio_api_key: SecretStr | None = None
     exa_api_key: SecretStr | None = None
     owner_token: SecretStr | None = Field(default=None, repr=False)
+    receive_move: bool = Field(default=False, validation_alias="BUD_RECEIVE_MOVE")
+    received_move_id: str | None = None
     photon_api_key: SecretStr | None = Field(default=None, repr=False)
     photon_project_id: str | None = Field(default=None, repr=False)
     photon_owner_handle: str | None = Field(default=None, repr=False)
@@ -77,6 +81,7 @@ class Settings(BaseSettings):
     port: int = Field(default=PORT, ge=1, le=65535, validation_alias="BUD_PORT")
     browse_home: Path | None = Field(default=None, validation_alias="BUD_BROWSE_HOME")
     browse_port: int = Field(default=19989, ge=1, le=65535, validation_alias="BUD_BROWSE_PORT")
+    browse_peer_ip: str | None = Field(default=None, validation_alias="BUD_BROWSE_PEER_IP")
     # Drive the owner's Chrome through OpenCode Browse when it is installed.
     browser_tools: bool = True
     models_file: Path | None = None
@@ -142,4 +147,17 @@ def get_settings() -> Settings:
         updates["data_dir"] = home_root / settings.data_dir
     if "workspace_dir" not in settings.model_fields_set and default_workspace_dir is not None:
         updates["workspace_dir"] = default_workspace_dir
-    return settings.model_copy(update=updates) if updates else settings
+    settings = settings.model_copy(update=updates)
+    receiver = settings.data_dir / MOVE_DIRECTORY
+    active = receiver / "active"
+    if active.is_dir():
+        return Settings(_env_file=active / "config.env").model_copy(
+            update={
+                "data_dir": active / "data",
+                "workspace_dir": active / "workspace",
+                "received_move_id": (active / "transfer-id").read_text().strip(),
+            }
+        )
+    if receiver.is_dir():
+        return settings.model_copy(update={"receive_move": True})
+    return settings

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // Motion: one spring for things that appear, a quicker fade for things that leave.
@@ -5,32 +6,48 @@ import SwiftUI
 private let appear = Animation.spring(duration: 0.3, bounce: 0)
 private let leave = Animation.easeOut(duration: 0.15)
 
+private final class PetViewLayout: ObservableObject {
+    @Published var inputHeight: CGFloat = 0
+}
+
 /// Everything in the floating panel, anchored to the pet in the bottom-right corner.
 struct PetView: View {
     @Bindable var companion: Companion
     var focusPanel: () -> Void
+    private let appearance = AppearanceStore.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateObject private var pupsHovered = Flag()
+    @StateObject private var layout = PetViewLayout()
 
+    private enum Row: Hashable { case pet, input, reply }
+    private enum PetItem: Hashable { case pet, pups, activity }
+    private static let spacing: CGFloat = 8
     private var anchor: Anchor { companion.anchor }
+    private var showsInput: Bool { companion.inputOpen && !companion.windowOpen }
 
     var body: some View {
-        // The bubble and the field stack away from the pet: up from it, or down from it near
-        // the top of the screen. The pet keeps its corner; everything else lines up with it.
-        VStack(alignment: anchor.left ? .leading : .trailing, spacing: 8) {
-            if anchor.below {
-                petRow
-                if companion.inputOpen && !companion.windowOpen { InputField(companion: companion) }
-                bubble
-                Spacer(minLength: 0)
-            } else {
-                Spacer(minLength: 0)
-                bubble
-                if companion.inputOpen && !companion.windowOpen { InputField(companion: companion) }
-                petRow
+        let _ = appearance.revision
+        let rows: [Row] = anchor.below ? [.pet, .input, .reply] : [.reply, .input, .pet]
+        VStack(alignment: anchor.left ? .leading : .trailing, spacing: Self.spacing) {
+            ForEach(rows, id: \.self) { row in
+                switch row {
+                case .pet:
+                    petRow
+                case .input:
+                    if showsInput {
+                        InputField(companion: companion)
+                            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
+                                layout.inputHeight = $0
+                            }
+                    }
+                case .reply:
+                    bubble
+                }
             }
         }
         .padding(PetPanel.inset)
         .frame(width: PetPanel.size.width, height: PetPanel.size.height, alignment: corner)
+        .preferredColorScheme(appearance.mode.colorScheme)
         .animation(companion.bubbleOpen ? appear : leave, value: companion.bubbleOpen)
         .animation(leave, value: companion.status)
     }
@@ -46,75 +63,96 @@ struct PetView: View {
 
     @ViewBuilder private var bubble: some View {
         if companion.bubbleOpen && !companion.windowOpen {
-            Bubble(companion: companion)
+            let inputSpace = showsInput ? layout.inputHeight + Self.spacing : 0
+            Bubble(companion: companion, maxHeight: max(0, anchor.contentHeight - inputSpace - Self.spacing))
                 .transition(bubbleTransition)
         }
     }
 
     /// The stop button sits on the bubble's side of the pet.
     private var petRow: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            if anchor.left {
-                pet
-                pupStack
-            }
-            if Voice.shared.state == .listening || Voice.shared.state == .transcribing {
-                VoicePill(voice: Voice.shared)
-                    .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: anchor.left ? .leading : .trailing)))
-            } else if companion.running {
-                StopButton(action: companion.stop)
-                    .transition(.opacity)
-            }
-            if !anchor.left {
-                pupStack
-                pet
+        let items: [PetItem] = anchor.left ? [.pet, .pups, .activity] : [.activity, .pups, .pet]
+        return HStack(alignment: .bottom, spacing: 8) {
+            ForEach(items, id: \.self) { item in
+                switch item {
+                case .pet: pet
+                case .pups: pupStack
+                case .activity: activity
+                }
             }
         }
         .animation(.spring(duration: 0.25, bounce: 0), value: Voice.shared.state)
         .animation(.spring(duration: 0.35, bounce: 0), value: companion.activeTasks.isEmpty)
     }
 
+    @ViewBuilder private var activity: some View {
+        if Voice.shared.state == .listening || Voice.shared.state == .transcribing {
+            VoicePill(voice: Voice.shared)
+                .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: anchor.left ? .leading : .trailing)))
+        } else if companion.running {
+            StopButton(action: companion.stop)
+                .transition(.opacity)
+        }
+    }
+
     @ViewBuilder private var pupStack: some View {
         if !companion.visiblePups.isEmpty {
-            let overflow = max(0, companion.activeTasks.count - companion.visiblePups.count)
-            HStack(alignment: .bottom, spacing: 4) {
-                ForEach(companion.visiblePups) { task in
-                    ChildPupView(task: task)
-                        .transition(.scale(scale: 0.6).combined(with: .opacity))
+            let count = companion.activeTasks.count
+            let overflow = max(0, count - companion.visiblePups.count)
+            VStack(alignment: anchor.left ? .leading : .trailing, spacing: 2) {
+                if pupsHovered.on, count > 0 {
+                    Button {
+                        ConversationWindow.shared.show()
+                    } label: {
+                        Text("\(count) \(count == 1 ? "job" : "jobs") running ›")
+                            .font(Paper.Typography.caption)
+                            .foregroundStyle(Paper.inkSecondary)
+                            .fixedSize()
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                    }
+                    .buttonStyle(PaperHit(shape: Capsule(), fill: Paper.elevated))
+                    .overlay { Capsule().strokeBorder(Paper.borderSubtle, lineWidth: 0.5).allowsHitTesting(false) }
+                    .help("Open the conversation")
                 }
-                if overflow > 0 {
-                    Text("+\(overflow)")
-                        .font(Paper.Typography.ledgerMeta)
-                        .foregroundStyle(Paper.inkSecondary)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .help("\(overflow) more background job\(overflow == 1 ? "" : "s") running")
-                        .transition(.opacity)
+                HStack(alignment: .bottom, spacing: 4) {
+                    ForEach(companion.visiblePups) { task in
+                        ChildPupView(task: task)
+                            .transition(.scale(scale: 0.6).combined(with: .opacity))
+                    }
+                    if overflow > 0 {
+                        Text("+\(overflow)")
+                            .font(Paper.Typography.ledgerMeta)
+                            .foregroundStyle(Paper.inkSecondary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .help("\(overflow) more background job\(overflow == 1 ? "" : "s") running")
+                            .transition(.opacity)
+                    }
                 }
+                .animation(.spring(duration: 0.35, bounce: 0), value: companion.activeTasks)
             }
-            .animation(.spring(duration: 0.35, bounce: 0), value: companion.activeTasks)
+            .contentShape(Rectangle())
+            .onHover { pupsHovered.on = $0 }
+            .onDisappear { pupsHovered.on = false }
         }
     }
 
     private var pet: some View {
-                PetButton(companion: companion) {
-                    // The release that ends a drag isn't a click.
-                    if companion.dragging { return }
-                    // With the window open, bud talks there: the pet brings it forward.
-                    if companion.windowOpen {
-                        ConversationWindow.shared.show()
-                        return
-                    }
-                    // Something waiting comes first: a click shows it rather than a blank field.
-                    if companion.needsAttention && !companion.bubbleOpen {
-                        companion.bubbleOpen = true
-                        return
-                    }
-                    companion.inputOpen.toggle()
-                    if !companion.inputOpen { companion.inputPurpose = .ask }
-                    if companion.inputOpen { focusPanel() }
-                }
+        PetButton(companion: companion) {
+            if companion.windowOpen {
+                ConversationWindow.shared.show()
+                return
+            }
+            if companion.needsAttention && !companion.bubbleOpen {
+                companion.bubbleOpen = true
+                return
+            }
+            companion.inputOpen.toggle()
+            if !companion.inputOpen { companion.inputPurpose = .ask }
+            if companion.inputOpen { focusPanel() }
+        }
     }
 
     /// Grows out of the pet's corner, so it reads as the pet speaking. Reduced motion: fade only.
@@ -131,36 +169,67 @@ struct PetView: View {
 
 // MARK: Pet
 
+final class PetPress: ObservableObject {
+    enum Phase: Equatable { case idle, pressed, dragging }
+
+    @Published private(set) var phase: Phase = .idle
+
+    func move(_ translation: CGSize) {
+        guard phase != .dragging else { return }
+        let next: Phase = hypot(translation.width, translation.height) >= 4 ? .dragging : .pressed
+        if next != phase { phase = next }
+    }
+
+    func release() -> Phase {
+        let previous = phase
+        if phase != .idle { phase = .idle }
+        return previous
+    }
+}
+
 private struct PetButton: View {
     let companion: Companion
     let action: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateObject private var press = PetPress()
 
     var body: some View {
-        Button(action: action) {
+        Group {
             if let sprite = PetSprite.named(companion.petID) {
                 pet(sprite)
             } else {
                 paw
             }
         }
-        .buttonStyle(PressScale())
-        // Drag the pet to move the whole panel; a few points of slack keep clicks clicks.
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 4, coordinateSpace: .global)
-                .onChanged { _ in
-                    companion.dragging = true
+        .scaleEffect(press.phase == .pressed && !reduceMotion ? 0.94 : 1)
+        .opacity(press.phase == .pressed && reduceMotion ? 0.9 : 1)
+        .animation(reduceMotion || press.phase == .dragging ? nil : .easeOut(duration: 0.1), value: press.phase)
+        .gesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                .onChanged { value in
+                    press.move(value.translation)
+                    guard press.phase == .dragging else { return }
                     companion.carry(pointerX: NSEvent.mouseLocation.x)
                     PetPanel.current?.drag(ended: false)
                 }
-                .onEnded { _ in
-                    PetPanel.current?.drag(ended: true)
-                    companion.setDown()
-                    // Cleared just after the button has seen the release.
-                    Task {
-                        try? await Task.sleep(for: .milliseconds(80))
-                        companion.dragging = false
+                .onEnded { value in
+                    press.move(value.translation)
+                    switch press.release() {
+                    case .pressed: action()
+                    case .dragging: setDown()
+                    case .idle: break
                     }
                 })
+        .onDisappear {
+            if press.release() == .dragging { setDown() }
+        }
+        .focusable(interactions: .activate)
+        .onKeyPress(keys: [.space, .return]) { _ in
+            action()
+            return .handled
+        }
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { action() }
         .accessibilityLabel("bud")
         .accessibilityValue(statusText)
         .accessibilityHint("Ask bud something")
@@ -170,6 +239,11 @@ private struct PetButton: View {
                 companion.bubbleOpen.toggle()
             }
         }
+    }
+
+    private func setDown() {
+        PetPanel.current?.drag(ended: true)
+        companion.setDown()
     }
 
     private var connected: Bool { companion.link == .connected }
@@ -408,20 +482,15 @@ struct UnsentSpeech: View {
     let companion: Companion
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text("“\(companion.unsentSpeech ?? "")”")
-                .font(Paper.Typography.callout)
-                .foregroundStyle(Paper.inkSecondary)
-                .lineLimit(2)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            Button(companion.speechDestination == .ask ? "Send" : "Add to draft") { companion.resendSpeech() }
-                .buttonStyle(CardButton(kind: .secondary))
-            Button { companion.dropSpeech() } label: {
-                Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
-            }
-            .buttonStyle(IconButton(size: 20))
-            .accessibilityLabel("Don't send")
-        }
+        RecoveryBar(
+            status: "Dictation held",
+            statusInk: Paper.inkPrimary,
+            excerpt: companion.unsentSpeech ?? "",
+            actionTitle: companion.speechDestination == .ask ? "Send" : "Add to draft",
+            action: companion.resendSpeech,
+            dismissLabel: "Don't send",
+            dismiss: companion.dropSpeech
+        )
     }
 }
 
@@ -430,22 +499,144 @@ struct UnsentMessage: View {
 
     var body: some View {
         if let message = companion.heldMessages.first {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("“\(message.text)”")
-                    .font(Paper.Typography.callout)
-                    .foregroundStyle(Paper.inkSecondary)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Button("Retry") { companion.retryHeldMessage() }
-                    .buttonStyle(CardButton(kind: .secondary))
-                Button { companion.dropHeldMessage() } label: {
-                    Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
-                }
-                .buttonStyle(IconButton(size: 20))
-                .accessibilityLabel("Discard unsent message")
-            }
+            RecoveryBar(
+                status: "Couldn't send",
+                statusInk: Paper.errorInk,
+                excerpt: message.text,
+                actionTitle: "Retry",
+                action: companion.retryHeldMessage,
+                dismissLabel: "Discard unsent message",
+                dismiss: companion.dropHeldMessage
+            )
             .disabled(companion.retryingHeldMessage)
         }
+    }
+}
+
+private struct RecoveryBar: View {
+    let status: String
+    let statusInk: Color
+    let excerpt: String
+    let actionTitle: String
+    let action: () -> Void
+    let dismissLabel: String
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(status)
+                .font(Paper.Typography.captionMedium)
+                .foregroundStyle(statusInk)
+                .fixedSize()
+            Text("“\(excerpt)”")
+                .foregroundStyle(Paper.inkMuted)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(actionTitle, action: action)
+                .buttonStyle(CardButton(kind: .quiet))
+                .fixedSize()
+            Button(action: dismiss) {
+                Image(systemName: "xmark").font(.system(size: 9, weight: .semibold))
+            }
+            .buttonStyle(IconButton(size: 22))
+            .accessibilityLabel(dismissLabel)
+        }
+        .font(Paper.Typography.caption)
+        .padding(.leading, 8)
+        .padding(.trailing, 3)
+        .padding(.vertical, 2)
+        .background(Paper.recessed, in: RoundedRectangle(cornerRadius: Paper.radiusSM))
+    }
+}
+
+/// Legible failure summary for a failed run, reusing the server's safe `kind`, `next`, and `reason`.
+struct RunFailureView: View {
+    let failure: RunFailure
+    var showTitle = true
+    var onEditAndResend: (@MainActor () -> Void)? = nil
+    var priorExternalSteps: [String] = []
+    @Environment(\.openSettings) private var openSettings
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateObject private var showDetails = Flag()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if showTitle {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.circle")
+                        .font(.system(size: 12))
+                        .accessibilityHidden(true)
+                    Text(failure.title)
+                        .font(Paper.Typography.label)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+                .foregroundStyle(Paper.errorInk)
+            }
+            Text(failure.nextStep)
+                .font(showTitle ? Paper.Typography.body : Paper.Typography.callout)
+                .foregroundStyle(Paper.inkPrimary)
+                .lineSpacing(showTitle ? 3.5 : 2)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+            if onEditAndResend != nil, !priorExternalSteps.isEmpty {
+                let warning = "Earlier steps may have acted in an external app: \(priorExternalSteps.joined(separator: ", "))."
+                Text(warning)
+                    .font(Paper.Typography.caption)
+                    .foregroundStyle(Paper.inkSecondary)
+                    .lineLimit(1)
+                    .help(warning)
+            }
+            if onEditAndResend != nil || (showTitle && (offersModels || failure.detail != nil)) {
+                HStack(spacing: 6) {
+                    if let onEditAndResend {
+                        Button("Edit and resend", action: onEditAndResend)
+                            .buttonStyle(CardButton(kind: .secondary))
+                    }
+                    if showTitle && offersModels { openModelsButton }
+                    if showTitle && failure.detail != nil { detailsButton }
+                }
+            }
+            if showTitle, showDetails.on, let detail = failure.detail {
+                Text(detail)
+                    .font(Paper.Typography.ledgerMeta)
+                    .foregroundStyle(Paper.inkMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .transition(.opacity)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .onChange(of: failure) { _, _ in showDetails.on = false }
+    }
+
+    private var offersModels: Bool {
+        ["permission", "model_unavailable", "auth", "quota", "context_full"].contains(failure.kind ?? "")
+    }
+
+    private var openModelsButton: some View {
+        Button("Open Models") {
+            SettingsTabState.shared.selected = .models
+            NSApp.activate()
+            openSettings()
+            Task { await SettingsTabState.shared.bringSettingsToFront() }
+        }
+        .buttonStyle(CardButton(kind: .secondary))
+    }
+
+    private var detailsButton: some View {
+        let title = showDetails.on ? "Hide details" : "Show details"
+        return Button {
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) {
+                showDetails.on.toggle()
+            }
+        } label: {
+            Image(systemName: "info.circle")
+        }
+        .buttonStyle(IconButton(active: showDetails.on))
+        .help(title)
+        .accessibilityLabel(title)
+        .accessibilityValue(showDetails.on ? "Expanded" : "Collapsed")
     }
 }
 
@@ -453,10 +644,27 @@ struct UnsentMessage: View {
 
 private struct Bubble: View {
     @Bindable var companion: Companion
+    let maxHeight: CGFloat
+    private let appearance = AppearanceStore.shared
+    @StateObject private var layout = BubbleLayout()
+
+    private final class BubbleLayout: ObservableObject {
+        @Published var contentHeight: CGFloat = 1
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            header
+        let _ = appearance.revision
+        let shape = BubbleShape(anchor: companion.anchor)
+        let usesDither = appearance.theme == .paper
+        let status = state
+        let overlaysControls = status == nil
+        let topTail = companion.anchor.below ? BubbleShape.tail : 0
+        let top = (overlaysControls ? 22 : 14) + topTail
+        let bottom = 16 + (companion.anchor.below ? 0 : BubbleShape.tail)
+        let contents = VStack(alignment: .leading, spacing: 12) {
+            if let status {
+                header(status)
+            }
             if !compact, !companion.question.isEmpty, companion.setups.isEmpty {
                 // What you asked, so the answer keeps its context. One line: a reminder.
                 Text(companion.question)
@@ -464,17 +672,12 @@ private struct Bubble: View {
                     .foregroundStyle(Paper.inkMuted)
                     .lineLimit(1)
                     .truncationMode(.tail)
-                    .padding(.top, -4)
+                    .padding(.top, overlaysControls ? 0 : -4)
                     .transition(.opacity)
             }
             if companion.running, companion.stepsLayout == .checklist, !companion.steps.isEmpty {
-                HStack(alignment: .top, spacing: 10) {
-                    RoundedRectangle(cornerRadius: 1)
-                        .fill(Paper.accent.opacity(0.4))
-                        .frame(width: 2)
-                    StepList(steps: companion.steps, live: true)
-                }
-                .fixedSize(horizontal: false, vertical: true)
+                StepList(steps: companion.steps, live: true)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if companion.showStepsAfter, !companion.running, !companion.lastSteps.isEmpty {
                 StepsSummary(companion: companion)
@@ -490,6 +693,9 @@ private struct Bubble: View {
             }
             if companion.unsentSpeech != nil { UnsentSpeech(companion: companion) }
             if !companion.heldMessages.isEmpty { UnsentMessage(companion: companion) }
+            if let failure = companion.runFailure, companion.setups.isEmpty {
+                RunFailureView(failure: failure, showTitle: false)
+            }
             if !companion.shown.isEmpty, companion.setups.isEmpty {
                 // The bubble hugs its text up to `maxReply`; longer replies scroll. Reading
                 // starts at the top, so streamed text grows below the fold instead of pulling
@@ -533,20 +739,30 @@ private struct Bubble: View {
                     .transition(.opacity)
             }
         }
+        viewport(contents, height: max(0, maxHeight - top - bottom))
         .foregroundStyle(Paper.inkPrimary)
         .padding(.horizontal, 18)
         // The tail's edge gets its extra room, toward the pet.
-        .padding(.top, 14 + (companion.anchor.below ? BubbleShape.tail : 0))
-        .padding(.bottom, 16 + (companion.anchor.below ? 0 : BubbleShape.tail))
-        // Only the name line: a small tag over the pet, not a wide empty card.
-        .frame(width: compact ? nil : 332, alignment: .leading)
-        .frame(minWidth: 132, alignment: .leading)
+        .padding(.top, top)
+        .padding(.bottom, bottom)
+        .frame(width: compact ? nil : companion.anchor.contentWidth, alignment: .leading)
+        .frame(minWidth: min(132, companion.anchor.contentWidth),
+               maxWidth: companion.anchor.contentWidth, alignment: .leading)
         .fixedSize(horizontal: compact, vertical: false)
-        .background(
-            DitherBackdrop()
-                .clipShape(BubbleShape(anchor: companion.anchor))
-        )
-        .surface(BubbleShape(anchor: companion.anchor))
+        .overlay(alignment: .topTrailing) {
+            if overlaysControls {
+                headerControls
+                    .padding(.top, topTail + 1)
+                    .padding(.trailing, 12)
+            }
+        }
+        .background {
+            if usesDither {
+                DitherBackdrop().clipShape(shape)
+            }
+        }
+        .surface(shape, fill: usesDither ? Paper.canvas : Paper.elevated)
+        .preferredColorScheme(appearance.mode.colorScheme)
         .onHover { companion.bubbleHovered = $0 }
         // A cited date opens the conversation window at that message.
         .environment(\.openURL, OpenURLAction { url in
@@ -554,6 +770,21 @@ private struct Bubble: View {
         })
         .animation(.easeOut(duration: 0.15), value: companion.approvals.first?.id)
         .animation(.easeOut(duration: 0.2), value: companion.receipt)
+    }
+
+    @ViewBuilder private func viewport<Content: View>(_ content: Content, height: CGFloat) -> some View {
+        if compact {
+            content
+        } else {
+            ScrollView {
+                content
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { layout.contentHeight = $0 }
+            }
+            .scrollIndicators(.never)
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(height: min(layout.contentHeight, height))
+        }
     }
 
     private func edgeFade(_ more: ReplyMore) -> some View {
@@ -568,9 +799,9 @@ private struct Bubble: View {
     }
 
     private var compact: Bool {
-        companion.shown.isEmpty && companion.notices.isEmpty && !companion.needsAttention
-            && companion.receipt == nil && companion.steps.isEmpty && companion.unsentSpeech == nil
-            && companion.heldMessages.isEmpty
+        companion.shown.isEmpty && companion.runFailure == nil && companion.notices.isEmpty
+            && !companion.needsAttention && companion.receipt == nil && companion.steps.isEmpty
+            && companion.unsentSpeech == nil && companion.heldMessages.isEmpty
     }
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -589,33 +820,26 @@ private struct Bubble: View {
         companion.approvals.isEmpty && companion.setups.isEmpty ? 260 : 60
     }
 
-    /// Who is speaking and what they're doing, like a name above a message.
-    private var header: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Text("bud")
-                .font(Paper.Typography.wordmark)
-            if let state {
-                if companion.status == .needsYou {
-                    // Option A: pure ink, never a colour that could pass for a link or an error.
-                    Rectangle().fill(Paper.inkPrimary).frame(width: 4.25, height: 4.25)
-                        .rotationEffect(.degrees(45))
-                        .alignmentGuide(.firstTextBaseline) { $0.height / 2 + 4 }
-                        .accessibilityHidden(true)
-                }
-                Text(state.text)
-                    .font(Fonts.sans(
-                        size: 12,
-                        weight: companion.status == .needsYou
-                            ? Fonts.OpticalWeight.medium
-                            : Fonts.OpticalWeight.regular))
-                    .foregroundStyle(state.tint)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .shimmer(active: state.busy)
-                    .contentTransition(.opacity)
-                    .id(state.text)
-                    .transition(.opacity)
+    private func header(_ state: (text: String, tint: Color, busy: Bool)) -> some View {
+        HStack(spacing: 6) {
+            if companion.status == .needsYou {
+                Rectangle().fill(Paper.inkPrimary).frame(width: 4.25, height: 4.25)
+                    .rotationEffect(.degrees(45))
+                    .accessibilityHidden(true)
             }
+            Text(state.text)
+                .font(Fonts.sans(
+                    size: 12,
+                    weight: companion.status == .needsYou
+                        ? Fonts.OpticalWeight.medium
+                        : Fonts.OpticalWeight.regular))
+                .foregroundStyle(state.tint)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .shimmer(active: state.busy)
+                .contentTransition(.opacity)
+                .id(state.text)
+                .transition(.opacity)
             Spacer(minLength: compact ? 6 : 0)
             if let count = stepCount {
                 Text(count)
@@ -623,10 +847,16 @@ private struct Bubble: View {
                     .foregroundStyle(Paper.inkMuted)
                     .contentTransition(.numericText())
             }
+            headerControls
+        }
+        .animation(.easeOut(duration: 0.15), value: state.text)
+    }
+
+    private var headerControls: some View {
+        HStack(spacing: 6) {
             expand
             close
         }
-        .animation(.easeOut(duration: 0.15), value: state?.text)
     }
 
     /// "step 3", for the counted layout while bud works.
@@ -644,7 +874,7 @@ private struct Bubble: View {
     /// Opens the whole conversation in a window, for long replies and earlier messages.
     private var expand: some View {
         chrome("arrow.up.left.and.arrow.down.right", label: "Open in a window", restOpacity: 0.7) {
-            ConversationWindow.shared.show()
+            Task { @MainActor in ConversationWindow.shared.show() }
         }
         .help("Open in a window")
     }
@@ -682,9 +912,8 @@ private struct Bubble: View {
             if companion.approvals.isEmpty { return ("A job needs you", Paper.inkPrimary, false) }
             let asking = companion.hasQuestion
             return (asking ? "Has a question" : "Needs your OK", Paper.inkPrimary, false)
-        case .failed: return ("Couldn't finish", Paper.errorInk, false)
-        case .done: return ("Done", Paper.inkSecondary, false)
-        case .idle: return nil
+        case .failed: return (companion.runFailure?.title ?? "Couldn't finish", Paper.errorInk, false)
+        case .done, .idle: return nil
         }
     }
 }
@@ -701,16 +930,18 @@ struct StepList: View {
     var limit: Int? = 5
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        let visible = steps.suffix(limit ?? steps.count)
+        return VStack(alignment: .leading, spacing: 0) {
             if let limit, steps.count > limit {
                 Text("\(steps.count - limit) earlier \(steps.count - limit == 1 ? "step" : "steps")")
                     .font(Paper.Typography.ledgerMeta)
                     .foregroundStyle(Paper.inkMuted)
                     .padding(.leading, 20)
+                    .padding(.bottom, visible.isEmpty ? 0 : 5)
             }
-            ForEach(steps.suffix(limit ?? steps.count)) { step in
+            ForEach(visible) { step in
                 // Every unfinished step is in flight: bud runs a call's functions together.
-                StepRow(step: step, live: live && !step.done)
+                StepRow(step: step, live: live && !step.done, connectsToNext: step.id != visible.last?.id)
                     .transition(.opacity.combined(with: .offset(y: 4)))
             }
         }
@@ -724,7 +955,11 @@ struct StepList: View {
 private struct StepRow: View {
     let step: Step
     let live: Bool
+    let connectsToNext: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private let markerSize: CGFloat = 12
+    private let markerInset: CGFloat = 2
 
     /// The step's place within its call, from its id ("call:2").
     private var order: Int { Int(step.id.split(separator: ":").last ?? "") ?? 0 }
@@ -735,13 +970,13 @@ private struct StepRow: View {
     }
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        HStack(alignment: .top, spacing: 8) {
             ZStack {
                 Circle()
-                    .strokeBorder(Paper.borderStrong, lineWidth: 1)
+                    .strokeBorder(Paper.borderStrong, lineWidth: 1.5)
                     .opacity(step.done ? 0 : 1)
                 Circle()
-                    .fill(Paper.inkPrimary.opacity(0.85))
+                    .fill(Paper.inkPrimary)
                     .scaleEffect(step.done || reduceMotion ? 1 : 0.6)
                     .opacity(step.done ? 1 : 0)
                 Tick()
@@ -750,8 +985,8 @@ private struct StepRow: View {
                     .opacity(step.done ? 1 : 0)
                     .padding(3)
             }
-            .frame(width: 12, height: 12)
-            .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
+            .frame(width: markerSize, height: markerSize)
+            .padding(.top, markerInset)
             .animation(check, value: step.done)
 
             Text(step.text)
@@ -760,6 +995,19 @@ private struct StepRow: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .shimmer(active: live)
+        }
+        .padding(.bottom, connectsToNext ? 5 : 0)
+        .overlay(alignment: .leading) {
+            if connectsToNext {
+                Rectangle()
+                    .fill(Paper.hairline)
+                    .frame(width: 1)
+                    .padding(.top, markerSize + markerInset)
+                    .padding(.bottom, -markerInset)
+                    .frame(width: markerSize)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
         }
         .accessibilityElement(children: .combine)
         .accessibilityValue(step.done ? "done" : live ? "in progress" : "")
@@ -783,38 +1031,33 @@ private struct StepsSummary: View {
     @StateObject private var hovered = Flag()
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            RoundedRectangle(cornerRadius: 1)
-                .fill(Paper.accent.opacity(companion.stepsExpanded ? 0.45 : 0.28))
-                .frame(width: 2)
-            VStack(alignment: .leading, spacing: 6) {
-                Button {
-                    companion.stepsExpanded.toggle()
-                } label: {
-                    HStack(spacing: 4) {
-                        Text("\(companion.lastSteps.count) \(companion.lastSteps.count == 1 ? "step" : "steps")")
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 8, weight: .bold))
-                            .rotationEffect(.degrees(companion.stepsExpanded ? 90 : 0))
-                    }
-                    .font(Paper.Typography.ledgerMeta)
-                    .foregroundStyle(hovered.on ? Paper.inkPrimary : Paper.inkSecondary)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 2)
-                    .background(
-                        hovered.on ? Paper.fillHover : .clear,
-                        in: RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
-                    .contentShape(Rectangle())
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                companion.stepsExpanded.toggle()
+            } label: {
+                HStack(spacing: 4) {
+                    Text("\(companion.lastSteps.count) \(companion.lastSteps.count == 1 ? "step" : "steps")")
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .bold))
+                        .rotationEffect(.degrees(companion.stepsExpanded ? 90 : 0))
                 }
-                .buttonStyle(.plain)
-                .pointerStyle(.link)
-                .onHover { hovered.on = $0 }
-                .padding(.leading, -5)
-                .accessibilityLabel(companion.stepsExpanded ? "Hide bud's steps" : "Show bud's steps")
-                if companion.stepsExpanded {
-                    StepList(steps: companion.lastSteps, live: false, limit: nil)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                }
+                .font(Paper.Typography.ledgerMeta)
+                .foregroundStyle(hovered.on ? Paper.inkPrimary : Paper.inkSecondary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(
+                    hovered.on ? Paper.fillHover : .clear,
+                    in: RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .pointerStyle(.link)
+            .onHover { hovered.on = $0 }
+            .padding(.leading, -5)
+            .accessibilityLabel(companion.stepsExpanded ? "Hide bud's steps" : "Show bud's steps")
+            if companion.stepsExpanded {
+                StepList(steps: companion.lastSteps, live: false, limit: nil)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
         .fixedSize(horizontal: false, vertical: true)
@@ -834,7 +1077,7 @@ struct ApprovalCard: View {
     @Environment(\.replyType) private var replyType
 
     private var inWindow: Bool {
-        !replyType.compact || companion.windowOpen
+        !replyType.compact
     }
 
     private var busy: Bool {
@@ -863,9 +1106,9 @@ struct ApprovalCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .surface(
             RoundedRectangle(cornerRadius: radius, style: .continuous),
-            lift: 1,
+            lift: 0,
             fill: Paper.elevated,
-            border: inWindow ? Paper.borderStrong : Paper.borderSubtle,
+            border: Paper.borderSubtle,
             borderWidth: 0.5
         )
         .disabled(busy)
@@ -936,10 +1179,7 @@ struct ApprovalCard: View {
             }
             Spacer(minLength: 4)
             if approval.grantable { alwaysAllow }
-            Button(companion.approvalFailures[approval.id] == nil ? approval.verb : "Retry") {
-                onDecide(true)
-            }
-            .buttonStyle(CardButton(kind: .primary))
+            approveButton
         }
     }
 
@@ -988,11 +1228,9 @@ struct ApprovalCard: View {
     private var heading: some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: approval.symbol)
-                .font(.system(size: 12, weight: .medium))
-                .frame(width: 26, height: 26)
-                .background(
-                    Paper.fillSubtle,
-                    in: RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous))
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Paper.inkSecondary)
+                .padding(.top, 1)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(approval.isQuestion ? "bud has a question" : approval.title)
@@ -1005,7 +1243,6 @@ struct ApprovalCard: View {
                         .lineLimit(1)
                 }
             }
-            .padding(.top, approval.job == nil ? 4 : 0)
             Spacer(minLength: 0)
         }
     }
@@ -1016,6 +1253,7 @@ struct ApprovalCard: View {
                 GridRow {
                     Text(approval.facts[index].label).foregroundStyle(Paper.inkSecondary)
                     Text(approval.facts[index].value)
+                        .foregroundStyle(Paper.inkPrimary)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                 }
@@ -1041,15 +1279,23 @@ struct ApprovalCard: View {
                     Text("Deny").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(CardButton(kind: .secondary))
-                Button {
-                    onDecide(true)
-                } label: {
-                    Text(companion.approvalFailures[approval.id] == nil ? approval.verb : "Retry")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(CardButton(kind: .primary))
+                approveButton
             }
         }
+    }
+
+    private var approveButton: some View {
+        let retrying = companion.approvalFailures[approval.id] != nil
+        let label = retrying ? "Retry" : approval.verb
+        let symbol = retrying ? "arrow.clockwise" : approval.verb.lowercased() == "send" ? "paperplane.fill" : "checkmark"
+        return Button { onDecide(true) } label: {
+            Image(systemName: symbol)
+                .font(.system(size: 12, weight: .semibold))
+                .frame(minWidth: inWindow ? 34 : nil, maxWidth: inWindow ? nil : .infinity)
+        }
+        .buttonStyle(CardButton(kind: .primary))
+        .help(label)
+        .accessibilityLabel(label)
     }
 
     private var alwaysAllow: some View {
@@ -1062,8 +1308,7 @@ struct ApprovalCard: View {
 
 }
 
-/// Per-view state without `@State` (a macro whose plugin ships only with Xcode): an
-/// observable object owned by the view, which `@StateObject` keeps across redraws.
+/// Observable per-view state that supports Command Line Tools builds.
 final class Flag: ObservableObject {
     @Published var on = false
 }
@@ -1109,25 +1354,30 @@ struct PaperHit<S: Shape>: ButtonStyle {
 struct IconButton: ButtonStyle {
     var size: CGFloat = 24
     var highlight = true
+    var active = false
 
     func makeBody(configuration: Configuration) -> some View {
-        Face(configuration: configuration, size: size, highlight: highlight)
+        Face(configuration: configuration, size: size, highlight: highlight, active: active)
     }
 
     private struct Face: View {
         let configuration: Configuration
         let size: CGFloat
         let highlight: Bool
+        let active: Bool
         @StateObject private var hover = Flag()
         @Environment(\.isEnabled) private var enabled
 
         var body: some View {
             let hovered = enabled && hover.on
+            let shape = highlight
+                ? AnyShape(RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
+                : AnyShape(Circle())
             configuration.label
-                .foregroundStyle(!highlight ? Paper.canvas : hovered ? Paper.inkPrimary : Paper.inkSecondary)
+                .foregroundStyle(!highlight ? Paper.canvas : hovered || active ? Paper.inkPrimary : Paper.inkSecondary)
                 .frame(width: size, height: size)
-                .background(highlight && hovered ? Paper.fillHover : .clear, in: Circle())
-                .contentShape(Circle())
+                .background(highlight && hovered ? Paper.fillHover : .clear, in: shape)
+                .contentShape(shape)
                 .modifier(PaperPress(pressed: enabled && configuration.isPressed))
                 .pointerStyle(enabled ? .link : .default)
                 .onHover { hover.on = $0 }
@@ -1407,12 +1657,12 @@ private struct InputField: View {
         .padding(.trailing, 8)
         .padding(.vertical, 8)
         .foregroundStyle(Paper.inkPrimary)
-        .frame(width: 332)
+        .frame(width: companion.anchor.contentWidth)
         .surface(
             shape,
             lift: 1,
             fill: dropTargeted ? Paper.overlay : Paper.elevated,
-            border: highlighted ? Paper.accent : Paper.borderSubtle,
+            border: dropTargeted ? Paper.accent : focused ? Paper.borderStrong : Paper.borderSubtle,
             borderWidth: dropTargeted ? 2 : highlighted ? 1 : 0.5
         )
         .dropAttachments(into: companion, isTargeted: $droppingAttachments.on)
@@ -1430,7 +1680,10 @@ private struct InputField: View {
                         .lineLimit(1)
                         .allowsHitTesting(false)
                 }
-                ChatInput(title: "", text: $companion.draft, focus: $focused, submit: { companion.send() })
+                ChatInput(
+                    title: "", text: $companion.draft, focus: $focused,
+                    submit: { companion.send() }, onPasteImage: companion.addPastedImage
+                )
                     .font(Paper.Typography.body)
                     .lineLimit(1...5)
                     .onExitCommand {
@@ -1452,36 +1705,82 @@ private struct InputField: View {
 
 // MARK: Settings
 
-/// Editable copy of the settings. A shared object, not `@State`: SwiftUI's `@State` is a macro
-/// whose plugin ships with Xcode, and this app builds with the Command Line Tools alone.
+/// Shared editable settings for the Settings window and its sheets.
 @MainActor @Observable
 final class SettingsDraft {
     static let shared = SettingsDraft()
     var settings = BudSettings.load()
-    var savedFeedback: String? = nil
+    var server: ServerSettingsDraft?
+    var move: MoveBudDraft?
+    var showingMove = false
+
+    func connectToServer() {
+        SettingsTabState.shared.selected = .connection
+        let next = ServerSettingsDraft()
+        if settings.savedRemote { next.address = settings.url }
+        server = next
+    }
+
+    func showMove() {
+        if move == nil {
+            let draft = MoveBudDraft()
+            if settings.savedRemote, let origin = RemoteBudServer.origin(settings.url) {
+                draft.server.address = origin.absoluteString
+                draft.server.token = (try? RemoteBudServer.token(for: origin)) ?? ""
+            }
+            draft.source = LocalBudService.installed()?.home
+                ?? (settings.home.isEmpty ? nil : URL(filePath: settings.home))
+            move = draft
+        }
+        showingMove = true
+    }
+
+    func finishMove() {
+        showingMove = false
+        move = nil
+        switchServer()
+    }
+
+    func useThisMac() {
+        BudSettings(url: BudSettings.defaultURL, home: "").save()
+        switchServer()
+    }
+
+    func switchServer() {
+        server = nil
+        settings = BudSettings.load()
+        Companion.shared.switchServer()
+    }
+
+    func reconnect() {
+        Companion.shared.start()
+    }
 }
 
 @MainActor @Observable
 final class SettingsTabState {
     static let shared = SettingsTabState()
 
-    enum Tab: String, CaseIterable, Identifiable {
-        case models = "Models"
-        case integrations = "Integrations"
-        case connection = "Connection"
+    enum Pane { case connection, models, integrations, computers }
 
-        var id: String { rawValue }
+    var selected: Pane = .connection
 
-        var symbol: String {
-            switch self {
-            case .models: "sparkles"
-            case .integrations: "key"
-            case .connection: "link"
-            }
-        }
+    func bringSettingsToFront() async {
+        try? await Task.sleep(for: .milliseconds(50))
+        let windows = NSApp.windows.filter { $0.title != "bud" }
+        let titles = ["General", "Models", "Apps", "Computers", "Settings"]
+        guard let window = windows.first(where: {
+            $0.identifier?.rawValue.localizedCaseInsensitiveContains("settings") == true
+        }) ?? windows.first(where: { titles.contains($0.title) }) else { return }
+
+        window.collectionBehavior.remove(.canJoinAllSpaces)
+        window.collectionBehavior.insert(.moveToActiveSpace)
+        window.level = ConversationWindow.shared.pinned ? .floating : .normal
+        NSApp.activate(ignoringOtherApps: true)
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
     }
-
-    var selected: Tab = .models
 }
 
 /// Settings: model sign-in, optional integration keys, and server connection details.
@@ -1489,212 +1788,523 @@ struct SettingsView: View {
     @Bindable var tab = SettingsTabState.shared
     @Bindable var store = OnboardingStore.shared
     @Bindable var draft = SettingsDraft.shared
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    private var contentTransitionAnimation: Animation {
-        reduceMotion ? .easeOut(duration: 0.14) : .easeOut(duration: 0.18)
-    }
-
-    private var bannerKey: String {
-        store.error ?? store.feedback ?? draft.savedFeedback ?? ""
-    }
+    @Bindable var companion = Companion.shared
+    @Bindable var appearance = AppearanceStore.shared
 
     var body: some View {
-        VStack(spacing: 0) {
-            PaperSegmentedTabs(selected: $tab.selected)
-                .padding(.horizontal, 20)
-                .padding(.vertical, 12)
-
-            Rectangle().fill(Paper.hairline).frame(height: 0.5)
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    settingsBanner
-                    Group {
-                        switch tab.selected {
-                        case .models:
-                            ModelSetupPanel(store: store)
-                        case .integrations:
+        let _ = appearance.revision
+        TabView(selection: $tab.selected) {
+            Tab("General", systemImage: "gearshape", value: .connection) {
+                pane { PaperConnectionPanel(draft: draft, appearance: appearance) }
+            }
+            Tab("Models", systemImage: "cpu", value: .models) {
+                pane {
+                    modelSettings { ModelSetupPanel(store: store) }
+                }
+            }
+            Tab("Apps", systemImage: "square.grid.2x2", value: .integrations) {
+                pane {
+                    if companion.link == .connected {
+                        let attempt = companion.connectionMachine.attempt
+                        ConnectedAppsSettings(isVisible: tab.selected == .integrations) { method, path, json in
+                            guard companion.link == .connected, companion.connectionMachine.attempt == attempt
+                            else { throw CancellationError() }
+                            let response = try await companion.sendOnboardingRequest(method, path, json: json)
+                            guard companion.link == .connected, companion.connectionMachine.attempt == attempt
+                            else { throw CancellationError() }
+                            return response
+                        }
+                        .id(attempt)
+                    }
+                    modelSettings {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Provider API keys").font(Paper.Typography.h3)
+                                .accessibilityAddTraits(.isHeader)
+                            Rectangle().fill(Paper.hairline).frame(height: 0.5)
                             IntegrationKeysPanel(store: store)
-                        case .connection:
-                            PaperConnectionPanel(draft: draft)
                         }
                     }
-                    .id(tab.selected)
-                    .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.99)))
                 }
-                .padding(20)
             }
-            .animation(contentTransitionAnimation, value: tab.selected)
-            .animation(.easeOut(duration: 0.18), value: bannerKey)
+            Tab("Computers", systemImage: "desktopcomputer", value: .computers) {
+                pane { ComputerSettings() }
+            }
         }
-        .frame(width: 540, height: 520)
+        .frame(width: 560, height: 440)
         .background(Paper.canvas)
+        .preferredColorScheme(appearance.mode.colorScheme)
         .onAppear {
             draft.settings = BudSettings.load()
-            draft.savedFeedback = nil
-            Task { await store.refresh() }
+            Task { await tab.bringSettingsToFront() }
+            if companion.link == .connected { Task { await store.refresh() } }
+        }
+        .onChange(of: companion.link) { _, link in
+            if link == .connected { Task { await store.refresh() } }
+        }
+        .onChange(of: tab.selected) { _, pane in
+            Task { await tab.bringSettingsToFront() }
+            if pane == .models, companion.link == .connected { Task { await store.refresh() } }
+        }
+        .sheet(isPresented: Binding(
+            get: { draft.server != nil },
+            set: { if !$0 { draft.server = nil } }
+        )) {
+            if let server = draft.server {
+                ServerSettings(
+                    draft: server, cancel: { draft.server = nil }, connected: draft.switchServer)
+                    .interactiveDismissDisabled(server.checking)
+            }
+        }
+        .sheet(isPresented: $draft.showingMove) {
+            if let move = draft.move {
+                MoveBudView(draft: move, cancel: { draft.showingMove = false }, moved: draft.finishMove)
+                    .interactiveDismissDisabled(move.active)
+            }
         }
     }
 
-    @ViewBuilder
-    private var settingsBanner: some View {
-        if tab.selected == .connection {
-            if let ok = draft.savedFeedback, !ok.isEmpty {
-                StatusStrip(text: ok, isError: false) { draft.savedFeedback = nil }
+    private func pane<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14, content: content)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(26)
+        }
+        .background(Paper.canvas)
+    }
+
+    @ViewBuilder private func modelSettings<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        switch companion.link {
+        case .connecting:
+            ProgressView("Connecting…").controlSize(.small)
+        case .problem:
+            HStack {
+                Text("Bud isn’t connected.")
+                Spacer()
+                Button("Try Again", action: draft.reconnect)
+                    .buttonStyle(CardButton(kind: .secondary))
             }
-        } else if let err = store.error, !err.isEmpty {
-            StatusStrip(text: err, isError: true) { store.clearBanner() }
-        } else if let ok = store.feedback, !ok.isEmpty {
-            StatusStrip(text: ok, isError: false) { store.clearBanner() }
+        case .connected:
+            if let err = store.error, !err.isEmpty {
+                StatusStrip(text: err, isError: true) { store.clearBanner() }
+            } else if let ok = store.feedback, !ok.isEmpty {
+                StatusStrip(text: ok, isError: false) { store.clearBanner() }
+            }
+            if store.status == .empty, store.loading {
+                ProgressView().controlSize(.small)
+            } else if store.status != .empty {
+                content()
+            }
         }
     }
 }
 
-private struct PaperSegmentedTabs: View {
-    @Binding var selected: SettingsTabState.Tab
-    @Namespace private var tabNamespace
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+struct ConnectedAppAccount: Identifiable {
+    enum Status: String {
+        case connected = "Connected"
+        case expired = "Expired"
+        case revoked = "Revoked"
+        case needsSignIn = "Needs sign-in"
+
+        init(_ value: String) {
+            switch value.lowercased() {
+            case "active", "connected": self = .connected
+            case "expired": self = .expired
+            case "revoked": self = .revoked
+            default: self = .needsSignIn
+            }
+        }
+    }
+
+    let id: String
+    let name: String
+    let appName: String
+    let status: Status
+
+    init?(_ raw: [String: Any]) {
+        guard let toolkit = raw["toolkit"] as? String, (2...64).contains(toolkit.utf8.count),
+              let first = toolkit.utf8.first, (97...122).contains(first),
+              toolkit.utf8.allSatisfy({ (97...122).contains($0) || (48...57).contains($0) || $0 == 95 }),
+              let value = raw["status"] as? String else { return nil }
+        id = toolkit
+        let appName = switch toolkit {
+        case "gmail": "Gmail"
+        case "calendar", "googlecalendar": "Google Calendar"
+        default: toolkit.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+        self.appName = appName
+        let suppliedName = (raw["display_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        name = suppliedName.flatMap { $0.isEmpty ? nil : $0 } ?? appName
+        status = Status(value)
+    }
+
+    func matches(_ query: String) -> Bool {
+        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return term.isEmpty || [name, appName, id, status.rawValue].contains { $0.localizedStandardContains(term) }
+    }
+
+    static func decode(_ response: [String: Any]) throws -> [Self] {
+        if let rows = response["accounts"] as? [[String: Any]] {
+            return rows.compactMap(Self.init)
+        }
+        // Older Bud servers expose only the built-in apps through the same route.
+        guard let statuses = response["statuses"] as? [String: String] else { throw ConnectionError.notBudServer }
+        return statuses.compactMap { toolkit, value in
+            guard value != "NOT_CONNECTED" else { return nil }
+            return Self(["toolkit": toolkit, "status": value])
+        }
+    }
+}
+
+@MainActor
+final class ConnectedAppsSettingsState: ObservableObject {
+    enum Action: String {
+        case reconnect = "connect"
+        case disconnect
+    }
+
+    @Published var search = ""
+    @Published private(set) var accounts: [ConnectedAppAccount]?
+    @Published private(set) var busy = false
+    @Published private(set) var error: String?
+
+    private let sendRequest: OnboardingStore.Transport
+    private let openBrowser: @MainActor (URL) -> Bool
+
+    init(
+        sendRequest: @escaping OnboardingStore.Transport,
+        openBrowser: @escaping @MainActor (URL) -> Bool = { NSWorkspace.shared.open($0) }
+    ) {
+        self.sendRequest = sendRequest
+        self.openBrowser = openBrowser
+    }
+
+    var filteredAccounts: [ConnectedAppAccount] {
+        (accounts ?? []).filter { $0.matches(search) }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    func refresh() async { await update() }
+
+    func change(_ action: Action, account: ConnectedAppAccount) async {
+        await update {
+            do {
+                let response = try await self.sendRequest("POST", "connections/\(account.id)/\(action.rawValue)", nil)
+                try Task.checkCancellation()
+                if action == .reconnect {
+                    guard let url = CapabilitySetup.signInURL(response["url"] as? String) else {
+                        return "The sign-in link is unavailable. Try again."
+                    }
+                    if !self.openBrowser(url) { return "Could not open your browser. Try again." }
+                }
+                return nil
+            } catch is CancellationError {
+                return nil
+            } catch ConnectionError.http(404, _) where action == .disconnect {
+                return "Update the Bud server to disconnect accounts here."
+            } catch {
+                return action == .reconnect ? "Could not start sign-in. Try again."
+                    : "Could not disconnect \(account.name). Try again."
+            }
+        }
+    }
+
+    private func update(after change: (@MainActor () async -> String?)? = nil) async {
+        guard !busy else { return }
+        busy = true
+        error = nil
+        defer { busy = false }
+
+        let actionError = await change?()
+        guard !Task.isCancelled else { return }
+        do {
+            let response = try await sendRequest("GET", "connections", nil)
+            try Task.checkCancellation()
+            accounts = try ConnectedAppAccount.decode(response)
+            error = actionError
+        } catch is CancellationError {
+            return
+        } catch {
+            accounts = nil
+            self.error = actionError ?? "Could not check connected accounts. Try refreshing."
+        }
+    }
+}
+
+private struct ConnectedAppsSettings: View {
+    let isVisible: Bool
+    @StateObject private var state: ConnectedAppsSettingsState
+
+    init(isVisible: Bool, sendRequest: @escaping OnboardingStore.Transport) {
+        self.isVisible = isVisible
+        _state = StateObject(wrappedValue: ConnectedAppsSettingsState(sendRequest: sendRequest))
+    }
 
     var body: some View {
-        let trackShape = RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous)
-        HStack(spacing: 3) {
-            ForEach(SettingsTabState.Tab.allCases) { item in
-                TabButton(
-                    item: item,
-                    active: selected == item,
-                    namespace: tabNamespace
-                ) {
-                    withAnimation(reduceMotion ? nil : .spring(duration: 0.26, bounce: 0)) {
-                        selected = item
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Connected accounts").font(Paper.Typography.h3)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer()
+                if state.busy { ProgressView().controlSize(.small) }
+                Button { Task { await state.refresh() } } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(IconButton())
+                .help("Refresh connected accounts")
+                .accessibilityLabel("Refresh connected accounts")
+                .disabled(state.busy)
+            }
+            if let error = state.error {
+                Text(error).font(Paper.Typography.callout).foregroundStyle(Paper.errorInk)
+            }
+            if let accounts = state.accounts {
+                if accounts.isEmpty {
+                    Text("No connected accounts").foregroundStyle(Paper.inkSecondary)
+                } else {
+                    TextField("Search connected accounts", text: $state.search)
+                    Text("Reconnecting replaces the current link immediately.")
+                        .font(Paper.Typography.caption)
+                        .foregroundStyle(Paper.inkMuted)
+                    let matches = state.filteredAccounts
+                    if matches.isEmpty {
+                        Text("No matching accounts").foregroundStyle(Paper.inkSecondary)
+                    } else {
+                        VStack(spacing: 0) {
+                            ForEach(matches) { account in
+                                Rectangle().fill(Paper.hairline).frame(height: 0.5)
+                                row(account)
+                            }
+                            Rectangle().fill(Paper.hairline).frame(height: 0.5)
+                        }
                     }
                 }
             }
         }
-        .padding(3)
-        .background(Paper.recessed, in: trackShape)
-        .overlay(trackShape.strokeBorder(Paper.hairline, lineWidth: 0.5))
+        .font(Paper.Typography.callout)
+        .onChange(of: isVisible, initial: true) { _, visible in
+            if visible { Task { await state.refresh() } }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            if isVisible { Task { await state.refresh() } }
+        }
     }
 
-    private struct TabButton: View {
-        let item: SettingsTabState.Tab
-        let active: Bool
-        let namespace: Namespace.ID
-        let action: () -> Void
-        @StateObject private var hover = Flag()
-        @Environment(\.colorScheme) private var scheme
-
-        var body: some View {
-            let pillShape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
-            Button(action: action) {
-                HStack(spacing: 5) {
-                    Image(systemName: item.symbol)
-                        .font(.system(size: 11, weight: .medium))
-                    Text(item.rawValue)
-                        .font(Paper.Typography.label)
+    private func row(_ account: ConnectedAppAccount) -> some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(account.name).font(Paper.Typography.label)
+                if account.name.caseInsensitiveCompare(account.appName) != .orderedSame {
+                    Text(account.appName).font(Paper.Typography.caption).foregroundStyle(Paper.inkMuted)
                 }
-                .foregroundStyle(active ? Paper.inkPrimary : (hover.on ? Paper.inkPrimary : Paper.inkSecondary))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
-                .background {
-                    if active {
-                        pillShape
-                            .fill(Paper.elevated)
-                            .overlay(pillShape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5))
-                            .shadow(
-                                color: .black.opacity(scheme == .dark ? 0.26 : 0.06),
-                                radius: 2,
-                                y: 1
-                            )
-                            .matchedGeometryEffect(id: "settings-tab", in: namespace)
-                    } else if hover.on {
-                        pillShape.fill(Paper.fillSubtle)
-                    }
-                }
-                .contentShape(pillShape)
             }
-            .buttonStyle(TabPressStyle())
-            .pointerStyle(.link)
-            .onHover { hover.on = $0 }
+            Spacer(minLength: 6)
+            Text(account.status.rawValue)
+                .font(Paper.Typography.caption)
+                .foregroundStyle(account.status == .connected ? Paper.approveInk : Paper.inkSecondary)
+                .fixedSize()
+            accountButton("Reconnect \(account.name)", icon: "arrow.triangle.2.circlepath", action: .reconnect, account: account)
+            accountButton("Disconnect \(account.name)", icon: "xmark.circle", action: .disconnect, account: account)
         }
+        .frame(minHeight: 40)
     }
 
-    private struct TabPressStyle: ButtonStyle {
-        func makeBody(configuration: Configuration) -> some View {
-            configuration.label.modifier(PaperPress(pressed: configuration.isPressed))
+    private func accountButton(
+        _ title: String, icon: String, action: ConnectedAppsSettingsState.Action, account: ConnectedAppAccount
+    ) -> some View {
+        Button { Task { await state.change(action, account: account) } } label: {
+            Image(systemName: icon)
         }
+        .buttonStyle(IconButton())
+        .help(title)
+        .accessibilityLabel(title)
+        .disabled(state.busy)
     }
 }
 
 private struct PaperConnectionPanel: View {
     @Bindable var draft: SettingsDraft
-    @FocusState private var urlFocused: Bool
-    @FocusState private var folderFocused: Bool
+    @Bindable var companion = Companion.shared
+    @Bindable var appearance: AppearanceStore
+    @Bindable private var sounds = SoundSettings.shared
 
     var body: some View {
-        let cardShape = RoundedRectangle(cornerRadius: Paper.radiusLG, style: .continuous)
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Connection")
-                    .font(Paper.Typography.h2)
-                    .tracking(Paper.Typography.h2Tracking)
-                    .foregroundStyle(Paper.inkPrimary)
-                Text("Local server address and bud data folder.")
-                    .font(Paper.Typography.callout)
-                    .foregroundStyle(Paper.inkSecondary)
+        VStack(alignment: .leading, spacing: 18) {
+            appearanceSection
+            locationSection
+        }
+        .foregroundStyle(Paper.inkPrimary)
+    }
+
+    private var appearanceSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Appearance").font(Paper.Typography.h3)
+            hairline
+            HStack(spacing: 12) {
+                Text("Theme").font(Paper.Typography.body)
+                Spacer(minLength: 0)
+                HStack(spacing: 8) {
+                    ForEach(BudTheme.allCases) { theme in themeButton(theme) }
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Theme")
             }
-
-            VStack(spacing: 0) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("bud URL")
-                        .font(Paper.Typography.label)
-                        .foregroundStyle(Paper.inkPrimary)
-                    PaperFieldBox(focused: urlFocused) {
-                        TextField("http://127.0.0.1:8420", text: $draft.settings.url)
-                            .focused($urlFocused)
-                    }
+            hairline
+            appearanceRow("Mode", subtitle: "Follow macOS, or pin Light or Dark") {
+                Picker("Mode", selection: $appearance.mode) {
+                    ForEach(BudAppearanceMode.allCases) { mode in Text(mode.title).tag(mode) }
                 }
-                .padding(14)
-
-                Rectangle().fill(Paper.hairline).frame(height: 0.5)
-
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("bud folder")
-                        .font(Paper.Typography.label)
-                        .foregroundStyle(Paper.inkPrimary)
-                    PaperFieldBox(focused: folderFocused) {
-                        TextField("/path/to/bud", text: $draft.settings.home)
-                            .focused($folderFocused)
-                    }
-                    Text("Holds bud's config.env, data, and owner token.")
-                        .font(Paper.Typography.caption)
-                        .foregroundStyle(Paper.inkMuted)
-                }
-                .padding(14)
             }
-            .surface(cardShape, lift: 1, fill: Paper.elevated, border: Paper.borderStrong, borderWidth: 0.5)
-
-            HStack(spacing: 10) {
-                Button("Run Setup Assistant…") { OnboardingWindow.shared.show() }
-                    .buttonStyle(CardButton(kind: .secondary))
-                Spacer(minLength: 8)
-                Button("Save and reconnect") {
-                    draft.settings.save()
-                    draft.savedFeedback = "Saved connection settings. Reconnecting..."
-                    Companion.shared.start()
+            hairline
+            appearanceRow("Font", subtitle: "SF Pro, Inter, or Editorial") {
+                Picker("Font", selection: $appearance.font) {
+                    ForEach(BudFont.allCases) { font in Text(font.title).tag(font) }
                 }
-                .buttonStyle(CardButton(kind: .primary))
+            }
+            hairline
+            appearanceRow("Sounds", subtitle: "Subtle chimes for sending and dictation") {
+                Toggle("", isOn: $sounds.enabled)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .accessibilityLabel("Sounds")
             }
         }
     }
+
+    private func themeButton(_ theme: BudTheme) -> some View {
+        let selected = appearance.theme == theme
+        let shape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
+        return Button {
+            appearance.theme = theme
+        } label: {
+            HStack(spacing: 6) {
+                ThemeSwatch(theme: theme)
+                Text(theme.title).font(Paper.Typography.captionMedium)
+            }
+            .foregroundStyle(Paper.inkPrimary)
+            .padding(.horizontal, 9)
+            .frame(height: 28)
+        }
+        .buttonStyle(PaperHit(shape: shape, fill: Paper.elevated))
+        .overlay {
+            shape.strokeBorder(selected ? Paper.inkPrimary : Paper.borderSubtle, lineWidth: selected ? 1.5 : 0.5)
+                .allowsHitTesting(false)
+        }
+        .accessibilityLabel("\(theme.title) theme")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private func appearanceRow<Control: View>(
+        _ title: String, subtitle: String, @ViewBuilder control: () -> Control
+    ) -> some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(Paper.Typography.body)
+                Text(subtitle)
+                    .font(Paper.Typography.caption)
+                    .foregroundStyle(Paper.inkMuted)
+            }
+            Spacer(minLength: 0)
+            control().labelsHidden().fixedSize()
+        }
+    }
+
+    private var locationSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Location").font(Paper.Typography.h3)
+            hairline
+            HStack(alignment: .firstTextBaseline) {
+                Text("Bud runs on")
+                    .font(Paper.Typography.body)
+                Spacer()
+                Text(URL(string: draft.settings.url)?.scheme == "https"
+                     ? URL(string: draft.settings.url)?.host() ?? draft.settings.url
+                     : "This Mac")
+                    .foregroundStyle(Paper.inkSecondary)
+            }
+            hairline
+            HStack {
+                switch companion.link {
+                case .connecting:
+                    ProgressView().controlSize(.small)
+                    Text("Connecting…")
+                case .connected:
+                    Text("Server")
+                case .problem:
+                    Text("Not connected")
+                    Button("Try Again", action: draft.reconnect)
+                        .buttonStyle(CardButton(kind: .secondary))
+                }
+                Spacer()
+                if draft.settings.savedRemote || URL(string: draft.settings.url)?.scheme == "https" {
+                    Button("Use This Mac", action: draft.useThisMac)
+                        .buttonStyle(CardButton(kind: .quiet))
+                }
+                Button("Connect to a server…", action: draft.connectToServer)
+                    .buttonStyle(CardButton(kind: .secondary))
+            }
+            .font(Paper.Typography.body)
+            hairline
+            HStack {
+                Text("Keep Bud running when this Mac is off.")
+                    .font(Paper.Typography.callout)
+                    .foregroundStyle(Paper.inkSecondary)
+                Spacer()
+                Button("Move Bud to a server…", action: draft.showMove)
+                    .buttonStyle(CardButton(kind: .secondary))
+            }
+            SwiftUI.Link("Set up on Azure", destination: URL(
+                string: "https://github.com/bamiboy237/bud/blob/master/docs/setup.md#host-bud-on-azure")!)
+                .font(Paper.Typography.callout)
+        }
+    }
+
+    private var hairline: some View {
+        Rectangle().fill(Paper.hairline).frame(height: 0.5)
+    }
 }
 
-/// Opens a finished job's saved report in the app the owner uses for that file type.
+private struct ThemeSwatch: View {
+    let theme: BudTheme
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        let (dark, light, border): (UInt32, UInt32, UInt32) = switch theme {
+        case .stone: (0x181915, 0xFAF9F7, scheme == .dark ? 0x272825 : 0xE5E3DC)
+        case .studio: (0x141416, 0xFFFFFF, 0xA1A1AA)
+        case .paper: (0x18191D, 0xF7F7F8, scheme == .dark ? 0x3C4048 : 0xE1E3E8)
+        }
+        HStack(spacing: 0) {
+            color(dark)
+            color(light)
+        }
+        .frame(width: 14, height: 14)
+        .clipShape(Circle())
+        .overlay { Circle().strokeBorder(color(border), lineWidth: 0.5) }
+        .overlay(alignment: scheme == .dark ? .leading : .trailing) {
+            if theme == .paper {
+                Circle().fill(color(scheme == .dark ? 0x7BB3EB : 0x1E4E79))
+                    .frame(width: 4, height: 4)
+                    .padding(.horizontal, 2)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private func color(_ hex: UInt32) -> Color {
+        Color(.sRGB, red: Double((hex >> 16) & 0xFF) / 255,
+              green: Double((hex >> 8) & 0xFF) / 255, blue: Double(hex & 0xFF) / 255)
+    }
+}
+
+/// Opens a finished job's saved report in Bud's inspector.
 struct OpenReport: View {
     let file: URL
 
     var body: some View {
-        Button("Open report") { NSWorkspace.shared.open(file) }
+        Button("Open report") { Companion.shared.openReport(file) }
             .buttonStyle(.link)
             .pointerStyle(.link)
             .font(Paper.Typography.callout)

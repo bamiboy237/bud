@@ -14,6 +14,46 @@ struct AttachmentDropTests {
         }
     }
 
+    @Test
+    func acceptsDocumentsButDoesNotReadAnExecutableDroppedIntoChat() throws {
+        let files = FileManager.default
+        let directory = files.temporaryDirectory.appending(path: UUID().uuidString)
+        try files.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? files.removeItem(at: directory) }
+
+        let text = directory.appending(path: "briefing.txt")
+        try Data("Handoff notes".utf8).write(to: text)
+        #expect(try DraftAttachment.read(text).reference.name == "briefing.txt")
+
+        let executable = directory.appending(path: "bash")
+        try Data([0xcf, 0xfa, 0xed, 0xfe]).write(to: executable)
+        try files.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path())
+        #expect(throws: DraftAttachment.ReadError.unsupportedFile) {
+            try DraftAttachment.read(executable)
+        }
+
+        let renamedExecutable = directory.appending(path: "bash.txt")
+        try files.moveItem(at: executable, to: renamedExecutable)
+        #expect(throws: DraftAttachment.ReadError.unsupportedFile) {
+            try DraftAttachment.read(renamedExecutable)
+        }
+    }
+
+    @Test
+    func doesNotFollowLinksDroppedIntoChat() throws {
+        let files = FileManager.default
+        let directory = files.temporaryDirectory.appending(path: UUID().uuidString)
+        try files.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? files.removeItem(at: directory) }
+        let report = directory.appending(path: "report.md")
+        try Data("Report".utf8).write(to: report)
+        let link = directory.appending(path: "link.md")
+        try files.createSymbolicLink(at: link, withDestinationURL: report)
+        #expect(throws: DraftAttachment.ReadError.unsupportedFile) {
+            try DraftAttachment.read(link)
+        }
+    }
+
     @Test @MainActor
     func attachmentsRespectCapacityAndLeaveTheDraftTextIntact() async throws {
         let companion = Companion()

@@ -28,6 +28,8 @@ from bud.core.onboarding import (
 )
 from bud.core.runner import Runner
 from bud.core.server import _create_app
+from bud.gateway.tracked import TrackedModel
+from bud.harness.operating_profile import ModelProfileConfig, OperatingProfile
 
 
 def _clear_managed_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -48,6 +50,19 @@ def _mock_connections(data_dir: Path, settings: Settings) -> Mock:
     found.store = Mock()
     found.store.session_scope.return_value = "scope"
     return found
+
+
+def _use_nondurable_runner(monkeypatch: pytest.MonkeyPatch) -> list[Runner]:
+    created: list[Runner] = []
+
+    def non_durable_runner(*args, **kwargs):
+        kwargs["durable"] = False
+        instance = Runner(*args, **kwargs)
+        created.append(instance)
+        return instance
+
+    monkeypatch.setattr("bud.core.server.Runner", non_durable_runner)
+    return created
 
 
 def test_write_env_updates_atomic_preserves_comments_and_rejects_unsafe_input(tmp_path: Path):
@@ -103,25 +118,47 @@ async def test_unconfigured_server_starts_and_hot_reloads_keys_in_place(
     _clear_managed_env(monkeypatch)
     bud_home = tmp_path / "bud_home"
     data_dir = bud_home / "data"
+    models_file = tmp_path / "models.toml"
+    models_file.write_text(
+        """
+[[models]]
+provider = "openai"
+name = "gpt-5"
+tier = "fast"
+input = 0
+output = 0
+cached = 0
+
+[[models]]
+provider = "local"
+name = "text-only"
+tier = "frontier"
+billing = "local"
+base_url = "http://localhost:1/v1"
+protocol = "chat"
+supports_tools = false
+allow_accounts = true
+
+[[models]]
+provider = "openai-chatgpt"
+name = "signed-out"
+tier = "frontier"
+billing = "subscription"
+""",
+        encoding="utf-8",
+    )
     settings = Settings(
         _env_file=None,
         data_dir=data_dir,
         workspace_dir=bud_home / "workspace",
+        models_file=models_file,
         approval_review=True,
     )
     found = _mock_connections(data_dir, settings)
     monkeypatch.setattr("bud.core.server.Connections", lambda _: found)
     monkeypatch.setattr("bud.composio.tools.build_toolset", lambda *args: FunctionToolset[None]([]))
 
-    created: list[Runner] = []
-
-    def non_durable_runner(*args, **kwargs):
-        kwargs["durable"] = False
-        instance = Runner(*args, **kwargs)
-        created.append(instance)
-        return instance
-
-    monkeypatch.setattr("bud.core.server.Runner", non_durable_runner)
+    created = _use_nondurable_runner(monkeypatch)
     token = "onboarding-test-" + "a" * 43
     app = _create_app(settings, SecretStr(token), None, simulate=False, model_id=None)
     runner = created[0]
@@ -133,6 +170,50 @@ async def test_unconfigured_server_starts_and_hot_reloads_keys_in_place(
             assert (await client.get("/onboarding")).status_code == 401
 
             headers = {"Authorization": f"Bearer {token}"}
+            available = "openai:gpt-5"
+            session_id = (await client.post("/sessions", headers=headers)).json()["session_id"]
+
+            async def assert_model_choices(expected: list[str]) -> None:
+                catalog = await client.get("/models", headers=headers)
+                assert catalog.status_code == 200
+                rows = catalog.json()
+                assert [row["id"] for row in rows] == [
+                    available,
+                    "local:text-only",
+                    "openai-chatgpt:signed-out",
+                ]
+                assert all(row.keys() == {"id", "tier", "billing", "configured"} for row in rows)
+                assert [row["id"] for row in rows if row["configured"]] == expected
+                onboarding = await client.get("/onboarding", headers=headers)
+                assert onboarding.json()["models"] == expected
+                # Exercise the durable model table without starting the global DBOS runtime.
+                with monkeypatch.context() as patch:
+                    patch.setattr(runner, "durable", True)
+                    _, registered = runner._build_models()
+                assert list(registered) == expected
+
+            async def assert_rejected(model: str, reason: str) -> None:
+                rejected_session = "a" * 32
+                for method, path in (
+                    ("PUT", "/onboarding/model"),
+                    ("POST", f"/sessions/{session_id}/model"),
+                    ("POST", "/sessions"),
+                    ("POST", "/sessions/primary"),
+                ):
+                    body = {"model": model}
+                    if path == "/sessions":
+                        body["session_id"] = rejected_session
+                    response = await client.request(method, path, headers=headers, json=body)
+                    assert response.status_code == 422
+                    assert reason in response.json()["detail"]
+                missing = await client.get(f"/sessions/{rejected_session}", headers=headers)
+                assert missing.status_code == 404
+
+            await assert_model_choices([])
+            await assert_rejected(available, "not configured")
+            await assert_rejected("local:text-only", "does not support tools")
+            await assert_rejected("openai-chatgpt:signed-out", "not configured")
+
             runtime_before = await client.get("/runtime", headers=headers)
             assert runtime_before.status_code == 200
             assert runtime_before.json()["has_model"] is False
@@ -186,6 +267,36 @@ async def test_unconfigured_server_starts_and_hot_reloads_keys_in_place(
             assert found.settings.composio_api_key is not None
             assert found.settings.composio_api_key.get_secret_value() == secret_composio
 
+            assert updated["models"] == [available]
+            await assert_model_choices([available])
+            primary = await client.post(
+                "/sessions/primary",
+                headers=headers,
+                json={"session_id": session_id, "model": available},
+            )
+            assert primary.status_code == 200
+            assert primary.json() == {"session_id": session_id}
+            switched = await client.post(
+                f"/sessions/{session_id}/model", headers=headers, json={"model": available}
+            )
+            assert switched.json() == {"session_id": session_id, "model": available}
+            selected = await client.put(
+                "/onboarding/model", headers=headers, json={"model": available}
+            )
+            assert selected.status_code == 200
+            assert selected.json()["default_model"] == available
+            assert runner._inputs("example", "new message")["owner_model"] == available
+            await assert_rejected("nonexistent:model", "Unknown model")
+            await assert_rejected("local:text-only", "does not support tools")
+            assert runner.session_models[session_id] == available
+            assert (data_dir / "default-model").read_text() == available
+            automatic = await client.put("/onboarding/model", headers=headers, json={"model": None})
+            assert automatic.json()["default_model"] is None
+            assert runner._inputs("example", "another message")["owner_model"] is None
+            assert (
+                await client.put("/onboarding/model", headers=headers, json={"model": available})
+            ).status_code == 200
+
             remove_resp = await client.post(
                 "/onboarding/keys",
                 headers=headers,
@@ -194,9 +305,87 @@ async def test_unconfigured_server_starts_and_hot_reloads_keys_in_place(
             assert remove_resp.status_code == 200
             assert remove_resp.json()["has_model"] is False
             assert remove_resp.json()["needs_onboarding"] is True
+            assert remove_resp.json()["default_model"] is None
+            await assert_model_choices([])
+            await assert_rejected(available, "not configured")
             assert runner.is_configured is False
             assert runner.harness.reviewer is None
             assert runner.harness._guards[0].reviewer is None
+    finally:
+        runner.gateway.close()
+
+
+@pytest.mark.parametrize("pin", [None, "cli", "profile"])
+async def test_env_default_allows_settings_changes_unless_model_is_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pin: str | None
+):
+    env_default = "openai:gpt-6-luna"
+    alternate = "openai:gpt-6.1-sol"
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"DEFAULT_MODEL={env_default}\n", encoding="utf-8")
+    settings = Settings(
+        _env_file=env_path,
+        openai_api_key=SecretStr("sk-offline-test"),
+    )
+    profile = (
+        OperatingProfile(id="pinned", version="1", model=ModelProfileConfig(model_id=alternate))
+        if pin == "profile"
+        else None
+    )
+    found = _mock_connections(settings.data_dir, settings)
+    monkeypatch.setattr("bud.core.server.Connections", lambda _: found)
+    monkeypatch.setattr("bud.composio.tools.build_toolset", lambda *args: FunctionToolset[None]([]))
+    created = _use_nondurable_runner(monkeypatch)
+    token = "onboarding-test-" + "a" * 43
+    app = _create_app(
+        settings,
+        SecretStr(token),
+        None,
+        simulate=False,
+        model_id=alternate if pin == "cli" else None,
+        operating_profile=profile,
+    )
+    runner = created[0]
+    choice_file = settings.data_dir / "default-model"
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": f"Bearer {token}"},
+        ) as client:
+            state = (await client.get("/onboarding")).json()
+            assert state["model_locked"] is (pin is not None)
+            assert state["default_model"] is None
+            assert state["active_model"] == (alternate if pin else env_default)
+
+            if pin:
+                locked = await client.put("/onboarding/model", json={"model": env_default})
+                assert locked.status_code == 409
+                assert not choice_file.exists()
+                assert runner._inputs("example", "new message")["model"] == alternate
+                return
+
+            assert alternate in state["models"]
+            selected = await client.put("/onboarding/model", json={"model": alternate})
+            assert selected.status_code == 200
+            assert selected.json()["default_model"] == alternate
+            assert selected.json()["active_model"] == alternate
+            assert choice_file.read_text() == alternate
+            assert runner._inputs("example", "new message")["model"] == alternate
+
+            reloaded = await client.post(
+                "/onboarding/keys", json={"keys": {"OPENAI_API_KEY": "sk-offline-refreshed"}}
+            )
+            assert reloaded.status_code == 200
+            assert reloaded.json()["active_model"] == alternate
+            automatic = await client.put("/onboarding/model", json={"model": None})
+            assert automatic.status_code == 200
+            assert automatic.json()["default_model"] is None
+            assert automatic.json()["active_model"] == env_default
+            assert choice_file.read_text() == ""
+            assert runner.owner_model is None
+            assert runner._inputs("example", "new message")["model"] == env_default
     finally:
         runner.gateway.close()
 
@@ -285,8 +474,15 @@ print(json.dumps({"ok": True, "active": runner.active_model_id}))
     assert payload["active"] == "openai:gpt-reload-test"
 
 
+@pytest.mark.parametrize(
+    ("env_default", "saved_choice"),
+    [(None, None), ("openai:gpt-6-luna", None), ("openai:gpt-6-luna", "openai:gpt-6.1-sol")],
+)
 async def test_chatgpt_login_manager_start_complete_and_logout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    env_default: str | None,
+    saved_choice: str | None,
 ):
     _clear_managed_env(monkeypatch)
     bud_home = tmp_path / "bud_chatgpt"
@@ -296,20 +492,14 @@ async def test_chatgpt_login_manager_start_complete_and_logout(
         data_dir=data_dir,
         workspace_dir=bud_home / "workspace",
         approval_review=True,
+        default_model=env_default,
+        openai_api_key=SecretStr("sk-offline-test") if env_default else None,
     )
     found = _mock_connections(data_dir, settings)
     monkeypatch.setattr("bud.core.server.Connections", lambda _: found)
     monkeypatch.setattr("bud.composio.tools.build_toolset", lambda *args: FunctionToolset[None]([]))
 
-    created: list[Runner] = []
-
-    def non_durable_runner(*args, **kwargs):
-        kwargs["durable"] = False
-        instance = Runner(*args, **kwargs)
-        created.append(instance)
-        return instance
-
-    monkeypatch.setattr("bud.core.server.Runner", non_durable_runner)
+    created = _use_nondurable_runner(monkeypatch)
     token = "chatgpt-test-" + "b" * 43
     app = _create_app(settings, SecretStr(token), None, simulate=False, model_id=None)
     runner = created[0]
@@ -334,28 +524,31 @@ async def test_chatgpt_login_manager_start_complete_and_logout(
         store.acquire()
         try:
             state = store.state()
-            state["models"] = [{"slug": "gpt-test", "display_name": "GPT Test"}]
+            state["models"] = [
+                {"slug": "gpt-other", "display_name": "GPT Other"},
+                {"slug": "gpt-test", "display_name": "GPT Test"},
+            ]
             state["selected_model"] = "gpt-test"
             store.save_state(state)
         finally:
             store.close()
         return state["models"]
 
-    manager = ChatGPTLoginManager(
-        data_dir,
-        on_before_auth=lambda: runner.gateway.close(),
-        on_complete=app.state.reload_runtime_config,
-        flow_factory=FakeFlow,
-        wait_listener=noop_wait,
-        refresh_fn=fake_refresh,
-    )
-    app.state.chatgpt_login = manager
+    manager: ChatGPTLoginManager = app.state.chatgpt_login
+    monkeypatch.setattr(manager, "_flow_factory", FakeFlow)
+    monkeypatch.setattr(manager, "_wait_listener", noop_wait)
+    monkeypatch.setattr(manager, "_refresh_fn", fake_refresh)
 
     try:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
             headers = {"Authorization": f"Bearer {token}"}
+            if saved_choice:
+                selected = await client.put(
+                    "/onboarding/model", headers=headers, json={"model": saved_choice}
+                )
+                assert selected.status_code == 200
             started = await client.post("/onboarding/chatgpt/start", headers=headers)
             assert started.status_code == 200
             start_json = started.json()
@@ -381,18 +574,45 @@ async def test_chatgpt_login_manager_start_complete_and_logout(
             assert done_json["chatgpt"]["status"] == "connected"
             assert done_json["has_model"] is True
             assert done_json["needs_onboarding"] is False
-            assert done_json["active_model"] == "openai-chatgpt:gpt-test"
+            expected = saved_choice or "openai-chatgpt:gpt-test"
+            assert done_json["default_model"] == expected
+            assert done_json["active_model"] == expected
+            assert runner._inputs("example", "new message")["model"] == expected
+            assert (data_dir / "default-model").read_text() == expected
             assert runner.is_configured is True
+            assert runner.harness.reviewer is not None
+            assert runner.harness.reviewer.model_provider is not None
+            assert runner.verifier is not None and runner.verifier.model_provider is not None
+            for provider in (
+                runner.harness.reviewer.model_provider,
+                runner.verifier.model_provider,
+            ):
+                model = provider()
+                assert isinstance(model, TrackedModel) and model.spec.id == expected
+
+            learner = runner.learner
+            assert learner is not None
+            model = learner.model("example")
+            assert isinstance(model, TrackedModel) and model.spec.id == expected
+            assert model.ledger is runner.gateway.ledger and model.session_id == "example:learn"
+            override = "openai-chatgpt:gpt-other"
+            runner.set_model("example", override)
+            model = learner.model("example")
+            assert isinstance(model, TrackedModel) and model.spec.id == override
 
             logged_out = await client.post("/onboarding/chatgpt/logout", headers=headers)
             assert logged_out.status_code == 200
             out_json = logged_out.json()
             assert out_json["chatgpt"]["connected"] is False
-            assert out_json["has_model"] is False
-            assert out_json["needs_onboarding"] is True
-            assert runner.is_configured is False
+            assert out_json["has_model"] is bool(env_default)
+            assert out_json["needs_onboarding"] is (env_default is None)
+            assert out_json["default_model"] == saved_choice
+            assert out_json["active_model"] == (saved_choice or env_default)
+            assert (data_dir / "default-model").read_text() == (saved_choice or "")
+            assert runner.is_configured is bool(env_default)
     finally:
         await manager.shutdown()
+        await runner.stop()
         runner.gateway.close()
 
 

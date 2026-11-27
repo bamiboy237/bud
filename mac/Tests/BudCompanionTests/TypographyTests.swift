@@ -28,26 +28,32 @@ struct TypographyTests {
     func bundledFontsResolveOpticalWeightsAndMonoCuts() throws {
         #expect(Fonts.register())
 
-        let body = Fonts.sansNSFont(size: 14, weight: Fonts.OpticalWeight.regular)
+        let body = Fonts.sansNSFont(size: 14, weight: Fonts.OpticalWeight.regular, family: .inter)
         #expect(body.familyName == "Inter Variable")
         #expect(abs(body.pointSize - 14) < 0.01)
         let bodyVars = CTFontCopyVariation(body as CTFont) as? [NSNumber: NSNumber] ?? [:]
         #expect(bodyVars[NSNumber(value: 0x77676874)]?.doubleValue == 440)
 
-        let h1 = Fonts.sansNSFont(size: 20, weight: Fonts.OpticalWeight.bold)
+        let h1 = Fonts.sansNSFont(size: 20, weight: Fonts.OpticalWeight.bold, family: .inter)
         #expect(h1.familyName == "Inter Variable")
         let h1Vars = CTFontCopyVariation(h1 as CTFont) as? [NSNumber: NSNumber] ?? [:]
         #expect(h1Vars[NSNumber(value: 0x77676874)]?.doubleValue == 650)
         #expect(h1Vars[NSNumber(value: 0x6f70737a)]?.doubleValue == 20)
 
-        let monoText = Fonts.monoNSFont(size: 12.5, bold: false, tabularDigits: true)
+        for (weight, expected) in [(Fonts.OpticalWeight.medium, 530.0), (Fonts.OpticalWeight.semibold, 590.0)] {
+            let font = Fonts.sansNSFont(size: 14, weight: weight, family: .inter)
+            let variations = CTFontCopyVariation(font as CTFont) as? [NSNumber: NSNumber]
+            #expect(variations?[NSNumber(value: 0x77676874)]?.doubleValue == expected)
+        }
+
+        let monoText = Fonts.monoNSFont(size: 12.5, bold: false, tabularDigits: true, family: .inter)
         #expect(monoText.fontName == Fonts.monoTextPostScriptName)
         #expect(abs(monoText.pointSize - 12.5) < 0.01)
 
-        let monoBold = Fonts.monoNSFont(size: 12.5, bold: true)
+        let monoBold = Fonts.monoNSFont(size: 12.5, bold: true, family: .inter)
         #expect(monoBold.fontName == Fonts.monoBoldPostScriptName)
 
-        let tabularSans = Fonts.sansNSFont(size: 14, weight: Fonts.OpticalWeight.regular, tabularDigits: true)
+        let tabularSans = Fonts.sansNSFont(size: 14, tabularDigits: true, family: .inter)
         let sansFeatures = tabularSans.fontDescriptor.object(forKey: .featureSettings) as? [[String: Any]]
         #expect(sansFeatures?.contains {
             ($0[kCTFontFeatureTypeIdentifierKey as String] as? Int) == kNumberSpacingType
@@ -83,35 +89,56 @@ struct TypographyTests {
     }
 
     @Test
-    func surfaceLadderAndSyntaxColorsResolveInLightAndDark() throws {
-        for appearanceName in [NSAppearance.Name.aqua, .darkAqua] {
-            let appearance = try #require(NSAppearance(named: appearanceName))
-            let recessed = hex(Paper.recessed, in: appearance)
-            let canvas = hex(Paper.canvas, in: appearance)
-            let elevated = hex(Paper.elevated, in: appearance)
+    func appearanceDefaultsToStoneSystemAndSFPro() throws {
+        _ = AppearanceStore.shared
+        let previousTheme = AppearanceStore.activeTheme
+        let previousFont = AppearanceStore.activeFont
+        let suite = "BudCompanionTests.Appearance.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer {
+            AppearanceStore.activeTheme = previousTheme
+            AppearanceStore.activeFont = previousFont
+            defaults.removePersistentDomain(forName: suite)
+        }
 
-            #expect(recessed != canvas)
-            #expect(canvas != elevated)
-            #expect(recessed != elevated)
+        let appearance = AppearanceStore(defaults: defaults)
+        #expect(appearance.theme == .stone)
+        #expect(appearance.mode == .system)
+        #expect(appearance.font == .sfPro)
+        #expect(AppearanceStore.activeTheme == .stone)
+        #expect(AppearanceStore.activeFont == .sfPro)
+    }
 
-            if appearanceName == .aqua {
-                #expect(recessed == 0xEFEFF1)
-                #expect(canvas == 0xF7F7F8)
-                #expect(elevated == 0xFFFFFF)
-            } else {
-                #expect(recessed == 0x111215)
-                #expect(canvas == 0x18191D)
-                #expect(elevated == 0x22242A)
-                #expect(alpha(Paper.placeholder, in: appearance) >= 0.45)
-                #expect(alpha(Paper.citationFill, in: appearance) >= 0.15)
-                #expect(alpha(Paper.citationBorder, in: appearance) >= 0.30)
-                #expect(alpha(Paper.codeChipFill, in: appearance) >= 0.07)
-            }
+    @Test
+    func surfaceLaddersResolveInLightAndDark() throws {
+        _ = AppearanceStore.shared
+        let previousTheme = AppearanceStore.activeTheme
+        defer { AppearanceStore.activeTheme = previousTheme }
 
-            #expect(Syntax.color(.plain) == nil)
-            for kind in [Syntax.Kind.keyword, .string, .number, .comment, .function, .type] {
-                #expect(Syntax.color(kind) != nil)
-            }
+        let light = try #require(NSAppearance(named: .aqua))
+        let dark = try #require(NSAppearance(named: .darkAqua))
+        let ladders: [(theme: BudTheme, light: [UInt32], dark: [UInt32])] = [
+            (.stone, [0xF2F1ED, 0xFAF9F7, 0xFFFFFF], [0x141512, 0x181915, 0x1E1F1B]),
+            // Studio light uses white for both the canvas and elevated surfaces.
+            (.studio, [0xF4F4F5, 0xFFFFFF, 0xFFFFFF], [0x111113, 0x141416, 0x1C1C1F]),
+            (.paper, [0xEFEFF1, 0xF7F7F8, 0xFFFFFF], [0x111215, 0x18191D, 0x22242A]),
+        ]
+        for ladder in ladders {
+            AppearanceStore.activeTheme = ladder.theme
+            let surfaces = [Paper.recessed, Paper.canvas, Paper.elevated]
+            #expect(surfaces.map { hex($0, in: light) } == ladder.light)
+            #expect(surfaces.map { hex($0, in: dark) } == ladder.dark)
+        }
+
+        AppearanceStore.activeTheme = .paper
+        #expect(abs(alpha(Paper.placeholder, in: dark) - 0.48) < 0.01)
+        #expect(alpha(Paper.citationFill, in: dark) >= 0.15)
+        #expect(alpha(Paper.citationBorder, in: dark) >= 0.30)
+        #expect(alpha(Paper.codeChipFill, in: dark) >= 0.07)
+
+        #expect(Syntax.color(.plain) == nil)
+        for kind in [Syntax.Kind.keyword, .string, .number, .comment, .function, .type] {
+            #expect(Syntax.color(kind) != nil)
         }
     }
 

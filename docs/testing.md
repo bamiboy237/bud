@@ -17,6 +17,19 @@ uv run pytest
 
 Narrow runs: `uv run pytest tests/test_server.py -x`. Override default 120s per-test timeout with `--timeout=300`. Add runtime Tracing in production via `uv sync --locked --no-dev --extra tracing`.
 
+### Linux server image
+
+Build the server image, then run the same offline migration check as CI:
+
+```sh
+BUD_DOMAIN=bud.example.test docker compose --project-name bud-relaunch-test build bud
+docker run --rm -i --network none --entrypoint python bud-server:local - < ops/smoke_server.py
+```
+
+The check moves a synthetic Bud profile to a fresh server. It checks that the
+source stays stopped and that the destination reopens the chat after a restart.
+It does not publish a port.
+
 ## Suite coverage & crash checkpoints
 
 | Area | Verified invariants |
@@ -35,7 +48,7 @@ Narrow runs: `uv run pytest tests/test_server.py -x`. Override default 120s per-
 
 ## CI & Release workflows
 
-- **CI (`.github/workflows/ci.yml`):** runs `lint`, `test` (Python 3.12 and 3.14), `package` (clean wheel + sdist venv smoke import), `tui` (`cargo fmt`, `clippy`, `test`), and `mac` (`swift test` + `./mac/build.sh` on `macos-26`). Every job passes with zero API keys.
+- **CI (`.github/workflows/ci.yml`):** runs lint, Python 3.12 and 3.14 tests, wheel and sdist checks, a Linux server image check, Rust tests, and Mac tests. None require API keys.
 - **Release (`.github/workflows/release.yml`):** on `v*` tag pushes, builds Python wheel, Rust `bud-tui`, and `Bud.app`, smoke-installs into an isolated temp `BUD_HOME`, and publishes `.tar.gz` + `SHA256SUMS.txt`.
 
 ## Manual evals

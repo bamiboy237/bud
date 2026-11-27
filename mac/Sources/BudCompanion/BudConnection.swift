@@ -8,19 +8,48 @@ struct BudSettings: Sendable {
     var url: String
     /// The bud checkout or install folder; `.env` and relative `DATA_DIR` resolve against it.
     var home: String
+    private(set) var localService: LocalBudService? = nil
+    var savedRemote = false
+
+    init(url: String, home: String, localService: LocalBudService? = nil, savedRemote: Bool = false) {
+        self.url = url
+        self.home = home
+        self.localService = localService
+        self.savedRemote = savedRemote
+    }
 
     static func load() -> BudSettings {
         let env = ProcessInfo.processInfo.environment
         let defaults = UserDefaults.standard
+        if env["BUD_URL"] == nil, env["BUD_HOME"] == nil,
+           let address = defaults.string(forKey: "budRemoteServer") {
+            return BudSettings(url: address, home: "", savedRemote: true)
+        }
         return BudSettings(
             url: env["BUD_URL"] ?? defaults.string(forKey: "budURL") ?? defaultURL,
             home: env["BUD_HOME"] ?? defaults.string(forKey: "budHome") ?? ""
+        ).selectingLocalService(
+            LocalBudService.installed(), isDevBuild: AppUpdater.isDevBuild(), environment: env
         )
     }
 
+    func selectingLocalService(
+        _ service: LocalBudService?, isDevBuild: Bool, environment: [String: String]
+    ) -> BudSettings {
+        guard !isDevBuild, environment["BUD_URL"] == nil, environment["BUD_HOME"] == nil,
+              let service, url == Self.defaultURL || url == service.url
+        else { return self }
+        return BudSettings(url: service.url, home: service.home.path(), localService: service)
+    }
+
     func save() {
+        UserDefaults.standard.removeObject(forKey: "budRemoteServer")
         UserDefaults.standard.set(url, forKey: "budURL")
         UserDefaults.standard.set(home, forKey: "budHome")
+    }
+
+    static func useRemote(_ origin: URL) {
+        UserDefaults.standard.set(origin.absoluteString, forKey: "budRemoteServer")
     }
 }
 
@@ -28,6 +57,9 @@ enum ConnectionError: Error, CustomStringConvertible {
     case badURL
     case noToken(String)
     case unreachable
+    case localStartupFailed
+    case notBudServer
+    case keychainUnavailable
     case http(Int, String)
 
     var description: String {
@@ -37,7 +69,13 @@ enum ConnectionError: Error, CustomStringConvertible {
         case .noToken(let detail):
             detail
         case .unreachable:
-            "Can't reach bud. Start it with bud serve, then choose Reconnect."
+            "Can't connect to Bud."
+        case .localStartupFailed:
+            "Bud couldn't start on this Mac."
+        case .notBudServer:
+            "This address didn’t return a Bud server."
+        case .keychainUnavailable:
+            "Bud couldn’t access the saved token in Keychain."
         case .http(let code, let detail):
             "bud answered \(code): \(detail)"
         }
@@ -60,7 +98,15 @@ struct BudConnection: Sendable {
             throw ConnectionError.badURL
         }
         self.base = base
-        self.token = try Self.ownerToken(home: settings.home)
+        if settings.savedRemote {
+            guard let origin = RemoteBudServer.origin(settings.url) else { throw ConnectionError.badURL }
+            self.token = try RemoteBudServer.token(for: origin)
+        } else if let service = settings.localService {
+            self.token = try Self.ownerToken(
+                home: service.home.path(), environment: ["DATA_DIR": service.home.appending(path: "data").path()])
+        } else {
+            self.token = try Self.ownerToken(home: settings.home)
+        }
         self.transport = { try await budSession.data(for: $0) }
     }
 
@@ -81,7 +127,8 @@ struct BudConnection: Sendable {
         let loopback = ["127.0.0.1", "localhost", "::1"].contains(url.host() ?? "")
         let plain = url.path().isEmpty || url.path() == "/"
         return (url.scheme == "https" || (url.scheme == "http" && loopback))
-            && plain && url.user() == nil && url.query() == nil
+            && plain && !(url.host() ?? "").isEmpty
+            && url.user() == nil && url.password() == nil && url.query() == nil && url.fragment() == nil
     }
 
     static func resolvedHomeURL(
@@ -143,7 +190,7 @@ struct BudConnection: Sendable {
         return token
     }
 
-    private static func valid(_ token: String) -> Bool {
+    static func valid(_ token: String) -> Bool {
         (43...256).contains(token.count)
             && token.unicodeScalars.allSatisfy {
                 CharacterSet.alphanumerics.contains($0) && $0.isASCII || $0 == "-" || $0 == "_"
@@ -224,12 +271,16 @@ struct BudConnection: Sendable {
         } catch {
             throw ConnectionError.unreachable
         }
+        try Self.check(response, data: data)
+        return data
+    }
+
+    private static func check(_ response: URLResponse, data: Data) throws {
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(code) else {
             let detail = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             throw ConnectionError.http(code, detail?["detail"].map { "\($0)" } ?? "request failed")
         }
-        return data
     }
 
     /// Who sent a message: routing metadata the server records, not a permission.
