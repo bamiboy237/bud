@@ -32,15 +32,37 @@ struct ChatAttachment: Codable, Identifiable, Equatable, Sendable {
 struct DraftAttachment: Identifiable, Equatable, Sendable {
     static let limit = 25 * 1024 * 1024
     static let maxCount = 5
+    private static let extensions: Set<String> = [
+        "txt", "text", "md", "markdown", "log", "json", "yaml", "yml", "csv", "tsv",
+        "pdf", "rtf", "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub",
+        "png", "jpg", "jpeg", "webp", "gif", "heic", "heif", "tiff", "tif", "bmp",
+    ]
+
+    static var contentTypes: [UTType] {
+        extensions.sorted().compactMap { UTType(filenameExtension: $0) }
+    }
+
+    enum ReadError: Error {
+        case unsupportedFile
+    }
+
     let reference: ChatAttachment
     let data: Data
     var id: String { reference.id }
 
     static func read(_ url: URL) throws -> Self {
+        guard url.isFileURL, extensions.contains(url.pathExtension.lowercased()) else {
+            throw ReadError.unsupportedFile
+        }
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-        guard values.isRegularFile == true, let size = values.fileSize, size <= limit else {
+        let values = try url.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .isAliasFileKey, .isExecutableKey, .fileSizeKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true,
+              values.isAliasFile != true, values.isExecutable != true else {
+            throw ReadError.unsupportedFile
+        }
+        guard let size = values.fileSize, size <= limit else {
             throw CocoaError(.fileReadTooLarge)
         }
         let file = try FileHandle(forReadingFrom: url)

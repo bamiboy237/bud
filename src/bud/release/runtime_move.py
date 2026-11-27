@@ -175,6 +175,61 @@ def _check_idle(data: Path) -> None:
     raise RuntimeMoveError("Open Bud on this Mac before moving its runtime.")
 
 
+def _make_routine_reports_portable(database: Path, workspace: Path) -> None:
+    with closing(sqlite3.connect(database)) as db, db:
+        rows = db.execute(
+            "SELECT occurrence_id, report_path FROM routine_occurrences "
+            "WHERE report_path IS NOT NULL"
+        ).fetchall()
+        for occurrence, value in rows:
+            path = Path(value)
+            if path.is_absolute() and path.is_relative_to(workspace):
+                db.execute(
+                    "UPDATE routine_occurrences SET report_path = ? WHERE occurrence_id = ?",
+                    (path.relative_to(workspace).as_posix(), occurrence),
+                )
+
+
+def _detach_workspace(messages: list[dict], source_ref: dict[str, str]) -> bool:
+    changed = False
+    for message in messages:
+        if message.get("kind") == "response" and message.get("workspace_ref") == source_ref:
+            del message["workspace_ref"]
+            changed = True
+    return changed
+
+
+def _make_chat_workspaces_portable(database: Path, workspace: Path) -> None:
+    # The destination resolves its configured workspace when history has no ref.
+    # Leave refs to other environments alone: their state did not move.
+    source_ref = {"provider": "local", "id": str(workspace)}
+    with closing(sqlite3.connect(database)) as db, db:
+        for run_id, data in db.execute("SELECT run_id, data FROM conversations"):
+            snapshot = json.loads(data)
+            if _detach_workspace(snapshot["messages"], source_ref):
+                db.execute(
+                    "UPDATE conversations SET data = ? WHERE run_id = ?",
+                    (json.dumps(snapshot), run_id),
+                )
+
+        # After a failed turn Bud can rebuild history from the run events.
+        for event_id, data in db.execute(
+            "SELECT id, data FROM events WHERE type IN ('run.completed', 'run.waiting')"
+        ):
+            event = json.loads(data)
+            changed = _detach_workspace(event.get("messages", []), source_ref)
+            if raw := event.get("conversation"):
+                # Older logs kept the saved conversation inside the event.
+                snapshot = json.loads(raw) if isinstance(raw, str) else raw
+                if _detach_workspace(snapshot["messages"], source_ref):
+                    event["conversation"] = (
+                        json.dumps(snapshot) if isinstance(raw, str) else snapshot
+                    )
+                    changed = True
+            if changed:
+                db.execute("UPDATE events SET data = ? WHERE id = ?", (json.dumps(event), event_id))
+
+
 def pack_runtime(settings: Settings, output: Path) -> None:
     """Write a private archive after the caller has stopped and fenced the source."""
     data = settings.data_dir.resolve()
@@ -197,7 +252,13 @@ def pack_runtime(settings: Settings, output: Path) -> None:
         _settings_file(settings, config)
         digests = {"config.env": digest(config)}
         for relative, path in files.items():
-            digests[relative.as_posix()] = _copy_file_consistent(path, stage / relative)
+            snapshot = stage / relative
+            checksum = _copy_file_consistent(path, snapshot)
+            if relative.parts[:3] == ("data", "composio", "sessions") and relative.name == "bud.db":
+                _make_routine_reports_portable(snapshot, workspace)
+                _make_chat_workspaces_portable(snapshot, workspace)
+                checksum = digest(snapshot)
+            digests[relative.as_posix()] = checksum
         manifest = stage / "manifest.json"
         manifest.write_text(json.dumps({"version": __version__, "files": digests}))
         names = ["manifest.json", *digests]

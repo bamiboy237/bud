@@ -1564,10 +1564,12 @@ def _create_app(
             raise HTTPException(404, "Unknown routine run.") from None
         if occurrence.routine_id != routine_id or not occurrence.report_path:
             raise HTTPException(404, "No report for this routine run.")
-        try:
-            relative = Path(occurrence.report_path).relative_to(workspace)
-        except ValueError:
-            raise HTTPException(404, "Report is outside Bud's workspace.") from None
+        relative = Path(occurrence.report_path)
+        if relative.is_absolute():
+            try:
+                relative = relative.relative_to(workspace)
+            except ValueError:
+                raise HTTPException(404, "Report is outside Bud's workspace.") from None
         found = read_workspace_text(workspace, relative.as_posix())
         if found is None:
             raise HTTPException(404, "The saved report is unavailable.")
