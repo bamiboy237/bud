@@ -3,6 +3,124 @@ import Testing
 @testable import BudCompanion
 
 struct BrowserInspectorTests {
+    @Test(arguments: ["about:blank", "ABOUT:blank", "", " "])
+    func blankTitlesUseTheTabHost(title: String) throws {
+        let tab = try #require(BrowserTab(["id": "docs", "title": title, "host": "docs.example"]))
+        #expect(tab.displayTitle == "docs.example")
+    }
+
+    @Test
+    func normalizesClicksAcrossThePreviewImage() {
+        let bounds = CGRect(x: 20, y: 10, width: 320, height: 160)
+        #expect(normalizedBrowserPoint(CGPoint(x: 20, y: 10), in: bounds) == .zero)
+        #expect(normalizedBrowserPoint(CGPoint(x: 100, y: 130), in: bounds) == CGPoint(x: 0.25, y: 0.75))
+        #expect(normalizedBrowserPoint(CGPoint(x: 370, y: 190), in: bounds) == CGPoint(x: 1, y: 1))
+        #expect(normalizedBrowserPoint(.zero, in: .zero) == nil)
+    }
+
+    @Test @MainActor
+    func interactiveTakeoverKeepsTheSelectedPreviewAndRefreshesOnlyThatTab() async throws {
+        let state = BrowserInspectorState()
+        state.applyStatus(["tabs": tabs("docs", "mail"), "active_tab": "mail"])
+        state.select("docs")
+        state.visibleTabIDs = ["docs", "mail"]
+        let image = NSImage(size: NSSize(width: 16, height: 10), flipped: false) { bounds in
+            NSColor.white.setFill()
+            NSBezierPath(rect: bounds).fill()
+            return true
+        }
+        state.recordPreview(image, for: "docs")
+        state.recordPreview(image, for: "mail")
+        let imageData = try #require(image.tiffRepresentation)
+        let docTab = try #require(state.groups.first?.tabs.first)
+        let connection = BudConnection(base: URL(string: "https://bud.example")!, token: "") { request in
+            let url = try #require(request.url)
+            let response: Data
+            switch (request.httpMethod, url.path) {
+            case ("POST", "/browser/view/takeover"):
+                let body = try #require(request.httpBody)
+                let json = try JSONSerialization.jsonObject(with: body) as? [String: String]
+                #expect(json == ["tab": "docs"])
+                response = Data(#"{"private":true,"interactive":true,"tab":"docs","handoff_open":false}"#.utf8)
+            case ("POST", "/browser/view/control/click"):
+                let body = try #require(request.httpBody)
+                let json = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+                #expect(json?["tab"] as? String == "docs")
+                #expect(json?["nx"] as? Double == 0.25)
+                #expect(json?["ny"] as? Double == 0.75)
+                response = Data("{}".utf8)
+            case ("GET", "/browser/view"):
+                response = Data(#"{"private":true,"interactive":true,"takeover_tab":"docs","tabs":[]}"#.utf8)
+            case ("GET", "/browser/view/docs/image"):
+                response = imageData
+            default:
+                Issue.record("Unexpected browser request \(request)")
+                return (Data(), Self.response(url, code: 404))
+            }
+            return (response, Self.response(url, code: 200))
+        }
+
+        await state.takeOver(docTab, using: connection)
+
+        #expect(state.control == .interactive(tabID: "docs", title: "docs"))
+        #expect(state.previews["docs"]?.image === image)
+        #expect(state.previews["mail"] == nil)
+        let refreshID = state.refreshID
+        let sent = await state.sendControl("click", tabID: "docs",
+                                           body: ["nx": 0.25, "ny": 0.75], using: connection)
+        #expect(sent)
+        #expect(state.refreshID == refreshID + 1)
+        await state.refresh(using: connection, id: state.refreshID)
+        #expect(state.previews["docs"]?.image !== image)
+        #expect(state.previews["docs"] != nil)
+    }
+
+    @Test(arguments: [true, false]) @MainActor
+    func giveBackControlKeepsControlOnFailureAndReturnsToTheDeckOnSuccess(interactive: Bool) async throws {
+        let state = BrowserInspectorState()
+        if interactive {
+            state.applyStatus(["private": true, "interactive": true, "takeover_tab": "docs"])
+            #expect(state.interactiveTabID == "docs")
+        } else {
+            state.applyStatus(["private": true, "handoff_open": true])
+        }
+        let control = try #require(state.control)
+        let base = URL(string: "https://bud.example")!
+        let rejected = BudConnection(base: base, token: "") { request in
+            let url = try #require(request.url)
+            #expect(request.httpMethod == "POST")
+            #expect(url.path == "/browser/view/resume")
+            return (Data(#"{"detail":"Try again."}"#.utf8), Self.response(url, code: 409))
+        }
+        let status = try JSONSerialization.data(withJSONObject: [
+            "enabled": true, "connected": true, "tabs": tabs("docs", "mail"),
+        ])
+        let accepted = BudConnection(base: base, token: "") { request in
+            let url = try #require(request.url)
+            switch (request.httpMethod, url.path) {
+            case ("POST", "/browser/view/resume"):
+                return (Data(#"{"private":false}"#.utf8), Self.response(url, code: 200))
+            case ("GET", "/browser/view"):
+                return (status, Self.response(url, code: 200))
+            default:
+                #expect(url.path == "/browser/view/docs/image")
+                return (Data(), Self.response(url, code: 200))
+            }
+        }
+
+        await state.resume(using: rejected)
+        #expect(state.control == control)
+        #expect(state.problem == "Try again.")
+        #expect(!state.sending)
+
+        let refreshID = state.refreshID
+        await state.resume(using: accepted)
+        #expect(state.control == nil)
+        #expect(state.refreshID == refreshID + 1)
+        await state.refresh(using: accepted, id: state.refreshID)
+        #expect(state.groups.flatMap(\.tabs).map(\.id) == ["docs", "mail"])
+    }
+
     @Test
     func groupsTabsByBrowserEvenWhenNamesMatch() {
         let tabs = [

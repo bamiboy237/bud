@@ -4,16 +4,27 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    TextPart,
     ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.models.function import FunctionModel
 
-from bud.harness.review import ReviewRequest, SessionGrants, ToolReviewer, Verdict, owner_answers
+from bud.config import Settings
+from bud.harness.review import (
+    ReviewRequest,
+    SessionGrants,
+    ToolReviewer,
+    Verdict,
+    build_reviewer,
+    owner_answers,
+)
 
 
 def test_rejected_question_calls_are_not_revalidated_as_owner_answers():
@@ -93,6 +104,79 @@ async def test_explicit_safe_authorized_response_allows(review_service, request_
     assert result.verdict is Verdict.ALLOW
     assert result.allowed is True
     assert len(requests) == 1
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_rejected_decisions_key_is_skipped_until_it_changes(
+    review_service, request_to_review, status
+):
+    reviewer, state, requests = review_service
+    state["status"] = status
+
+    def respond(messages, info):
+        prompt = messages[0].parts[-1]
+        assert isinstance(prompt, UserPromptPart)
+        assert "OWNER REQUEST (trusted)" in str(prompt.content)
+        return ModelResponse(
+            parts=[
+                TextPart(
+                    '{"risk":"low","authorization":"high","concern":"none","sensitive":"sends"}'
+                )
+            ]
+        )
+
+    reviewer.model_provider = lambda: FunctionModel(respond, model_name="active-model")
+    for _ in range(2):
+        result = await reviewer.review(request_to_review)
+        assert result.verdict is Verdict.PROMPT
+        assert result.sensitive == "sends"
+        assert result.model == "active-model"
+    assert len(requests) == 1
+
+    reviewer.api_key = "replacement-key"
+    state["status"] = 200
+    assert (await reviewer.review(request_to_review)).verdict is Verdict.ALLOW
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize(
+    ("answer", "verdict"),
+    [
+        (
+            '{"risk":"low","authorization":"high","concern":"none","sensitive":"none"}',
+            Verdict.ALLOW,
+        ),
+        ('{"risk":"low","authorization":"high","concern":"none"}', Verdict.ERROR),
+        (
+            '{"risk":"safe","authorization":"high","concern":"none","sensitive":"none"}',
+            Verdict.ERROR,
+        ),
+        (
+            '{"risk":"low","authorization":"high","concern":"none","sensitive":"none",'
+            '"allow":true}',
+            Verdict.ERROR,
+        ),
+        ("not JSON", Verdict.ERROR),
+        (None, Verdict.ERROR),
+    ],
+)
+async def test_reviewer_without_key_requires_valid_gateway_answer(
+    request_to_review, answer, verdict
+):
+    def respond(*_):
+        if answer is None:
+            raise ModelHTTPError(401, "active-model")
+        return ModelResponse(parts=[TextPart(answer)])
+
+    reviewer = build_reviewer(
+        Settings(approval_review=True), model_provider=lambda: FunctionModel(respond)
+    )
+    assert reviewer is not None
+    try:
+        result = await reviewer.review(request_to_review)
+        assert result.verdict is verdict
+    finally:
+        await reviewer.close()
 
 
 @pytest.mark.parametrize(

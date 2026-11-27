@@ -5,6 +5,7 @@ import json
 import os
 import re
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -12,7 +13,7 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.types import Receive, Scope, Send
 
 from bud import browser
@@ -24,20 +25,55 @@ NO_STORE = {"Cache-Control": "no-store"}
 MAX_PREVIEW_BYTES = 8 * 1024 * 1024
 
 
-class TakeoverRequest(BaseModel):
+class TabRequest(BaseModel):
     tab: str = Field(pattern=TAB_ID)
 
 
+class TakeoverRequest(TabRequest):
+    interactive: bool = True
+
+
+class ClickRequest(TabRequest):
+    nx: float = Field(ge=0, le=1)
+    ny: float = Field(ge=0, le=1)
+
+
+class ScrollRequest(TabRequest):
+    dx: float = Field(allow_inf_nan=False)
+    dy: float = Field(allow_inf_nan=False)
+
+
+class TypeRequest(TabRequest):
+    text: str
+
+
+class KeyRequest(TabRequest):
+    key: str
+
+
+class NavigateRequest(TabRequest):
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def require_http(cls, url: str) -> str:
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError("Enter an HTTP or HTTPS URL.")
+        return url
+
+
 class PreviewResponse(Response):
-    def __init__(self, data: bytes, view: "BrowserView", generation: int):
+    def __init__(self, data: bytes, view: "BrowserView", generation: int, tab: str):
         super().__init__(data, media_type="image/jpeg", headers=NO_STORE)
         self.view = view
         self.generation = generation
+        self.tab = tab
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         async with self.view.preview_send:
             try:
-                self.view.check_preview(self.generation)
+                self.view.check_preview(self.generation, self.tab)
             except HTTPException as exc:
                 paused = JSONResponse(
                     {"detail": exc.detail}, status_code=exc.status_code, headers=NO_STORE
@@ -66,6 +102,7 @@ class BrowserView:
         if not marker.exists():
             self.ready.set()
         self.handoff: asyncio.Task[dict[str, str]] | None = None
+        self.takeover_tab: str | None = None
         self.active_tab: str | None = None
         self.preview_send = asyncio.Lock()
         self.preview_generation = 0
@@ -98,6 +135,8 @@ class BrowserView:
             self.marker.unlink(missing_ok=True)
         except OSError:
             raise HTTPException(503, "Bud could not clear the private browser pause.") from None
+        self.takeover_tab = None
+        self.preview_generation += 1
         self.ready.set()
 
     async def _command(self, path: Path, *args: str, timeout: float) -> bytes:
@@ -118,7 +157,13 @@ class BrowserView:
         return await self._command(path, action, "--json", payload, *args, timeout=timeout)
 
     async def _inventory(self, path: Path) -> dict[str, Any]:
-        offline = {"connected": False, "browsers": [], "tabs": [], "_tab_ids": {}}
+        offline = {
+            "connected": False,
+            "browsers": [],
+            "tabs": [],
+            "active_tab": None,
+            "_tab_ids": {},
+        }
         try:
             status = json.loads(await self._command(path, "status", "--json", timeout=5))
             match status:
@@ -154,6 +199,7 @@ class BrowserView:
         tabs = []
         tab_ids = {}
         active = None
+        selected = self.takeover_tab or self.active_tab
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -170,7 +216,7 @@ class BrowserView:
                 tab_ids[alias] = target
             if target is None:
                 continue
-            if self.active_tab is not None and self.active_tab in (tab_id, alias):
+            if selected is not None and selected in (tab_id, alias):
                 active = tab_id
             url = item.get("url")
             try:
@@ -179,10 +225,14 @@ class BrowserView:
                 host = None
             source_id = item.get("browser")
             title = item.get("title")
+            if not isinstance(title, str) or not title.strip():
+                title = host or "Browser tab"
+            elif title == "about:blank" and host:
+                title = host
             tabs.append(
                 {
                     "id": tab_id,
-                    "title": title[:160] if isinstance(title, str) and title else "Browser tab",
+                    "title": title[:160],
                     "host": host or "",
                     "browser": source_id if isinstance(source_id, str) else None,
                 }
@@ -233,7 +283,8 @@ class BrowserView:
     async def _handoff(self, path: Path, tab: str, message: str) -> dict[str, str]:
         try:
             # Drain commands started before the pause before opening Chrome for private input.
-            await asyncio.gather(*self.previews, return_exceptions=True)
+            if self.previews:
+                await asyncio.wait(self.previews)
             raw = await self._tab_command(
                 path, "handoff", tab, timeout=610, message=message, timeoutSeconds=600
             )
@@ -244,6 +295,10 @@ class BrowserView:
                 return {"outcome": outcome}
         except (HTTPException, OSError, RuntimeError, KeyError, ValueError, TypeError):
             pass
+        except asyncio.CancelledError:
+            if self.handoff is not None:
+                raise
+            return {"outcome": "cancelled"}
         finally:
             self.handoff = None
         return {"outcome": "unavailable"}
@@ -254,15 +309,19 @@ class BrowserView:
             raise HTTPException(409, "Connect and enable Browse from chat first.")
         return path
 
-    def check_preview(self, generation: int) -> None:
-        if self.private or generation != self.preview_generation:
+    def check_preview(self, generation: int, tab: str) -> None:
+        if (
+            generation != self.preview_generation
+            or self.handoff_open
+            or (self.private and self.takeover_tab != tab)
+        ):
             raise HTTPException(423, PREVIEW_PAUSED)
         if not self.consent.on():
             raise HTTPException(409, "Connect and enable Browse from chat first.")
 
     async def _capture(self, path: Path, tab: str, generation: int) -> bytes:
         target = await self._available_tab(path, tab)
-        self.check_preview(generation)
+        self.check_preview(generation, tab)
         try:
             self.relay.home.mkdir(parents=True, exist_ok=True, mode=0o700)
             with TemporaryDirectory(dir=self.relay.home) as folder:
@@ -279,7 +338,7 @@ class BrowserView:
                     )
                 except RuntimeError:
                     # A tab can close between lookup and capture.
-                    self.check_preview(generation)
+                    self.check_preview(generation, tab)
                     await self._available_tab(path, target)
                     raise
                 with output.open("rb") as stream:
@@ -292,16 +351,28 @@ class BrowserView:
             ):
                 raise ValueError("Invalid preview.")
         except (OSError, RuntimeError, ValueError):
-            self.check_preview(generation)
+            self.check_preview(generation, tab)
             raise HTTPException(502, PREVIEW_UNAVAILABLE) from None
-        self.check_preview(generation)
+        self.check_preview(generation, tab)
         return data
 
+    @asynccontextmanager
+    async def _control(self, tab: str):
+        async with self.lock:
+            if self.takeover_tab != tab:
+                raise HTTPException(423, "Take over this tab before using browser controls.")
+            path = self._enabled_path()
+            try:
+                yield path
+            except (OSError, RuntimeError, ValueError, TimeoutError):
+                raise HTTPException(502, "Browse could not perform that action.") from None
+
     async def stop(self) -> None:
-        if self.handoff is not None and not self.handoff.done():
-            self.handoff.cancel()
-            await asyncio.gather(self.handoff, return_exceptions=True)
+        handoff = self.handoff
         self.handoff = None
+        if handoff is not None and not handoff.done():
+            handoff.cancel()
+            await asyncio.gather(handoff, return_exceptions=True)
 
     def routes(self) -> APIRouter:
         router = APIRouter()
@@ -309,27 +380,43 @@ class BrowserView:
         @router.get("/browser/view")
         async def view(response: Response):
             response.headers.update(NO_STORE)
-            if self.private:
-                return {"private": True, "handoff_open": self.handoff_open, "tabs": []}
             async with self.lock:
-                if self.private:
+                tab = self.takeover_tab
+                if self.private and tab is None:
                     return {"private": True, "handoff_open": self.handoff_open, "tabs": []}
                 path = self.locate()
-                if not self.consent.on() or path is None:
+                enabled = self.consent.on() and path is not None
+                if not enabled and tab is None:
                     return {"private": False, "enabled": False, "tabs": []}
-                status = await self._inventory(path)
-                status.pop("_tab_ids")
-                return {"private": False, "enabled": True, **status}
+                status = {"connected": False, "tabs": [], "browsers": [], "active_tab": None}
+                if enabled and path is not None:
+                    try:
+                        status = await self._inventory(path)
+                    except HTTPException:
+                        if tab is None:
+                            raise
+                    else:
+                        status.pop("_tab_ids")
+                if tab is not None:
+                    return {
+                        "private": True,
+                        "interactive": True,
+                        "takeover_tab": tab,
+                        "handoff_open": False,
+                        "enabled": enabled,
+                        **status,
+                    }
+                return {"private": False, "enabled": enabled, **status}
 
         @router.get("/browser/view/{tab}/image")
         async def image(tab: str):
             if not re.fullmatch(TAB_ID, tab):
                 raise HTTPException(404, "Unknown tab.")
             generation = self.preview_generation
-            self.check_preview(generation)
+            self.check_preview(generation, tab)
             try:
                 async with asyncio.timeout(20), self.preview_slots:
-                    self.check_preview(generation)
+                    self.check_preview(generation, tab)
                     path = self._enabled_path()
                     capture = asyncio.create_task(self._capture(path, tab, generation))
                     self.previews.add(capture)
@@ -338,9 +425,9 @@ class BrowserView:
                     finally:
                         self.previews.discard(capture)
             except TimeoutError:
-                self.check_preview(generation)
+                self.check_preview(generation, tab)
                 raise HTTPException(502, PREVIEW_UNAVAILABLE) from None
-            return PreviewResponse(data, self, generation)
+            return PreviewResponse(data, self, generation, tab)
 
         @router.post("/browser/view/takeover", status_code=202)
         async def takeover(body: TakeoverRequest):
@@ -351,19 +438,81 @@ class BrowserView:
                     raise HTTPException(409, "A private browser session is already active.")
                 path = self._enabled_path()
                 tab = await self._available_tab(path, body.tab)
+                if body.interactive:
+                    await self.enter()
+                    self.takeover_tab = tab
+                    return {"private": True, "interactive": True, "tab": tab, "handoff_open": False}
                 await self.start_handoff(path, tab)
             return {"private": True}
 
+        @router.post("/browser/view/control/click")
+        async def click(body: ClickRequest):
+            async with self._control(body.tab) as path:
+                raw = await self._tab_command(
+                    path, "eval", body.tab, timeout=10, expression="[innerWidth, innerHeight]"
+                )
+                match json.loads(raw):
+                    case [int(width), int(height)] if width > 0 and height > 0:
+                        x = min(int(body.nx * width), width - 1)
+                        y = min(int(body.ny * height), height - 1)
+                    case _:
+                        raise ValueError("Invalid browser viewport.")
+                await self._command(
+                    path,
+                    "click",
+                    "--tab",
+                    body.tab,
+                    "--x",
+                    str(x),
+                    "--y",
+                    str(y),
+                    "--force",
+                    timeout=15,
+                )
+            return {"ok": True}
+
+        @router.post("/browser/view/control/scroll")
+        async def scroll(body: ScrollRequest):
+            async with self._control(body.tab) as path:
+                await self._command(
+                    path,
+                    "scroll",
+                    "--tab",
+                    body.tab,
+                    "--deltaX",
+                    str(body.dx),
+                    "--deltaY",
+                    str(body.dy),
+                    timeout=10,
+                )
+            return {"ok": True}
+
+        @router.post("/browser/view/control/type")
+        async def type_text(body: TypeRequest):
+            async with self._control(body.tab) as path:
+                await self._tab_command(path, "type", body.tab, timeout=15, text=body.text)
+            return {"ok": True}
+
+        @router.post("/browser/view/control/key")
+        async def key(body: KeyRequest):
+            async with self._control(body.tab) as path:
+                await self._tab_command(path, "press", body.tab, timeout=15, key=body.key)
+            return {"ok": True}
+
+        @router.post("/browser/view/control/navigate")
+        async def navigate(body: NavigateRequest):
+            async with self._control(body.tab) as path:
+                await self._tab_command(path, "navigate", body.tab, timeout=35, url=body.url)
+            return {"ok": True}
+
         @router.post("/browser/view/resume")
         async def resume():
-            if not self.private:
-                return {"private": False}
-            if self.handoff_open:
-                raise HTTPException(409, "Use Continue in the Chrome tab to finish handback.")
             async with self.lock:
                 if self.handoff_open:
-                    raise HTTPException(409, "Use Continue in the Chrome tab to finish handback.")
-                self.resume()
+                    await self.stop()
+                if self.private:
+                    async with self.preview_send:
+                        self.resume()
             return {"private": False}
 
         return router

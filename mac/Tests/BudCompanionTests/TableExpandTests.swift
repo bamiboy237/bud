@@ -1,19 +1,31 @@
-import AppKit
+import CoreGraphics
+import Markdown
 import Testing
 @testable import BudCompanion
 
 struct TableExpandTests {
     @Test @MainActor
-    func widestRowDeterminesWhetherExpansionIsAvailable() {
-        let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-        let header = "Year   |   Result"
-        let row = "2026   |   A result too wide for the header's viewport"
-        let available = MarkdownTableLayout.textWidth(header, font: font)
-        let contentWidth = MarkdownTableLayout.textWidth("\(header)\n\(row)", font: font)
+    func tableIsASeparateNativeBlockBetweenProseRuns() throws {
+        let markdown = """
+            Before the table.
 
-        #expect(!MarkdownTableLayout.overflows(available, available: available))
-        #expect(MarkdownTableLayout.overflows(contentWidth, available: available))
-        #expect(!MarkdownTableLayout.overflows(contentWidth, available: contentWidth + 20))
+            | Year | Result |
+            | --- | --- |
+            | 2026 | A result wider than the header |
+
+            After the table.
+            """
+        let segments = MarkdownView(markdown, rich: true).segments
+        try #require(segments.count == 3)
+        #expect(segments[0].nativeBlock == nil)
+        #expect(segments[1].nativeBlock is Markdown.Table)
+        #expect(segments[2].nativeBlock == nil)
+    }
+
+    @Test
+    func edgeFadeAllowsOnePointOfRounding() {
+        #expect(!MarkdownTableLayout.overflows(201, available: 200))
+        #expect(MarkdownTableLayout.overflows(202, available: 200))
     }
 
     @Test

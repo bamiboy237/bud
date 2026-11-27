@@ -142,6 +142,9 @@ async def test_private_input_blocks_preview_agent_reads_and_survives_restart(tmp
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         assert (await client.get("/browser/view")).status_code == 401
+        assert (
+            await client.post("/browser/view/control/key", json={"tab": "7", "key": "Enter"})
+        ).status_code == 401
         client.headers["Authorization"] = f"Bearer {token}"
         status = (await client.get("/browser/view")).json()
         assert status["connected"] is True
@@ -160,7 +163,9 @@ async def test_private_input_blocks_preview_agent_reads_and_survives_restart(tmp
         assert result.status_code == 200 and result.headers["cache-control"] == "no-store"
         await use("browser_tabs", {"action": "list"}, {"tabs": [{"tab": 6}]})
         assert (await client.get("/browser/view")).json()["active_tab"] == "7"
-        assert (await client.post("/browser/view/takeover", json={"tab": "7"})).status_code == 202
+        assert (
+            await client.post("/browser/view/takeover", json={"tab": "7", "interactive": False})
+        ).status_code == 202
         await asyncio.wait_for(entered.wait(), timeout=1)
 
         assert (await client.get("/browser/view")).json() == {
@@ -169,7 +174,6 @@ async def test_private_input_blocks_preview_agent_reads_and_survives_restart(tmp
             "tabs": [],
         }
         assert (await client.get("/browser/view/6/image")).status_code == 423
-        assert (await client.post("/browser/view/resume")).status_code == 409
         assert BrowserView(marker, consent, relay, lambda: browse).private
 
         calls_before = counts["tabs"]
@@ -293,12 +297,14 @@ async def test_takeover_discards_in_flight_preview_and_closed_handoff_can_resume
         try:
             await asyncio.wait_for(capturing.wait(), timeout=1)
             takeover = await asyncio.wait_for(
-                client.post("/browser/view/takeover", json={"tab": "fixture"}), timeout=1
+                client.post(
+                    "/browser/view/takeover", json={"tab": "fixture", "interactive": False}
+                ),
+                timeout=1,
             )
             assert takeover.status_code == 202 and view.private
             assert not handoff.is_set()
             assert (await client.get("/browser/view/7/image")).status_code == 423
-            assert (await client.post("/browser/view/resume")).status_code == 409
             release.set()
             response = await image
             assert response.status_code == 423 and JPEG not in response.content
@@ -315,6 +321,108 @@ async def test_takeover_discards_in_flight_preview_and_closed_handoff_can_resume
             release.set()
             closed.set()
             await asyncio.gather(image, return_exceptions=True)
+            await view.stop()
+
+
+async def test_interactive_takeover_controls_one_tab_and_unblocks_agent(preview_app, monkeypatch):
+    _, client, view, status, install = preview_app
+    status["tabs"][0].update(title="about:blank", url="https://www.youtube.com/?private=data")
+    status["tabs"][1].update(title="", url="https://example.test/")
+    calls = []
+
+    async def command(_, action, *args, timeout):
+        if action == "screenshot":
+            assert json.loads(args[1])["tab"] == 6
+            Path(args[-1]).write_bytes(JPEG)
+        elif args[0] == "--json":
+            calls.append((action, json.loads(args[1])))
+        else:
+            calls.append((action, *args))
+        return b"[800, 600]" if action == "eval" else b"{}"
+
+    install(command)
+    tools = browser.BrowseTools(Path("browse"), view.consent, view.relay, view)
+    agent_read = AsyncMock(return_value="agent can read")
+    monkeypatch.setattr(tools, "_call", agent_read)
+
+    async with client:
+        result = await client.post("/browser/view/takeover", json={"tab": "fixture"})
+        assert result.status_code == 202
+        assert result.json() == {
+            "private": True,
+            "interactive": True,
+            "tab": "6",
+            "handoff_open": False,
+        }
+        assert view.marker.exists() and not view.ready.is_set()
+        inventory = (await client.get("/browser/view")).json()
+        assert inventory["private"] and inventory["interactive"] and inventory["connected"]
+        assert not inventory["handoff_open"]
+        assert inventory["takeover_tab"] == inventory["active_tab"] == "6"
+        assert [tab["title"] for tab in inventory["tabs"]] == ["www.youtube.com", "example.test"]
+        assert (await client.get("/browser/view/6/image")).content == JPEG
+        assert (await client.get("/browser/view/7/image")).status_code == 423
+
+        async def control(action, tab="6", **args):
+            return await client.post(f"/browser/view/control/{action}", json={"tab": tab, **args})
+
+        assert (await control("click", nx=1.1, ny=0.5)).status_code == 422
+        assert (await control("navigate", url="file:///tmp/private")).status_code == 422
+        assert (await control("key", tab="7", key="Enter")).status_code == 423
+        read = asyncio.create_task(
+            tools.call_tool("browser_snapshot", {"tab": "6"}, Mock(), Mock())
+        )
+        try:
+            for action, args in [
+                ("click", {"nx": 0.25, "ny": 1}),
+                ("scroll", {"dx": -5, "dy": 25.5}),
+                ("type", {"text": 'hello "there"'}),
+                ("key", {"key": "Enter"}),
+                ("navigate", {"url": "https://example.test/"}),
+            ]:
+                assert (await control(action, **args)).json() == {"ok": True}
+            assert not read.done()
+            agent_read.assert_not_awaited()
+            assert calls == [
+                ("eval", {"tab": 6, "expression": "[innerWidth, innerHeight]"}),
+                ("click", "--tab", "6", "--x", "200", "--y", "599", "--force"),
+                ("scroll", "--tab", "6", "--deltaX", "-5.0", "--deltaY", "25.5"),
+                ("type", {"tab": 6, "text": 'hello "there"'}),
+                ("press", {"tab": 6, "key": "Enter"}),
+                ("navigate", {"tab": 6, "url": "https://example.test/"}),
+            ]
+            status.pop("extension")
+            disconnected = (await client.get("/browser/view")).json()
+            assert disconnected["takeover_tab"] == "6" and not disconnected["connected"]
+            assert (await client.post("/browser/view/resume")).json() == {"private": False}
+            assert await asyncio.wait_for(read, timeout=1) == "agent can read"
+            assert view.takeover_tab is None and not view.marker.exists()
+            assert (await control("type", text="too late")).status_code == 423
+        finally:
+            read.cancel()
+            await asyncio.gather(read, return_exceptions=True)
+
+
+async def test_resume_cancels_open_chrome_handoff(preview_app):
+    _, client, view, _, install = preview_app
+    opened = asyncio.Event()
+
+    async def command(_, action, *args, timeout):
+        assert action == "handoff"
+        opened.set()
+        await asyncio.Event().wait()
+
+    install(command)
+    async with client:
+        await client.post("/browser/view/takeover", json={"tab": "6", "interactive": False})
+        try:
+            await asyncio.wait_for(opened.wait(), timeout=1)
+            task = view.handoff
+            assert task is not None
+            assert (await client.post("/browser/view/resume")).json() == {"private": False}
+            assert await asyncio.wait_for(task, timeout=1) == {"outcome": "cancelled"}
+            assert not view.handoff_open and view.ready.is_set() and not view.marker.exists()
+        finally:
             await view.stop()
 
 

@@ -2,13 +2,21 @@ import AppKit
 import Markdown
 import SwiftUI
 
-/// A reply drawn from its markdown tree: one view per block, so paragraphs get space between
-/// them and list items hang off their markers. Inline styling (bold, code, links) becomes an
-/// attributed string inside each block, so text wraps and links stay clickable.
-///
-/// Changed text is parsed afresh, so an unfinished construct settles as soon as it closes.
-/// Unchanged replies reuse their parse when the conversation is rebuilt.
+/// A reply with selectable runs of prose and native views for rich blocks.
 struct MarkdownView: View {
+    struct Segment: Identifiable {
+        let id: Int
+        let nativeBlock: (any Markup)?
+        let range: NSRange
+        fileprivate let document: SelectableMarkdown
+
+        func localRange(for match: NSRange) -> NSRange? {
+            let overlap = NSIntersectionRange(range, match)
+            guard overlap.length > 0 else { return nil }
+            return NSRange(location: overlap.location - range.location, length: overlap.length)
+        }
+    }
+
     private let parsed: ParsedMarkdown.Entry
     let rich: Bool
     var selection: ReplyTextSelection?
@@ -17,7 +25,6 @@ struct MarkdownView: View {
     var onQuote: ((String) -> Void)?
     @Environment(\.replyType) private var type
     @Bindable private var appearance = AppearanceStore.shared
-    @StateObject private var tableReader = TableReaderSelection()
 
     init(
         _ text: String, rich: Bool = false, selection: ReplyTextSelection? = nil,
@@ -32,55 +39,98 @@ struct MarkdownView: View {
     }
 
     static func selectableText(_ text: String) -> String {
-        ParsedMarkdown.parse(text).selectable.string
+        ParsedMarkdown.parse(text).richLayout.text
     }
 
-    @ViewBuilder
+    private var layout: SelectableLayout { rich ? parsed.richLayout : parsed.plainLayout }
+    var segments: [Segment] { layout.segments }
+
     var body: some View {
+        content
+            .environment(\.markdownEquations, parsed.equations)
+            .tint(Paper.accent)
+    }
+
+    @ViewBuilder private var content: some View {
         if let selection, let onQuote {
-            let document = parsed.selectable
-            let expandsTables = rich && document.hasTables
+            let matches = ChatFindMatch.ranges(in: layout.text, query: query)
             VStack(alignment: .leading, spacing: type.blockSpacing) {
-                SelectableReplyView(
-                    document: document, type: type, appearanceRevision: appearance.revision,
-                    query: query, activeRange: activeRange, selection: selection, quote: onQuote,
-                    expandTable: expandsTables ? { tableReader.table = document.table(at: $0) } : nil
-                )
-                // Place the expand controls in the conversation's existing trailing margin.
-                .padding(.trailing, expandsTables ? -TableExpandButton.size : 0)
-                if rich {
-                    ForEach(Array(parsed.blocks.enumerated()), id: \.offset) { _, block in
-                        if let paragraph = block as? Paragraph, paragraph.childCount == 1 {
-                            if let link = paragraph.child(at: 0) as? Markdown.Link,
-                               let url = SafePreviewURL(link.destination) {
-                                WebLinkCard(url: url.value, title: String(inline(link).characters))
-                            } else if let image = paragraph.child(at: 0) as? Markdown.Image,
-                                      let url = SafePreviewURL(image.source) {
-                                WebImageCard(url: url.value, title: String(inline(image).characters))
+                ForEach(segments) { segment in
+                    let localMatches = matches.compactMap { segment.localRange(for: $0) }
+                    let activeMatch = activeRange.flatMap { segment.localRange(for: $0) }
+                    if let block = segment.nativeBlock {
+                        Block(markup: block, first: segment.id == 0, rich: rich)
+                            .overlay {
+                                if !localMatches.isEmpty {
+                                    RoundedRectangle(cornerRadius: Paper.radiusSM)
+                                        .strokeBorder(Paper.accent.opacity(activeMatch == nil ? 0.24 : 0.8))
+                                        .allowsHitTesting(false)
+                                }
                             }
-                        }
+                    } else {
+                        SelectableReplyView(
+                            document: segment.document, type: type, appearanceRevision: appearance.revision,
+                            matches: localMatches, activeRange: activeMatch, selection: selection, quote: onQuote)
                     }
-                }
-            }
-            .sheet(isPresented: Binding(
-                get: { tableReader.table != nil },
-                set: { if !$0 { tableReader.table = nil } }
-            )) {
-                if let table = tableReader.table {
-                    TableReader(table: table)
-                        .environment(\.markdownEquations, parsed.equations)
                 }
             }
         } else {
             Blocks(blocks: parsed.blocks, spacing: type.blockSpacing, rich: rich)
-                .environment(\.markdownEquations, parsed.equations)
-                .tint(Paper.accent)
         }
     }
 }
 
-private final class TableReaderSelection: ObservableObject {
-    @Published var table: Markdown.Table?
+@MainActor
+private struct SelectableLayout {
+    let segments: [MarkdownView.Segment]
+    let text: String
+
+    init(blocks: [any Markup], equations: [Character: MarkdownEquation], rich: Bool) {
+        var segments: [MarkdownView.Segment] = []
+        var text = ""
+        var offset = 0
+
+        func append(_ blocks: ArraySlice<any Markup>, nativeBlock: (any Markup)? = nil) {
+            let document = SelectableMarkdown(blocks: Array(blocks), equations: equations)
+            guard !document.isEmpty else { return }
+            if !segments.isEmpty {
+                text += "\n\n"
+                offset += 2
+            }
+            let length = document.string.utf16.count
+            segments.append(.init(id: blocks.startIndex, nativeBlock: nativeBlock,
+                                  range: NSRange(location: offset, length: length), document: document))
+            text += document.string
+            offset += length
+        }
+
+        var proseStart = blocks.startIndex
+        for (index, block) in blocks.enumerated() {
+            guard Self.isNative(block, equations: equations, rich: rich) else { continue }
+            if proseStart < index { append(blocks[proseStart..<index]) }
+            append(blocks[index...index], nativeBlock: block)
+            proseStart = index + 1
+        }
+        if proseStart < blocks.endIndex { append(blocks[proseStart...]) }
+        self.segments = segments
+        self.text = text
+    }
+
+    private static func isNative(_ block: any Markup, equations: [Character: MarkdownEquation], rich: Bool) -> Bool {
+        switch block {
+        case is CodeBlock, is Markdown.Table:
+            return true
+        case let paragraph as Paragraph:
+            if rich, StandaloneWebCard(paragraph) != nil { return true }
+            guard !equations.isEmpty else { return false }
+            return MarkdownMath.paragraphParts(inline(paragraph), equations: equations).contains {
+                if case .equation = $0 { return true }
+                return false
+            }
+        default:
+            return false
+        }
+    }
 }
 
 @MainActor
@@ -89,7 +139,8 @@ private enum ParsedMarkdown {
     final class Entry {
         let blocks: [any Markup]
         let equations: [Character: MarkdownEquation]
-        lazy var selectable = SelectableMarkdown(blocks: blocks, equations: equations)
+        lazy var richLayout = SelectableLayout(blocks: blocks, equations: equations, rich: true)
+        lazy var plainLayout = SelectableLayout(blocks: blocks, equations: equations, rich: false)
 
         init(_ text: String) {
             let document = Document(parsing: text)
@@ -120,9 +171,9 @@ private enum ParsedMarkdown {
 }
 
 @MainActor
-private final class SelectableMarkdown {
+fileprivate final class SelectableMarkdown {
     private enum Style {
-        case prose, heading(Int), code(String?), table(Markdown.Table)
+        case prose, heading(Int), code(String?), table
     }
 
     private struct BlockText {
@@ -135,7 +186,7 @@ private final class SelectableMarkdown {
     private let blocks: [BlockText]
     private let equations: [Character: MarkdownEquation]
     let string: String
-    let hasTables: Bool
+    var isEmpty: Bool { blocks.isEmpty }
 
     init(blocks: [any Markup], equations: [Character: MarkdownEquation]) {
         self.equations = equations
@@ -143,15 +194,6 @@ private final class SelectableMarkdown {
         string = self.blocks.enumerated().map { index, block in
             (index == 0 ? "" : block.separator) + String(block.text.characters)
         }.joined()
-        hasTables = self.blocks.contains {
-            if case .table = $0.style { return true }
-            return false
-        }
-    }
-
-    func table(at index: Int) -> Markdown.Table? {
-        if case .table(let table) = blocks[index].style { return table }
-        return nil
     }
 
     private static func flatten(
@@ -176,7 +218,7 @@ private final class SelectableMarkdown {
                 let text = rows.map { row in
                     row.map { String(inlineText($0, equations: equations).characters) }.joined(separator: "   |   ")
                 }.joined(separator: "\n")
-                return [.init(text: AttributedString(text), style: .table(table), indent: indent, separator: separator)]
+                return [.init(text: AttributedString(text), style: .table, indent: indent, separator: separator)]
             case is ThematicBreak:
                 return [.init(text: AttributedString("────────"), style: .prose, indent: indent, separator: separator)]
             case is Paragraph:
@@ -228,7 +270,7 @@ private final class SelectableMarkdown {
         return result
     }
 
-    func attributed(type: ReplyType, expandsTables: Bool) -> NSAttributedString {
+    func attributed(type: ReplyType) -> NSAttributedString {
         let output = NSMutableAttributedString(string: "")
         for (index, block) in blocks.enumerated() {
             let paragraph = NSMutableParagraphStyle()
@@ -263,7 +305,6 @@ private final class SelectableMarkdown {
                 output.append(NSAttributedString(
                     string: block.separator, attributes: [.font: bodyFont, .paragraphStyle: paragraph]))
             }
-            let start = output.length
             for run in content.runs {
                 let intent = run.inlinePresentationIntent ?? []
                 let isCode = run[CodeRun.self] == true
@@ -286,10 +327,6 @@ private final class SelectableMarkdown {
                 }
                 if intent.contains(.strikethrough) { attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
                 output.append(NSAttributedString(string: String(content[run.range].characters), attributes: attributes))
-            }
-            if expandsTables, case .table = block.style, output.length > start {
-                output.addAttribute(.replyTable, value: index, range: NSRange(
-                    location: start, length: output.length - start))
             }
         }
         return output
@@ -344,7 +381,6 @@ private final class SelectableMarkdown {
 private extension NSAttributedString.Key {
     static let replyCode = Self("bud.replyCode")
     static let replyEquation = Self("bud.replyEquation")
-    static let replyTable = Self("bud.replyTable")
 }
 
 private enum EquationRun: AttributedStringKey {
@@ -362,28 +398,25 @@ private struct SelectableReplyView: NSViewRepresentable {
     let document: SelectableMarkdown
     let type: ReplyType
     let appearanceRevision: Int
-    let query: String
+    let matches: [NSRange]
     let activeRange: NSRange?
     let selection: ReplyTextSelection
     let quote: (String) -> Void
-    let expandTable: ((Int) -> Void)?
     @Environment(\.openURL) private var openURL
 
     func makeNSView(context: Context) -> ReplyTextView { ReplyTextView() }
 
     func updateNSView(_ view: ReplyTextView, context: Context) {
-        selection.view = view
+        view.replySelection = selection
         view.onQuote = quote
         view.onLink = { openURL($0) }
-        view.expandTable = expandTable
         view.update(document: document, type: type, appearanceRevision: appearanceRevision,
-                    query: query, activeRange: activeRange)
+                    matches: matches, activeRange: activeRange)
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: ReplyTextView, context: Context) -> CGSize? {
         guard let width = proposal.width, width.isFinite, width > 0 else { return nil }
-        let gutter = expandTable == nil ? 0 : TableExpandButton.size
-        return CGSize(width: width, height: nsView.height(fitting: max(1, width - gutter)))
+        return CGSize(width: width, height: nsView.height(fitting: width))
     }
 }
 
@@ -391,24 +424,15 @@ private struct SelectableReplyView: NSViewRepresentable {
 final class ReplyTextView: NSTextView, NSTextViewDelegate {
     var onQuote: ((String) -> Void)?
     var onLink: ((URL) -> Void)?
-    fileprivate var expandTable: ((Int) -> Void)?
+    fileprivate weak var replySelection: ReplyTextSelection?
     private var contentKey: ContentKey?
-    private var tables: [TableLocation] = []
-    private var tableButtons: [Int: NSHostingView<TableExpandButton>] = [:]
-
-    private struct TableLocation {
-        let index: Int
-        let start: Int
-        let width: CGFloat
-    }
 
     private struct ContentKey: Equatable {
         let document: ObjectIdentifier
         let type: ReplyType
         let appearance: Int
-        let query: String
+        let matches: [NSRange]
         let activeRange: NSRange?
-        let expandsTables: Bool
     }
 
     init() {
@@ -435,31 +459,19 @@ final class ReplyTextView: NSTextView, NSTextViewDelegate {
     required init?(coder: NSCoder) { fatalError() }
 
     fileprivate func update(
-        document: SelectableMarkdown, type: ReplyType, appearanceRevision: Int, query: String, activeRange: NSRange?
+        document: SelectableMarkdown, type: ReplyType, appearanceRevision: Int,
+        matches: [NSRange], activeRange: NSRange?
     ) {
         let key = ContentKey(document: ObjectIdentifier(document), type: type, appearance: appearanceRevision,
-                             query: query, activeRange: activeRange, expandsTables: expandTable != nil)
+                             matches: matches, activeRange: activeRange)
         guard contentKey != key, let textStorage else { return }
-        let text = NSMutableAttributedString(attributedString: document.attributed(
-            type: type, expandsTables: key.expandsTables))
+        let text = NSMutableAttributedString(attributedString: document.attributed(type: type))
         let matchColor = NSColor(Paper.fillSubtle)
         let activeColor = NSColor(Paper.accent.opacity(0.24))
-        for range in ChatFindMatch.ranges(in: text.string, query: query) {
+        for range in matches {
             text.addAttribute(.backgroundColor, value: range == activeRange ? activeColor : matchColor, range: range)
         }
         document.renderEquations(in: text, type: type)
-        tables = []
-        if key.expandsTables {
-            text.enumerateAttribute(.replyTable, in: NSRange(location: 0, length: text.length)) { index, range, _ in
-                guard let index = index as? Int,
-                      let font = text.attribute(.font, at: range.location, effectiveRange: nil) as? NSFont,
-                      let paragraph = text.attribute(.paragraphStyle, at: range.location, effectiveRange: nil)
-                        as? NSParagraphStyle else { return }
-                let lines = (text.string as NSString).substring(with: range)
-                let width = MarkdownTableLayout.textWidth(lines, font: font) + paragraph.headIndent
-                tables.append(TableLocation(index: index, start: range.location, width: width))
-            }
-        }
         let range = selectedRange()
         textStorage.setAttributedString(text)
         if NSMaxRange(range) <= text.length { setSelectedRange(range) }
@@ -477,40 +489,9 @@ final class ReplyTextView: NSTextView, NSTextViewDelegate {
         return ceil(layoutManager.usedRect(for: textContainer).maxY)
     }
 
-    override func setFrameSize(_ newSize: NSSize) {
-        let widthChanged = frame.width != newSize.width
-        super.setFrameSize(newSize)
-        if widthChanged, !tables.isEmpty { needsLayout = true }
-    }
-
-    override func layout() {
-        super.layout()
-        guard !tables.isEmpty || !tableButtons.isEmpty else { return }
-        guard let layoutManager else { return }
-
-        let gutter = expandTable == nil ? 0 : TableExpandButton.size
-        let width = max(1, bounds.width - gutter)
-        _ = height(fitting: width)
-        let overflowing = tables.filter { MarkdownTableLayout.overflows($0.width, available: width) }
-        for index in Set(tableButtons.keys).subtracting(overflowing.map(\.index)) {
-            tableButtons.removeValue(forKey: index)?.removeFromSuperview()
-        }
-        for table in overflowing {
-            let button: NSHostingView<TableExpandButton>
-            if let existing = tableButtons[table.index] {
-                button = existing
-            } else {
-                let index = table.index
-                button = NSHostingView(rootView: TableExpandButton { [weak self] in self?.expandTable?(index) })
-                tableButtons[index] = button
-                addSubview(button)
-            }
-            let glyph = layoutManager.glyphIndexForCharacter(at: table.start)
-            let line = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
-            let size = TableExpandButton.size
-            button.frame = CGRect(
-                x: width, y: max(0, textContainerOrigin.y + line.midY - size / 2), width: size, height: size)
-        }
+    func textViewDidChangeSelection(_ notification: Notification) {
+        guard window?.firstResponder === self else { return }
+        replySelection?.view = self
     }
 
     var selectedText: String? {
@@ -680,12 +661,8 @@ private struct Block: View {
             }
             .padding(.top, first ? 0 : heading.level <= 2 ? type.blockSpacing * 0.6 : 2)
         case let paragraph as Paragraph:
-            if rich, paragraph.childCount == 1, let link = paragraph.child(at: 0) as? Markdown.Link,
-               let url = SafePreviewURL(link.destination) {
-                WebLinkCard(url: url.value, title: String(inline(link).characters))
-            } else if rich, paragraph.childCount == 1, let image = paragraph.child(at: 0) as? Markdown.Image,
-                      let url = SafePreviewURL(image.source) {
-                WebImageCard(url: url.value, title: String(inline(image).characters))
+            if rich, let card = StandaloneWebCard(paragraph) {
+                card
             } else {
                 paragraphText(inline(paragraph, code: type.code))
             }
@@ -738,6 +715,30 @@ private struct Block: View {
         case 2: type.heading
         case 3: type.section
         default: type.minor
+        }
+    }
+}
+
+private struct StandaloneWebCard: View {
+    let url: URL
+    let title: String
+    let isImage: Bool
+
+    init?(_ paragraph: Paragraph) {
+        guard paragraph.childCount == 1, let child = paragraph.child(at: 0) else { return nil }
+        let image = child as? Markdown.Image
+        let link = child as? Markdown.Link
+        guard let preview = SafePreviewURL(image?.source ?? link?.destination) else { return nil }
+        url = preview.value
+        title = String(inline(child).characters)
+        isImage = image != nil
+    }
+
+    var body: some View {
+        if isImage {
+            WebImageCard(url: url, title: title)
+        } else {
+            WebLinkCard(url: url, title: title)
         }
     }
 }
@@ -1043,19 +1044,12 @@ enum MarkdownTableLayout {
         width > available + 1
     }
 
-    static func textWidth(_ rows: String, font: NSFont) -> CGFloat {
-        rows.split(separator: "\n").reduce(0) { widest, row in
-            max(widest, (String(row) as NSString).size(withAttributes: [.font: font]).width)
-        }
-    }
-
     static func pinOffset(origin: CGPoint, header: Bool, firstColumn: Bool) -> CGSize {
         CGSize(width: firstColumn ? max(0, -origin.x) : 0, height: header ? max(0, -origin.y) : 0)
     }
 }
 
 private struct TableExpandButton: View {
-    static let size: CGFloat = 24
     let expand: () -> Void
 
     var body: some View {
@@ -1063,7 +1057,7 @@ private struct TableExpandButton: View {
             Image(systemName: "arrow.up.left.and.arrow.down.right")
                 .font(.system(size: 10, weight: .medium))
         }
-        .buttonStyle(IconButton(size: Self.size))
+        .buttonStyle(IconButton(size: 24))
         .help("Expand table")
         .accessibilityLabel("Expand table")
     }
@@ -1079,12 +1073,12 @@ private struct TableView: View {
     @StateObject private var expanded = Flag()
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            TableGrid(table: table).fixedSize()
-            VStack(alignment: .trailing, spacing: 2) {
-                TableExpandButton { expanded.on = true }
+        HStack(alignment: .top, spacing: 4) {
+            ViewThatFits(in: .horizontal) {
+                TableGrid(table: table).fixedSize()
                 scrollableGrid
             }
+            TableExpandButton { expanded.on = true }
         }
         .sheet(isPresented: $expanded.on) { TableReader(table: table) }
     }

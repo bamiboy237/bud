@@ -28,6 +28,7 @@ from bud.core.onboarding import (
 )
 from bud.core.runner import Runner
 from bud.core.server import _create_app
+from bud.gateway.tracked import TrackedModel
 from bud.harness.operating_profile import ModelProfileConfig, OperatingProfile
 
 
@@ -579,6 +580,25 @@ async def test_chatgpt_login_manager_start_complete_and_logout(
             assert runner._inputs("example", "new message")["model"] == expected
             assert (data_dir / "default-model").read_text() == expected
             assert runner.is_configured is True
+            assert runner.harness.reviewer is not None
+            assert runner.harness.reviewer.model_provider is not None
+            assert runner.verifier is not None and runner.verifier.model_provider is not None
+            for provider in (
+                runner.harness.reviewer.model_provider,
+                runner.verifier.model_provider,
+            ):
+                model = provider()
+                assert isinstance(model, TrackedModel) and model.spec.id == expected
+
+            learner = runner.learner
+            assert learner is not None
+            model = learner.model("example")
+            assert isinstance(model, TrackedModel) and model.spec.id == expected
+            assert model.ledger is runner.gateway.ledger and model.session_id == "example:learn"
+            override = "openai-chatgpt:gpt-other"
+            runner.set_model("example", override)
+            model = learner.model("example")
+            assert isinstance(model, TrackedModel) and model.spec.id == override
 
             logged_out = await client.post("/onboarding/chatgpt/logout", headers=headers)
             assert logged_out.status_code == 200
@@ -592,6 +612,7 @@ async def test_chatgpt_login_manager_start_complete_and_logout(
             assert runner.is_configured is bool(env_default)
     finally:
         await manager.shutdown()
+        await runner.stop()
         runner.gateway.close()
 
 

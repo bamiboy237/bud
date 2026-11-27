@@ -54,7 +54,7 @@ from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 
-from bud.config import get_settings
+from bud.config import Settings, get_settings
 from bud.core.events import RUN_END_EVENTS, Event, EventType
 from bud.core.hub import Hub
 from bud.core.log import StopRequested
@@ -114,7 +114,7 @@ from bud.harness.ask import AskAnswer, answer_from_text, ask_summary, questions_
 from bud.harness.learning import Learner
 from bud.harness.operating_profile import OperatingProfile
 from bud.harness.recall import CITATION, Recall, plain_citations, recalled_so_far, render
-from bud.harness.review import ToolReviewer
+from bud.harness.review import ToolReviewer, decisions_key
 from bud.harness.spiral import paused_in
 from bud.harness.steering import SteeringCapability, SteerSignal
 from bud.harness.verify import build_verifier
@@ -243,6 +243,7 @@ class Runner(DBOSConfiguredInstance):
         workspace: Path | None = None,
         operating_profile: OperatingProfile | None = None,
         allow_unconfigured: bool = False,
+        settings: Settings | None = None,
     ) -> None:
         self.hub = hub
         self.gateway = gateway
@@ -279,7 +280,9 @@ class Runner(DBOSConfiguredInstance):
         )
         self.workspace = workspace
         # Checks each finished job's deliverable; without it, reports say "not checked".
-        self.verifier = build_verifier() if jobs else None
+        self.verifier = (
+            build_verifier(settings, model_provider=self.decision_model) if jobs else None
+        )
         self.job_output = job_output(self.verifier)
         self.learner = learner
         self.recall = recall
@@ -417,6 +420,7 @@ class Runner(DBOSConfiguredInstance):
         reviewer: ToolReviewer | None = None,
         owner_model: str | None = None,
         policy_tools: dict[str, Action] | None = None,
+        settings: Settings | None = None,
     ) -> None:
         """Hot-swap the gateway, DBOS model table, default model, and reviewer live."""
         default_model, runtime_models = self._build_models(gateway)
@@ -431,13 +435,12 @@ class Runner(DBOSConfiguredInstance):
             self.harness.registry = gateway.registry
             self.harness.set_reviewer(reviewer)
             self.harness.policy.tools = tools
-            if self.learner is not None:
-                self.learner.model = lambda session_id: gateway.model(
-                    self.profile.model.tier,
-                    f"{session_id}:learn",
-                    require_tools=True,
-                    selected=self.profile.model.model_id,
-                )
+            if settings is not None and self._jobs:
+                if self.verifier is None:
+                    self.verifier = build_verifier(settings, model_provider=self.decision_model)
+                    self.job_output = job_output(self.verifier)
+                else:
+                    self.verifier.api_key = decisions_key(settings)
             self.agent.model = default_model
             self.runtime_model_ids = runtime_ids
             if self._durability is not None:
@@ -555,6 +558,56 @@ class Runner(DBOSConfiguredInstance):
                 return model_ids[0], model_ids[1:]
         return "unconfigured", []
 
+    def decision_model(self) -> Model:
+        """Use the current run's route with the live gateway, or the owner's default.
+
+        When signed into ChatGPT, prefer ``openai-chatgpt:gpt-6-luna`` for low-cost
+        approval review and job verification when that account exposes it.
+        """
+        with self._routing_lock:
+            run = self._current.get(None)
+            if run and run.get("model") not in (None, "unconfigured"):
+                selected, fallbacks = run["model"], run.get("model_fallbacks", [])
+            else:
+                selected, fallbacks = self._resolve_run_route()
+            if selected and selected.startswith("openai-chatgpt:"):
+                review_slug = (
+                    self.harness.reviewer.model
+                    if self.harness.reviewer is not None
+                    else "gpt-6-luna"
+                )
+                preferred = f"openai-chatgpt:{review_slug}"
+                if selected != preferred:
+                    with contextlib.suppress(NoModelAvailable):
+                        self.gateway.validate_model(preferred, require_tools=False)
+                        fallbacks = [selected, *[m for m in fallbacks if m != selected]]
+                        selected = preferred
+            return self.gateway.model(
+                self.tier, require_tools=True, selected=selected, fallback_ids=fallbacks
+            )
+
+    def learning_model(self, session_id: str) -> Model:
+        with self._routing_lock:
+            events = self.hub.log.read(session_id)
+            selected, fallbacks = self._resolve_run_route(
+                self._valid_override(session_model(events))
+            )
+            return self.gateway.model(
+                self.tier,
+                f"{session_id}:learn",
+                require_tools=True,
+                selected=selected,
+                fallback_ids=fallbacks,
+            )
+
+    def _valid_override(self, override: str | None) -> str | None:
+        if override is not None:
+            try:
+                self.gateway.validate_model(override, require_tools=True)
+            except NoModelAvailable:
+                return None
+        return override
+
     def _pinned_model(self, run: dict) -> tuple[str, Model]:
         model_id = run.get("model") or run.get("owner_model")
         if model_id == "unconfigured":
@@ -606,15 +659,12 @@ class Runner(DBOSConfiguredInstance):
     ) -> dict:
         with self._routing_lock:
             events = self.hub.log.read(session_id)
-            override = session_model(events)
             owner_model = self.owner_model
             fingerprint = self.fingerprint
+            override = session_model(events)
             if override is not None:
                 self.session_models[session_id] = override
-                try:
-                    self.gateway.validate_model(override, require_tools=True)
-                except NoModelAvailable:
-                    override = None
+            override = self._valid_override(override)
             model_id, fallbacks = self._resolve_run_route(override)
         endings = [event for event in events if event.type in RUN_END_EVENTS]
         checkpoint = next(

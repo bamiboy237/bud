@@ -120,12 +120,14 @@ private enum Rhythm {
     static let headerHeight: CGFloat = 40
 }
 
-struct ConversationScrollFollow {
+struct ConversationScrollFollow: Equatable {
     private(set) var initialScrollPending = true
     private(set) var isFollowingBottom = true
     private(set) var userScrolling = false
+    private var nearBottom = true
 
     var followsLayout: Bool { isFollowingBottom && !userScrolling && !initialScrollPending }
+    var showsJumpButton: Bool { !isFollowingBottom && !nearBottom }
 
     mutating func takeInitialScroll() -> Bool {
         guard initialScrollPending else { return false }
@@ -138,8 +140,14 @@ struct ConversationScrollFollow {
         userScrolling = true
     }
 
-    mutating func userMoved(nearBottom: Bool) {
-        if userScrolling { isFollowingBottom = nearBottom }
+    mutating func geometryChanged(from old: ChatScrollGeometry, to new: ChatScrollGeometry) {
+        nearBottom = new.nearBottom
+        // Showing an earlier message can start moving while still inside the bottom threshold.
+        if nearBottom, !old.nearBottom || userScrolling || !new.overflows {
+            isFollowingBottom = true
+        } else if userScrolling, old.offset != new.offset {
+            isFollowingBottom = false
+        }
     }
 
     mutating func userEndedScrolling() { userScrolling = false }
@@ -160,7 +168,7 @@ struct ConversationScrollFollow {
 private final class ScrollState: ObservableObject {
     @Published var follow = ConversationScrollFollow()
     @Published var position = ScrollPosition(idType: String.self)
-    var showsJumpButton: Bool { !follow.isFollowingBottom }
+    var showsJumpButton: Bool { follow.showsJumpButton }
     private var phase = ScrollPhase.idle
     private var wheelEnd: Task<Void, Never>?
 
@@ -187,18 +195,20 @@ private final class ScrollState: ObservableObject {
     }
 }
 
-private struct ChatScrollGeometry: Equatable {
+struct ChatScrollGeometry: Equatable {
     let content: CGSize
     let viewport: CGSize
     let offset: CGFloat
     let distanceFromBottom: CGFloat
-    var nearBottom: Bool { distanceFromBottom <= 8 }
+    var overflows: Bool { content.height > viewport.height + 8 }
+    var nearBottom: Bool { !overflows || distanceFromBottom <= 24 }
+}
 
+extension ChatScrollGeometry {
     init(_ geometry: ScrollGeometry) {
-        content = geometry.contentSize
-        viewport = geometry.containerSize
-        offset = geometry.visibleRect.minY
-        distanceFromBottom = content.height - geometry.visibleRect.maxY
+        self.init(content: geometry.contentSize, viewport: geometry.containerSize,
+                  offset: geometry.visibleRect.minY,
+                  distanceFromBottom: geometry.contentSize.height - geometry.visibleRect.maxY)
     }
 }
 
@@ -394,11 +404,10 @@ private struct ConversationView: View {
                 .scrollPosition($scroll.position, anchor: .top)
                 .onScrollPhaseChange { _, phase in scroll.phaseChanged(phase) }
                 .onScrollGeometryChange(for: ChatScrollGeometry.self, of: ChatScrollGeometry.init) { old, new in
-                    if scroll.follow.userScrolling, old.offset != new.offset,
-                       scroll.follow.isFollowingBottom != new.nearBottom {
-                        scroll.follow.userMoved(nearBottom: new.nearBottom)
-                    }
-                    if scroll.follow.followsLayout, new.distanceFromBottom > 1,
+                    var follow = scroll.follow
+                    follow.geometryChanged(from: old, to: new)
+                    if follow != scroll.follow { scroll.follow = follow }
+                    if follow.followsLayout, new.overflows, new.distanceFromBottom > 1,
                        old.content != new.content || old.viewport != new.viewport {
                         proxy.scrollTo("end", anchor: .bottom)
                     }
@@ -503,6 +512,10 @@ private struct ConversationView: View {
             case .delivery(let selection):
                 DesktopDeliveryInspector(selection: selection, close: companion.closeInspector)
                     .id(selection.id)
+            case .report(let file):
+                ReportInspector(file: file, close: closeInspector)
+                    .id(file)
+                    .inspectorColumnWidth(min: 300, ideal: 420, max: 700)
             case .source(let panel, let request):
                 SourcePanelView(panel: panel, companion: companion)
                     .id(request)
@@ -819,6 +832,17 @@ private struct ConversationView: View {
         }
     }
 
+    private func reportSummary(_ text: String) -> String {
+        // A notice can end partway through a link destination after truncation.
+        let markdown = text.replacingOccurrences(
+            of: #"!?\[([^\]\r\n]*)\]\([^)\r\n]*$"#, with: "$1", options: .regularExpression)
+        let plain = MarkdownView.selectableText(markdown)
+            .replacingOccurrences(of: "\u{2014}", with: " ")
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        return plain.isEmpty ? "Report ready" : plain
+    }
+
     /// The reply in progress, or the last one, with what bud is doing and anything it needs.
     @ViewBuilder private func latest(query: String, active: ChatFindMatch?) -> some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -828,11 +852,18 @@ private struct ConversationView: View {
                 WorkLine(work: work)
             }
             ForEach(companion.notices.filter { $0.report != nil }) { notice in
-                VStack(alignment: .leading, spacing: 4) {
-                    Label(notice.text, systemImage: "arrow.turn.down.right")
-                        .font(Paper.Typography.callout)
-                        .foregroundStyle(Paper.inkSecondary)
-                    if let report = notice.report { OpenReport(file: report) }
+                if let report = notice.report {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(reportSummary(notice.text))
+                            .font(Paper.Typography.callout)
+                            .foregroundStyle(Paper.inkSecondary)
+                            .lineLimit(2)
+                        Button("Open report") { companion.openReport(report) }
+                            .buttonStyle(.link)
+                            .pointerStyle(.link)
+                            .font(Paper.Typography.callout)
+                            .accessibilityLabel("Open report \(report.lastPathComponent)")
+                    }
                 }
             }
             if companion.unsentSpeech != nil {
@@ -1945,11 +1976,10 @@ private struct JumpButton: View {
 
     var body: some View {
         Button(action: action) {
-            Label("Jump to latest", systemImage: "arrow.down")
-                .font(Paper.Typography.captionMedium)
+            Image(systemName: "arrow.down")
+                .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(hovered.on ? Paper.inkPrimary : Paper.inkSecondary)
-                .padding(.horizontal, 11)
-                .frame(height: 30)
+                .frame(width: 30, height: 30)
                 .surface(
                     Capsule(),
                     lift: 1.0,
@@ -1962,6 +1992,71 @@ private struct JumpButton: View {
         .buttonStyle(.plain)
         .pointerStyle(.link)
         .onHover { hovered.on = $0 }
+        .help("Jump to latest")
+        .accessibilityLabel("Jump to latest")
+    }
+}
+
+private struct ReportInspector: View {
+    private final class Report: ObservableObject {
+        enum State {
+            case loading, ready(String), unreadable
+        }
+
+        @Published var state: State = .loading
+    }
+
+    let file: URL
+    let close: () -> Void
+    @StateObject private var report = Report()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 4) {
+                Text("Report")
+                    .font(Paper.Typography.label)
+                    .accessibilityAddTraits(.isHeader)
+                Spacer()
+                Button { NSWorkspace.shared.open(file) } label: {
+                    Image(systemName: "arrow.up.forward.square")
+                }
+                .buttonStyle(IconButton(size: 28))
+                .help("Open in default app")
+                .accessibilityLabel("Open in default app")
+                Button(action: close) { Image(systemName: "xmark") }
+                    .buttonStyle(IconButton(size: 26))
+                    .help("Close report")
+                    .accessibilityLabel("Close report")
+            }
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 14)
+            .frame(height: Rhythm.headerHeight)
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
+            switch report.state {
+            case .loading:
+                ProgressView().controlSize(.small).padding(16)
+            case .ready(let contents):
+                ScrollView {
+                    MarkdownView(contents, rich: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
+                }
+            case .unreadable:
+                Text("This report could not be read.")
+                    .font(Paper.Typography.callout)
+                    .foregroundStyle(Paper.inkSecondary)
+                    .padding(16)
+            }
+        }
+        .frame(maxHeight: .infinity, alignment: .topLeading)
+        .background(Paper.canvas)
+        .task(id: file) { [file] in
+            let contents = await Task.detached {
+                try? String(contentsOf: file, encoding: .utf8)
+            }.value
+            guard !Task.isCancelled else { return }
+            report.state = contents.map { .ready($0) } ?? .unreadable
+        }
     }
 }
 

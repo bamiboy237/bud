@@ -4,6 +4,25 @@ import Testing
 
 struct InspectorSelectionTests {
     @Test @MainActor
+    func openReportReplacesOtherInspectorsAndKeepsTheReportOpen() {
+        let companion = Companion()
+        let first = URL(fileURLWithPath: "/tmp/first-report.md")
+        let second = URL(fileURLWithPath: "/tmp/second-report.md")
+        companion.toggleInspector(.source(SourcePanel(target: .workspace(path: "plan.md")), request: UUID()))
+
+        companion.openReport(first)
+        #expect(companion.inspector?.target == .report(first))
+        companion.openReport(first)
+        #expect(companion.inspector?.target == .report(first))
+        companion.openReport(second)
+        guard case .report(let file) = companion.inspector else {
+            Issue.record("Expected the report inspector")
+            return
+        }
+        #expect(file == second)
+    }
+
+    @Test @MainActor
     func reselectingAResourceClosesItEvenWhenItsViewIDChanges() {
         let companion = Companion()
         let connection = BudConnection(base: URL(string: "http://127.0.0.1:8420")!, token: "")

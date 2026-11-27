@@ -42,6 +42,7 @@ enum InspectorSelection {
     case attachment(AttachmentSelection)
     case routine(RoutineSelection)
     case browser(BrowserSelection)
+    case report(URL)
     case delivery(DesktopDeliverySelection)
     case source(SourcePanel, request: UUID)
 
@@ -49,6 +50,7 @@ enum InspectorSelection {
         case attachment(session: String, file: String)
         case routine(session: String, routine: String?, occurrence: String?)
         case browser
+        case report(URL)
         case delivery(session: String, job: String)
         case source(SourceTarget)
     }
@@ -61,6 +63,8 @@ enum InspectorSelection {
             .routine(session: selection.session, routine: selection.routineID, occurrence: selection.occurrenceID)
         case .browser:
             .browser
+        case .report(let file):
+            .report(file)
         case .delivery(let selection):
             .delivery(session: selection.session, job: selection.jobID)
         case .source(let panel, _):
@@ -1062,6 +1066,11 @@ final class Companion {
             return
         }
         toggleInspector(.browser(BrowserSelection(connection: connection)))
+    }
+
+    func openReport(_ file: URL) {
+        if self === Self.shared { ConversationWindow.shared.show() }
+        inspector = .report(file)
     }
 
     @discardableResult

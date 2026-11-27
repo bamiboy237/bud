@@ -1,3 +1,4 @@
+import CoreGraphics
 import Testing
 @testable import BudCompanion
 
@@ -10,7 +11,7 @@ struct ConversationScrollTests {
         #expect(!initialScroll)
         #expect(!follow.followsLayout)
 
-        follow.userMoved(nearBottom: false)
+        follow.geometryChanged(from: geometry(0), to: geometry(100))
         follow.userEndedScrolling()
         #expect(!follow.isFollowingBottom)
         #expect(!follow.followsLayout)
@@ -26,8 +27,8 @@ struct ConversationScrollTests {
         #expect(follow.followsLayout)
 
         follow.userBeganScrolling()
-        follow.userMoved(nearBottom: false)
-        follow.userMoved(nearBottom: true)
+        follow.geometryChanged(from: geometry(0), to: geometry(100))
+        follow.geometryChanged(from: geometry(100), to: geometry(0))
         #expect(!follow.followsLayout)
         follow.userEndedScrolling()
         #expect(follow.followsLayout)
@@ -37,12 +38,41 @@ struct ConversationScrollTests {
     func revealingAnOlderMessagePausesFollowingUntilJumpToLatest() {
         var follow = ConversationScrollFollow()
         follow.revealEarlierMessage()
-        follow.userMoved(nearBottom: true)
+        follow.geometryChanged(from: geometry(0), to: geometry(12))
+        #expect(!follow.showsJumpButton)
+        follow.geometryChanged(from: geometry(12), to: geometry(100))
+        #expect(follow.showsJumpButton)
         let initialScroll = follow.takeInitialScroll()
         #expect(!initialScroll)
         #expect(!follow.followsLayout)
 
         follow.jumpToLatest()
+        #expect(follow.followsLayout)
+    }
+
+    @Test
+    func bounceSettlingAfterWheelEndsResumesFollowingAndHidesJump() {
+        var follow = ConversationScrollFollow()
+        follow.userBeganScrolling()
+        follow.geometryChanged(from: geometry(0), to: geometry(25))
+        follow.userEndedScrolling()
+        #expect(follow.showsJumpButton)
+        #expect(!follow.isFollowingBottom)
+
+        follow.geometryChanged(from: geometry(25), to: geometry(24))
+        #expect(!follow.showsJumpButton)
+        #expect(follow.followsLayout)
+    }
+
+    @Test(arguments: [300, 408])
+    func shortChatsHideJumpDespiteAnOffsetFromBounce(contentHeight: Int) {
+        var follow = ConversationScrollFollow()
+        follow.revealEarlierMessage()
+        follow.geometryChanged(from: geometry(0), to: geometry(100))
+        #expect(follow.showsJumpButton)
+
+        follow.geometryChanged(from: geometry(100), to: geometry(40, contentHeight: CGFloat(contentHeight)))
+        #expect(!follow.showsJumpButton)
         #expect(follow.followsLayout)
     }
 
@@ -60,5 +90,11 @@ struct ConversationScrollTests {
                 shortcuts: shortcuts, find: find, queuedEdit: queuedEdit, inspector: inspector
             ) == target)
         }
+    }
+
+    private func geometry(_ distance: CGFloat, contentHeight: CGFloat = 800) -> ChatScrollGeometry {
+        ChatScrollGeometry(content: CGSize(width: 320, height: contentHeight),
+                           viewport: CGSize(width: 320, height: 400),
+                           offset: contentHeight - 400 - distance, distanceFromBottom: distance)
     }
 }

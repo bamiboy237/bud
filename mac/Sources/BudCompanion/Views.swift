@@ -2299,12 +2299,12 @@ private struct ThemeSwatch: View {
     }
 }
 
-/// Opens a finished job's saved report in the app the owner uses for that file type.
+/// Opens a finished job's saved report in Bud's inspector.
 struct OpenReport: View {
     let file: URL
 
     var body: some View {
-        Button("Open report") { NSWorkspace.shared.open(file) }
+        Button("Open report") { Companion.shared.openReport(file) }
             .buttonStyle(.link)
             .pointerStyle(.link)
             .font(Paper.Typography.callout)

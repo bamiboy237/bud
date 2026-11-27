@@ -729,7 +729,12 @@ def _create_app(
     harness.refuses.update(
         dict.fromkeys(LOCAL_TOOLS, lambda tool_args: local_refusal(tool_args, outside))
     )
-    reviewer = build_reviewer(settings)
+
+    def review_model():
+        return runner.decision_model()
+
+    review_provider = review_model if gateway.selectable_models(require_tools=True) else None
+    reviewer = build_reviewer(settings, model_provider=review_provider)
     has_reviewer = reviewer is not None
     # Standing permissions the owner granted from an approval card. The policy reads them on
     # every call, so a new grant or a revoke applies without a restart.
@@ -804,7 +809,18 @@ def _create_app(
                     # Reuse the live store's credential lock while validating the candidate.
                     new_gateway.chatgpt = chatgpt
                     new_gateway.build_model = provider_model_factory(new_settings, chatgpt)
-                new_reviewer = build_reviewer(new_settings)
+                provider = (
+                    review_model if new_gateway.selectable_models(require_tools=True) else None
+                )
+                current_reviewer = harness.reviewer
+                if (
+                    current_reviewer is not None
+                    and new_settings.openai_api_key == settings.openai_api_key
+                    and current_reviewer.model_provider is provider
+                ):
+                    new_reviewer = current_reviewer
+                else:
+                    new_reviewer = build_reviewer(new_settings, model_provider=provider)
                 new_config_env_path = resolve_config_env_path(new_settings)
                 policy = harness.policy.model_copy(update={"tools": harness.policy.tools.copy()})
                 apply_mode(policy, live_mode["mode"], reviewer=new_reviewer is not None)
@@ -813,6 +829,7 @@ def _create_app(
                     reviewer=new_reviewer,
                     owner_model=default_model_for(new_gateway),
                     policy_tools=policy.tools,
+                    settings=new_settings,
                 )
             except Exception:
                 if new_gateway is not None and new_gateway is not old_gateway:

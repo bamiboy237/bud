@@ -21,6 +21,12 @@ struct BrowserTab: Identifiable {
         self.host = raw["host"] as? String ?? ""
         browser = raw["browser"] as? String
     }
+
+    var displayTitle: String {
+        let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !host.isEmpty, name.isEmpty || name.lowercased() == "about:blank" { return host }
+        return name.isEmpty ? "Untitled tab" : name
+    }
 }
 
 struct BrowserTabGroup: Identifiable {
@@ -74,6 +80,11 @@ enum BrowserEmptyState: Equatable {
     case disconnected, disabled, noTabs
 }
 
+enum BrowserControl: Equatable {
+    case interactive(tabID: String, title: String)
+    case chrome(title: String?, handoffOpen: Bool)
+}
+
 @MainActor
 final class BrowserInspectorState: ObservableObject {
     @Published var groups: [BrowserTabGroup] = []
@@ -84,9 +95,9 @@ final class BrowserInspectorState: ObservableObject {
     @Published var expanded = false
     @Published var enabled: Bool?
     @Published var connected: Bool?
-    @Published private(set) var privateInput = false
-    @Published var handoffOpen = false
-    @Published private(set) var controlledTabTitle: String?
+    @Published private(set) var control: BrowserControl?
+    @Published var address = ""
+    @Published var quickText = ""
     @Published var sending = false
     @Published var problem: String?
     @Published private(set) var refreshID = 0
@@ -95,8 +106,20 @@ final class BrowserInspectorState: ObservableObject {
     private var lastRefreshedTabID: String?
 
     var tabCount: Int { groups.reduce(0) { $0 + $1.tabs.count } }
+    var interactiveTabID: String? {
+        if case .interactive(let tabID, _) = control { return tabID }
+        return nil
+    }
+    var privateInput: Bool {
+        if case .chrome = control { return true }
+        return false
+    }
+    var handoffOpen: Bool {
+        if case .chrome(_, let open) = control { return open }
+        return false
+    }
     var emptyState: BrowserEmptyState? {
-        if privateInput { return nil }
+        if control != nil { return nil }
         if connected == false { return .disconnected }
         if enabled == false { return .disabled }
         if connected == true, groups.isEmpty { return .noTabs }
@@ -116,13 +139,18 @@ final class BrowserInspectorState: ObservableObject {
     }
 
     func applyStatus(_ status: [String: Any]) {
+        let tabs = (status["tabs"] as? [[String: Any]] ?? []).compactMap(BrowserTab.init)
+        if status["interactive"] as? Bool == true,
+           let tabID = status["takeover_tab"] as? String {
+            let title = tabs.first { $0.id == tabID }?.displayTitle
+            enterInteractive(tabID: tabID, title: title)
+            return
+        }
         if status["private"] as? Bool == true {
             enterPrivateInput(handoffOpen: status["handoff_open"] as? Bool == true)
             return
         }
-        privateInput = false
-        handoffOpen = false
-        controlledTabTitle = nil
+        endControl()
         problem = nil
         enabled = status["enabled"] as? Bool
         connected = status["connected"] as? Bool
@@ -130,7 +158,6 @@ final class BrowserInspectorState: ObservableObject {
             clearTabs()
             return
         }
-        let tabs = (status["tabs"] as? [[String: Any]] ?? []).compactMap(BrowserTab.init)
         groups = BrowserTabGroup.make(
             tabs: tabs, browsers: status["browsers"] as? [[String: Any]] ?? [])
         activeTabID = status["active_tab"] as? String
@@ -143,6 +170,10 @@ final class BrowserInspectorState: ObservableObject {
 
     func refresh(using connection: BudConnection, id: Int) async {
         guard await refreshStatus(using: connection, id: id) else { return }
+        if let tabID = interactiveTabID {
+            await refreshPreview(tabID, using: connection, id: id)
+            return
+        }
         let selected = focus.selected
         guard !selected.isEmpty else { return }
         await refreshPreview(selected, using: connection, id: id)
@@ -152,7 +183,7 @@ final class BrowserInspectorState: ObservableObject {
         }
         let start = otherTabs.firstIndex { $0 == lastRefreshedTabID }.map { $0 + 1 } ?? 0
         for tabID in (otherTabs[start...] + otherTabs[..<start]).prefix(4) {
-            guard canRefresh(id), !privateInput, !groups.isEmpty else { break }
+            guard canRefresh(id), control == nil, !groups.isEmpty else { break }
             guard visibleTabIDs.contains(tabID) else { continue }
             lastRefreshedTabID = tabID
             await refreshPreview(tabID, using: connection, id: id)
@@ -168,9 +199,17 @@ final class BrowserInspectorState: ObservableObject {
             return !privateInput && emptyState == nil
         } catch {
             guard canRefresh(id) else { return false }
-            if case ConnectionError.http(404, _) = error {
-                applyStatus(["enabled": false, "connected": false])
-            } else {
+            switch error {
+            case ConnectionError.unreachable, ConnectionError.http(502, _):
+                if let tabID = interactiveTabID {
+                    recordPreview(nil, for: tabID)
+                } else {
+                    connectionFailed(error)
+                }
+            case ConnectionError.http(404, _):
+                connectionFailed(error)
+                connected = false
+            default:
                 connectionFailed(error)
             }
             return false
@@ -181,22 +220,29 @@ final class BrowserInspectorState: ObservableObject {
         let image: NSImage?
         do {
             let data = try await connection.getBytes("browser/view/\(tabID)/image", queryItems: [])
-            guard canRefresh(id), !privateInput else { return }
+            guard canCapture(tabID, id: id) else { return }
             image = NSImage(data: data)
         } catch {
-            guard canRefresh(id), !privateInput else { return }
+            guard canCapture(tabID, id: id) else { return }
             switch error {
             case ConnectionError.http(423, _):
-                enterPrivateInput(handoffOpen: true)
-                return
+                if interactiveTabID == nil {
+                    enterPrivateInput(handoffOpen: true)
+                    return
+                }
+                guard await refreshStatus(using: connection, id: id),
+                      canCapture(tabID, id: id) else { return }
+                image = nil
             case ConnectionError.http(401, _), ConnectionError.http(403, _), ConnectionError.http(409, _):
                 connectionFailed(error)
                 return
             case ConnectionError.unreachable, ConnectionError.http(404, _), ConnectionError.http(502, _):
                 // Check whether the tab and Browse are still available after an ambiguous capture failure.
                 guard await refreshStatus(using: connection, id: id),
-                      canRefresh(id),
-                      groups.contains(where: { $0.tabs.contains { $0.id == tabID } }) else { return }
+                      canCapture(tabID, id: id),
+                      interactiveTabID == tabID || groups.contains(where: {
+                          $0.tabs.contains { $0.id == tabID }
+                      }) else { return }
                 image = nil
             default:
                 image = nil
@@ -218,10 +264,42 @@ final class BrowserInspectorState: ObservableObject {
         id == refreshID && !sending && !Task.isCancelled
     }
 
-    private func enterPrivateInput(handoffOpen: Bool) {
-        privateInput = true
-        self.handoffOpen = handoffOpen
+    private func canCapture(_ tabID: String, id: Int) -> Bool {
+        canRefresh(id) && !privateInput && (interactiveTabID ?? tabID) == tabID
+    }
+
+    private func enterInteractive(tabID: String, title: String?) {
+        let name: String
+        if case .interactive(let previousID, let previousTitle) = control, previousID == tabID {
+            name = title ?? previousTitle
+        } else {
+            name = title ?? groups.flatMap(\.tabs).first { $0.id == tabID }?.displayTitle ?? "Browser tab"
+            previews = previews.filter { $0.key == tabID }
+            previewIssues = previewIssues.filter { $0.key == tabID }
+            address = ""
+            quickText = ""
+            focus.selected = tabID
+        }
+        let next = BrowserControl.interactive(tabID: tabID, title: name)
+        if control != next { control = next }
+    }
+
+    private func enterPrivateInput(handoffOpen: Bool, title: String? = nil) {
+        var name = title
+        if name == nil, case .chrome(let previousTitle, _) = control { name = previousTitle }
+        let next = BrowserControl.chrome(title: name, handoffOpen: handoffOpen)
+        guard control != next else { return }
+        endControl()
+        control = next
         clearTabs()
+    }
+
+    private func endControl() {
+        guard control != nil else { return }
+        control = nil
+        address = ""
+        quickText = ""
+        clearPreviews()
     }
 
     private func connectionFailed(_ error: Error) {
@@ -247,32 +325,145 @@ final class BrowserInspectorState: ObservableObject {
         previewIssues = [:]
     }
 
-    func send(_ action: String, using connection: BudConnection, body: [String: String]? = nil) async {
-        guard !sending else { return }
-        if action == "takeover", let tabID = body?["tab"],
-           let tab = groups.flatMap(\.tabs).first(where: { $0.id == tabID }) {
-            let trimmed = tab.title.trimmingCharacters(in: .whitespacesAndNewlines)
-            controlledTabTitle = trimmed.isEmpty ? (tab.host.isEmpty ? nil : tab.host) : trimmed
-        }
-        sending = true
-        clearPreviews()
-        problem = nil
-        do {
-            let response = try await connection.send("POST", "browser/view/\(action)", json: body)
-            if response["private"] as? Bool == true {
-                enterPrivateInput(handoffOpen: true)
-            } else {
-                privateInput = false
-                handoffOpen = false
-                controlledTabTitle = nil
+    func takeOver(_ tab: BrowserTab, using connection: BudConnection) async {
+        guard control == nil else { return }
+        await post("takeover", using: connection, body: ["tab": tab.id]) { response in
+            if response["interactive"] as? Bool == true, let tabID = response["tab"] as? String {
+                enterInteractive(tabID: tabID, title: tab.displayTitle)
+            } else if response["private"] as? Bool == true {
+                enterPrivateInput(handoffOpen: response["handoff_open"] as? Bool ?? true, title: tab.displayTitle)
             }
-        } catch ConnectionError.http(404, _) {
-            applyStatus(["enabled": false, "connected": false])
+        }
+    }
+
+    func resume(using connection: BudConnection) async {
+        guard control != nil else { return }
+        await post("resume", using: connection) { _ in endControl() }
+    }
+
+    @discardableResult
+    func sendControl(
+        _ action: String, tabID: String, body: [String: Any], using connection: BudConnection
+    ) async -> Bool {
+        guard interactiveTabID == tabID else { return false }
+        var payload = body
+        payload["tab"] = tabID
+        let timeout: TimeInterval = action == "navigate" ? 40 : 30
+        return await post("control/\(action)", using: connection, body: payload, timeout: timeout) { _ in }
+    }
+
+    @discardableResult
+    private func post(
+        _ path: String, using connection: BudConnection, body: [String: Any]? = nil,
+        timeout: TimeInterval = 10, apply: ([String: Any]) -> Void
+    ) async -> Bool {
+        guard !sending, !Task.isCancelled else { return false }
+        sending = true
+        problem = nil
+        defer {
+            sending = false
+            requestRefresh()
+        }
+        do {
+            var request = connection.request("POST", "browser/view/\(path)", json: body)
+            request.timeoutInterval = timeout
+            apply(try await connection.send(request))
+            return true
+        } catch ConnectionError.http(_, let detail) {
+            problem = detail
         } catch {
             problem = "\(error)"
         }
-        sending = false
-        requestRefresh()
+        return false
+    }
+}
+
+func normalizedBrowserPoint(_ point: CGPoint, in bounds: CGRect) -> CGPoint? {
+    guard bounds.width > 0, bounds.height > 0 else { return nil }
+    return CGPoint(
+        x: min(1, max(0, (point.x - bounds.minX) / bounds.width)),
+        y: min(1, max(0, (point.y - bounds.minY) / bounds.height))
+    )
+}
+
+private struct BrowserPreviewInput: NSViewRepresentable {
+    let click: (@MainActor (CGPoint) -> Void)?
+    let scroll: @MainActor (CGSize) async -> Void
+
+    func makeNSView(context: Context) -> Canvas { Canvas() }
+
+    func updateNSView(_ view: Canvas, context: Context) {
+        view.click = click
+        view.scroll = scroll
+    }
+
+    final class Canvas: NSView {
+        var click: (@MainActor (CGPoint) -> Void)?
+        var scroll: (@MainActor (CGSize) async -> Void)?
+        private var latestClick: CGPoint?
+        private var ringTask: Task<Void, Never>?
+        private var scrollTask: Task<Void, Never>?
+        private var pendingScroll = CGSize.zero
+
+        override var isFlipped: Bool { true }
+
+        override func mouseDown(with event: NSEvent) {}
+
+        override func mouseUp(with event: NSEvent) {
+            let point = convert(event.locationInWindow, from: nil)
+            guard let click, bounds.contains(point),
+                  let normalized = normalizedBrowserPoint(point, in: bounds) else { return }
+            latestClick = point
+            needsDisplay = true
+            ringTask?.cancel()
+            ringTask = Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(200))
+                guard !Task.isCancelled, let self else { return }
+                latestClick = nil
+                needsDisplay = true
+            }
+            click(normalized)
+        }
+
+        override func draw(_ dirtyRect: NSRect) {
+            guard let point = latestClick else { return }
+            let ring = NSBezierPath(ovalIn: NSRect(x: point.x - 8, y: point.y - 8, width: 16, height: 16))
+            NSColor.black.withAlphaComponent(0.4).setFill()
+            ring.fill()
+            NSColor.white.withAlphaComponent(0.8).setStroke()
+            ring.lineWidth = 1.5
+            ring.stroke()
+        }
+
+        override func scrollWheel(with event: NSEvent) {
+            let scale: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 16
+            pendingScroll.width -= event.scrollingDeltaX * scale
+            pendingScroll.height -= event.scrollingDeltaY * scale
+            guard scrollTask == nil, pendingScroll != .zero else { return }
+            scrollTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(80))
+                    guard !Task.isCancelled, let self else { return }
+                    let delta = pendingScroll
+                    pendingScroll = .zero
+                    if delta != .zero { await scroll?(delta) }
+                    if pendingScroll == .zero {
+                        scrollTask = nil
+                        return
+                    }
+                }
+            }
+        }
+
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            super.viewWillMove(toWindow: newWindow)
+            if newWindow == nil {
+                ringTask?.cancel()
+                scrollTask?.cancel()
+                scrollTask = nil
+                pendingScroll = .zero
+            }
+        }
     }
 }
 
@@ -287,31 +478,28 @@ struct BrowserInspector: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Rectangle().fill(Paper.hairline).frame(height: 0.5)
-            if state.privateInput {
-                privateInput
-                    .padding(14)
-            } else if state.sending {
-                VStack(alignment: .leading, spacing: 10) {
-                    ProgressView().controlSize(.small)
-                    Text("Wait for Private input before entering private information.")
+            if let control = state.control {
+                switch control {
+                case .interactive(let tabID, let title):
+                    interactiveControl(tabID, title: title)
+                case .chrome(let title, let handoffOpen):
+                    chromeControl(title: title, handoffOpen: handoffOpen)
                 }
-                .font(Paper.Typography.callout)
-                .foregroundStyle(Paper.inkSecondary)
-                .padding(14)
             } else if let emptyState = state.emptyState {
                 emptyContent(emptyState)
             } else if !state.groups.isEmpty {
-                tabList
+                tabList.disabled(state.sending)
             } else if let problem = state.problem {
                 guidance(problem) { connectionActions }
             } else {
                 ProgressView().controlSize(.small).padding(14)
             }
-            if state.privateInput, let problem = state.problem {
+            if (state.control != nil || state.emptyState == nil && !state.groups.isEmpty),
+               let problem = state.problem {
                 Text(problem)
                     .font(Paper.Typography.callout)
                     .foregroundStyle(Paper.errorInk)
-                    .padding(.horizontal, 14)
+                    .padding([.horizontal, .bottom], 14)
             }
         }
         .frame(maxHeight: .infinity, alignment: .topLeading)
@@ -320,7 +508,7 @@ struct BrowserInspector: View {
         .task(id: state.refreshID) { [id = state.refreshID] in
             while !Task.isCancelled, id == state.refreshID {
                 await state.refresh(using: selection.connection, id: id)
-                try? await Task.sleep(for: .seconds(state.privateInput ? 1 : 3))
+                try? await Task.sleep(for: .seconds(state.control == nil ? 3 : 1))
             }
         }
     }
@@ -332,7 +520,7 @@ struct BrowserInspector: View {
                     .font(Paper.Typography.label)
                     .foregroundStyle(Paper.inkPrimary)
                 let count = state.tabCount
-                if count > 0, !state.privateInput, !state.sending {
+                if count > 0, state.control == nil {
                     Text("\(count) \(count == 1 ? "tab" : "tabs")")
                         .font(Paper.Typography.caption)
                         .foregroundStyle(Paper.inkMuted)
@@ -386,8 +574,7 @@ struct BrowserInspector: View {
 
     private func tabCard(_ tab: BrowserTab) -> some View {
         let selected = tab.id == state.focus.selected
-        let fallbackTitle = tab.host.isEmpty ? "Untitled tab" : tab.host
-        let title = tab.title.isEmpty ? fallbackTitle : tab.title
+        let title = tab.displayTitle
         let previewLabel = selected ? "Preview of the selected browser tab" : "Preview of \(title)"
         let preview = state.previews[tab.id]
         let issue = state.previewIssues[tab.id]
@@ -404,14 +591,8 @@ struct BrowserInspector: View {
                                 .resizable()
                                 .scaledToFit()
                                 .accessibilityLabel(previewLabel)
-                        } else if let issue {
-                            VStack(spacing: 6) {
-                                Image(systemName: "macwindow")
-                                Text(issue).font(Paper.Typography.caption)
-                            }
-                            .foregroundStyle(Paper.inkMuted)
                         } else {
-                            ProgressView().controlSize(.small)
+                            previewPlaceholder(issue)
                         }
                     }
                     .clipShape(shape)
@@ -437,24 +618,21 @@ struct BrowserInspector: View {
                             .help("Refresh preview")
                             .accessibilityLabel("Refresh preview")
                         Button("Take over") {
-                            Task {
-                                await state.send("takeover", using: selection.connection, body: ["tab": tab.id])
-                            }
+                            Task { await state.takeOver(tab, using: selection.connection) }
                         }
                         .buttonStyle(CardButton(kind: .secondary))
-                        .help("Take over privately")
-                        .accessibilityLabel("Take over privately")
                         .disabled(state.sending)
                     }
                 }
                 HStack(spacing: 6) {
+                    let showHost = !tab.host.isEmpty && tab.host != title
                     if tab.id == state.activeTabID {
                         Text("Bud's tab")
                             .font(Paper.Typography.captionMedium)
                             .foregroundStyle(Paper.inkSecondary)
-                        if !tab.host.isEmpty { Text("·").accessibilityHidden(true) }
+                        if showHost { Text("·").accessibilityHidden(true) }
                     }
-                    if !tab.host.isEmpty {
+                    if showHost {
                         Text(tab.host).lineLimit(1)
                     }
                 }
@@ -479,30 +657,158 @@ struct BrowserInspector: View {
         }
     }
 
-    private var privateInput: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Label {
-                Text("You have control").font(Paper.Typography.label)
-            } icon: {
-                Image(systemName: "hand.raised.fill").font(.system(size: 13))
+    @ViewBuilder
+    private func previewPlaceholder(_ issue: String?) -> some View {
+        if let issue {
+            VStack(spacing: 6) {
+                Image(systemName: "macwindow")
+                Text(issue).font(Paper.Typography.caption)
             }
-            .foregroundStyle(Paper.inkPrimary)
-            if let controlledTabTitle = state.controlledTabTitle {
-                Text(controlledTabTitle)
-                    .font(Paper.Typography.callout)
+            .foregroundStyle(Paper.inkMuted)
+        } else {
+            ProgressView().controlSize(.small)
+        }
+    }
+
+    private func controlBar(title: String?) -> some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("You have control")
+                    .font(Paper.Typography.label)
                     .foregroundStyle(Paper.inkPrimary)
-                    .lineLimit(2)
+                if let title {
+                    Text(title)
+                        .font(Paper.Typography.caption)
+                        .foregroundStyle(Paper.inkSecondary)
+                        .lineLimit(1)
+                }
             }
-            Text(state.handoffOpen
-                 ? "Bud is paused on this tab while you work in the browser. Select Continue in the tab when you're done."
-                 : "Bud is paused on this tab while you work in the browser. Give back control when you're done.")
+            Spacer(minLength: 0)
+            Button("Give back control") { Task { await state.resume(using: selection.connection) } }
+                .buttonStyle(CardButton(kind: .primary))
+                .fixedSize()
+                .disabled(state.sending)
+        }
+    }
+
+    private func chromeControl(title: String?, handoffOpen: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            controlBar(title: title)
+            Text(handoffOpen
+                 ? "Work in Chrome. You can also select Continue there to give back control."
+                 : "Bud is paused while you work in Chrome.")
                 .font(Paper.Typography.callout)
                 .foregroundStyle(Paper.inkSecondary)
-            if !state.handoffOpen, !state.sending {
-                Button("Give back control") { Task { await state.send("resume", using: selection.connection) } }
-                    .buttonStyle(CardButton(kind: .primary))
+        }
+        .padding(14)
+    }
+
+    private func interactiveControl(_ tabID: String, title: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            controlBar(title: title)
+            let issue = state.previewIssues[tabID]
+            let shape = RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous)
+            ZStack {
+                Paper.recessed
+                if let preview = state.previews[tabID] {
+                    Image(nsImage: preview.image)
+                        .resizable()
+                        .scaledToFit()
+                        .accessibilityLabel("Live preview of \(title)")
+                        .overlay {
+                            BrowserPreviewInput(
+                                click: state.sending ? nil : { @MainActor point in
+                                    Task {
+                                        _ = await control("click", tabID, ["nx": point.x, "ny": point.y])
+                                    }
+                                },
+                                scroll: { @MainActor delta in
+                                    _ = await control("scroll", tabID, ["dx": delta.width, "dy": delta.height])
+                                }
+                            )
+                        }
+                } else {
+                    previewPlaceholder(issue)
+                }
+            }
+            .clipShape(shape)
+            .overlay { PaperOutline(shape: shape, focused: false) }
+            .id(tabID)
+            if state.previews[tabID] != nil, let issue {
+                Text(issue).font(Paper.Typography.caption).foregroundStyle(Paper.inkSecondary)
+            }
+            controlInputs(tabID)
+                .disabled(state.sending)
+        }
+        .padding(14)
+    }
+
+    private func controlInputs(_ tabID: String) -> some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 4) {
+                controlField("Address", text: $state.address) { navigate(tabID) }
+                controlButton("arrow.right", label: "Go") { navigate(tabID) }
+            }
+            HStack(spacing: 2) {
+                controlField("Type into focused field...", text: $state.quickText) {
+                    let text = state.quickText
+                    guard !text.isEmpty else { return }
+                    Task {
+                        if await control("type", tabID, ["text": text]), state.quickText == text {
+                            state.quickText = ""
+                        }
+                    }
+                }
+                quickKey("Enter", symbol: "return", tabID: tabID)
+                quickKey("Backspace", symbol: "delete.left", tabID: tabID)
+                quickKey("Tab", symbol: "arrow.right.to.line", tabID: tabID)
+                quickKey("Escape", symbol: "escape", label: "Esc", tabID: tabID)
             }
         }
+    }
+
+    private func controlField(
+        _ label: String, text: Binding<String>, submit: @escaping () -> Void
+    ) -> some View {
+        TextField(label, text: text)
+            .textFieldStyle(.plain)
+            .font(Paper.Typography.callout)
+            .padding(.horizontal, 8)
+            .frame(height: 26)
+            .background(Paper.fillSubtle, in: RoundedRectangle(cornerRadius: Paper.radiusSM))
+            .onSubmit(submit)
+    }
+
+    private func controlButton(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol).font(.system(size: 12, weight: .medium))
+        }
+        .buttonStyle(IconButton())
+        .help(label)
+        .accessibilityLabel(label)
+    }
+
+    private func quickKey(_ key: String, symbol: String, label: String? = nil, tabID: String) -> some View {
+        controlButton(symbol, label: label ?? key) {
+            Task { await control("key", tabID, ["key": key]) }
+        }
+    }
+
+    private func navigate(_ tabID: String) {
+        let address = state.address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !address.isEmpty else { return }
+        let url = address.contains("://") ? address : "https://\(address)"
+        guard let parsed = URL(string: url), let scheme = parsed.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https"), let host = parsed.host(), !host.isEmpty else {
+            state.problem = "Enter an HTTP or HTTPS address."
+            return
+        }
+        Task { await control("navigate", tabID, ["url": parsed.absoluteString]) }
+    }
+
+    @discardableResult
+    private func control(_ action: String, _ tabID: String, _ body: [String: Any]) async -> Bool {
+        await state.sendControl(action, tabID: tabID, body: body, using: selection.connection)
     }
 
     @ViewBuilder

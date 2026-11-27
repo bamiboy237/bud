@@ -127,15 +127,11 @@ def compose_runner(
             conversation_search(log, deferred=harness.operating_profile.harness.defer_capabilities)
         )
     profile = harness.operating_profile
+    runner: Runner
     learner = (
         Learner(
             harness.memory,
-            lambda session_id: gateway.model(
-                profile.model.tier,
-                f"{session_id}:learn",
-                require_tools=True,
-                selected=profile.model.model_id,
-            ),
+            lambda session_id: runner.learning_model(session_id),
             preferences=harness.preferences,
         )
         if harness.memory is not None
@@ -154,7 +150,9 @@ def compose_runner(
         "recall": recall,
         "workspace": workspace,
         "operating_profile": profile,
+        "settings": settings,
     }
     if allow_unconfigured:
         kwargs["allow_unconfigured"] = True
-    return runner_cls(hub, gateway, harness, **kwargs)
+    runner = runner_cls(hub, gateway, harness, **kwargs)
+    return runner

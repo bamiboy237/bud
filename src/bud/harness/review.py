@@ -2,8 +2,8 @@
 
 Adapted from Mistral Vibe's "smart approve" (`_smart_approve.py`, Apache-2.0,
 https://github.com/mistralai/mistral-vibe). Vibe's design is kept; the domain is changed from
-a coding agent to a personal assistant, and the classifier is OpenAI's Decisions API instead
-of a chat completion.
+a coding agent to a personal assistant, and the classifier uses OpenAI's Decisions API when
+available or asks the active model for choices.
 
 How a call is judged:
 
@@ -17,7 +17,8 @@ How a call is judged:
 3. It answers three multiple-choice questions in one request: how risky the call is, how
    strongly the owner authorized this exact call, and which concern (if any) applies. Choice
    answers come back as probability distributions, so code can read a conservative tail
-   instead of trusting the single most likely answer.
+   instead of trusting the single most likely answer. The active model returns one choice per
+   question.
 4. Code applies the outcome policy itself and fails closed: critical never runs, a call
    nobody authorized never runs, high risk needs real authorization, and any named concern is
    a contradiction with "safe". The model's words never reach the agent or the owner; the
@@ -39,6 +40,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 from pydantic import BaseModel, Field
+from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -47,6 +49,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
+from pydantic_ai.models import Model
 
 from bud.harness.ask import ask_summary
 
@@ -73,6 +76,8 @@ CONCERNS = (
 )
 # Kinds of action that always need the owner, however clearly they were asked for.
 SENSITIVE = ("none", "payment", "sends", "deletes", "credentials", "opaque")
+
+ModelProvider = Callable[[], Model]
 
 # Shown to the owner and returned to the agent when a call is held. Fixed text chosen in
 # code: nothing a model or a stranger wrote is ever repeated back as an explanation.
@@ -517,8 +522,83 @@ def too_long_to_review(args: dict[str, Any]) -> bool:
     return len(json.dumps(args, default=str, ensure_ascii=False)) > MAX_ARGS_CHARS
 
 
-class ToolReviewer:
-    """Classifies one pending write through the Decisions API."""
+class DecisionsClient:
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        model: str,
+        timeout: float,
+        url: str,
+        model_provider: ModelProvider | None,
+    ) -> None:
+        self.model = model
+        self.timeout = timeout
+        self.url = url
+        self.model_provider = model_provider
+        self._client = httpx.AsyncClient(timeout=timeout)
+        self.api_key = api_key
+        self._rejected_key: str | None = None
+
+    async def decisions(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        key = self.api_key
+        if self.model_provider is not None and (not key or key == self._rejected_key):
+            return None
+        async with asyncio.timeout(self.timeout):
+            response = await self._client.post(
+                self.url, headers={"Authorization": f"Bearer {key}"}, json=payload
+            )
+        if response.status_code in (401, 403):
+            if key == self.api_key:
+                self._rejected_key = key
+            if self.model_provider is not None:
+                return None
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict):
+            raise ValueError("Decisions did not return an object.")
+        return body
+
+    async def gateway_answer(
+        self, payload: dict[str, Any], model: Model, format_instructions: str, *, name: str
+    ) -> str:
+        rules = payload["input"][0]["content"][0]["text"]
+        prompt = json.dumps(
+            {"evidence": payload["input"][1]["content"], "questions": payload["questions"]},
+            ensure_ascii=False,
+        )
+        agent = Agent(
+            model,
+            name=name,
+            instructions=f"{rules}\n\nReturn only a JSON object. {format_instructions}",
+        )
+        async with asyncio.timeout(self.timeout):
+            return (await agent.run(prompt)).output
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+
+class ReviewAnswers(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    risk: Literal["low", "medium", "high", "critical"]
+    authorization: Literal["unknown", "low", "medium", "high"]
+    concern: Literal[
+        "none",
+        "unrequested",
+        "wrong_target",
+        "visible_to_others",
+        "destructive",
+        "exfiltration",
+        "injected",
+        "standing_change",
+    ]
+    sensitive: Literal["none", "payment", "sends", "deletes", "credentials", "opaque"]
+
+
+class ToolReviewer(DecisionsClient):
+    """Classifies one pending write using Decisions or the active model."""
 
     def __init__(
         self,
@@ -527,12 +607,11 @@ class ToolReviewer:
         model: str = DEFAULT_REVIEW_MODEL,
         timeout: float = REVIEW_TIMEOUT_SECONDS,
         url: str = DECISIONS_URL,
+        model_provider: ModelProvider | None = None,
     ) -> None:
-        self.model = model
-        self.timeout = timeout
-        self.url = url
-        self._client = httpx.AsyncClient(timeout=timeout)
-        self._headers = {"Authorization": f"Bearer {api_key}"}
+        super().__init__(
+            api_key, model=model, timeout=timeout, url=url, model_provider=model_provider
+        )
         # The latest reviews, for evals and debugging; not part of any decision.
         self.recent: deque[dict[str, Any]] = deque(maxlen=500)
 
@@ -581,23 +660,38 @@ class ToolReviewer:
         """Never raises and never allows on failure: any error is an ERROR verdict."""
         started = time.perf_counter()
         tokens = 0
+        model_name = self.model
         try:
-            # httpx timeouts apply per phase; this bounds the whole round trip.
-            async with asyncio.timeout(self.timeout):
-                response = await self._client.post(
-                    self.url, headers=self._headers, json=self.payload(request)
+            payload = self.payload(request)
+            body = await self.decisions(payload)
+            if body is None:
+                assert self.model_provider is not None
+                model = self.model_provider()
+                model_name = model.model_name
+                raw = await self.gateway_answer(
+                    payload,
+                    model,
+                    "Use exactly these keys: risk, authorization, concern, sensitive. "
+                    "Select one listed value for each.",
+                    name="bud_reviewer",
                 )
-            response.raise_for_status()
-            body = response.json()
-            tokens = int((body.get("usage") or {}).get("input_tokens", 0))
-            risk, authorization, concern, sensitive = parse_answers(body)
+                answer = ReviewAnswers.model_validate_json(raw)
+                risk, authorization, concern, sensitive = (
+                    answer.risk,
+                    answer.authorization,
+                    answer.concern,
+                    answer.sensitive,
+                )
+            else:
+                tokens = int((body.get("usage") or {}).get("input_tokens", 0))
+                risk, authorization, concern, sensitive = parse_answers(body)
         except Exception as exc:
             logger.warning("approval review failed for %s: %s", request.tool, type(exc).__name__)
             result = ReviewResult(
                 verdict=Verdict.ERROR,
                 reason="The reviewer could not be reached or gave an unusable answer, "
                 "so the owner decides.",
-                model=self.model,
+                model=model_name,
                 latency_ms=(time.perf_counter() - started) * 1000,
                 error=type(exc).__name__,
             )
@@ -612,7 +706,7 @@ class ToolReviewer:
                 reason=""
                 if verdict is Verdict.ALLOW
                 else reason_for(risk, authorization, concern, sensitive),
-                model=self.model,
+                model=model_name,
                 latency_ms=(time.perf_counter() - started) * 1000,
             )
         self.recent.append(
@@ -624,9 +718,6 @@ class ToolReviewer:
             }
         )
         return result
-
-    async def close(self) -> None:
-        await self._client.aclose()
 
 
 class SessionGrants:
@@ -659,15 +750,23 @@ class SessionGrants:
 Describer = Callable[[dict[str, Any]], str | None | Awaitable[str | None]]
 
 
-def build_reviewer(settings: "Settings | None" = None) -> ToolReviewer | None:
-    """None unless the owner left review on and an OpenAI key exists.
+def decisions_key(settings: "Settings") -> str:
+    return settings.openai_api_key.get_secret_value().strip() if settings.openai_api_key else ""
+
+
+def build_reviewer(
+    settings: "Settings | None" = None, *, model_provider: ModelProvider | None = None
+) -> ToolReviewer | None:
+    """Build the reviewer when enabled and a key or gateway model is available.
 
     Without a reviewer, auto mode asks about every write, exactly like strict.
     """
     from bud.config import get_settings
 
     resolved = settings if settings is not None else get_settings()
-    api_key = resolved.openai_api_key.get_secret_value().strip() if resolved.openai_api_key else ""
-    if not resolved.approval_review or not api_key:
+    api_key = decisions_key(resolved)
+    if not resolved.approval_review or (not api_key and model_provider is None):
         return None
-    return ToolReviewer(api_key, model=resolved.approval_review_model)
+    return ToolReviewer(
+        api_key, model=resolved.approval_review_model, model_provider=model_provider
+    )

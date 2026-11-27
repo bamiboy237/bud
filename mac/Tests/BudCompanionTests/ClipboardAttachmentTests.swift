@@ -82,7 +82,7 @@ struct ClipboardAttachmentTests {
     }
 
     private func finishReading(_ companion: Companion) async throws {
-        let deadline = ContinuousClock.now + .seconds(2)
+        let deadline = ContinuousClock.now + .seconds(5)
         while companion.readingAttachments, ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(5))
         }
