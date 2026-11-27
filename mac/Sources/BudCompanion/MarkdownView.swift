@@ -19,7 +19,7 @@ struct MarkdownView: View {
     }
 
     var body: some View {
-        // Links and citations take the one accent, scoped here so pickers elsewhere keep theirs.
+        // Scope the link accent to the reply.
         Blocks(blocks: parsed.blocks, spacing: type.blockSpacing, rich: rich)
             .environment(\.markdownEquations, parsed.equations)
             .tint(Paper.accent)
@@ -252,8 +252,7 @@ private struct Prose: View {
             .textRenderer(InlinePillRenderer(
                 codeFill: Paper.codeChipFill,
                 codeBorder: Paper.codeChipBorder,
-                citationFill: Paper.citationFill,
-                citationBorder: Paper.citationBorder))
+                citationFill: Paper.fillSubtle))
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -326,14 +325,13 @@ private struct InlinePillRenderer: TextRenderer {
     let codeFill: Color
     let codeBorder: Color
     let citationFill: Color
-    let citationBorder: Color
 
     func draw(layout: SwiftUI.Text.Layout, in context: inout GraphicsContext) {
         for line in layout {
             drawPills(in: line, context: &context, isCitation: false, fill: codeFill, border: codeBorder)
             drawPills(
                 in: line, context: &context, isCitation: true,
-                fill: citationFill, border: citationBorder)
+                fill: citationFill, border: nil)
             for run in line { context.draw(run) }
         }
     }
@@ -433,7 +431,6 @@ private struct CodeBlockView: View {
     let code: String
     let language: String?
     @Environment(\.replyType) private var type
-    @StateObject private var copyHovered = Flag()
     @StateObject private var copied = Flag()
 
     private var source: String { code.hasSuffix("\n") ? String(code.dropLast()) : code }
@@ -474,26 +471,12 @@ private struct CodeBlockView: View {
                     copied.on = false
                 }
             } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: copied.on ? "checkmark" : "doc.on.doc")
-                        .font(.system(size: 10, weight: .medium))
-                    if copied.on {
-                        Text("Copied")
-                            .font(type.meta)
-                    }
-                }
-                .foregroundStyle(copied.on || copyHovered.on ? Paper.inkPrimary : Paper.inkMuted)
-                .padding(.horizontal, 6)
-                .frame(height: 18)
-                .background(
-                    copyHovered.on ? Paper.fillHover : .clear,
-                    in: RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
+                Image(systemName: copied.on ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 11, weight: .medium))
             }
-            .buttonStyle(.plain)
-            .pointerStyle(.link)
-            .onHover { copyHovered.on = $0 }
+            .buttonStyle(IconButton(size: 22, active: copied.on))
             .help(copied.on ? "Copied" : "Copy code")
-            .accessibilityLabel("Copy code")
+            .accessibilityLabel(copied.on ? "Copied" : "Copy code")
         }
         .padding(.horizontal, 10)
         .frame(height: Metrics.codeHeaderHeight)
@@ -556,8 +539,7 @@ private struct TableView: View {
                 .textRenderer(InlinePillRenderer(
                     codeFill: Paper.codeChipFill,
                     codeBorder: Paper.codeChipBorder,
-                    citationFill: Paper.citationFill,
-                    citationBorder: Paper.citationBorder))
+                    citationFill: Paper.fillSubtle))
                 .fontWeight(header ? .semibold : .regular)
                 .foregroundStyle(header ? Paper.inkSecondary : Paper.inkPrimary)
                 .multilineTextAlignment(alignment.text)
@@ -637,9 +619,9 @@ private func inline(
             if let destination = link.destination, let url = URL(string: destination) {
                 run.link = url
                 if url.scheme == Citations.scheme {
-                    // Citations render as high-contrast 11pt mono micro-pills.
+                    // Citations use compact mono text inside their chips.
                     run.font = Paper.Typography.ledgerMeta
-                    run.foregroundColor = Paper.citationInk
+                    run.foregroundColor = Paper.inkSecondary
                     run[CitationRun.self] = true
                     if nextStartsWithPunctuation { run[TightTrailingRun.self] = true }
                     if let lastChar = out.characters.last, !lastChar.isWhitespace,
@@ -653,6 +635,7 @@ private func inline(
                             : ChipMetrics.gap
                     }
                 } else {
+                    run.foregroundColor = Paper.accent
                     run.underlineStyle = .single
                 }
             }

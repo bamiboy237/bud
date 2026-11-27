@@ -511,8 +511,13 @@ private struct Bubble: View {
         let _ = appearance.revision
         let shape = BubbleShape(anchor: companion.anchor)
         let usesDither = appearance.theme == .paper
+        let status = state
+        let overlaysControls = status == nil
+        let topTail = companion.anchor.below ? BubbleShape.tail : 0
         VStack(alignment: .leading, spacing: 12) {
-            header
+            if let status {
+                header(status)
+            }
             if !compact, !companion.question.isEmpty, companion.setups.isEmpty {
                 // What you asked, so the answer keeps its context. One line: a reminder.
                 Text(companion.question)
@@ -520,17 +525,12 @@ private struct Bubble: View {
                     .foregroundStyle(Paper.inkMuted)
                     .lineLimit(1)
                     .truncationMode(.tail)
-                    .padding(.top, -4)
+                    .padding(.top, overlaysControls ? 0 : -4)
                     .transition(.opacity)
             }
             if companion.running, companion.stepsLayout == .checklist, !companion.steps.isEmpty {
-                HStack(alignment: .top, spacing: 10) {
-                    RoundedRectangle(cornerRadius: 1)
-                        .fill(Paper.accent.opacity(0.4))
-                        .frame(width: 2)
-                    StepList(steps: companion.steps, live: true)
-                }
-                .fixedSize(horizontal: false, vertical: true)
+                StepList(steps: companion.steps, live: true)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if companion.showStepsAfter, !companion.running, !companion.lastSteps.isEmpty {
                 StepsSummary(companion: companion)
@@ -595,12 +595,18 @@ private struct Bubble: View {
         .foregroundStyle(Paper.inkPrimary)
         .padding(.horizontal, 18)
         // The tail's edge gets its extra room, toward the pet.
-        .padding(.top, 14 + (companion.anchor.below ? BubbleShape.tail : 0))
+        .padding(.top, (overlaysControls ? 22 : 14) + topTail)
         .padding(.bottom, 16 + (companion.anchor.below ? 0 : BubbleShape.tail))
-        // Only the name line: a small tag over the pet, not a wide empty card.
         .frame(width: compact ? nil : 332, alignment: .leading)
         .frame(minWidth: 132, alignment: .leading)
         .fixedSize(horizontal: compact, vertical: false)
+        .overlay(alignment: .topTrailing) {
+            if overlaysControls {
+                headerControls
+                    .padding(.top, topTail + 1)
+                    .padding(.trailing, 12)
+            }
+        }
         .background {
             if usesDither {
                 DitherBackdrop().clipShape(shape)
@@ -650,33 +656,26 @@ private struct Bubble: View {
         companion.approvals.isEmpty && companion.setups.isEmpty ? 260 : 60
     }
 
-    /// Who is speaking and what they're doing, like a name above a message.
-    private var header: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Text("bud")
-                .font(Paper.Typography.wordmark)
-            if let state {
-                if companion.status == .needsYou {
-                    // Option A: pure ink, never a colour that could pass for a link or an error.
-                    Rectangle().fill(Paper.inkPrimary).frame(width: 4.25, height: 4.25)
-                        .rotationEffect(.degrees(45))
-                        .alignmentGuide(.firstTextBaseline) { $0.height / 2 + 4 }
-                        .accessibilityHidden(true)
-                }
-                Text(state.text)
-                    .font(Fonts.sans(
-                        size: 12,
-                        weight: companion.status == .needsYou
-                            ? Fonts.OpticalWeight.medium
-                            : Fonts.OpticalWeight.regular))
-                    .foregroundStyle(state.tint)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .shimmer(active: state.busy)
-                    .contentTransition(.opacity)
-                    .id(state.text)
-                    .transition(.opacity)
+    private func header(_ state: (text: String, tint: Color, busy: Bool)) -> some View {
+        HStack(spacing: 6) {
+            if companion.status == .needsYou {
+                Rectangle().fill(Paper.inkPrimary).frame(width: 4.25, height: 4.25)
+                    .rotationEffect(.degrees(45))
+                    .accessibilityHidden(true)
             }
+            Text(state.text)
+                .font(Fonts.sans(
+                    size: 12,
+                    weight: companion.status == .needsYou
+                        ? Fonts.OpticalWeight.medium
+                        : Fonts.OpticalWeight.regular))
+                .foregroundStyle(state.tint)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .shimmer(active: state.busy)
+                .contentTransition(.opacity)
+                .id(state.text)
+                .transition(.opacity)
             Spacer(minLength: compact ? 6 : 0)
             if let count = stepCount {
                 Text(count)
@@ -684,10 +683,16 @@ private struct Bubble: View {
                     .foregroundStyle(Paper.inkMuted)
                     .contentTransition(.numericText())
             }
+            headerControls
+        }
+        .animation(.easeOut(duration: 0.15), value: state.text)
+    }
+
+    private var headerControls: some View {
+        HStack(spacing: 6) {
             expand
             close
         }
-        .animation(.easeOut(duration: 0.15), value: state?.text)
     }
 
     /// "step 3", for the counted layout while bud works.
@@ -744,8 +749,7 @@ private struct Bubble: View {
             let asking = companion.hasQuestion
             return (asking ? "Has a question" : "Needs your OK", Paper.inkPrimary, false)
         case .failed: return (companion.runFailure?.title ?? "Couldn't finish", Paper.errorInk, false)
-        case .done: return ("Done", Paper.inkSecondary, false)
-        case .idle: return nil
+        case .done, .idle: return nil
         }
     }
 }
@@ -762,16 +766,18 @@ struct StepList: View {
     var limit: Int? = 5
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        let visible = steps.suffix(limit ?? steps.count)
+        return VStack(alignment: .leading, spacing: 0) {
             if let limit, steps.count > limit {
                 Text("\(steps.count - limit) earlier \(steps.count - limit == 1 ? "step" : "steps")")
                     .font(Paper.Typography.ledgerMeta)
                     .foregroundStyle(Paper.inkMuted)
                     .padding(.leading, 20)
+                    .padding(.bottom, visible.isEmpty ? 0 : 5)
             }
-            ForEach(steps.suffix(limit ?? steps.count)) { step in
+            ForEach(visible) { step in
                 // Every unfinished step is in flight: bud runs a call's functions together.
-                StepRow(step: step, live: live && !step.done)
+                StepRow(step: step, live: live && !step.done, connectsToNext: step.id != visible.last?.id)
                     .transition(.opacity.combined(with: .offset(y: 4)))
             }
         }
@@ -785,7 +791,11 @@ struct StepList: View {
 private struct StepRow: View {
     let step: Step
     let live: Bool
+    let connectsToNext: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private let markerSize: CGFloat = 12
+    private let markerInset: CGFloat = 2
 
     /// The step's place within its call, from its id ("call:2").
     private var order: Int { Int(step.id.split(separator: ":").last ?? "") ?? 0 }
@@ -796,13 +806,13 @@ private struct StepRow: View {
     }
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        HStack(alignment: .top, spacing: 8) {
             ZStack {
                 Circle()
-                    .strokeBorder(Paper.borderStrong, lineWidth: 1)
+                    .strokeBorder(Paper.borderStrong, lineWidth: 1.5)
                     .opacity(step.done ? 0 : 1)
                 Circle()
-                    .fill(Paper.inkPrimary.opacity(0.85))
+                    .fill(Paper.inkPrimary)
                     .scaleEffect(step.done || reduceMotion ? 1 : 0.6)
                     .opacity(step.done ? 1 : 0)
                 Tick()
@@ -811,8 +821,8 @@ private struct StepRow: View {
                     .opacity(step.done ? 1 : 0)
                     .padding(3)
             }
-            .frame(width: 12, height: 12)
-            .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
+            .frame(width: markerSize, height: markerSize)
+            .padding(.top, markerInset)
             .animation(check, value: step.done)
 
             Text(step.text)
@@ -821,6 +831,19 @@ private struct StepRow: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .shimmer(active: live)
+        }
+        .padding(.bottom, connectsToNext ? 5 : 0)
+        .overlay(alignment: .leading) {
+            if connectsToNext {
+                Rectangle()
+                    .fill(Paper.hairline)
+                    .frame(width: 1)
+                    .padding(.top, markerSize + markerInset)
+                    .padding(.bottom, -markerInset)
+                    .frame(width: markerSize)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
         }
         .accessibilityElement(children: .combine)
         .accessibilityValue(step.done ? "done" : live ? "in progress" : "")
@@ -992,10 +1015,7 @@ struct ApprovalCard: View {
             }
             Spacer(minLength: 4)
             if approval.grantable { alwaysAllow }
-            Button(companion.approvalFailures[approval.id] == nil ? approval.verb : "Retry") {
-                onDecide(true)
-            }
-            .buttonStyle(CardButton(kind: .primary))
+            approveButton
         }
     }
 
@@ -1044,11 +1064,9 @@ struct ApprovalCard: View {
     private var heading: some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: approval.symbol)
-                .font(.system(size: 12, weight: .medium))
-                .frame(width: 26, height: 26)
-                .background(
-                    Paper.fillSubtle,
-                    in: RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous))
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Paper.inkSecondary)
+                .padding(.top, 1)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(approval.isQuestion ? "bud has a question" : approval.title)
@@ -1061,7 +1079,6 @@ struct ApprovalCard: View {
                         .lineLimit(1)
                 }
             }
-            .padding(.top, approval.job == nil ? 4 : 0)
             Spacer(minLength: 0)
         }
     }
@@ -1072,6 +1089,7 @@ struct ApprovalCard: View {
                 GridRow {
                     Text(approval.facts[index].label).foregroundStyle(Paper.inkSecondary)
                     Text(approval.facts[index].value)
+                        .foregroundStyle(Paper.inkPrimary)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                 }
@@ -1097,15 +1115,23 @@ struct ApprovalCard: View {
                     Text("Deny").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(CardButton(kind: .secondary))
-                Button {
-                    onDecide(true)
-                } label: {
-                    Text(companion.approvalFailures[approval.id] == nil ? approval.verb : "Retry")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(CardButton(kind: .primary))
+                approveButton
             }
         }
+    }
+
+    private var approveButton: some View {
+        let retrying = companion.approvalFailures[approval.id] != nil
+        let label = retrying ? "Retry" : approval.verb
+        let symbol = retrying ? "arrow.clockwise" : approval.verb.lowercased() == "send" ? "paperplane.fill" : "checkmark"
+        return Button { onDecide(true) } label: {
+            Image(systemName: symbol)
+                .font(.system(size: 12, weight: .semibold))
+                .frame(minWidth: inWindow ? 34 : nil, maxWidth: inWindow ? nil : .infinity)
+        }
+        .buttonStyle(CardButton(kind: .primary))
+        .help(label)
+        .accessibilityLabel(label)
     }
 
     private var alwaysAllow: some View {
@@ -1164,15 +1190,17 @@ struct PaperHit<S: Shape>: ButtonStyle {
 struct IconButton: ButtonStyle {
     var size: CGFloat = 24
     var highlight = true
+    var active = false
 
     func makeBody(configuration: Configuration) -> some View {
-        Face(configuration: configuration, size: size, highlight: highlight)
+        Face(configuration: configuration, size: size, highlight: highlight, active: active)
     }
 
     private struct Face: View {
         let configuration: Configuration
         let size: CGFloat
         let highlight: Bool
+        let active: Bool
         @StateObject private var hover = Flag()
         @Environment(\.isEnabled) private var enabled
 
@@ -1182,7 +1210,7 @@ struct IconButton: ButtonStyle {
                 ? AnyShape(RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
                 : AnyShape(Circle())
             configuration.label
-                .foregroundStyle(!highlight ? Paper.canvas : hovered ? Paper.inkPrimary : Paper.inkSecondary)
+                .foregroundStyle(!highlight ? Paper.canvas : hovered || active ? Paper.inkPrimary : Paper.inkSecondary)
                 .frame(width: size, height: size)
                 .background(highlight && hovered ? Paper.fillHover : .clear, in: shape)
                 .contentShape(shape)

@@ -539,6 +539,7 @@ private struct ConversationView: View {
         let canCancel = companion.replyingTo != nil || companion.inputPurpose != .ask
         let dropTargeted = droppingAttachments.on && companion.canAddAttachments
         let composerShape = RoundedRectangle(cornerRadius: Paper.radiusComposer, style: .continuous)
+        let voice = Voice.shared
 
         return VStack(alignment: .leading, spacing: 0) {
             if let quote = companion.replyingTo {
@@ -595,15 +596,15 @@ private struct ConversationView: View {
                     }
             }
             .padding(.horizontal, 14)
-            .padding(.top, 12)
-            .padding(.bottom, 6)
+            .padding(.top, 11)
+            .padding(.bottom, 5)
 
             // Bottom utility strip: minimal by default, with send/stop action on the right.
             HStack(alignment: .center, spacing: 8) {
                 if companion.inputPurpose == .ask {
                     Button { window.chooseAttachments(companion.addAttachments) } label: {
-                        Image(systemName: "paperclip")
-                            .font(.system(size: 13, weight: .medium))
+                        Image(systemName: "plus")
+                            .font(.system(size: 14, weight: .medium))
                     }
                     .buttonStyle(IconButton(size: 28))
                     .help("Attach files")
@@ -621,6 +622,23 @@ private struct ConversationView: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 8)
+                if companion.inputPurpose == .ask, !companion.needsOnboarding, voice.state != .off {
+                    let listening = voice.state == .listening
+                    let hint = "Hold \(voice.keyName) to talk to bud"
+                    Button {
+                        if listening {
+                            voice.cancel()
+                        } else {
+                            companion.nudge("\(hint).")
+                        }
+                    } label: {
+                        Image(systemName: listening ? "waveform" : "mic")
+                            .font(.system(size: 12.5, weight: .medium))
+                    }
+                    .buttonStyle(IconButton(size: 26, active: listening))
+                    .help(hint)
+                    .accessibilityLabel("Voice input")
+                }
                 if companion.needsOnboarding, companion.inputPurpose == .ask {
                     Button("Add a model…") { OnboardingWindow.shared.show() }
                         .buttonStyle(CardButton(kind: .secondary))
@@ -632,8 +650,7 @@ private struct ConversationView: View {
                         .opacity(canSend ? 1 : 0.35)
                 }
             }
-            .padding(.leading, 14)
-            .padding(.trailing, 8)
+            .padding(.horizontal, 10)
             .padding(.bottom, 8)
             .padding(.top, 2)
         }
@@ -735,16 +752,37 @@ private struct TurnView: View {
                     }
                 }
                 if let jobID = turn.desktopJobID {
+                    let shape = RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous)
                     Button {
                         companion.openDesktopDelivery(jobID)
                     } label: {
-                        Label(turn.text, systemImage: "macwindow")
-                            .font(Paper.Typography.callout)
-                            .padding(10)
-                            .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusMD))
+                        HStack(spacing: 10) {
+                            Image(systemName: "macwindow")
+                                .font(.system(size: 13))
+                                .foregroundStyle(Paper.inkSecondary)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(turn.text)
+                                    .font(Paper.Typography.callout)
+                                    .foregroundStyle(Paper.inkPrimary)
+                                    .lineLimit(2)
+                                Text("Browser delivery")
+                                    .font(Paper.Typography.caption)
+                                    .foregroundStyle(Paper.inkMuted)
+                            }
+                            Spacer(minLength: 8)
+                            HStack(spacing: 4) {
+                                Text("Open").font(Paper.Typography.captionMedium)
+                                Image(systemName: "chevron.right").font(.system(size: 9))
+                            }
+                            .foregroundStyle(Paper.inkSecondary)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: 360, alignment: .leading)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(PaperHit(shape: shape, fill: Paper.elevated))
+                    .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5).allowsHitTesting(false) }
                     .help("Open browser delivery")
+                    .accessibilityLabel(turn.text)
                 } else if !turn.text.isEmpty {
                     Reply(text: turn.text, sources: turn.sources, companion: companion, finished: true)
                 }
@@ -838,10 +876,15 @@ private struct Working: View {
         VStack(alignment: .leading, spacing: 8) {
             TimelineView(.periodic(from: since, by: 1)) { context in
                 let stepSuffix = steps.isEmpty ? "" : " · \(steps.count) \(steps.count == 1 ? "step" : "steps")"
-                Text("Working for \(elapsed(Int(context.date.timeIntervalSince(since))))\(stepSuffix)")
-                    .font(Fonts.sans(size: 11.5, tabularDigits: true))
-                    .foregroundStyle(Paper.inkSecondary)
-                    .shimmer(active: true)
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(Paper.inkSecondary)
+                        .frame(width: 5, height: 5)
+                        .accessibilityHidden(true)
+                    Text("Working · \(elapsed(Int(context.date.timeIntervalSince(since))))\(stepSuffix)")
+                        .font(Fonts.sans(size: 11.5, tabularDigits: true))
+                        .foregroundStyle(Paper.inkSecondary)
+                }
             }
             if !steps.isEmpty {
                 StepList(steps: steps, live: true)
