@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // Motion: one spring for things that appear, a quicker fade for things that leave.
@@ -9,11 +10,13 @@ private let leave = Animation.easeOut(duration: 0.15)
 struct PetView: View {
     @Bindable var companion: Companion
     var focusPanel: () -> Void
+    private let appearance = AppearanceStore.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var anchor: Anchor { companion.anchor }
 
     var body: some View {
+        let _ = appearance.revision
         // The bubble and the field stack away from the pet: up from it, or down from it near
         // the top of the screen. The pet keeps its corner; everything else lines up with it.
         VStack(alignment: anchor.left ? .leading : .trailing, spacing: 8) {
@@ -31,6 +34,7 @@ struct PetView: View {
         }
         .padding(PetPanel.inset)
         .frame(width: PetPanel.size.width, height: PetPanel.size.height, alignment: corner)
+        .preferredColorScheme(appearance.mode.colorScheme)
         .animation(companion.bubbleOpen ? appear : leave, value: companion.bubbleOpen)
         .animation(leave, value: companion.status)
     }
@@ -453,34 +457,44 @@ struct UnsentMessage: View {
 struct RunFailureView: View {
     let failure: RunFailure
     var showTitle = true
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            RoundedRectangle(cornerRadius: 1)
-                .fill(Paper.errorInk.opacity(0.55))
-                .frame(width: 2)
-            VStack(alignment: .leading, spacing: 4) {
-                if showTitle {
+        VStack(alignment: .leading, spacing: 6) {
+            if showTitle {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.circle")
+                        .font(.system(size: 12))
+                        .accessibilityHidden(true)
                     Text(failure.title)
                         .font(Paper.Typography.label)
-                        .foregroundStyle(Paper.errorInk)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                 }
-                Text(failure.nextStep)
-                    .font(showTitle ? Paper.Typography.body : Paper.Typography.callout)
-                    .foregroundStyle(Paper.inkPrimary)
-                    .lineSpacing(showTitle ? 3.5 : 2)
+                .foregroundStyle(Paper.errorInk)
+            }
+            Text(failure.nextStep)
+                .font(showTitle ? Paper.Typography.body : Paper.Typography.callout)
+                .foregroundStyle(Paper.inkPrimary)
+                .lineSpacing(showTitle ? 3.5 : 2)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+            if let detail = failure.detail {
+                Text(detail)
+                    .font(Paper.Typography.ledgerMeta)
+                    .foregroundStyle(Paper.inkMuted)
+                    .lineLimit(showTitle ? nil : 4)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
-                if let detail = failure.detail {
-                    Text(detail)
-                        .font(Paper.Typography.ledgerMeta)
-                        .foregroundStyle(Paper.inkMuted)
-                        .lineLimit(showTitle ? nil : 4)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
+            }
+            if showTitle, ["permission", "model_unavailable", "auth", "quota", "context_full"]
+                .contains(failure.kind ?? "") {
+                Button("Open Models") {
+                    SettingsTabState.shared.selected = .models
+                    NSApp.activate()
+                    openSettings()
                 }
+                .buttonStyle(CardButton(kind: .secondary))
             }
         }
         .fixedSize(horizontal: false, vertical: true)
@@ -491,8 +505,12 @@ struct RunFailureView: View {
 
 private struct Bubble: View {
     @Bindable var companion: Companion
+    private let appearance = AppearanceStore.shared
 
     var body: some View {
+        let _ = appearance.revision
+        let shape = BubbleShape(anchor: companion.anchor)
+        let usesDither = appearance.theme == .paper
         VStack(alignment: .leading, spacing: 12) {
             header
             if !compact, !companion.question.isEmpty, companion.setups.isEmpty {
@@ -583,11 +601,13 @@ private struct Bubble: View {
         .frame(width: compact ? nil : 332, alignment: .leading)
         .frame(minWidth: 132, alignment: .leading)
         .fixedSize(horizontal: compact, vertical: false)
-        .background(
-            DitherBackdrop()
-                .clipShape(BubbleShape(anchor: companion.anchor))
-        )
-        .surface(BubbleShape(anchor: companion.anchor))
+        .background {
+            if usesDither {
+                DitherBackdrop().clipShape(shape)
+            }
+        }
+        .surface(shape, fill: usesDither ? Paper.canvas : Paper.elevated)
+        .preferredColorScheme(appearance.mode.colorScheme)
         .onHover { companion.bubbleHovered = $0 }
         // A cited date opens the conversation window at that message.
         .environment(\.openURL, OpenURLAction { url in
@@ -824,38 +844,33 @@ private struct StepsSummary: View {
     @StateObject private var hovered = Flag()
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            RoundedRectangle(cornerRadius: 1)
-                .fill(Paper.accent.opacity(companion.stepsExpanded ? 0.45 : 0.28))
-                .frame(width: 2)
-            VStack(alignment: .leading, spacing: 6) {
-                Button {
-                    companion.stepsExpanded.toggle()
-                } label: {
-                    HStack(spacing: 4) {
-                        Text("\(companion.lastSteps.count) \(companion.lastSteps.count == 1 ? "step" : "steps")")
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 8, weight: .bold))
-                            .rotationEffect(.degrees(companion.stepsExpanded ? 90 : 0))
-                    }
-                    .font(Paper.Typography.ledgerMeta)
-                    .foregroundStyle(hovered.on ? Paper.inkPrimary : Paper.inkSecondary)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 2)
-                    .background(
-                        hovered.on ? Paper.fillHover : .clear,
-                        in: RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
-                    .contentShape(Rectangle())
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                companion.stepsExpanded.toggle()
+            } label: {
+                HStack(spacing: 4) {
+                    Text("\(companion.lastSteps.count) \(companion.lastSteps.count == 1 ? "step" : "steps")")
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .bold))
+                        .rotationEffect(.degrees(companion.stepsExpanded ? 90 : 0))
                 }
-                .buttonStyle(.plain)
-                .pointerStyle(.link)
-                .onHover { hovered.on = $0 }
-                .padding(.leading, -5)
-                .accessibilityLabel(companion.stepsExpanded ? "Hide bud's steps" : "Show bud's steps")
-                if companion.stepsExpanded {
-                    StepList(steps: companion.lastSteps, live: false, limit: nil)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
-                }
+                .font(Paper.Typography.ledgerMeta)
+                .foregroundStyle(hovered.on ? Paper.inkPrimary : Paper.inkSecondary)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(
+                    hovered.on ? Paper.fillHover : .clear,
+                    in: RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .pointerStyle(.link)
+            .onHover { hovered.on = $0 }
+            .padding(.leading, -5)
+            .accessibilityLabel(companion.stepsExpanded ? "Hide bud's steps" : "Show bud's steps")
+            if companion.stepsExpanded {
+                StepList(steps: companion.lastSteps, live: false, limit: nil)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
         .fixedSize(horizontal: false, vertical: true)
@@ -904,9 +919,9 @@ struct ApprovalCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .surface(
             RoundedRectangle(cornerRadius: radius, style: .continuous),
-            lift: 1,
+            lift: 0,
             fill: Paper.elevated,
-            border: inWindow ? Paper.borderStrong : Paper.borderSubtle,
+            border: Paper.borderSubtle,
             borderWidth: 0.5
         )
         .disabled(busy)
@@ -1103,8 +1118,7 @@ struct ApprovalCard: View {
 
 }
 
-/// Per-view state without `@State` (a macro whose plugin ships only with Xcode): an
-/// observable object owned by the view, which `@StateObject` keeps across redraws.
+/// Observable per-view state that supports Command Line Tools builds.
 final class Flag: ObservableObject {
     @Published var on = false
 }
@@ -1164,11 +1178,14 @@ struct IconButton: ButtonStyle {
 
         var body: some View {
             let hovered = enabled && hover.on
+            let shape = highlight
+                ? AnyShape(RoundedRectangle(cornerRadius: Paper.radiusXS, style: .continuous))
+                : AnyShape(Circle())
             configuration.label
                 .foregroundStyle(!highlight ? Paper.canvas : hovered ? Paper.inkPrimary : Paper.inkSecondary)
                 .frame(width: size, height: size)
-                .background(highlight && hovered ? Paper.fillHover : .clear, in: Circle())
-                .contentShape(Circle())
+                .background(highlight && hovered ? Paper.fillHover : .clear, in: shape)
+                .contentShape(shape)
                 .modifier(PaperPress(pressed: enabled && configuration.isPressed))
                 .pointerStyle(enabled ? .link : .default)
                 .onHover { hover.on = $0 }
@@ -1453,7 +1470,7 @@ private struct InputField: View {
             shape,
             lift: 1,
             fill: dropTargeted ? Paper.overlay : Paper.elevated,
-            border: highlighted ? Paper.accent : Paper.borderSubtle,
+            border: dropTargeted ? Paper.accent : focused ? Paper.borderStrong : Paper.borderSubtle,
             borderWidth: dropTargeted ? 2 : highlighted ? 1 : 0.5
         )
         .dropAttachments(into: companion, isTargeted: $droppingAttachments.on)
@@ -1493,8 +1510,7 @@ private struct InputField: View {
 
 // MARK: Settings
 
-/// Editable copy of the settings. A shared object, not `@State`: SwiftUI's `@State` is a macro
-/// whose plugin ships with Xcode, and this app builds with the Command Line Tools alone.
+/// Shared editable settings for the Settings window and its sheets.
 @MainActor @Observable
 final class SettingsDraft {
     static let shared = SettingsDraft()
@@ -1561,11 +1577,13 @@ struct SettingsView: View {
     @Bindable var store = OnboardingStore.shared
     @Bindable var draft = SettingsDraft.shared
     @Bindable var companion = Companion.shared
+    @Bindable var appearance = AppearanceStore.shared
 
     var body: some View {
+        let _ = appearance.revision
         TabView(selection: $tab.selected) {
             Tab("General", systemImage: "gearshape", value: .connection) {
-                pane { PaperConnectionPanel(draft: draft) }
+                pane { PaperConnectionPanel(draft: draft, appearance: appearance) }
             }
             Tab("Models", systemImage: "cpu", value: .models) {
                 pane {
@@ -1581,14 +1599,18 @@ struct SettingsView: View {
                 pane { ComputerSettings() }
             }
         }
-        .frame(width: 540, height: 320)
+        .frame(width: 560, height: 440)
         .background(Paper.canvas)
+        .preferredColorScheme(appearance.mode.colorScheme)
         .onAppear {
             draft.settings = BudSettings.load()
             if companion.link == .connected { Task { await store.refresh() } }
         }
         .onChange(of: companion.link) { _, link in
             if link == .connected { Task { await store.refresh() } }
+        }
+        .onChange(of: tab.selected) { _, pane in
+            if pane == .models, companion.link == .connected { Task { await store.refresh() } }
         }
         .sheet(isPresented: Binding(
             get: { draft.server != nil },
@@ -1628,6 +1650,7 @@ struct SettingsView: View {
                 Text("Bud isn’t connected.")
                 Spacer()
                 Button("Try Again", action: draft.reconnect)
+                    .buttonStyle(CardButton(kind: .secondary))
             }
         case .connected:
             if let err = store.error, !err.isEmpty {
@@ -1647,11 +1670,59 @@ struct SettingsView: View {
 private struct PaperConnectionPanel: View {
     @Bindable var draft: SettingsDraft
     @Bindable var companion = Companion.shared
+    @Bindable var appearance: AppearanceStore
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            appearanceSection
+            locationSection
+        }
+        .foregroundStyle(Paper.inkPrimary)
+    }
+
+    private var appearanceSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Appearance").font(Paper.Typography.h3)
+            hairline
+            appearanceRow("Theme", subtitle: "Stone, Studio, or Paper") {
+                Picker("Theme", selection: $appearance.theme) {
+                    ForEach(BudTheme.allCases) { theme in Text(theme.title).tag(theme) }
+                }
+            }
+            hairline
+            appearanceRow("Mode", subtitle: "Follow macOS, or pin Light or Dark") {
+                Picker("Mode", selection: $appearance.mode) {
+                    ForEach(BudAppearanceMode.allCases) { mode in Text(mode.title).tag(mode) }
+                }
+            }
+            hairline
+            appearanceRow("Font", subtitle: "SF Pro, Inter, or Editorial") {
+                Picker("Font", selection: $appearance.font) {
+                    ForEach(BudFont.allCases) { font in Text(font.title).tag(font) }
+                }
+            }
+        }
+    }
+
+    private func appearanceRow<Control: View>(
+        _ title: String, subtitle: String, @ViewBuilder control: () -> Control
+    ) -> some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(Paper.Typography.body)
+                Text(subtitle)
+                    .font(Paper.Typography.caption)
+                    .foregroundStyle(Paper.inkMuted)
+            }
+            Spacer(minLength: 0)
+            control().labelsHidden().fixedSize()
+        }
+    }
+
+    private var locationSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Location").font(Paper.Typography.h3)
-                .padding(.bottom, 6)
+            hairline
             HStack(alignment: .firstTextBaseline) {
                 Text("Bud runs on")
                     .font(Paper.Typography.body)
@@ -1661,7 +1732,7 @@ private struct PaperConnectionPanel: View {
                      : "This Mac")
                     .foregroundStyle(Paper.inkSecondary)
             }
-            Divider()
+            hairline
             HStack {
                 switch companion.link {
                 case .connecting:
@@ -1672,26 +1743,34 @@ private struct PaperConnectionPanel: View {
                 case .problem:
                     Text("Not connected")
                     Button("Try Again", action: draft.reconnect)
+                        .buttonStyle(CardButton(kind: .secondary))
                 }
                 Spacer()
                 if draft.settings.savedRemote || URL(string: draft.settings.url)?.scheme == "https" {
                     Button("Use This Mac", action: draft.useThisMac)
+                        .buttonStyle(CardButton(kind: .quiet))
                 }
                 Button("Connect to a server…", action: draft.connectToServer)
+                    .buttonStyle(CardButton(kind: .secondary))
             }
             .font(Paper.Typography.body)
-            Divider()
+            hairline
             HStack {
                 Text("Keep Bud running when this Mac is off.")
                     .font(Paper.Typography.callout)
                     .foregroundStyle(Paper.inkSecondary)
                 Spacer()
                 Button("Move Bud to a server…", action: draft.showMove)
+                    .buttonStyle(CardButton(kind: .secondary))
             }
             SwiftUI.Link("Set up on Azure", destination: URL(
                 string: "https://github.com/bamiboy237/bud/blob/master/docs/setup.md#host-bud-on-azure")!)
                 .font(Paper.Typography.callout)
         }
+    }
+
+    private var hairline: some View {
+        Rectangle().fill(Paper.hairline).frame(height: 0.5)
     }
 }
 

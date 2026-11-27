@@ -118,6 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Fonts.register()
+        AppearanceStore.shared.applyWindowAppearance()
         let companion = Companion.shared
         let panel = PetPanel(root: PetView(companion: companion) { [weak self] in self?.focusPanel() }) {
             companion.anchor = $0

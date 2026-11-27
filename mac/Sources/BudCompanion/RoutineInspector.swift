@@ -42,6 +42,7 @@ struct RoutineMessageCard: View {
     let open: () -> Void
 
     var body: some View {
+        let shape = RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous)
         Button(action: open) {
             HStack(spacing: 10) {
                 Image(systemName: "clock.arrow.circlepath").foregroundStyle(Paper.accent)
@@ -51,13 +52,15 @@ struct RoutineMessageCard: View {
                         .foregroundStyle(Paper.inkSecondary)
                 }
                 Spacer(minLength: 8)
-                Image(systemName: "chevron.right").font(.caption2)
-                    .foregroundStyle(Paper.inkSecondary)
+                Image(systemName: "chevron.right")
+                    .font(Paper.Typography.ledgerMeta)
+                    .foregroundStyle(Paper.inkMuted)
             }
             .padding(10)
             .frame(maxWidth: 320, alignment: .leading)
         }
-        .buttonStyle(PaperHit(shape: RoundedRectangle(cornerRadius: Paper.radiusMD), fill: Paper.elevated))
+        .buttonStyle(PaperHit(shape: shape, fill: Paper.elevated))
+        .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5).allowsHitTesting(false) }
         .accessibilityLabel("\(card.title), \(card.label)")
     }
 }
@@ -343,19 +346,23 @@ struct RoutineInspector: View {
             HStack {
                 if state.report != nil || !state.listing {
                     Button { state.back(using: selection) } label: { Image(systemName: "chevron.left") }
-                        .buttonStyle(IconButton(size: 24))
+                        .buttonStyle(IconButton(size: 26))
                         .accessibilityLabel("Back")
                         .disabled(state.pending)
                 }
                 Text(heading)
-                    .font(Paper.Typography.callout).lineLimit(1)
+                    .font(Paper.Typography.label)
+                    .foregroundStyle(Paper.inkPrimary)
+                    .lineLimit(1)
                 Spacer()
                 Button(action: close) { Image(systemName: "xmark") }
-                    .buttonStyle(IconButton(size: 24))
+                    .buttonStyle(IconButton(size: 26))
                     .accessibilityLabel("Close routines")
             }
-            .padding(12)
-            Divider()
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 14)
+            .frame(height: 40)
+            hairline
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     if !state.editing, let problem = state.problem {
@@ -368,25 +375,7 @@ struct RoutineInspector: View {
                             Text("Ask Bud in chat to schedule a routine.")
                                 .foregroundStyle(Paper.inkSecondary)
                         }
-                        ForEach(state.list) { item in
-                            Button {
-                                Task { await state.show(item.id, using: selection) }
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(item.title).font(Paper.Typography.callout)
-                                        Text(item.status.capitalized)
-                                            .foregroundStyle(Paper.inkSecondary).font(.caption)
-                                    }
-                                    Spacer()
-                                    Image(systemName: "chevron.right").font(.caption2)
-                                }
-                                .padding(9)
-                            }
-                            .buttonStyle(PaperHit(
-                                shape: RoundedRectangle(cornerRadius: Paper.radiusMD), fill: Paper.elevated))
-                            .disabled(state.pending)
-                        }
+                        routineList
                     } else if let routine = state.routine {
                         detail(routine)
                     }
@@ -417,6 +406,37 @@ struct RoutineInspector: View {
         return state.editing ? "Edit routine" : "Routine"
     }
 
+    private var hairline: some View {
+        Rectangle().fill(Paper.hairline).frame(height: 0.5)
+    }
+
+    private var routineList: some View {
+        VStack(spacing: 0) {
+            ForEach(state.list) { item in
+                Button {
+                    Task { await state.show(item.id, using: selection) }
+                } label: {
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(item.title).font(Paper.Typography.callout)
+                            Text(item.status.capitalized)
+                                .font(Paper.Typography.caption)
+                                .foregroundStyle(Paper.inkSecondary)
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(Paper.Typography.ledgerMeta)
+                            .foregroundStyle(Paper.inkMuted)
+                    }
+                    .padding(9)
+                }
+                .buttonStyle(PaperHit(shape: RoundedRectangle(cornerRadius: Paper.radiusSM)))
+                .disabled(state.pending)
+                if item.id != state.list.last?.id { hairline }
+            }
+        }
+    }
+
     @ViewBuilder
     private func detail(_ value: RoutineSummary) -> some View {
         if state.editing {
@@ -431,6 +451,7 @@ struct RoutineInspector: View {
                     .foregroundStyle(Paper.inkSecondary)
             }
             section("Plan") {
+                let shape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
                 let plan = Text(value.prompt)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -442,7 +463,8 @@ struct RoutineInspector: View {
                 .textSelection(.enabled)
                 .frame(maxHeight: 132)
                 .padding(8)
-                .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusSM))
+                .background(Paper.elevated, in: shape)
+                .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5).allowsHitTesting(false) }
             }
             scheduleSummary(RoutineSchedule(cron: value.cron), timezone: value.timezone)
             if let next = value.nextRunAt {
@@ -479,23 +501,29 @@ struct RoutineInspector: View {
             .opacity(state.pending ? 0.55 : 1)
         }
         if !state.editing && !value.recentOccurrences.isEmpty {
-            Divider()
-            Text("Run history").font(Paper.Typography.callout)
-            ForEach(value.recentOccurrences) { run in
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(date(run.scheduledFor))
-                    Text("\(label(run.executionStatus)) · \(label(run.deliveryStatus))")
-                        .font(.caption).foregroundStyle(Paper.inkSecondary)
-                    if run.reportPath != nil {
-                        Button("Open report") { Task { await state.openReport(value.id, run.id, using: selection) } }
-                            .buttonStyle(.link).disabled(state.pending)
+            VStack(alignment: .leading, spacing: 0) {
+                Text("Run history")
+                    .font(Paper.Typography.label)
+                    .padding(.bottom, 6)
+                ForEach(value.recentOccurrences) { run in
+                    hairline
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(date(run.scheduledFor)).font(Paper.Typography.callout)
+                        Text("\(label(run.executionStatus)) · \(label(run.deliveryStatus))")
+                            .font(Paper.Typography.caption)
+                            .foregroundStyle(Paper.inkSecondary)
+                        if run.reportPath != nil {
+                            Button("Open report") {
+                                Task { await state.openReport(value.id, run.id, using: selection) }
+                            }
+                            .buttonStyle(.link)
+                            .disabled(state.pending)
+                        }
                     }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(run.id == state.markedRun ? Paper.accentFill : .clear)
                 }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(
-                    run.id == state.markedRun ? Paper.accentFill : Paper.elevated,
-                    in: RoundedRectangle(cornerRadius: Paper.radiusMD))
             }
         }
     }
@@ -508,12 +536,14 @@ struct RoutineInspector: View {
                     .font(Paper.Typography.callout)
             }
             section("Plan") {
+                let shape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
                 TextEditor(text: $state.prompt)
                     .font(Paper.Typography.callout)
                     .scrollContentBackground(.hidden)
                     .padding(6)
                     .frame(height: 112)
-                    .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusSM))
+                    .background(Paper.elevated, in: shape)
+                    .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5).allowsHitTesting(false) }
                     .accessibilityLabel("Plan")
             }
             scheduleEditor
@@ -553,25 +583,25 @@ struct RoutineInspector: View {
                 }
             }
             if state.schedule.frequency == .custom {
-                Divider()
+                hairline
                 TextField("Cron expression", text: $state.schedule.customCron,
                           prompt: Text("Minute hour day month weekday"))
                     .font(Paper.Typography.code)
                     .accessibilityLabel("Cron expression")
             } else {
-                Divider()
+                hairline
                 DatePicker("Time", selection: $state.schedule.time, displayedComponents: .hourAndMinute)
                     .environment(\.calendar, RoutineSchedule.clockCalendar)
                     .environment(\.timeZone, .gmt)
                 if state.schedule.frequency == .weekly {
-                    Divider()
+                    hairline
                     Picker("Day", selection: $state.schedule.weekday) {
                         ForEach(weekdayNames.indices, id: \.self) { day in
                             Text(weekdayNames[day]).tag(day)
                         }
                     }
                 } else if state.schedule.frequency == .monthly {
-                    Divider()
+                    hairline
                     Picker("Day of month", selection: $state.schedule.monthDay) {
                         ForEach(1...31, id: \.self) { day in Text("\(day)").tag(day) }
                     }
@@ -582,7 +612,7 @@ struct RoutineInspector: View {
                     }
                 }
             }
-            Divider()
+            hairline
             LabeledContent("Time zone") {
                 TextField("Time zone", text: $state.timezone)
                     .textFieldStyle(.roundedBorder)
@@ -594,7 +624,7 @@ struct RoutineInspector: View {
     private func scheduleSummary(_ schedule: RoutineSchedule, timezone: String) -> some View {
         frequencySection {
             LabeledContent("Repeat", value: schedule.frequency.rawValue)
-            Divider()
+            hairline
             if schedule.frequency == .custom {
                 LabeledContent("Cron expression") {
                     Text(schedule.cron).monospaced().textSelection(.enabled)
@@ -603,14 +633,14 @@ struct RoutineInspector: View {
                 LabeledContent("Time", value: schedule.time.formatted(
                     Date.FormatStyle(date: .omitted, time: .shortened, timeZone: .gmt)))
                 if schedule.frequency == .weekly {
-                    Divider()
+                    hairline
                     LabeledContent("Day", value: weekdayNames[schedule.weekday])
                 } else if schedule.frequency == .monthly {
-                    Divider()
+                    hairline
                     LabeledContent("Day of month", value: "\(schedule.monthDay)")
                 }
             }
-            Divider()
+            hairline
             LabeledContent("Time zone", value: timezone)
         }
     }
@@ -628,10 +658,9 @@ struct RoutineInspector: View {
 
     private func frequencySection<Rows: View>(@ViewBuilder rows: () -> Rows) -> some View {
         section("Frequency") {
+            hairline
             VStack(alignment: .leading, spacing: 7, content: rows)
                 .font(Paper.Typography.callout)
-                .padding(10)
-                .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusMD))
         }
     }
 

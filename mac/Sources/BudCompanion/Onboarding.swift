@@ -156,6 +156,7 @@ final class OnboardingStore {
     @ObservationIgnored private let sendRequest: Transport
     @ObservationIgnored private let openURL: URLOpener
     @ObservationIgnored private let syncNeedsOnboarding: NeedsOnboardingSink
+    @ObservationIgnored private let isRunning: @MainActor () -> Bool
     @ObservationIgnored private var pollTask: Task<Void, Never>?
     @ObservationIgnored private var initializedExpansion = false
     @ObservationIgnored private var serverGeneration = 0
@@ -165,11 +166,13 @@ final class OnboardingStore {
             try await Companion.shared.sendOnboardingRequest(method, path, json: json)
         },
         openURL: @escaping URLOpener = { NSWorkspace.shared.open($0) },
-        syncNeedsOnboarding: @escaping NeedsOnboardingSink = { Companion.shared.needsOnboarding = $0 }
+        syncNeedsOnboarding: @escaping NeedsOnboardingSink = { Companion.shared.needsOnboarding = $0 },
+        isRunning: @escaping @MainActor () -> Bool = { Companion.shared.running }
     ) {
         self.sendRequest = sendRequest
         self.openURL = openURL
         self.syncNeedsOnboarding = syncNeedsOnboarding
+        self.isRunning = isRunning
     }
 
     func clearBanner() {
@@ -196,6 +199,9 @@ final class OnboardingStore {
             let raw = try await sendRequest("GET", "onboarding", nil)
             guard generation == serverGeneration else { return }
             apply(raw)
+            if status.chatgpt.status == "waiting", pollTask == nil {
+                beginPolling()
+            }
             if let preservingError { error = preservingError }
         } catch {
             guard generation == serverGeneration else { return }
@@ -236,6 +242,7 @@ final class OnboardingStore {
             let response = try await sendRequest("PUT", "onboarding/model", ["model": value])
             guard generation == serverGeneration else { return }
             apply(response)
+            feedback = isRunning() ? "Default updated for new runs." : "Default model updated."
         } catch ConnectionError.http(422, _) {
             guard generation == serverGeneration else { return }
             status.models.removeAll { $0 == model }
@@ -324,11 +331,12 @@ final class OnboardingStore {
     private func beginPolling() {
         stopPolling()
         pollTask = Task {
-            while !Task.isCancelled {
+            while true {
                 try? await Task.sleep(for: .milliseconds(1500))
-                guard !Task.isCancelled else { break }
+                guard !Task.isCancelled else { return }
                 do {
                     let raw = try await sendRequest("GET", "onboarding", nil)
+                    guard !Task.isCancelled else { return }
                     apply(raw)
                     if status.chatgpt.status == "connected" {
                         feedback = "Connected to ChatGPT."
@@ -344,6 +352,7 @@ final class OnboardingStore {
                         break
                     }
                 } catch {
+                    guard !Task.isCancelled else { return }
                     self.error = "\(error)"
                     break
                 }
@@ -405,7 +414,9 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
         window.backgroundColor = NSColor(Paper.canvas)
         window.delegate = self
         window.contentView = NSHostingView(
-            rootView: AddModelView(store: OnboardingStore.shared, close: close)
+            rootView: AddModelView(store: OnboardingStore.shared, close: close) { [weak window] in
+                window?.backgroundColor = NSColor(Paper.canvas)
+            }
         )
         return window
     }
@@ -414,6 +425,8 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
 private struct AddModelView: View {
     @Bindable var store: OnboardingStore
     let close: () -> Void
+    let updateBackground: () -> Void
+    private let appearance = AppearanceStore.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -428,22 +441,29 @@ private struct AddModelView: View {
                         Text(error)
                             .font(Paper.Typography.callout)
                             .foregroundStyle(Paper.errorInk)
+                    } else if let feedback = store.feedback {
+                        StatusStrip(text: feedback, isError: false) { store.clearBanner() }
                     }
                     ModelSetupPanel(store: store)
                 }
                 .padding(.horizontal, 24)
                 .padding(.bottom, 12)
             }
-            Divider()
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
             HStack {
                 Spacer()
                 Button(store.status.hasModel ? "Done" : "Close", action: close)
+                    .buttonStyle(CardButton(kind: store.status.hasModel ? .primary : .secondary))
                     .keyboardShortcut(.cancelAction)
             }
             .padding(16)
         }
         .frame(width: 500, height: 365)
         .background(Paper.canvas)
+        .preferredColorScheme(appearance.mode.colorScheme)
+        .onChange(of: appearance.revision, initial: true) { _, _ in
+            updateBackground()
+        }
     }
 }
 
@@ -499,10 +519,10 @@ struct ModelSetupPanel: View {
                 }
             }
             .font(Paper.Typography.body)
-            Divider()
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
             chatGPTRow
             if !store.status.modelKeys.isEmpty {
-                Divider()
+                Rectangle().fill(Paper.hairline).frame(height: 0.5)
                 DisclosureGroup("Use an API key", isExpanded: $store.apiKeysExpanded) {
                     ForEach(store.status.modelKeys) { key in
                         KeyRowView(key: key, store: store)
@@ -530,16 +550,25 @@ struct ModelSetupPanel: View {
             }
             if cg.status == "waiting" {
                 Button("Open sign-in page", action: store.openPendingChatGPTURL)
+                    .buttonStyle(CardButton(kind: .secondary))
                     .disabled(cg.url == nil)
+                    .opacity(cg.url == nil ? 0.55 : 1)
                 Button("Cancel") { Task { await store.cancelChatGPTLogin() } }
+                    .buttonStyle(CardButton(kind: .quiet))
                     .disabled(store.busyChatGPT)
+                    .opacity(store.busyChatGPT ? 0.55 : 1)
             } else if cg.connected {
                 Text("Connected").foregroundStyle(Paper.inkSecondary)
                 Button("Sign out") { Task { await store.logoutChatGPT() } }
+                    .buttonStyle(CardButton(kind: .quiet))
                     .disabled(store.busyChatGPT)
+                    .opacity(store.busyChatGPT ? 0.55 : 1)
             } else if URL(string: BudSettings.load().url)?.scheme != "https" {
+                let canStart = !store.busyChatGPT && store.status != .empty
                 Button("Sign in with ChatGPT") { Task { await store.startChatGPTLogin() } }
-                    .disabled(store.busyChatGPT || store.status == .empty)
+                    .buttonStyle(CardButton(kind: .primary))
+                    .disabled(!canStart)
+                    .opacity(canStart ? 1 : 0.55)
             } else {
                 Text("Use an API key for this server").foregroundStyle(Paper.inkSecondary)
             }
@@ -553,7 +582,9 @@ struct IntegrationKeysPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             ForEach(store.status.integrationKeys) { key in
-                if key.id != store.status.integrationKeys.first?.id { Divider() }
+                if key.id != store.status.integrationKeys.first?.id {
+                    Rectangle().fill(Paper.hairline).frame(height: 0.5)
+                }
                 KeyRowView(key: key, store: store)
             }
         }

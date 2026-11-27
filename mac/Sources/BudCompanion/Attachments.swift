@@ -129,13 +129,15 @@ struct AttachmentChip: View {
     let name: String
 
     var body: some View {
+        let shape = RoundedRectangle(cornerRadius: Paper.radiusMD, style: .continuous)
         Label(name, systemImage: "doc")
             .font(Paper.Typography.callout)
             .lineLimit(1)
             .truncationMode(.middle)
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
-            .background(Paper.elevated, in: RoundedRectangle(cornerRadius: Paper.radiusMD))
+            .background(Paper.elevated, in: shape)
+            .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5).allowsHitTesting(false) }
     }
 }
 
@@ -213,7 +215,8 @@ struct AttachmentInspector: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
                 Text(selection.file.name)
-                    .font(Paper.Typography.callout)
+                    .font(Paper.Typography.label)
+                    .foregroundStyle(Paper.inkPrimary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(selection.file.name)
@@ -221,7 +224,7 @@ struct AttachmentInspector: View {
                 Button { state.showDesktops.toggle() } label: {
                     Image(systemName: "desktopcomputer.and.arrow.down")
                 }
-                .buttonStyle(IconButton(size: 24))
+                .buttonStyle(IconButton(size: 26))
                 .help("Send to paired desktops")
                 .accessibilityLabel("Send to paired desktops")
                 .popover(isPresented: $state.showDesktops, arrowEdge: .bottom) {
@@ -232,16 +235,18 @@ struct AttachmentInspector: View {
                         ? "arrow.down.right.and.arrow.up.left"
                         : "arrow.up.left.and.arrow.down.right")
                 }
-                .buttonStyle(IconButton(size: 24))
+                .buttonStyle(IconButton(size: 26))
                 .help(state.expanded ? "Narrow preview" : "Expand preview")
                 .accessibilityLabel(state.expanded ? "Narrow preview" : "Expand preview")
                 Button(action: close) { Image(systemName: "xmark") }
-                    .buttonStyle(IconButton(size: 24))
+                    .buttonStyle(IconButton(size: 26))
                     .help("Close preview")
                     .accessibilityLabel("Close preview")
             }
-            .padding(12)
-            Divider()
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 14)
+            .frame(height: 40)
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
             switch state.content {
             case .pdf(let document):
                 PDFPreview(document: document)
@@ -267,6 +272,7 @@ struct AttachmentInspector: View {
                 Spacer()
             }
         }
+        .background(Paper.canvas)
         .inspectorColumnWidth(min: state.expanded ? 480 : 240, ideal: state.expanded ? 580 : 320, max: 900)
         .task(id: selection.id) { await load() }
     }

@@ -61,32 +61,47 @@ struct DesktopDeliveryInspector: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Browser delivery").font(Paper.Typography.callout)
+                Text("Browser delivery")
+                    .font(Paper.Typography.label)
+                    .foregroundStyle(Paper.inkPrimary)
                 Spacer()
                 Button(action: close) { Image(systemName: "xmark") }
-                    .buttonStyle(IconButton(size: 24))
+                    .buttonStyle(IconButton(size: 26))
                     .accessibilityLabel("Close browser delivery")
-            }.padding(12)
-            Divider()
+            }
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 14)
+            .frame(height: 40)
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     if let status = state.status {
                         Text(summary(status)).font(Paper.Typography.callout)
+                        Rectangle().fill(Paper.hairline).frame(height: 0.5)
                         LabeledContent("File", value: status.file.name)
                         Button("Preview selected file") {
                             state.preview = AttachmentSelection(
                                 file: status.file, session: selection.session,
                                 connection: selection.connection)
                         }
+                        .buttonStyle(CardButton(kind: .secondary))
+                        Rectangle().fill(Paper.hairline).frame(height: 0.5)
                         LabeledContent("Desktop", value: desktopLabel(status.desktop, id: status.desktopID))
-                        Text(status.url).font(.caption).textSelection(.enabled)
+                        Text(status.url)
+                            .font(Paper.Typography.caption)
+                            .foregroundStyle(Paper.inkSecondary)
+                            .textSelection(.enabled)
                         if status.phase == "delivered" || status.phase == "uncertain" {
-                            Text("Reference \(status.reference)").font(.caption).textSelection(.enabled)
+                            Text("Reference \(status.reference)")
+                                .font(Paper.Typography.caption)
+                                .foregroundStyle(Paper.inkSecondary)
+                                .textSelection(.enabled)
                         }
                         if status.canApprove {
                             Button("Approve submission") {
                                 Task { await act("approve", body: ["desktop": status.desktopID]) }
                             }
+                            .buttonStyle(CardButton(kind: .primary))
                             .disabled(state.working)
                         }
                         if status.canChange || status.phase == "approved" {
@@ -103,13 +118,17 @@ struct DesktopDeliveryInspector: View {
                                     let targetID = state.targetID
                                     Task { await act("retarget", body: ["desktop": targetID]) }
                                 }
+                                .buttonStyle(CardButton(kind: .secondary))
                                 .disabled(state.working || state.targetID.isEmpty)
+                                .opacity(state.working || state.targetID.isEmpty ? 0.55 : 1)
                             }
                             Button("Cancel delivery") { Task { await act("cancel") } }
+                                .buttonStyle(CardButton(kind: .quiet))
                                 .disabled(state.working)
                         }
                         if status.phase == "uncertain" {
                             Button("Check for receipt") { Task { await act("verify") } }
+                                .buttonStyle(CardButton(kind: .secondary))
                                 .disabled(state.working)
                         }
                     } else if state.problem == nil {

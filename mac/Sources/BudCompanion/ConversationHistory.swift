@@ -54,8 +54,13 @@ struct ConversationHistory: View {
     let close: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Conversations").font(Paper.Typography.h2).padding(.horizontal, 20)
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Conversations")
+                .font(Paper.Typography.label)
+                .foregroundStyle(Paper.inkPrimary)
+                .padding(.horizontal, 14)
+                .frame(height: 40)
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(state.entries) { entry in
@@ -63,37 +68,50 @@ struct ConversationHistory: View {
                             if let url = entry.link { show(url) }
                         } label: {
                             HStack(alignment: .firstTextBaseline, spacing: 12) {
-                                Text(entry.label).lineLimit(2)
+                                Text(entry.label)
+                                    .font(Paper.Typography.callout)
+                                    .foregroundStyle(Paper.inkPrimary)
+                                    .lineLimit(2)
                                 Spacer()
-                                Text(entry.updated.prefix(10)).foregroundStyle(Paper.inkSecondary)
+                                Text(entry.updated.prefix(10))
+                                    .font(Paper.Typography.ledgerMeta)
+                                    .foregroundStyle(Paper.inkMuted)
                             }
+                            .padding(.horizontal, 8)
                             .padding(.vertical, 10)
-                            .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
-                        Divider()
+                        .buttonStyle(PaperHit(shape: RoundedRectangle(cornerRadius: Paper.radiusSM)))
+                        Rectangle().fill(Paper.hairline).frame(height: 0.5)
                     }
                     if state.loading {
                         ProgressView().controlSize(.small).padding(.top, 12)
                     } else if state.failed {
                         Button("Try Again") { Task { await state.load(offset: state.entries.count) } }
+                            .buttonStyle(CardButton(kind: .secondary))
+                            .padding(.top, 12)
                     } else if state.entries.isEmpty {
-                        Text("No conversations yet").foregroundStyle(Paper.inkSecondary)
+                        Text("No conversations yet")
+                            .font(Paper.Typography.callout)
+                            .foregroundStyle(Paper.inkSecondary)
+                            .padding(.top, 12)
                     } else if state.more {
                         Button("Show more") { Task { await state.load(offset: state.entries.count) } }
+                            .buttonStyle(CardButton(kind: .secondary))
                             .padding(.top, 12)
                     }
                 }
-                .padding(.horizontal, 20)
+                .padding(.horizontal, 14)
             }
-            Divider()
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
             HStack {
                 Spacer()
-                Button("Done", action: close).keyboardShortcut(.cancelAction)
+                Button("Done", action: close)
+                    .buttonStyle(CardButton(kind: .primary))
+                    .keyboardShortcut(.cancelAction)
             }
-            .padding(.horizontal, 20)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
         }
-        .padding(.vertical, 18)
         .frame(width: 460, height: 350)
         .background(Paper.canvas)
         .task { await state.load(offset: 0) }

@@ -78,20 +78,24 @@ struct BrowserInspector: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Browser").font(Paper.Typography.callout)
+                Text("Browser")
+                    .font(Paper.Typography.label)
+                    .foregroundStyle(Paper.inkPrimary)
                 Spacer()
                 Button { state.expanded.toggle() } label: {
                     Image(systemName: state.expanded
                         ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
                 }
-                .buttonStyle(IconButton(size: 24))
+                .buttonStyle(IconButton(size: 26))
                 .accessibilityLabel(state.expanded ? "Narrow browser" : "Expand browser")
                 Button(action: close) { Image(systemName: "xmark") }
-                    .buttonStyle(IconButton(size: 24))
+                    .buttonStyle(IconButton(size: 26))
                     .accessibilityLabel("Close browser")
             }
-            .padding(12)
-            Divider()
+            .font(.system(size: 12, weight: .medium))
+            .padding(.horizontal, 14)
+            .frame(height: 40)
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
             Group {
                 if state.privateInput {
                     VStack(alignment: .leading, spacing: 12) {
@@ -141,8 +145,11 @@ struct BrowserInspector: View {
                         .disabled(state.sending || state.focus.selected.isEmpty)
                         .opacity(state.sending ? 0.55 : 1)
                         if let screenshot = state.screenshot {
+                            let shape = RoundedRectangle(cornerRadius: Paper.radiusSM, style: .continuous)
                             Image(nsImage: screenshot)
                                 .resizable().scaledToFit()
+                                .clipShape(shape)
+                                .overlay { shape.strokeBorder(Paper.borderSubtle, lineWidth: 0.5) }
                                 .frame(maxWidth: .infinity)
                                 .accessibilityLabel("Preview of the selected browser tab")
                         } else if let previewIssue = state.previewIssue {

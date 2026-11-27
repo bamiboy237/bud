@@ -179,4 +179,57 @@ import Testing
         #expect(store.status.chatgpt.status == "idle")
         #expect(store.status.chatgpt.connected == false)
     }
+
+    @Test @MainActor func refreshResumesPollingForWaitingChatGPTLogin() async throws {
+        var requests = 0
+        let store = OnboardingStore(
+            sendRequest: { method, path, _ in
+                #expect(method == "GET")
+                #expect(path == "onboarding")
+                requests += 1
+                let connected = requests > 1
+                return ["chatgpt": [
+                    "connected": connected,
+                    "status": connected ? "connected" : "waiting",
+                ]]
+            },
+            openURL: { _ in },
+            syncNeedsOnboarding: { _ in }
+        )
+        defer { store.stopPolling() }
+
+        await store.refresh()
+        #expect(store.status.chatgpt.status == "waiting")
+
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(5)
+        while !store.status.chatgpt.connected, clock.now < deadline {
+            try await clock.sleep(for: .milliseconds(25))
+        }
+
+        #expect(requests == 2)
+        #expect(store.status.chatgpt.status == "connected")
+        #expect(store.feedback == "Connected to ChatGPT.")
+    }
+
+    @Test(arguments: [true, false])
+    @MainActor func modelSelectionConfirmsUpdate(running: Bool) async {
+        let model = "openai:gpt-5"
+        let store = OnboardingStore(
+            sendRequest: { method, path, body in
+                #expect(method == "PUT")
+                #expect(path == "onboarding/model")
+                #expect(body?["model"] as? String == model)
+                return ["default_model": model, "models": [model]]
+            },
+            openURL: { _ in },
+            syncNeedsOnboarding: { _ in },
+            isRunning: { running }
+        )
+
+        await store.chooseModel(model)
+
+        #expect(store.status.defaultModel == model)
+        #expect(store.feedback == (running ? "Default updated for new runs." : "Default model updated."))
+    }
 }
