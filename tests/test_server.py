@@ -1,5 +1,6 @@
 """Authenticated HTTP tests against fresh Bud/DBOS processes and real workspace files."""
 
+import asyncio
 import hashlib
 import json
 import os
@@ -12,14 +13,20 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import Mock
 
 import httpx
 import pytest
+from dbos._dbos import _get_or_create_dbos_registry
+from pydantic import SecretStr
 
+from bud.config import get_settings
+from bud.core import server as core_server
 from bud.core.log import EventLog
 from bud.core.projection import unreported_job_news
+from bud.gateway.chatgpt import ChatGPTError, ChatGPTStore
 from bud.limits import MAX_MESSAGE_CHARS
-from tests.server_process import DRAFT, FILENAME, REVISED
+from tests.server_process import DRAFT, FILENAME, REVISED, offline_gateway
 
 ROOT = Path(__file__).resolve().parents[1]
 TOKEN = "offline-process-test-owner-" + "x" * 32
@@ -236,6 +243,149 @@ def strict_from_boot(root: Path) -> None:
     data = root.resolve() / "data"
     data.mkdir(parents=True, exist_ok=True)
     (data / "approval-mode.json").write_text(json.dumps({"mode": "strict"}))
+
+
+async def test_failed_gateway_reload_preserves_the_live_gateway_and_dbos_models(monkeypatch):
+    settings = get_settings()
+    settings.data_dir.mkdir(parents=True)
+    live_gateway = offline_gateway(settings)
+    live_store = ChatGPTStore(settings.data_dir)
+    live_store.acquire()
+    live_gateway.chatgpt = live_store
+    old_close = Mock(wraps=live_gateway.close)
+    monkeypatch.setattr(live_gateway, "close", old_close)
+    monkeypatch.setattr(core_server, "build_gateway", lambda *args, **kwargs: live_gateway)
+    monkeypatch.setattr(_get_or_create_dbos_registry(), "instance_info_map", {})
+    compose_runner = core_server.compose_runner
+    runner = None
+
+    def capture_runner(*args, **kwargs):
+        nonlocal runner
+        runner = compose_runner(*args, **kwargs)
+        return runner
+
+    monkeypatch.setattr(core_server, "compose_runner", capture_runner)
+    app = core_server._create_app(settings, SecretStr(TOKEN), None, simulate=True, model_id=None)
+    assert runner is not None
+    durability = runner._durability
+    assert durability is not None
+    models_by_id = durability._models_by_id
+    extra_models = durability._extra_models
+    fingerprint = runner.fingerprint
+    model = runner.agent.model
+    model_id = live_gateway.registry.models[0].id
+
+    candidate = offline_gateway(settings)
+    build_candidate_model = candidate.build_model
+    candidate.chatgpt = ChatGPTStore(settings.data_dir)
+    close_candidate = Mock(wraps=candidate.close)
+    monkeypatch.setattr(candidate, "close", close_candidate)
+
+    def fail_build(*args, **kwargs):
+        raise RuntimeError("private provider error")
+
+    def candidate_factory(_settings, store):
+        assert store is live_store
+        store.acquire()
+        return fail_build
+
+    try:
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+                headers={"Authorization": f"Bearer {TOKEN}"},
+            ) as client,
+        ):
+            for gateway_build in (fail_build, lambda *args, **kwargs: candidate):
+                monkeypatch.setattr(core_server, "build_gateway", gateway_build)
+                monkeypatch.setattr(core_server, "provider_model_factory", candidate_factory)
+                response = await client.post(
+                    "/onboarding/keys", json={"keys": {"MISTRAL_API_KEY": "test-key"}}
+                )
+                assert response.status_code == 422
+                assert response.json() == {
+                    "detail": "Bud could not reload the model configuration."
+                }
+                old_close.assert_not_called()
+                assert runner.gateway is live_gateway
+                assert runner.agent.model is model
+                assert runner.harness.registry is live_gateway.registry
+                assert runner._budget_guard.ledger is live_gateway.ledger
+                assert runner.fingerprint == fingerprint
+                assert durability._models_by_id is models_by_id
+                assert durability._extra_models is extra_models
+                assert runner.runtime_model_ids == {model_id}
+                with pytest.raises(ChatGPTError, match="Another bud process"):
+                    ChatGPTStore(settings.data_dir).acquire()
+
+            close_candidate.assert_called_once_with(preserve_chatgpt=live_store)
+            catalog = await client.get("/models")
+            assert catalog.json()[0]["id"] == model_id
+            session_id = (await client.post("/sessions", json={"model": model_id})).json()[
+                "session_id"
+            ]
+            path = f"/sessions/{session_id}"
+            assert (
+                await client.post(f"{path}/messages", json={"text": "Hello"})
+            ).status_code == 202
+            async with asyncio.timeout(5):
+                while True:
+                    state = (await client.get(path)).json()
+                    if state["recent_runs"] and not state["run_active"]:
+                        break
+                    await asyncio.sleep(0.01)
+            assert state["recent_runs"][-1]["status"] == "completed"
+            assert state["transcript"][-1]["text"] == "Offline reply."
+
+            monkeypatch.setattr(
+                core_server, "provider_model_factory", lambda *_: build_candidate_model
+            )
+            response = await client.post(
+                "/onboarding/keys", json={"keys": {"MISTRAL_API_KEY": "test-key"}}
+            )
+            assert response.status_code == 200
+            assert runner.gateway is candidate
+            assert durability._models_by_id is not models_by_id
+            assert durability._models_by_id["default"] is runner.agent.model
+            old_close.assert_called_once_with(preserve_chatgpt=live_store)
+            with pytest.raises(ChatGPTError, match="Another bud process"):
+                ChatGPTStore(settings.data_dir).acquire()
+    finally:
+        live_store.close()
+
+
+async def test_session_model_http_reset_preserves_response_shape(monkeypatch):
+    settings = get_settings()
+    settings.data_dir.mkdir(parents=True)
+    gateway = offline_gateway(settings)
+    monkeypatch.setattr(core_server, "build_gateway", lambda *args, **kwargs: gateway)
+    runner = core_server.Runner
+
+    def non_durable_runner(*args, **kwargs):
+        kwargs["durable"] = False
+        return runner(*args, **kwargs)
+
+    monkeypatch.setattr(core_server, "Runner", non_durable_runner)
+    app = core_server._create_app(settings, SecretStr(TOKEN), None, simulate=True, model_id=None)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    ) as client:
+        model = gateway.registry.models[0].id
+        created = await client.post("/sessions", json={"model": model})
+        assert created.status_code == 201
+        session_id = created.json()["session_id"]
+        path = f"/sessions/{session_id}"
+        expected = {"session_id": session_id, "model": ""}
+        assert (await client.post(f"{path}/model", json={})).json() == expected
+        log = EventLog(settings.data_dir / "bud.db")
+        assert log.snapshot(session_id, log.read(session_id)).model == model
+        assert (await client.post(f"{path}/model", json={"model": None})).json() == expected
+        assert log.snapshot(session_id, log.read(session_id)).model is None
+        assert "model" not in (await client.get(path)).json()
 
 
 def start_report(server: ServerProcess) -> tuple[str, dict]:

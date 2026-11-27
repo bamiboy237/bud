@@ -231,6 +231,15 @@ class Snapshot(BaseModel):
     recent_runs: list[RunView] = Field(default_factory=list)
     tasks: list[TaskView] = Field(default_factory=list)
     routines: list[RoutineView] = Field(default_factory=list)
+    # Internal session preference. Clients still receive the existing snapshot fields.
+    model: str | None = Field(default=None, exclude=True)
+
+
+def session_model(events: list[Event]) -> str | None:
+    for event in reversed(events):
+        if event.type == "session.model_changed":
+            return event.data["model"]
+    return None
 
 
 def queued_messages(events: list[Event]) -> list[QueuedMessage]:
@@ -319,8 +328,8 @@ def pending_setups(events: list[Event]) -> list[PendingSetup]:
     A `capability.setup` event replaces a capability's card wholesale; a
     `capability.status` recheck only moves its state, so the sign-in link or
     steps the card already showed stay with it. A connected card has settled
-    and stops being pending, like a decided approval; a failed card stays —
-    its reason sentence is the recovery move the person still needs.
+    and stops being pending, like a decided approval. A failed card stays
+    open so the person can see how to recover.
     """
     cards: dict[str, PendingSetup] = {}
     for event in events:
@@ -560,6 +569,7 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
     transcript = [turn for turn in transcript if id(turn) not in reserved or turn.text]
     return Snapshot(
         session_id=session_id,
+        model=session_model(events),
         last_seq=events[-1].seq if events else 0,
         run_active=active,
         status=state,

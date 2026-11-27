@@ -92,8 +92,9 @@ from bud.core.setup import (
     setup_registry,
 )
 from bud.core.workspace_home import display_path, workspace_home
-from bud.gateway import NoModelAvailable, build_gateway
+from bud.gateway import Gateway, NoModelAvailable, build_gateway
 from bud.gateway.chatgpt import ChatGPTError
+from bud.gateway.router import provider_model_factory
 from bud.harness.actions import Policy, load_policy
 from bud.harness.agent import Harness
 from bud.harness.ask import MAX_QUESTIONS, AskAnswer
@@ -243,7 +244,8 @@ class ConfirmDeliveryRequest(BaseModel):
 def sse_frame(event: Event) -> str:
     # Live text has no stored position; only stored events move the reconnect cursor.
     cursor = "" if event.live else f"id: {event.seq}\n"
-    return f"{cursor}event: {event.type}\ndata: {event.model_dump_json()}\n\n"
+    payload = event.model_dump_json(exclude={"data": {"model_fallbacks"}})
+    return f"{cursor}event: {event.type}\ndata: {payload}\n\n"
 
 
 def hold_single_server_lock(path: Path) -> TextIO:
@@ -762,35 +764,58 @@ def _create_app(
     model_choice = DefaultModelChoice(settings.data_dir / "default-model")
     model_locked = bool(model_id or settings.default_model or active_profile.model.model_id)
 
-    def apply_default_model() -> None:
+    def default_model_for(candidate: Gateway) -> str | None:
         choice = None if model_locked else model_choice.read()
-        runner.owner_model = None
         if choice:
             with contextlib.suppress(NoModelAvailable):
-                runner.owner_model = gateway.validate_model(choice, require_tools=True).id
+                return candidate.validate_model(choice, require_tools=True).id
+        return None
 
-    apply_default_model()
+    runner.owner_model = default_model_for(gateway)
 
     def reload_runtime_config(*, cleared_keys: set[str] | None = None) -> None:
         nonlocal settings, gateway, has_reviewer, config_env_path
         with refresh_lock:
-            new_settings = reload_settings(settings, config_env_path, cleared_keys=cleared_keys)
-            gateway.close()
-            new_gateway = build_gateway(
-                new_settings,
-                providers={"openai-chatgpt", "openai", "meta", "mistral", "deepseek"}
-                if not simulate
-                else None,
-                model_id=model_id,
-            )
-            new_reviewer = build_reviewer(new_settings)
+            old_gateway = gateway
+            new_gateway = None
+            try:
+                new_settings = reload_settings(settings, config_env_path, cleared_keys=cleared_keys)
+                new_gateway = build_gateway(
+                    new_settings,
+                    providers={"openai-chatgpt", "openai", "meta", "mistral", "deepseek"}
+                    if not simulate
+                    else None,
+                    model_id=model_id,
+                )
+                chatgpt = old_gateway.chatgpt
+                if (
+                    chatgpt is not None
+                    and new_gateway.chatgpt is not None
+                    and chatgpt.folder == new_gateway.chatgpt.folder
+                ):
+                    # Reuse the live store's credential lock while validating the candidate.
+                    new_gateway.chatgpt = chatgpt
+                    new_gateway.build_model = provider_model_factory(new_settings, chatgpt)
+                new_reviewer = build_reviewer(new_settings)
+                new_config_env_path = resolve_config_env_path(new_settings)
+                policy = harness.policy.model_copy(update={"tools": harness.policy.tools.copy()})
+                apply_mode(policy, live_mode["mode"], reviewer=new_reviewer is not None)
+                runner.reload_gateway(
+                    new_gateway,
+                    reviewer=new_reviewer,
+                    owner_model=default_model_for(new_gateway),
+                    policy_tools=policy.tools,
+                )
+            except Exception:
+                if new_gateway is not None and new_gateway is not old_gateway:
+                    new_gateway.close(preserve_chatgpt=old_gateway.chatgpt)
+                raise OnboardingError("Bud could not reload the model configuration.") from None
             settings = new_settings
             gateway = new_gateway
             has_reviewer = new_reviewer is not None
-            config_env_path = resolve_config_env_path(new_settings)
-            runner.reload_gateway(new_gateway, reviewer=new_reviewer)
-            apply_default_model()
-            apply_mode(harness.policy, live_mode["mode"], reviewer=has_reviewer)
+            config_env_path = new_config_env_path
+            if old_gateway is not new_gateway:
+                old_gateway.close(preserve_chatgpt=new_gateway.chatgpt)
             if connections is not None and account_toolset is not None:
                 connections.settings = new_settings
                 current_binding = connections.binding or connections.stored()
@@ -1047,15 +1072,17 @@ def _create_app(
         target = as_mode(body.mode)
         if target is None:
             raise HTTPException(400, "Unknown mode; one of strict/auto.")
-        profile_store.save(target)
-        overlay = apply_mode(harness.policy, target, reviewer=has_reviewer)
-        live_mode["mode"] = target
+        with refresh_lock:
+            profile_store.save(target)
+            overlay = apply_mode(harness.policy, target, reviewer=has_reviewer)
+            live_mode["mode"] = target
+            summary = mode_summary(target, reviewer=has_reviewer)
         auto = sum(1 for action in overlay.values() if action == "review")
         return JSONResponse(
             {
                 "mode": target,
                 "auto_writes": auto,
-                "summary": mode_summary(target, reviewer=has_reviewer),
+                "summary": summary,
             },
             headers={"Cache-Control": "no-store"},
         )
@@ -1218,11 +1245,9 @@ def _create_app(
                 for status in gateway.catalog(require_tools=True)
             ]
 
-    def _apply_model(session_id: str, request: NewSession | None) -> None:
-        if request is None or request.model is None:
-            return
+    def _apply_model(session_id: str, model_id: str | None) -> None:
         try:
-            runner.set_model(session_id, request.model)
+            runner.set_model(session_id, model_id)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
 
@@ -1241,7 +1266,8 @@ def _create_app(
                 session_id = log.primary_session(request.session_id if request else None)
             except ValueError as exc:
                 raise HTTPException(409, str(exc)) from None
-            _apply_model(session_id, request)
+            if request is not None and request.model is not None:
+                _apply_model(session_id, request.model)
         hub.wake(session_id)
         return {"session_id": session_id}
 
@@ -1256,7 +1282,8 @@ def _create_app(
             created = log.append_once(
                 session_id, "session.created", key=f"session-created:{session_id}"
             )
-            _apply_model(session_id, request)
+            if request is not None and request.model is not None:
+                _apply_model(session_id, request.model)
         if created is not None:
             hub.wake(session_id)
         return {"session_id": session_id}
@@ -1264,9 +1291,9 @@ def _create_app(
     @app.post("/sessions/{session_id}/model")
     def set_session_model(session_id: str, request: NewSession) -> dict[str, str]:
         require_session(session_id)
-        with refresh_lock:
-            _apply_model(session_id, request)
-        hub.wake(session_id)
+        if "model" in request.model_fields_set:
+            with refresh_lock:
+                _apply_model(session_id, request.model)
         return {"session_id": session_id, "model": request.model or ""}
 
     @app.get("/sessions/{session_id}")

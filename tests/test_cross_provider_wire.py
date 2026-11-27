@@ -1,6 +1,7 @@
 """Exercise Bud's provider adapters over HTTP without contacting any provider."""
 
 import json
+import re
 from base64 import b64decode
 from collections.abc import AsyncIterator
 from functools import partial
@@ -130,7 +131,7 @@ async def wire(
         httpx.AsyncClient(transport=httpx.MockTransport(api_response)) as client,
         httpx2.AsyncClient(transport=httpx2.MockTransport(chatgpt_response)) as chatgpt_client,
     ):
-        for name in ("OpenAIProvider", "DeepSeekProvider", "EndpointProvider"):
+        for name in ("OpenAIProvider", "DeepSeekProvider", "MistralChatProvider"):
             monkeypatch.setattr(router, name, partial(getattr(router, name), http_client=client))
         monkeypatch.setattr(
             router,
@@ -168,10 +169,8 @@ async def wire(
 
 
 def saved_history(source: str, call_id: str) -> Conversation:
-    provider, model = source.split(":", 1)
+    provider_name, model = source.split(":", 1)
     is_responses = source in {OPENAI, CHATGPT}
-    # Bud's Mistral endpoint uses the generic OpenAI provider name.
-    provider_name = "openai" if source == MISTRAL else provider
     conversation = Conversation(
         messages=[
             ModelRequest(parts=[CompactionPart(content=SUMMARY)]),
@@ -256,7 +255,11 @@ async def test_responses_history_switches_to_chat(
     [assistant] = [message for message in messages if message.get("tool_calls")]
     [call] = assistant["tool_calls"]
     [tool] = [message for message in messages if message["role"] == "tool"]
-    assert call["id"] == tool["tool_call_id"] == LONG_CALL_ID
+    assert call["id"] == tool["tool_call_id"]
+    if target == MISTRAL:
+        assert re.fullmatch(r"[A-Za-z0-9]{9}", call["id"])
+    else:
+        assert call["id"] == LONG_CALL_ID
     assert call["function"]["name"] == "lookup_order"
     assert json.loads(call["function"]["arguments"]) == {"order": "A-1042"}
     assert tool["content"] == "In transit."
@@ -280,9 +283,6 @@ async def test_responses_history_switches_to_chat(
     assert REASONING in serialized
     for opaque in (ENCRYPTED_THINKING, ENCRYPTED_COMPACTION, "cmp_previous", "fc_previous"):
         assert opaque not in serialized
-    if source == OPENAI and target == MISTRAL and "rs_previous" in assistant:
-        assert assistant["rs_previous"] == REASONING
-        pytest.xfail("Generic Mistral provider misreads the OpenAI reasoning ID as a JSON field")
     assert "rs_previous" not in serialized
 
 

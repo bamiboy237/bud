@@ -19,6 +19,7 @@ from pydantic_ai.exceptions import (
 from pydantic_ai.models import Model
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings, OpenAIResponsesModel
+from pydantic_ai.profiles.mistral import mistral_model_profile
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.deepseek import DeepSeekProvider
 from pydantic_ai.providers.meta import MetaProvider
@@ -112,6 +113,16 @@ class EndpointProvider(OpenAIProvider):
         )
 
 
+class MistralChatProvider(EndpointProvider):
+    @property
+    def name(self) -> str:
+        return "mistral"
+
+    @staticmethod
+    def model_profile(model_name: str) -> OpenAIModelProfile:
+        return {**EndpointProvider.model_profile(model_name), **mistral_model_profile(model_name)}
+
+
 def should_fall_back(exc: Exception, *, subscription: bool = False) -> bool:
     """Plan routes only fall back on availability; API routes retain rate/quota fallback."""
     code = getattr(exc, "provider_error_code", None) or ""
@@ -138,7 +149,8 @@ def provider_model_factory(settings: Settings, chatgpt: ChatGPTStore) -> ModelFa
         key = (spec.provider, spec.base_url)
         if key not in providers:
             if spec.base_url:
-                providers[key] = EndpointProvider(
+                endpoint = MistralChatProvider if spec.provider == "mistral" else EndpointProvider
+                providers[key] = endpoint(
                     base_url=spec.base_url,
                     api_key=secret.get_secret_value() if secret else "local-no-key",
                 )
@@ -162,7 +174,7 @@ def provider_model_factory(settings: Settings, chatgpt: ChatGPTStore) -> ModelFa
             elif spec.provider == "mistral":
                 if not settings.mistral_api_key:
                     return None
-                providers[key] = EndpointProvider(
+                providers[key] = MistralChatProvider(
                     base_url="https://api.mistral.ai/v1",
                     api_key=settings.mistral_api_key.get_secret_value(),
                 )
@@ -219,8 +231,8 @@ class Gateway:
         self.fallback = fallback
         self.explicit_models = explicit_models
 
-    def close(self) -> None:
-        if self.chatgpt is not None:
+    def close(self, *, preserve_chatgpt: ChatGPTStore | None = None) -> None:
+        if self.chatgpt is not None and self.chatgpt is not preserve_chatgpt:
             self.chatgpt.close()
 
     def _model_status(self, spec: ModelSpec, *, require_tools: bool) -> ModelStatus:
@@ -266,10 +278,21 @@ class Gateway:
         *,
         require_tools: bool = False,
         selected: str | None = None,
+        fallback_ids: list[str] | None = None,
         workspace: Path | None = None,
     ) -> Model:
         target = selected or self.selected_model
-        if target:
+        if target and fallback_ids:
+            by_id = {spec.id: spec for spec in self.registry.tier(tier)}
+            specs = (
+                [
+                    by_id[target],
+                    *(by_id[model_id] for model_id in fallback_ids if model_id in by_id),
+                ]
+                if target in by_id
+                else []
+            )
+        elif target:
             specs = [spec for spec in self.registry.models if spec.id == target][:1]
         else:
             specs = [
@@ -283,7 +306,15 @@ class Gateway:
                 and spec.base_url != chain[0].spec.base_url
             ):
                 break
-            model = self.build_model(spec)
+            if chain and target:
+                status = self._model_status(spec, require_tools=require_tools)
+                if not status.selectable:
+                    continue
+                model = status.model
+            else:
+                model = self.build_model(spec)
+                if model is None and target:
+                    break
             if model is not None:
                 if require_tools and not _supports_tools(model):
                     raise NoModelAvailable(
@@ -292,7 +323,7 @@ class Gateway:
                 chain.append(
                     TrackedModel(model, spec, self.ledger, session_id, workspace=workspace)
                 )
-                if not self.fallback or target:
+                if not self.fallback or (target and not fallback_ids):
                     break
         if not chain:
             target = target or f"tier {tier!r}"

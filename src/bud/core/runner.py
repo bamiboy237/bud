@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+from threading import RLock
 from typing import Any, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -25,7 +26,7 @@ from pydantic_ai import (
     ToolApproved,
     ToolDenied,
 )
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, ResolveModelId
 from pydantic_ai.durable_exec.dbos import DBOSDurability
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
@@ -43,7 +44,12 @@ from pydantic_ai.messages import (
     ToolReturnPart,
     UserPromptPart,
 )
-from pydantic_ai.models import Model, ModelRequestContext, ModelRequestParameters
+from pydantic_ai.models import (
+    Model,
+    ModelRequestContext,
+    ModelRequestParameters,
+    ModelResolutionContext,
+)
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
@@ -71,6 +77,7 @@ from bud.core.projection import (
     reply_text,
     request_groups,
     runs,
+    session_model,
     since_last_prompt,
     undecided_approvals,
     unreported_job_news,
@@ -101,7 +108,7 @@ from bud.gateway.tracked import (
     request_attribution,
     request_session,
 )
-from bud.harness.actions import UncertainSideEffectError
+from bud.harness.actions import Action, UncertainSideEffectError
 from bud.harness.agent import Harness
 from bud.harness.ask import AskAnswer, answer_from_text, ask_summary, questions_of, render_answers
 from bud.harness.learning import Learner
@@ -258,6 +265,10 @@ class Runner(DBOSConfiguredInstance):
         self._routine_wake: asyncio.Event | None = None
         self._closing = False
         self._current: ContextVar[dict] = ContextVar("bud_run")
+        self._run_model: ContextVar[tuple[str, Model] | None] = ContextVar(
+            "bud_run_model", default=None
+        )
+        self._routing_lock = RLock()
         self.session_models: dict[str, str] = {}
         self.work_items = WorkItems(hub, workspace) if jobs else None
         enable_routines = jobs if routines is None else routines
@@ -281,7 +292,7 @@ class Runner(DBOSConfiguredInstance):
             harness.policy.tools.update({CREATE_ROUTINE: "ask", LIST_ROUTINES: "allow"})
             harness.policy.no_grants |= {CREATE_ROUTINE}
         self.version = replay_version()
-        self.fingerprint = self._compute_fingerprint()
+        self.fingerprint = self._compute_fingerprint(gateway, harness.policy.tools)
         if durable:
             super().__init__("core")
         default_model, runtime_models = self._build_models()
@@ -301,6 +312,8 @@ class Runner(DBOSConfiguredInstance):
         self.context = harness.build_context(self._record_context)
         self._budget_guard = RoutineBudgetGuard(ledger=self.gateway.ledger)
         runner_capabilities: list[AbstractCapability[None]] = [self._budget_guard]
+        if durable:
+            runner_capabilities.append(ResolveModelId(self._resolve_pinned_model))
         if self.work_items is not None:
             runner_capabilities.append(
                 TaskFlow(
@@ -331,37 +344,38 @@ class Runner(DBOSConfiguredInstance):
         )
         self._durability = self._find_durability(self.agent._root_capability) if durable else None
 
-    def _compute_fingerprint(self) -> str:
+    def _compute_fingerprint(self, gateway: Gateway, policy_tools: dict[str, Action]) -> str:
         return sha256(
             (
                 self.profile.digest
                 + self.harness.prompt_version
-                + self.gateway.registry.model_dump_json()
-                + json.dumps(self.harness.policy.tools, sort_keys=True)
-                + str(self.gateway.selected_model)
-                + str(self.gateway.fallback)
+                + gateway.registry.model_dump_json()
+                + json.dumps(policy_tools, sort_keys=True)
+                + str(gateway.selected_model)
+                + str(gateway.fallback)
                 + str(self._jobs)
                 + self.tier
                 + str(self.harness.results.retention.total_seconds())
             ).encode()
         ).hexdigest()
 
-    def _build_models(self) -> tuple[Model, dict[str, Model]]:
+    def _build_models(self, gateway: Gateway | None = None) -> tuple[Model, dict[str, Model]]:
+        gateway = gateway if gateway is not None else self.gateway
         # DBOS passes model IDs across step boundaries. Register selectable models
         # up front only for durable runners, since building can take the ChatGPT lock.
         runtime_models: dict[str, Model] = {}
         if self.durable:
-            for status in self.gateway.catalog(require_tools=True):
+            for status in gateway.catalog(require_tools=True):
                 if status.selectable and status.model is not None:
                     runtime_models[status.id] = TrackedModel(
                         status.model,
                         status.spec,
-                        self.gateway.ledger,
+                        gateway.ledger,
                         steer_signal=self._steer_signal,
                         workspace=self.workspace,
                     )
         try:
-            default_model = self.gateway.model(
+            default_model = gateway.model(
                 self.tier,
                 require_tools=True,
                 selected=self.profile.model.model_id,
@@ -387,38 +401,51 @@ class Runner(DBOSConfiguredInstance):
     @property
     def is_configured(self) -> bool:
         """True when default runs have an automatic or owner-selected model."""
-        return self.owner_model is not None or not isinstance(self.agent.model, _UnconfiguredModel)
+        with self._routing_lock:
+            return self.owner_model is not None or not isinstance(
+                self.agent.model, _UnconfiguredModel
+            )
 
     @property
     def active_model_id(self) -> str | None:
         """Primary model ID that new runs use, or None when unconfigured."""
-        return self._resolve_run_model("") if self.is_configured else None
+        with self._routing_lock:
+            return self._resolve_run_route(self.owner_model)[0] if self.is_configured else None
 
     def reload_gateway(
         self,
         gateway: Gateway,
         *,
         reviewer: ToolReviewer | None = None,
+        owner_model: str | None = None,
+        policy_tools: dict[str, Action] | None = None,
     ) -> None:
         """Hot-swap the gateway, DBOS model table, default model, and reviewer live."""
-        self.gateway = gateway
-        self._budget_guard.ledger = gateway.ledger
-        self.harness.registry = gateway.registry
-        self.harness.set_reviewer(reviewer)
-        if self.learner is not None:
-            self.learner.model = lambda session_id: gateway.model(
-                self.profile.model.tier,
-                f"{session_id}:learn",
-                require_tools=True,
-                selected=self.profile.model.model_id,
-            )
-        default_model, runtime_models = self._build_models()
-        self.runtime_model_ids = frozenset(runtime_models)
-        self.agent.model = default_model
-        if self._durability is not None:
-            self._durability._extra_models = dict(runtime_models)
-            self._durability._models_by_id = {"default": default_model, **runtime_models}
-        self.fingerprint = self._compute_fingerprint()
+        default_model, runtime_models = self._build_models(gateway)
+        runtime_ids = frozenset(runtime_models)
+        models_by_id = {"default": default_model, **runtime_models}
+        with self._routing_lock:
+            tools = self.harness.policy.tools if policy_tools is None else policy_tools
+            fingerprint = self._compute_fingerprint(gateway, tools)
+            self.gateway = gateway
+            self.owner_model = owner_model
+            self._budget_guard.ledger = gateway.ledger
+            self.harness.registry = gateway.registry
+            self.harness.set_reviewer(reviewer)
+            self.harness.policy.tools = tools
+            if self.learner is not None:
+                self.learner.model = lambda session_id: gateway.model(
+                    self.profile.model.tier,
+                    f"{session_id}:learn",
+                    require_tools=True,
+                    selected=self.profile.model.model_id,
+                )
+            self.agent.model = default_model
+            self.runtime_model_ids = runtime_ids
+            if self._durability is not None:
+                self._durability._extra_models = runtime_models
+                self._durability._models_by_id = models_by_id
+            self.fingerprint = fingerprint
 
     def _clock_utc(self) -> datetime:
         now = self.harness.clock()
@@ -511,29 +538,55 @@ class Runner(DBOSConfiguredInstance):
             self._reconcile_routines_on_recovery()
             self.tick_routines()
 
-    def _resolve_run_model(self, session_id: str) -> str:
-        override = self.session_models.get(session_id)
-        if override:
-            return override
-        if self.profile.model.model_id:
-            return self.profile.model.model_id
-        if self.gateway.selected_model:
-            return self.gateway.selected_model
-        if self.owner_model:
-            return self.owner_model
+    def _resolve_run_route(self, selected: str | None) -> tuple[str, list[str]]:
+        if selected:
+            return selected, []
         model = self.agent.model
-        if isinstance(model, _UnconfiguredModel):
-            return "unconfigured"
         if isinstance(model, TrackedModel):
-            return model.spec.id
+            return model.spec.id, []
         if isinstance(model, FallbackModel):
-            for candidate in model.models:
-                if isinstance(candidate, TrackedModel):
-                    return candidate.spec.id
-        tier_specs = self.gateway.registry.tier(self.tier)
-        if tier_specs:
-            return tier_specs[0].id
-        return f"tier:{self.tier}"
+            model_ids = [
+                candidate.spec.id
+                for candidate in model.models
+                if isinstance(candidate, TrackedModel)
+            ]
+            if model_ids:
+                return model_ids[0], model_ids[1:]
+        return "unconfigured", []
+
+    def _pinned_model(self, run: dict) -> tuple[str, Model]:
+        model_id = run.get("model") or run.get("owner_model")
+        if model_id == "unconfigured":
+            raise NoModelAvailable(
+                "No model is configured yet. Open Bud Settings to sign in with ChatGPT "
+                "or add an API key."
+            )
+        if not model_id:
+            raise RecoveryRefused("The queued run has no saved model.")
+        fallbacks = run.get("model_fallbacks")
+        if self._durability is not None:
+            registered = self._durability._models_by_id.get(model_id)
+            if registered is None:
+                raise NoModelAvailable("The model selected for this run is no longer available.")
+            if not fallbacks:
+                return model_id, registered
+        model = self.gateway.model(
+            self.tier,
+            session_id=run["session_id"],
+            require_tools=True,
+            selected=model_id,
+            fallback_ids=fallbacks,
+            workspace=self.workspace,
+        )
+        self._attach_steer_signal(model)
+        return model_id, model
+
+    def _resolve_pinned_model(
+        self, _ctx: ModelResolutionContext[None], model_id: str
+    ) -> Model | None:
+        # The DBOS model step resolves the ID again. Keep the same route through live reloads.
+        pinned = self._run_model.get()
+        return pinned[1] if pinned is not None and pinned[0] == model_id else None
 
     def _config_changed(self, run: dict) -> bool:
         if run.get("version") != self.version or run.get("config") != self.fingerprint:
@@ -550,7 +603,18 @@ class Runner(DBOSConfiguredInstance):
         origin: dict | None = None,
         trigger: str = "message",
     ) -> dict:
-        events = self.hub.log.read(session_id)
+        with self._routing_lock:
+            events = self.hub.log.read(session_id)
+            override = session_model(events)
+            owner_model = self.owner_model
+            fingerprint = self.fingerprint
+            if override is not None:
+                self.session_models[session_id] = override
+                try:
+                    self.gateway.validate_model(override, require_tools=True)
+                except NoModelAvailable:
+                    override = None
+            model_id, fallbacks = self._resolve_run_route(override or owner_model)
         endings = [event for event in events if event.type in RUN_END_EVENTS]
         checkpoint = next(
             (
@@ -621,11 +685,12 @@ class Runner(DBOSConfiguredInstance):
             else (events[-1].seq if events else 0),
             "results": RESULTS.dump_json(results).decode() if results is not None else None,
             "skills": skills,
-            "model": self._resolve_run_model(session_id),
-            "owner_model": self.owner_model,
+            "model": model_id,
+            **({"model_fallbacks": fallbacks} if fallbacks else {}),
+            "owner_model": owner_model,
             "profile": self.profile.attribution(),
             "prompt_version": self.harness.prompt_version,
-            "config": self.fingerprint,
+            "config": fingerprint,
             "version": self.version,
         }
 
@@ -713,14 +778,19 @@ class Runner(DBOSConfiguredInstance):
         self._drain(session_id)
 
     def set_model(self, session_id: str, model_id: str | None) -> None:
-        if model_id is None:
-            self.session_models.pop(session_id, None)
-            return
-        try:
-            self.gateway.validate_model(model_id, require_tools=True)
-        except NoModelAvailable as exc:
-            raise ValueError(str(exc)) from None
-        self.session_models[session_id] = model_id
+        model_id = model_id or None
+        with self._routing_lock:
+            if model_id is not None:
+                try:
+                    self.gateway.validate_model(model_id, require_tools=True)
+                except NoModelAvailable as exc:
+                    raise ValueError(str(exc)) from None
+            if model_id != session_model(self.hub.log.read(session_id)):
+                self.hub.publish(session_id, "session.model_changed", {"model": model_id})
+            if model_id is None:
+                self.session_models.pop(session_id, None)
+            else:
+                self.session_models[session_id] = model_id
 
     @staticmethod
     def _validate_text(text: str) -> None:
@@ -2057,22 +2127,22 @@ class Runner(DBOSConfiguredInstance):
         signal = SteerSignal(run_id=run["run_id"])
         self._signals[run["run_id"]] = signal
         self._session_signals[run["session_id"]] = signal
+        model_token = None
         try:
             if self.hub.log.stop_requested(run["run_id"]):
                 return
-            if self._config_changed(run):
-                self._finish(
-                    run,
-                    "run.failed",
-                    {
-                        "run_id": run["run_id"],
-                        "reason": "Code or configuration changed; recovery stopped before tools.",
-                        "kind": "recovery",
-                        "next": NEXT_STEP["recovery"],
-                    },
-                    [],
-                )
+            try:
+                with self._routing_lock:
+                    if self._config_changed(run):
+                        raise RecoveryRefused(
+                            "Code or configuration changed; recovery stopped before tools."
+                        )
+                    model_id, model = self._pinned_model(run)
+            except (NoModelAvailable, RecoveryRefused) as exc:
+                # A recovered workflow can already have journal entries for its first steps.
+                self._finish(run, "run.failed", {"run_id": run["run_id"], **_failure(exc)}, [])
                 return
+            model_token = self._run_model.set((model_id, model))
             budget = run.get("budget")
             max_usd = budget.get("max_usd") if isinstance(budget, dict) else None
             if isinstance(max_usd, (int, float)):
@@ -2096,18 +2166,6 @@ class Runner(DBOSConfiguredInstance):
                 history = [*history, ModelResponse(parts=[call])]
             if conversation is not None and conversation.conversation_id != run["session_id"]:
                 raise RecoveryRefused("Conversation does not belong to this session.")
-            model_override = self.session_models.get(run["session_id"]) or run.get("owner_model")
-            if (
-                model_override is not None
-                and self.durable
-                and model_override not in self.runtime_model_ids
-            ):
-                # Fail fast with bud's own error instead of pydantic-ai's
-                # infer_model fallback, which would use a different credential path.
-                raise NoModelAvailable(
-                    f"No configured model for {model_override}. Check its API key in .env "
-                    "or `bud login chatgpt`, then pick again."
-                )
             # Appended to the newest message, after the cached prefix, so prompt caching holds.
             # Turns compaction always keeps are surely in context; recalling them repeats them.
             in_context = [
@@ -2147,28 +2205,10 @@ class Runner(DBOSConfiguredInstance):
                 else contextlib.nullcontext()
             )
             try:
-                if model_override is None and isinstance(self.agent.model, _UnconfiguredModel):
-                    raise NoModelAvailable(
-                        "No model is configured yet. Open Bud Settings to sign in with ChatGPT "
-                        "or add an API key."
-                    )
                 async with deadline_cm:
                     result = await self.agent.run(
                         prompt,
-                        model=(
-                            # Durable runs resolve pre-registered keys; local runs take instance.
-                            model_override
-                            if self.durable
-                            else self.gateway.model(
-                                self.tier,
-                                session_id=run["session_id"],
-                                require_tools=True,
-                                selected=model_override,
-                                workspace=self.workspace,
-                            )
-                            if model_override
-                            else None
-                        ),
+                        model=model_id if self.durable else model,
                         conversation=conversation,
                         message_history=history or None,
                         deferred_tool_results=RESULTS.validate_json(run["results"])
@@ -2290,6 +2330,8 @@ class Runner(DBOSConfiguredInstance):
                 self._session_signals.pop(run["session_id"], None)
             request_attribution.reset(attr_token)
             request_session.reset(session_token)
+            if model_token is not None:
+                self._run_model.reset(model_token)
             self._current.reset(token)
 
     def _history(self, run: dict) -> tuple[Conversation | None, list[ModelMessage]]:
@@ -2323,7 +2365,7 @@ class Runner(DBOSConfiguredInstance):
             {
                 "run_id": run["run_id"],
                 "trigger": run["trigger"],
-                "model": run.get("model") or self._resolve_run_model(run["session_id"]),
+                "model": run.get("model") or run.get("owner_model"),
                 "profile": run.get("profile") or self.profile.attribution(),
                 "prompt": self.harness.prompt_version,
                 "prompt_version": self.harness.prompt_version,

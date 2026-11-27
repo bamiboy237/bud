@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 EventType = Literal[
     "session.created",
     "session.primary",
+    "session.model_changed",
     "user.message",
     "message.queued",
     "message.edited",

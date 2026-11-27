@@ -3,7 +3,7 @@ from collections import deque
 
 import pytest
 from pydantic_ai import Conversation, ConversationTypeAdapter
-from pydantic_ai.exceptions import ModelRequestTimeout, UserError
+from pydantic_ai.exceptions import ModelRequestTimeout, ModelServerError, UserError
 from pydantic_ai.messages import (
     CompactionPart,
     ModelMessagesTypeAdapter,
@@ -18,7 +18,9 @@ from pydantic_ai.usage import RunUsage
 
 from bud.core.runner import DecisionRejected, UnknownApproval
 from bud.gateway.errors import NEXT_STEP
-from tests.runner_support import create_note, reply, running_bud
+from bud.gateway.registry import Registry
+from bud.gateway.router import Gateway
+from tests.runner_support import create_note, reply, running_bud, scripted_model
 
 
 def responses(*items):
@@ -32,6 +34,123 @@ def responses(*items):
         return response
 
     return respond
+
+
+def configure_model_choices(bud, *, alternate=True, primary_offline=False):
+    old = bud.runner.gateway
+    primary = old.registry.models[0]
+    secondary = primary.model_copy(update={"name": "alternate"})
+
+    def respond(messages, info):
+        if primary_offline:
+            raise ModelServerError(primary.name, "Unavailable")
+        return reply("Primary model")
+
+    models = {
+        primary.id: scripted_model(respond),
+        secondary.id: scripted_model(lambda *_: reply("Alternate model")) if alternate else None,
+    }
+    bud.runner.reload_gateway(
+        Gateway(Registry(models=[primary, secondary]), old.ledger, lambda spec: models[spec.id])
+    )
+    return primary.id, secondary.id
+
+
+@pytest.mark.parametrize("alternate_available", [True, False])
+async def test_session_model_survives_restart_or_uses_default(tmp_path, alternate_available):
+    async with running_bud(tmp_path, responses()) as bud:
+        primary, alternate = configure_model_choices(bud)
+        bud.log.append("owner", "session.created")
+        bud.runner.set_model("owner", alternate)
+
+    async with running_bud(tmp_path, responses()) as bud:
+        configure_model_choices(bud, alternate=alternate_available)
+        await bud.runner.recover()
+        assert bud.runner.snapshot("owner").model == alternate
+        bud.runner.start("owner", "Which model is running?", "first")
+        await bud.settle()
+        state = bud.runner.snapshot("owner")
+        assert state.transcript[-1].text == (
+            "Alternate model" if alternate_available else "Primary model"
+        )
+        assert state.recent_runs[-1].model == (alternate if alternate_available else primary)
+        bud.runner.set_model("owner", None)
+
+    async with running_bud(tmp_path, responses()) as bud:
+        configure_model_choices(bud)
+        await bud.runner.recover()
+        assert bud.runner.snapshot("owner").model is None
+        bud.runner.start("owner", "Which model is running after reset?", "second")
+        await bud.settle()
+        assert bud.runner.snapshot("owner").transcript[-1].text == "Primary model"
+
+
+@pytest.mark.parametrize("selection", ["automatic", "session", "default"])
+async def test_enqueued_run_keeps_its_model_after_a_switch(tmp_path, selection):
+    async with running_bud(tmp_path, responses()) as bud:
+        primary, alternate = configure_model_choices(bud)
+        bud.log.append("owner", "session.created")
+        if selection == "session":
+            bud.runner.set_model("owner", alternate)
+        elif selection == "default":
+            bud.runner.owner_model = alternate
+        pinned = primary if selection == "automatic" else alternate
+        replacement = alternate if pinned == primary else primary
+
+        bud.runner.start("owner", "Use the queued model", "first")
+        assert bud.log.pending_runs()[0]["model"] == pinned
+        bud.runner.owner_model = replacement
+        bud.runner.set_model("owner", replacement)
+        await bud.settle()
+
+        state = bud.runner.snapshot("owner")
+        assert state.recent_runs[-1].model == pinned
+        assert state.transcript[-1].text == (
+            "Primary model" if pinned == primary else "Alternate model"
+        )
+
+
+async def test_enqueued_automatic_run_keeps_its_fallback(tmp_path):
+    async with running_bud(tmp_path, responses()) as bud:
+        primary, alternate = configure_model_choices(bud, primary_offline=True)
+        bud.log.append("owner", "session.created")
+        bud.runner.start("owner", "Try the automatic route", "first")
+        assert bud.log.pending_runs()[0]["model"] == primary
+        await bud.settle()
+        assert bud.runner.snapshot("owner").transcript[-1].text == "Alternate model"
+        assert {entry["model"] for entry in bud.runner.gateway.ledger.session_models("owner")} == {
+            primary,
+            alternate,
+        }
+
+
+@pytest.mark.parametrize("pinned_available", [True, False])
+async def test_recovery_keeps_the_enqueued_model_or_fails_safely(
+    tmp_path, monkeypatch, pinned_available
+):
+    async with running_bud(tmp_path, responses()) as bud:
+        primary, alternate = configure_model_choices(bud)
+        bud.log.append("owner", "session.created")
+        bud.runner.set_model("owner", alternate)
+        with monkeypatch.context() as patch:
+            patch.setattr(bud.runner, "_launch", lambda run: None)
+            bud.runner.start("owner", "Recover on the queued model", "first")
+        assert bud.log.pending_runs()[0]["model"] == alternate
+        bud.runner.set_model("owner", primary)
+
+    async with running_bud(tmp_path, responses()) as bud:
+        configure_model_choices(bud, alternate=pinned_available)
+        await bud.runner.recover()
+        await bud.settle()
+        state = bud.runner.snapshot("owner")
+        assert state.model == primary
+        if pinned_available:
+            assert state.recent_runs[-1].model == alternate
+            assert state.transcript[-1].text == "Alternate model"
+        else:
+            assert state.recent_runs[-1].status == "failed"
+            assert state.recent_runs[-1].kind == "model_unavailable"
+            assert not bud.runner.gateway.ledger.session_models("owner")
 
 
 @pytest.mark.parametrize("edit", [True, False], ids=["edit", "cancel"])
