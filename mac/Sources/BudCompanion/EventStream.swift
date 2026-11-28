@@ -55,7 +55,8 @@ func followEvents(
     var lastSeq = start
     var backoff = initialBackoff
     while !Task.isCancelled {
-        var request = connection.request("GET", "sessions/\(session)/events")
+        var request = connection.request(
+            "GET", "sessions/\(session)/events", queryItems: [URLQueryItem(name: "source_format", value: "web")])
         // bud sends a keep-alive every 15 s, so 45 s of silence means a dead connection.
         request.timeoutInterval = 45
         request.setValue(String(lastSeq), forHTTPHeaderField: "Last-Event-ID")

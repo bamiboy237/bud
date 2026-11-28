@@ -1,6 +1,11 @@
 import Foundation
 
 struct ApprovalBatch {
+    static func reviewedIDs(_ reviewed: [Approval], pending: [Approval]) -> [String] {
+        let eligible = Set(pending.lazy.filter(\.canBatch).map(\.id))
+        return reviewed.filter { $0.canBatch && eligible.contains($0.id) }.map(\.id)
+    }
+
     enum DecisionError: Error, CustomStringConvertible {
         case noLongerPending
 

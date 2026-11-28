@@ -301,6 +301,10 @@ private final class DraftPreviewSelection: ObservableObject {
     @Published var id: String?
 }
 
+private final class SuggestionHover: ObservableObject {
+    @Published var suggestion: WelcomeSuggestion?
+}
+
 private struct ConversationView: View {
     private static let logo: NSImage? = {
         if let icon = PetSprite.named("dog")?.icon(height: 22) {
@@ -327,6 +331,7 @@ private struct ConversationView: View {
     @StateObject private var shortcuts = Flag()
     @StateObject private var textZoom = TextZoom()
     @StateObject private var draftPreviewSelection = DraftPreviewSelection()
+    @StateObject private var suggestionHover = SuggestionHover()
     @StateObject private var stopAllRequested = Flag()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.openSettings) private var openSettings
@@ -395,11 +400,16 @@ private struct ConversationView: View {
                     .frame(maxWidth: .infinity)
                 }
                 .overlay {
-                    if companion.link == .connected, !companion.running, companion.turns.isEmpty,
-                       companion.shown.isEmpty, companion.runFailure == nil {
-                        welcome
+                    if companion.showsWelcome { welcome }
+                }
+                .overlay(alignment: .bottom) {
+                    if let suggestion = suggestionHover.suggestion,
+                       companion.welcomeSuggestions.contains(suggestion) {
+                        suggestionPreview(suggestion)
+                            .transition(.opacity)
                     }
                 }
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: suggestionHover.suggestion)
                 .defaultScrollAnchor(.bottom, for: .initialOffset)
                 .scrollPosition($scroll.position, anchor: .top)
                 .onScrollPhaseChange { _, phase in scroll.phaseChanged(phase) }
@@ -473,6 +483,7 @@ private struct ConversationView: View {
             if !queueEdits.recoveries.isEmpty { recoverQueuedEdits }
             if companion.link != .connected { offlineStrip }
             field
+            if !companion.welcomeSuggestions.isEmpty { welcomeTips }
         }
         .contentShape(Rectangle())
         .dropAttachments(into: companion, isTargeted: $droppingAttachments.on)
@@ -509,6 +520,11 @@ private struct ConversationView: View {
             case .browser(let selection):
                 BrowserInspector(selection: selection, close: companion.closeInspector)
                     .id(selection.id)
+            case .browserFrame(let selection):
+                SavedBrowserFrameInspector(
+                    selection: selection, companion: companion, close: companion.closeInspector
+                )
+                .id(selection.id)
             case .delivery(let selection):
                 DesktopDeliveryInspector(selection: selection, close: companion.closeInspector)
                     .id(selection.id)
@@ -549,6 +565,11 @@ private struct ConversationView: View {
         .onChange(of: companion.replyingTo) { _, quote in
             if quote != nil { typing = true }
         }
+        .onChange(of: companion.welcomeSuggestions) { _, suggestions in
+            if let hovered = suggestionHover.suggestion, !suggestions.contains(hovered) {
+                suggestionHover.suggestion = nil
+            }
+        }
         .onChange(of: companion.pendingMessages.map(\.id)) { _, ids in
             guard !queueEdits.saving, let draft = queueEdits.draft, !ids.contains(draft.id) else { return }
             queueEdits.recover(draft)
@@ -585,6 +606,74 @@ private struct ConversationView: View {
                 connectToServer
             }
         }
+    }
+
+    private var welcomeTips: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            ForEach(companion.welcomeSuggestions) { suggestion in
+                let hovered = suggestionHover.suggestion == suggestion
+                Button {
+                    companion.useSuggestion(suggestion)
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: suggestion.symbol)
+                            .font(.system(size: 12, weight: .medium))
+                            .frame(width: 16)
+                            .accessibilityHidden(true)
+                        Text(suggestion.title)
+                            .font(Paper.Typography.callout)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.leading, 8)
+                    .padding(.trailing, 26)
+                    .frame(height: 26)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(hovered ? Paper.inkPrimary : Paper.inkSecondary)
+                .background(hovered ? Paper.fillHover : .clear,
+                            in: RoundedRectangle(cornerRadius: Paper.radiusSM))
+                .pointerStyle(.link)
+                .accessibilityHint(suggestion.prompt)
+                .accessibilityAction(named: Text("Dismiss suggestion")) {
+                    companion.dismissSuggestion(suggestion)
+                }
+                .overlay(alignment: .trailing) {
+                    if hovered {
+                        Button { companion.dismissSuggestion(suggestion) } label: {
+                            Image(systemName: "xmark").font(.system(size: 8, weight: .medium))
+                        }
+                        .buttonStyle(IconButton(size: 24))
+                        .accessibilityLabel("Dismiss suggestion")
+                    }
+                }
+                .onHover { inside in
+                    if inside {
+                        suggestionHover.suggestion = suggestion
+                    } else if suggestionHover.suggestion == suggestion {
+                        suggestionHover.suggestion = nil
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: column)
+        .padding(.horizontal, 24)
+        .padding(.bottom, 14)
+    }
+
+    private func suggestionPreview(_ suggestion: WelcomeSuggestion) -> some View {
+        Text(suggestion.prompt)
+            .font(Paper.Typography.callout)
+            .foregroundStyle(Paper.inkPrimary)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(12)
+            .surface(RoundedRectangle(cornerRadius: Paper.radiusMD), fill: Paper.overlay)
+            .frame(maxWidth: 380)
+            .padding(.horizontal, 24)
+            .padding(.bottom, 4)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
     }
 
     private var connectToServer: some View {
@@ -846,11 +935,14 @@ private struct ConversationView: View {
     /// The reply in progress, or the last one, with what bud is doing and anything it needs.
     @ViewBuilder private func latest(query: String, active: ChatFindMatch?) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            if companion.running, let start = companion.runStart {
+            if companion.running, companion.chromePause == nil, let start = companion.runStart {
                 Working(since: start, steps: companion.steps)
-            } else if let work = companion.lastWork, !companion.shown.isEmpty || companion.runFailure != nil {
-                WorkLine(work: work)
+            } else if let work = companion.lastWork,
+                      !companion.shown.isEmpty || companion.runFailure != nil || !work.provenance.isEmpty {
+                WorkLine(work: work, companion: companion)
+                    .id(companion.replySeq)
             }
+            ChromePauseNotice(companion: companion)
             ForEach(companion.notices.filter { $0.report != nil }) { notice in
                 if let report = notice.report {
                     VStack(alignment: .leading, spacing: 4) {
@@ -1163,7 +1255,7 @@ private struct ConversationView: View {
         .animation(.easeOut(duration: 0.15), value: companion.replyingTo)
         .frame(maxWidth: column)
         .padding(.horizontal, 24)
-        .padding(.bottom, 18)
+        .padding(.bottom, companion.welcomeSuggestions.isEmpty ? 18 : 5)
         .padding(.top, 6)
     }
 
@@ -1672,7 +1764,7 @@ private struct TurnView: View {
             }
         } else {
             VStack(alignment: .leading, spacing: 12) {
-                if let work = turn.work { WorkLine(work: work) }
+                if let work = turn.work { WorkLine(work: work, companion: companion) }
                 if let card = turn.routine {
                     RoutineMessageCard(card: card) {
                         companion.openRoutines(card.id, occurrence: card.occurrenceID)
@@ -1913,12 +2005,16 @@ private struct Working: View {
 /// A finished run folded to one muted line, "Worked for 34s · 4 steps ›", that opens the steps.
 private struct WorkLine: View {
     let work: Work
+    let companion: Companion
     @StateObject private var open = Flag()
     @StateObject private var hovered = Flag()
+    @StateObject private var sourcesOpen = Flag()
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.displayScale) private var displayScale
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if work.steps.isEmpty {
+            if work.steps.isEmpty && work.provenance.isEmpty {
                 summary
             } else {
                 Button { open.on.toggle() } label: {
@@ -1940,23 +2036,116 @@ private struct WorkLine: View {
                 .pointerStyle(.link)
                 .onHover { hovered.on = $0 }
                 .padding(.leading, -5)
-                .accessibilityHint(open.on ? "Hide bud's steps" : "Show bud's steps")
+                .accessibilityHint(open.on ? "Hide work details" : "Show work details")
                 if open.on {
-                    StepList(steps: work.steps, live: false, limit: nil)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    details.transition(.opacity)
                 }
             }
         }
         .fixedSize(horizontal: false, vertical: true)
-        .animation(.spring(duration: 0.25, bounce: 0), value: open.on)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: open.on)
     }
 
     private var summary: some View {
         let count = work.steps.count
         let steps = count == 0 ? "" : " · \(count) \(count == 1 ? "step" : "steps")"
-        return Text("Worked for \(elapsed(work.seconds))\(steps)")
+        let timing = work.seconds.map { "Worked for \(elapsed($0))" } ?? "Worked"
+        return Text(timing + steps)
             .font(Fonts.sans(size: 11.5, tabularDigits: true))
             .foregroundStyle(hovered.on ? Paper.inkPrimary : Paper.inkSecondary)
+    }
+
+    private var details: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !work.steps.isEmpty { StepList(steps: work.steps, live: false, limit: nil) }
+            ForEach(work.provenance.browserFrames) { frame in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("Checked \(frame.domain)")
+                    if !frame.title.isEmpty, frame.title != frame.domain, frame.title != frame.url {
+                        Text(frame.title).foregroundStyle(Paper.inkMuted).lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                    Button("View frame") { companion.openBrowserFrame(frame) }
+                        .buttonStyle(.plain)
+                        .pointerStyle(.link)
+                        .fixedSize()
+                }
+            }
+            if !work.provenance.webSources.isEmpty { sources }
+            ForEach(work.provenance.approvalReceipts) { receipt in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(receipt.label).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    Text(receipt.summary).foregroundStyle(Paper.inkMuted).fixedSize()
+                }
+                .accessibilityElement(children: .combine)
+            }
+            ForEach(work.provenance.memoryUsed) { memory in
+                let forgotten = companion.forgottenPreferences.contains(memory.id)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    if forgotten {
+                        Text("Preference forgotten").italic()
+                    } else {
+                        Text("Used memory: “\(memory.text)”")
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                        Button("Forget") { Task { await companion.forgetPreference(memory.id) } }
+                            .buttonStyle(.plain)
+                            .pointerStyle(.link)
+                            .disabled(companion.forgettingPreferences.contains(memory.id))
+                            .fixedSize()
+                    }
+                }
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: forgotten)
+            }
+        }
+        .font(Paper.Typography.caption)
+        .foregroundStyle(Paper.inkSecondary)
+        .padding(.leading, 12)
+        .overlay(alignment: .leading) {
+            Rectangle().fill(Paper.hairline).frame(width: 1 / displayScale)
+                .accessibilityHidden(true)
+        }
+    }
+
+    private var sources: some View {
+        let pages = work.provenance.webSources
+        let read = pages.count { $0.status == .read }
+        let label = read > 0 ? "Read \(read) of \(pages.count) pages"
+            : "\(pages.count) web \(pages.count == 1 ? "page" : "pages")"
+        return VStack(alignment: .leading, spacing: 5) {
+            Button { sourcesOpen.on.toggle() } label: {
+                HStack(spacing: 5) {
+                    Text(label)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .medium))
+                        .rotationEffect(.degrees(sourcesOpen.on ? 90 : 0))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .pointerStyle(.link)
+            .accessibilityHint(sourcesOpen.on ? "Hide web pages" : "Show web pages")
+            if sourcesOpen.on {
+                ForEach(pages) { page in
+                    let title = page.title.isEmpty ? page.domain : "\(page.title) · \(page.domain)"
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        if let url = page.link {
+                            SwiftUI.Link(title, destination: url)
+                                .buttonStyle(.plain)
+                                .pointerStyle(.link)
+                                .help(page.excerpt.isEmpty ? page.url : page.excerpt)
+                        } else {
+                            Text(title)
+                        }
+                        Spacer(minLength: 0)
+                        Text(page.status == .read ? "Read" : "Found").foregroundStyle(Paper.inkMuted)
+                    }
+                }
+                .padding(.leading, 10)
+            }
+        }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: sourcesOpen.on)
     }
 }
 

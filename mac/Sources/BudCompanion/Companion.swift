@@ -42,6 +42,7 @@ enum InspectorSelection {
     case attachment(AttachmentSelection)
     case routine(RoutineSelection)
     case browser(BrowserSelection)
+    case browserFrame(BrowserFrameSelection)
     case report(URL)
     case delivery(DesktopDeliverySelection)
     case source(SourcePanel, request: UUID)
@@ -50,6 +51,7 @@ enum InspectorSelection {
         case attachment(session: String, file: String)
         case routine(session: String, routine: String?, occurrence: String?)
         case browser
+        case browserFrame(String)
         case report(URL)
         case delivery(session: String, job: String)
         case source(SourceTarget)
@@ -63,6 +65,8 @@ enum InspectorSelection {
             .routine(session: selection.session, routine: selection.routineID, occurrence: selection.occurrenceID)
         case .browser:
             .browser
+        case .browserFrame(let selection):
+            .browserFrame(selection.id)
         case .report(let file):
             .report(file)
         case .delivery(let selection):
@@ -160,7 +164,7 @@ struct Turn: Identifiable, Equatable {
     let id = UUID()
     let fromOwner: Bool
     let text: String
-    /// What bud did for this reply, when it happened while the app was watching.
+    /// What bud did for this reply.
     var work: Work?
     /// The stored event this turn came from, so a source link can find it.
     var seq: Int?
@@ -174,7 +178,13 @@ struct Turn: Identifiable, Equatable {
 /// A run's work, for the folded line above its reply: "Worked for 34s · 4 steps".
 struct Work: Equatable {
     var steps: [Step]
-    var seconds: Int
+    var seconds: Int?
+    var provenance = TurnProvenance()
+
+    static func recorded(_ payload: [String: Any]) -> Work? {
+        let provenance = TurnProvenance(payload)
+        return provenance.isEmpty ? nil : Work(steps: [], seconds: nil, provenance: provenance)
+    }
 }
 
 /// Safe, structured summary of a failed run built from the server's `reason`, `kind`, and `next`.
@@ -368,7 +378,7 @@ final class Companion {
     }
 
     var failedTurnExternalSteps: [String] { runFailure == nil ? [] : turnExternalSteps }
-    @ObservationIgnored private var replySeq: Int?
+    private(set) var replySeq: Int?
     /// The main conversation so far, finished turns only: the reply being written is `shown`.
     private(set) var turns: [Turn] = []
     /// Where a source link pointed in this conversation; the window scrolls there.
@@ -376,6 +386,11 @@ final class Companion {
     private(set) var focusRequest = 0
     private(set) var routineRevision = 0
     private(set) var inspector: InspectorSelection?
+    private(set) var forgottenPreferences: Set<String> = []
+    private(set) var forgettingPreferences: Set<String> = []
+    private(set) var chromePause: ChromePause?
+    private(set) var browserPrivate = false
+    private(set) var returningChrome = false
     var draftAttachments: [DraftAttachment] = [] {
         didSet { if draftAttachments.isEmpty { clearAttachmentDropSummary() } }
     }
@@ -410,7 +425,7 @@ final class Companion {
     private(set) var updatingSetups: Set<String> = []
     private(set) var openedSetups: Set<String> = []
     private(set) var setupProblems: [String: String] = [:]
-    var needsAttention: Bool { !approvals.isEmpty || !setups.isEmpty || stalledCount > 0 }
+    var needsAttention: Bool { chromePause != nil || !approvals.isEmpty || !setups.isEmpty || stalledCount > 0 }
     /// How many things wait on you: decisions, setups, and stalled jobs. The pet's badge.
     var waitingCount: Int { openApprovals.count + setups.count + stalledCount }
     private var stalledCount: Int { activeTasks.filter { $0.status == "stalled" }.count }
@@ -437,6 +452,28 @@ final class Companion {
     var replyMore: ReplyMore = .init()
     var inputOpen = false
     var draft = ""
+    private var dismissedSuggestions: Set<WelcomeSuggestion> = []
+
+    var showsWelcome: Bool {
+        link == .connected && !running && turns.isEmpty && reply.isEmpty
+            && pendingMessages.isEmpty && lastWork == nil && runFailure == nil
+    }
+
+    var welcomeSuggestions: [WelcomeSuggestion] {
+        guard showsWelcome, !needsOnboarding, draft.isEmpty, inputPurpose == .ask,
+              draftAttachments.isEmpty, replyingTo == nil, question.isEmpty else { return [] }
+        return WelcomeSuggestion.allCases.filter { !dismissedSuggestions.contains($0) }
+    }
+
+    func dismissSuggestion(_ suggestion: WelcomeSuggestion) {
+        dismissedSuggestions.insert(suggestion)
+    }
+
+    func useSuggestion(_ suggestion: WelcomeSuggestion) {
+        guard welcomeSuggestions.contains(suggestion) else { return }
+        draft = suggestion.prompt
+        requestComposerFocus()
+    }
     @ObservationIgnored private var savedDrafts: [InputPurpose: String] = [:]
     private(set) var heldMessages: [HeldMessage] = []
     private(set) var pendingMessages: [PendingMessage] = []
@@ -468,6 +505,7 @@ final class Companion {
     @ObservationIgnored private var connection: BudConnection?
     @ObservationIgnored private var session = ""
     @ObservationIgnored private var follower: Task<Void, Never>?
+    @ObservationIgnored private var chromeMonitor: Task<Void, Never>?
     @ObservationIgnored private var handshake: Task<Void, Never>?
     /// Bumped by each start(), so a slower earlier connection can't install itself afterwards.
     private var generation: Int { connectionMachine.attempt }
@@ -549,6 +587,7 @@ final class Companion {
         steps = []
         lastSteps = []
         lastWork = nil
+        forgottenPreferences = []
         question = ""
         reply = ""
         shown = ""
@@ -606,6 +645,12 @@ final class Companion {
     private func startConnection(resetBackoff: Bool) {
         if stopping { finishStop(error: "Connection changed before bud confirmed Stop.") }
         closeInspector()
+        chromeMonitor?.cancel()
+        chromeMonitor = nil
+        forgettingPreferences = []
+        chromePause = nil
+        browserPrivate = false
+        returningChrome = false
         setupMonitor?.cancel()
         setupMonitor = nil
         fastPollRemaining = 0
@@ -645,7 +690,12 @@ final class Companion {
                         guard let session = primary["session_id"] as? String else {
                             throw ConnectionError.http(0, "no session returned")
                         }
-                        let snapshot = try await connection.send("GET", "sessions/\(session)")
+                        let snapshot: [String: Any]
+                        do {
+                            snapshot = try await connection.send("GET", "sessions/\(session)/conversation")
+                        } catch ConnectionError.http(404, _) {
+                            snapshot = try await connection.send("GET", "sessions/\(session)")
+                        }
                         let nextEffects = connectionMachine.reduce(.handshakeSucceeded(attempt: mine))
                         guard !nextEffects.isEmpty else { return }
                         self.connection = connection
@@ -746,12 +796,14 @@ final class Companion {
         turns = transcript.compactMap { turn in
             let attachments = ChatAttachment.decode(turn["attachments"])
             let routine = RoutineCard(turn["routine"])
+            let owner = turn["role"] as? String == "user"
+            let work = owner ? nil : Work.recorded(turn)
             guard let text = turn["text"] as? String,
-                  !text.isEmpty || !attachments.isEmpty || routine != nil
+                  !text.isEmpty || !attachments.isEmpty || routine != nil || work != nil
             else { return nil }
             return Turn(
-                fromOwner: turn["role"] as? String == "user", text: text, seq: turn["seq"] as? Int,
-                sources: Citations.sources(turn["sources"]),
+                fromOwner: owner, text: text, work: work, seq: turn["seq"] as? Int,
+                sources: Citations.turnSources(turn),
                 attachments: attachments, routine: routine,
                 desktopJobID: turn["desktop_job_id"] as? String)
         }
@@ -765,9 +817,11 @@ final class Companion {
         }
         // Only a reply to the latest message: after a newer message, an older reply misleads.
         // It becomes the reply, not a turn: the latest reply is always `reply`, so it's drawn once.
+        lastWork = nil
         if runFailure == nil, let last = turns.last, !last.fromOwner, last.routine == nil, last.desktopJobID == nil {
             replySeq = last.seq
             replySources = last.sources
+            lastWork = last.work
             reply = last.text
             turns.removeLast()
         } else {
@@ -811,7 +865,7 @@ final class Companion {
     private func showStatus() {
         running = activity == .working
         let stalled = activeTasks.contains { $0.status == "stalled" }
-        let waiting = !openApprovals.isEmpty || !setups.isEmpty || stalled
+        let waiting = chromePause != nil || !openApprovals.isEmpty || !setups.isEmpty || stalled
         if activity != .done || waiting {
             finishGesture?.cancel()
             finishGesture = nil
@@ -1066,6 +1120,80 @@ final class Companion {
             return
         }
         toggleInspector(.browser(BrowserSelection(connection: connection)))
+    }
+
+    func openBrowserFrame(_ frame: TurnProvenance.BrowserFrame) {
+        guard let connection else {
+            nudge("Reconnect to Bud to view the frame.")
+            return
+        }
+        toggleInspector(.browserFrame(BrowserFrameSelection(frame: frame, connection: connection)))
+    }
+
+    private func monitorChrome() {
+        guard chromeMonitor == nil, let connection else { return }
+        let mine = generation
+        chromeMonitor = Task {
+            while !Task.isCancelled, mine == generation {
+                do {
+                    let status = try await connection.send("GET", "browser/view")
+                    guard !Task.isCancelled, mine == generation else { return }
+                    if !returningChrome { applyBrowserStatus(status) }
+                } catch ConnectionError.http(404, _) {
+                    return
+                } catch {
+                    // Keep a known pause until the server confirms it ended.
+                }
+                let hasSavedFrame: Bool
+                if case .browserFrame = inspector { hasSavedFrame = true } else { hasSavedFrame = false }
+                let watching = running || browserPrivate || hasSavedFrame
+                do { try await Task.sleep(for: .seconds(watching ? 1 : 5)) } catch { return }
+            }
+        }
+    }
+
+    private func applyBrowserStatus(_ status: [String: Any]) {
+        guard let isPrivate = status["private"] as? Bool else { return }
+        browserPrivate = isPrivate
+        let pause = ChromePause(status)
+        guard pause != chromePause else { return }
+        chromePause = pause
+        if pause != nil {
+            bubbleOpen = true
+        } else if !running, shown.isEmpty, !needsAttention, runFailure == nil, notices.isEmpty {
+            bubbleOpen = false
+        }
+        showStatus()
+    }
+
+    func returnChromeControl() async {
+        guard chromePause == .manual, let connection, !returningChrome else { return }
+        let mine = generation
+        returningChrome = true
+        defer { if mine == generation { returningChrome = false } }
+        do {
+            let status = try await connection.send("POST", "browser/view/resume")
+            guard mine == generation else { return }
+            applyBrowserStatus(status)
+        } catch {
+            if mine == generation { nudge("Could not give control back to Bud. Try again.") }
+        }
+    }
+
+    func forgetPreference(_ id: String) async {
+        guard let connection, !forgottenPreferences.contains(id), forgettingPreferences.insert(id).inserted
+        else { return }
+        let mine = generation
+        defer { if mine == generation { forgettingPreferences.remove(id) } }
+        do {
+            try await connection.forgetPreference(id)
+        } catch ConnectionError.http(404, _) {
+            // The preference has already been removed from this account.
+        } catch {
+            if mine == generation { nudge("Could not forget this preference. Try again.") }
+            return
+        }
+        if mine == generation { forgottenPreferences.insert(id) }
     }
 
     func openReport(_ file: URL) {
@@ -1610,7 +1738,8 @@ final class Companion {
     /// Yes or no on an action. A job's approval goes through this session too: bud finds the job.
     @discardableResult
     func decide(_ id: String, approved: Bool, after delay: Duration? = nil) -> Bool {
-        respond(to: id, path: nil, body: ApprovalDecision(approved: approved).body, after: delay)
+        guard !approved || approvals.first(where: { $0.id == id })?.hasFullPreview != false else { return false }
+        return respond(to: id, path: nil, body: ApprovalDecision(approved: approved).body, after: delay)
     }
 
     /// Yes now, and yes to this tool from now on: bud records the standing grant, then applies.
@@ -1638,8 +1767,8 @@ final class Companion {
         approvalDeck.setAnimating(animating)
     }
 
-    func approveBatch(_ approvals: [Approval]) {
-        let ids = approvals.filter { !$0.isQuestion }.map(\.id)
+    func approveBatch(_ reviewed: [Approval]) {
+        let ids = ApprovalBatch.reviewedIDs(reviewed, pending: approvals)
         guard let connection, let attempt = approvalDeck.beginBatch(ids: ids) else { return }
         let route = "sessions/\(session)/approvals/"
         let mine = generation
@@ -1914,6 +2043,7 @@ final class Companion {
         case .connected:
             connectionMachine.reduce(.streamConnected(attempt: from))
             link = connectionMachine.link
+            monitorChrome()
         case .lost:
             connectionMachine.reduce(
                 .streamLost(
@@ -1923,15 +2053,18 @@ final class Companion {
                 ))
             link = connectionMachine.link
         case .fatal(401):
+            chromeMonitor?.cancel()
             connectionMachine.reduce(
                 .streamFatal(attempt: from, reason: "bud rejected the owner token."))
             link = connectionMachine.link
         case .fatal(409):
+            chromeMonitor?.cancel()
             connectionMachine.reduce(
                 .streamFatal(
                     attempt: from, reason: "bud switched accounts. Reconnect from the menu."))
             link = connectionMachine.link
         case .fatal(let code):
+            chromeMonitor?.cancel()
             connectionMachine.reduce(
                 .streamFatal(attempt: from, reason: "bud closed the stream (\(code))."))
             link = connectionMachine.link
@@ -2005,7 +2138,8 @@ final class Companion {
         case "run.started", "run.recovered":
             runID = event.data["run_id"] as? String
             runFailure = nil
-            if ["job", "setup"].contains(event.string("trigger")) {
+            let trigger = event.string("trigger")
+            if ["job", "setup"].contains(trigger) {
                 clearTurnDraft()
                 archiveReply()
                 reply = ""
@@ -2014,6 +2148,12 @@ final class Companion {
                 blocks = []
                 seenRequests = []
                 steps = []
+                lastSteps = []
+                stepsExpanded = false
+            } else if trigger == "approval", replySeq != nil {
+                archiveReply()
+                reply = ""
+                showWhole()
                 lastSteps = []
                 stepsExpanded = false
             }
@@ -2064,15 +2204,13 @@ final class Companion {
             runID = nil
             runFailure = nil
             clearTurnDraft()
-            finish(event)
-            closeSteps()
+            closeSteps(provenance: finish(event))
             playFinishGesture()
             refreshApprovals()
         case "run.waiting":
             // The run is parked on the owner; the open approvals make the pet say so.
             runFailure = nil
-            finish(event)
-            closeSteps()
+            closeSteps(provenance: finish(event))
             activity = .idle
             bubbleOpen = true
         case "approval.requested", "task.approval":
@@ -2185,7 +2323,9 @@ final class Companion {
                     reply = ""
                     showWhole()
                 }
-                turns.append(Turn(fromOwner: false, text: text, seq: event.seq, routine: card))
+                turns.append(Turn(
+                    fromOwner: false, text: text, work: Work.recorded(event.data), seq: event.seq,
+                    sources: Citations.turnSources(event.data), routine: card))
             }
         case "routine.updated", "routine.paused", "routine.resumed", "routine.triggered",
              "routine.delivery_confirmed":
@@ -2238,20 +2378,21 @@ final class Companion {
     }
 
     /// The run is over: its steps all count as done, and they move to the summary.
-    private func closeSteps() {
-        if !steps.isEmpty {
-            lastSteps = steps.map { Step(id: $0.id, text: $0.text, done: true) }
-            steps = []
-        }
-        if let runStart {
-            lastWork = Work(steps: lastSteps, seconds: Int(Date.now.timeIntervalSince(runStart).rounded()))
+    private func closeSteps(provenance: TurnProvenance? = nil) {
+        lastSteps = steps.map { Step(id: $0.id, text: $0.text, done: true) }
+        steps = []
+        if provenance != nil || replySeq == nil {
+            let seconds = runStart.map { Int(Date.now.timeIntervalSince($0).rounded()) }
+            let details = provenance ?? TurnProvenance()
+            lastWork = seconds != nil || !lastSteps.isEmpty || !details.isEmpty
+                ? Work(steps: lastSteps, seconds: seconds, provenance: details) : nil
         }
         runStart = nil
     }
 
     /// The finished reply joins the conversation, carrying the work that produced it.
     private func archiveReply() {
-        if !reply.isEmpty {
+        if !reply.isEmpty || lastWork?.provenance.isEmpty == false {
             turns.append(
                 Turn(fromOwner: false, text: reply, work: lastWork, seq: replySeq, sources: replySources))
         }
@@ -2292,14 +2433,15 @@ final class Companion {
     }
 
     /// The stored run end is the authority: it replaces whatever was streamed.
-    private func finish(_ event: BudEvent) {
+    private func finish(_ event: BudEvent) -> TurnProvenance? {
         blocks = []
         seenRequests = []
         let full = Self.replyText(event.data)
-        guard !full.isEmpty else { return }
+        guard !full.isEmpty, event.data["silent_completion"] as? Bool != true else { return nil }
         replySeq = event.seq
-        replySources = Citations.sources(event.data["sources"])
+        replySources = Citations.turnSources(event.data)
         reply = full
+        return TurnProvenance(event.data)
     }
 
     private func notice(_ event: BudEvent) {

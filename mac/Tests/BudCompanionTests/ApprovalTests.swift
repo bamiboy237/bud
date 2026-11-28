@@ -83,14 +83,14 @@ struct ApprovalTests {
     @Test
     func batchExcludesOtherRequestsJobsAndQuestions() throws {
         let selected = try approval("archive_email")
-        let sibling = try approval("send_email", id: "b")
-        let otherRun = try approval("send_email", id: "c", run: "other")
-        let otherTask = try approval("send_email", id: "d", task: 7)
+        let sibling = try approval("mark_read", id: "b")
+        let otherRun = try approval("mark_read", id: "c", run: "other")
+        let otherTask = try approval("mark_read", id: "d", task: 7)
         let question = try approval("ask_user", id: "e")
         let items = [selected, sibling, otherRun, otherTask, question]
         #expect(selected.batch(in: items).map(\.id) == ["a", "b"])
         #expect(question.batch(in: items).isEmpty)
-        let legacy = try approval("send_email", run: nil)
+        let legacy = try approval("mark_read", run: nil)
         #expect(legacy.batch(in: [legacy, sibling]).isEmpty)
     }
 
@@ -101,10 +101,10 @@ struct ApprovalTests {
             "run_id": "job-run-1", "task_id": 1, "request_id": "owner-request",
         ], jobs: [:]))
         let second = try #require(Approval([
-            "approval_id": "b", "tool": "send_email", "args": [:],
+            "approval_id": "b", "tool": "mark_read", "args": [:],
             "run_id": "job-run-2", "task_id": 2, "request_id": "owner-request",
         ], jobs: [:]))
-        let unrelated = try approval("send_email", id: "c", run: "owner-request")
+        let unrelated = try approval("mark_read", id: "c", run: "owner-request")
         #expect(first.batch(in: [first, second, unrelated]).map(\.id) == ["a", "b"])
     }
 
@@ -265,10 +265,10 @@ struct ApprovalTests {
     @Test @MainActor
     func retryIncludesOnlyFailedItemsStillPendingInTheSameRequest() async throws {
         let a = try approval("archive_email", id: "a")
-        let b = try approval("send_email", id: "b")
-        let denied = try approval("send_email", id: "denied")
-        let arrivedLater = try approval("send_email", id: "new")
-        let unrelated = try approval("send_email", id: "other", run: "other-request")
+        let b = try approval("mark_read", id: "b")
+        let denied = try approval("mark_read", id: "denied")
+        let arrivedLater = try approval("mark_read", id: "new")
+        let unrelated = try approval("mark_read", id: "other", run: "other-request")
         let first = await ApprovalBatch.approve([a.id, b.id, denied.id]) { id in
             ["applied": id == a.id]
         }

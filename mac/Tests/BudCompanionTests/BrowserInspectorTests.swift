@@ -3,6 +3,14 @@ import Testing
 @testable import BudCompanion
 
 struct BrowserInspectorTests {
+    @Test
+    func chromeHandoffAndManualReturnUseSeparateActions() {
+        #expect(ChromePause(["private": true, "handoff_open": true]) == .handoff)
+        #expect(ChromePause(["private": true, "handoff_open": false]) == .manual)
+        #expect(ChromePause(["private": true, "interactive": true]) == nil)
+        #expect(ChromePause(["private": false]) == nil)
+    }
+
     @Test(arguments: ["about:blank", "ABOUT:blank", "", " "])
     func blankTitlesUseTheTabHost(title: String) throws {
         let tab = try #require(BrowserTab(["id": "docs", "title": title, "host": "docs.example"]))

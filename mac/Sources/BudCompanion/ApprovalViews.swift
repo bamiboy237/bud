@@ -110,7 +110,7 @@ struct ApprovalDeck: View {
     }
 
     private var currentBatch: PendingBatch? {
-        guard let current = currentApproval, let key = current.requestID else { return nil }
+        guard let current = currentApproval, current.canBatch, let key = current.requestID else { return nil }
         let items = current.batch(in: companion.approvals)
         guard items.count > 1 else { return nil }
         return PendingBatch(

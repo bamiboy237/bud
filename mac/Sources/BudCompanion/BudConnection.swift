@@ -243,8 +243,21 @@ struct BudConnection: Sendable {
         try await send(request(method, path, json: json, queryItems: queryItems))
     }
 
-    func getBytes(_ path: String, queryItems: [URLQueryItem]) async throws -> Data {
+    func getBytes(_ path: String, queryItems: [URLQueryItem] = []) async throws -> Data {
         try await checkedData(request("GET", path, queryItems: queryItems))
+    }
+
+    func forgetPreference(_ id: String) async throws {
+        guard id.wholeMatch(of: /[a-f0-9]{32}/) != nil else { throw ConnectionError.notBudServer }
+        let response = try await send("POST", "preferences/\(id)/forget")
+        guard response["ok"] as? Bool == true, response["id"] as? String == id else {
+            throw ConnectionError.notBudServer
+        }
+    }
+
+    func browserFrame(_ id: String) async throws -> Data {
+        guard id.wholeMatch(of: /[a-f0-9]{32}/) != nil else { throw ConnectionError.notBudServer }
+        return try await getBytes("browser/frames/\(id)")
     }
 
     func postMessage(

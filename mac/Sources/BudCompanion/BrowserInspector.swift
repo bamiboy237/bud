@@ -6,6 +6,156 @@ struct BrowserSelection: Identifiable {
     let id = UUID()
 }
 
+struct BrowserFrameSelection: Identifiable {
+    let frame: TurnProvenance.BrowserFrame
+    let connection: BudConnection
+    var id: String { frame.id }
+}
+
+enum ChromePause: Equatable {
+    case handoff, manual
+
+    init?(_ status: [String: Any]) {
+        guard status["private"] as? Bool == true, status["interactive"] as? Bool != true else { return nil }
+        self = status["handoff_open"] as? Bool == true ? .handoff : .manual
+    }
+
+    var message: String {
+        switch self {
+        case .handoff: "Chrome needs your input. Finish there, then select Continue."
+        case .manual: "Finish in Chrome, then give control back to Bud."
+        }
+    }
+}
+
+struct ChromePrivateInput: View {
+    let pause: ChromePause
+    let busy: Bool
+    let onOpenFailure: () -> Void
+    let onReturn: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(pause.message)
+                .font(Paper.Typography.callout)
+                .foregroundStyle(Paper.inkSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button("Open Chrome") {
+                    Task { if !(await activateChrome()) { onOpenFailure() } }
+                }
+                .buttonStyle(CardButton(kind: .quiet))
+                if pause == .manual {
+                    Button("Give back control", action: onReturn)
+                        .buttonStyle(CardButton(kind: .primary))
+                        .disabled(busy)
+                }
+            }
+        }
+    }
+}
+
+struct SavedBrowserFrameInspector: View {
+    let selection: BrowserFrameSelection
+    let companion: Companion
+    let close: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Saved browser frame").font(Paper.Typography.label)
+                Spacer()
+                Button(action: close) { Image(systemName: "xmark").font(.system(size: 12, weight: .medium)) }
+                    .buttonStyle(IconButton(size: 26))
+                    .accessibilityLabel("Close saved frame")
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 40)
+            Rectangle().fill(Paper.hairline).frame(height: 0.5)
+            if companion.browserPrivate {
+                Text("Frames are hidden during private input.")
+                    .font(Paper.Typography.callout)
+                    .foregroundStyle(Paper.inkSecondary)
+                    .padding(14)
+            } else {
+                SavedFramePreview(selection: selection)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Paper.canvas)
+        .inspectorColumnWidth(min: 265, ideal: 380, max: 750)
+    }
+}
+
+private struct SavedFramePreview: View {
+    let selection: BrowserFrameSelection
+    @StateObject private var state = PreviewState()
+
+    private final class PreviewState: ObservableObject {
+        @Published var image: NSImage?
+        @Published var message: String?
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            let frame = selection.frame
+            Text(frame.title.isEmpty ? frame.domain : frame.title)
+                .font(Paper.Typography.callout)
+                .lineLimit(2)
+            if let image = state.image {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .accessibilityLabel("Captured page from \(frame.domain)")
+            } else if let message = state.message {
+                Text(message)
+                    .font(Paper.Typography.callout)
+                    .foregroundStyle(Paper.inkSecondary)
+            } else {
+                ProgressView().controlSize(.small).accessibilityLabel("Loading frame")
+            }
+        }
+        .padding(14)
+        .task {
+            let connection = selection.connection
+            do {
+                guard try await permitsPreview(using: connection) else { return }
+                let bytes: Data
+                do {
+                    bytes = try await connection.browserFrame(selection.id)
+                } catch ConnectionError.http(404, _) {
+                    if !Task.isCancelled { state.message = "Frame no longer saved" }
+                    return
+                }
+                guard try await permitsPreview(using: connection) else { return }
+                guard let image = NSImage(data: bytes) else {
+                    state.message = "Could not load frame"
+                    return
+                }
+                state.image = image
+            } catch {
+                if !Task.isCancelled { state.message = "Could not load frame" }
+            }
+        }
+    }
+
+    private func permitsPreview(using connection: BudConnection) async throws -> Bool {
+        let status: [String: Any]
+        do {
+            status = try await connection.send("GET", "browser/view")
+        } catch ConnectionError.http(404, _) {
+            // Bud can still serve saved frames when live browser tools are disabled.
+            return !Task.isCancelled
+        }
+        guard !Task.isCancelled else { return false }
+        guard status["private"] as? Bool == false else {
+            state.message = "Frames are hidden during private input."
+            return false
+        }
+        return true
+    }
+}
+
 struct BrowserTab: Identifiable {
     let id: String
     let title: String
@@ -693,12 +843,15 @@ struct BrowserInspector: View {
 
     private func chromeControl(title: String?, handoffOpen: Bool) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            controlBar(title: title)
-            Text(handoffOpen
-                 ? "Work in Chrome. You can also select Continue there to give back control."
-                 : "Bud is paused while you work in Chrome.")
-                .font(Paper.Typography.callout)
-                .foregroundStyle(Paper.inkSecondary)
+            Text(title ?? "Chrome paused")
+                .font(Paper.Typography.label)
+                .lineLimit(1)
+            ChromePrivateInput(
+                pause: handoffOpen ? .handoff : .manual,
+                busy: state.sending,
+                onOpenFailure: { state.problem = "Could not open Chrome on this Mac." },
+                onReturn: { Task { await state.resume(using: selection.connection) } }
+            )
         }
         .padding(14)
     }

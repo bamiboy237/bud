@@ -8,6 +8,8 @@ struct Approval: Identifiable, Equatable {
     let requestID: String?
     let emailPreview: EmailPreview?
     let expectsOriginalEmail: Bool
+    let requiresFullPreview: Bool
+    let hasFullPreview: Bool
     /// The job that asked, when it wasn't the main chat.
     let job: String?
     /// What will happen, in plain words: "Send email to dana@brightpath.example".
@@ -52,6 +54,7 @@ struct Approval: Identifiable, Equatable {
     let questions: [Question]
 
     var isQuestion: Bool { tool == "ask_user" }
+    var canBatch: Bool { !isQuestion && !requiresFullPreview }
 
     /// True when bud may keep this tool's permission: the card then offers "Always allow".
     /// Sends, real Gmail and Calendar writes, and skill installs never are.
@@ -69,8 +72,8 @@ struct Approval: Identifiable, Equatable {
     }
 
     func batch(in approvals: [Approval]) -> [Approval] {
-        guard !isQuestion, let requestID else { return [] }
-        return approvals.filter { !$0.isQuestion && $0.requestID == requestID }
+        guard canBatch, let requestID else { return [] }
+        return approvals.filter { $0.canBatch && $0.requestID == requestID }
     }
 
     func retryBatch(in approvals: [Approval], failures: [String: String]) -> [Approval] {
@@ -90,35 +93,86 @@ struct Approval: Identifiable, Equatable {
             ?? (raw["run_id"] as? String)?.nilIfEmpty.map {
                 "task:\(raw["task_id"] as? Int ?? 0):run:\($0)"
             }
-        emailPreview = (raw["preview"] as? [String: Any]).flatMap(EmailPreview.init)
-        grantable = raw["grantable"] as? Bool ?? false
+        let preview = raw["preview"] as? [String: Any]
+        let review = raw["review"] as? [String: Any] ?? [:]
+        let toolName = tool.lowercased()
+        let fullPreview = review["require_full_preview"] as? Bool == true
+            || raw["require_full_preview"] as? Bool == true
+            || Self.isOutboundSend(toolName)
+        requiresFullPreview = fullPreview
+        emailPreview = preview.flatMap(EmailPreview.init)
+        grantable = !fullPreview && raw["grantable"] as? Bool == true
         expectsOriginalEmail = ["archive_email", "mark_read", "draft_reply"].contains(tool)
             || args["thread_id"] != nil || args["draft_id"] != nil
         job = (raw["task_id"] as? Int).flatMap { jobs[$0] }
         questions = Question.parse(args)
-        let toolName = tool.lowercased()
         let words = Self.describe(toolName, args)
         action = tool == "ask_user" ? (questions.first?.text ?? "") : words.title
         verb = words.verb
         symbol = words.symbol
-        let review = raw["review"] as? [String: Any] ?? [:]
         // enable_browser's looked-up fact is the caution, which the body already shows.
-        facts = Self.facts(toolName, args) + Self.reviewFacts(tool == "enable_browser" ? [:] : review)
+        var facts = Self.facts(toolName, args)
+        if toolName == "create_routine",
+           let value = raw["next_run_at"] as? String,
+           let timezone = (raw["timezone"] as? String ?? args["timezone"] as? String)
+               .flatMap(TimeZone.init(identifier:)),
+           let nextRun = Self.nextRunText(value, timezone: timezone) {
+            facts.insert(("Next run", nextRun), at: facts.first?.label == "Schedule" ? 1 : 0)
+        }
+        if fullPreview, !facts.contains(where: { $0.label == "To" }),
+           let destination = Self.text(args, "channel", "channel_id", "chat_id", "conversation_id").nilIfEmpty {
+            facts.insert(("To", destination), at: 0)
+        }
+        if fullPreview, args["subject"] as? String == "" {
+            facts.append(("Subject", "No subject"))
+        }
+        self.facts = facts + Self.reviewFacts(tool == "enable_browser" ? [:] : review)
+        let proposedBody = [
+            "body", "body_text", "text", "message", "message_text", "content",
+        ].lazy.compactMap { args[$0] as? String }.first
+        let previewBody = (preview?["proposed_body_text"] as? String)?.nilIfEmpty
+        let wantsSubject = toolName.contains("mail") || toolName.hasSuffix("_draft")
+            || toolName.hasSuffix("_thread") || args["subject"] != nil
+        hasFullPreview = !fullPreview || (
+            (proposedBody != nil || previewBody != nil)
+                && facts.contains { $0.label == "To" }
+                && (!wantsSubject || facts.contains { $0.label == "Subject" })
+        )
         if tool == "enable_browser" {
             // Fixed words from the app, never from the model, so the caution cannot be edited.
             // The card shows this line; the full caution sits under "What this allows".
             body = Self.browserSummary
         } else if toolName == "create_routine" {
             body = Self.text(args, "prompt").nilIfEmpty
+        } else if fullPreview {
+            body = (args["is_html"] as? Bool == true ? previewBody : nil) ?? proposedBody ?? previewBody
         } else if args["is_html"] as? Bool == true {
             // Approvals saved before previews existed have no proposed text; show the body
             // they carry rather than hiding what will be sent.
-            body = ((raw["preview"] as? [String: Any])?["proposed_body_text"] as? String)
-                .flatMap(\.nilIfEmpty)
+            body = previewBody
                 ?? Self.text(args, "body", "body_text", "text", "description").nilIfEmpty
         } else {
             body = Self.text(args, "body", "body_text", "text", "description", "content").nilIfEmpty
         }
+    }
+
+    private static let sendActions = [
+        "send_email", "send_mail", "send_message", "send_draft", "send_sms",
+        "reply_email", "reply_message", "reply_to_email", "reply_to_thread", "forward_email", "post_message",
+    ]
+
+    private static func isOutboundSend(_ tool: String) -> Bool {
+        tool == "gmail_send" || sendActions.contains { tool == $0 || tool.hasSuffix("_" + $0) }
+    }
+
+    static func nextRunText(
+        _ value: String, timezone: TimeZone, localTimeZone: TimeZone = .current, locale: Locale = .current
+    ) -> String? {
+        guard let date = parseBudTimestamp(value) else { return nil }
+        let formatted = date.formatted(
+            Date.FormatStyle(date: .abbreviated, time: .shortened, locale: locale, timeZone: timezone))
+        guard timezone != localTimeZone else { return formatted }
+        return formatted + " " + (timezone.abbreviation(for: date) ?? timezone.identifier)
     }
 
     /// Approvals that are a plain yes or no, with nothing to revise.

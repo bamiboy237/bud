@@ -1,6 +1,16 @@
 import AppKit
 import SwiftUI
 
+@MainActor
+func activateChrome() async -> Bool {
+    let id = "com.google.Chrome"
+    if let chrome = NSRunningApplication.runningApplications(withBundleIdentifier: id).first,
+       chrome.activate() { return true }
+    let workspace = NSWorkspace.shared
+    guard let url = workspace.urlForApplication(withBundleIdentifier: id) else { return false }
+    return (try? await workspace.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())) != nil
+}
+
 /// Which side of the pet the bubble opens on. It opens above and to the left, toward the
 /// middle of the screen, until the pet is moved near the top or the left edge.
 struct Anchor: Equatable {

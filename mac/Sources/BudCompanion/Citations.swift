@@ -66,6 +66,10 @@ enum Citations {
         }
     }
 
+    static func turnSources(_ payload: [String: Any]) -> [String: Source] {
+        sources(payload["citation_sources"] ?? payload["sources"])
+    }
+
     /// The conversation message or workspace file a source link opens, or nil for any other link.
     static func target(_ url: URL) -> SourceTarget? {
         guard url.scheme == scheme, let host = url.host(), !host.isEmpty else { return nil }

@@ -5,6 +5,26 @@ import Testing
 @Suite
 struct RoutineApprovalTests {
     @Test
+    func nextRunUsesRoutineLocalTimeAndIdentifiesTheTimeZone() throws {
+        let stamp = "2026-12-01T18:30:00.123456+00:00"
+        let zone = try #require(TimeZone(identifier: "America/Chicago"))
+        let locale = Locale(identifier: "en_US")
+        let approval = try #require(Approval([
+            "approval_id": "routine", "tool": "create_routine",
+            "args": ["cron": "30 12 * * *"],
+            "next_run_at": stamp, "timezone": zone.identifier,
+        ], jobs: [:]))
+
+        #expect(approval.facts.map(\.label) == ["Schedule", "Next run"])
+        #expect(approval.facts.last?.value == Approval.nextRunText(stamp, timezone: zone))
+        let remote = Approval.nextRunText(stamp, timezone: zone, localTimeZone: .gmt, locale: locale)
+        let local = Approval.nextRunText(stamp, timezone: zone, localTimeZone: zone, locale: locale)
+        #expect(local?.contains("Dec 1, 2026") == true)
+        #expect(local?.contains("12:30") == true)
+        #expect(remote == local.map { $0 + " CST" })
+    }
+
+    @Test
     func showsRoutinePlanBeforeApproval() throws {
         let prompt = "Summarize unread mail and flag anything that needs a reply."
         let approval = try #require(Approval([

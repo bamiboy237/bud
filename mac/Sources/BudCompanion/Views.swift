@@ -642,6 +642,20 @@ struct RunFailureView: View {
 
 // MARK: Bubble
 
+struct ChromePauseNotice: View {
+    let companion: Companion
+
+    var body: some View {
+        if let pause = companion.chromePause {
+            ChromePrivateInput(
+                pause: pause, busy: companion.returningChrome || companion.link != .connected,
+                onOpenFailure: { companion.nudge("Could not open Chrome on this Mac.") },
+                onReturn: { Task { await companion.returnChromeControl() } }
+            )
+        }
+    }
+}
+
 private struct Bubble: View {
     @Bindable var companion: Companion
     let maxHeight: CGFloat
@@ -665,6 +679,7 @@ private struct Bubble: View {
             if let status {
                 header(status)
             }
+            ChromePauseNotice(companion: companion)
             if !compact, !companion.question.isEmpty, companion.setups.isEmpty {
                 // What you asked, so the answer keeps its context. One line: a reminder.
                 Text(companion.question)
@@ -675,7 +690,8 @@ private struct Bubble: View {
                     .padding(.top, overlaysControls ? 0 : -4)
                     .transition(.opacity)
             }
-            if companion.running, companion.stepsLayout == .checklist, !companion.steps.isEmpty {
+            if companion.chromePause == nil, companion.running, companion.stepsLayout == .checklist,
+               !companion.steps.isEmpty {
                 StepList(steps: companion.steps, live: true)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -861,7 +877,7 @@ private struct Bubble: View {
 
     /// "step 3", for the counted layout while bud works.
     private var stepCount: String? {
-        guard companion.stepsLayout == .counted, companion.running,
+        guard companion.chromePause == nil, companion.stepsLayout == .counted, companion.running,
               !companion.steps.isEmpty else { return nil }
         return "step \(companion.steps.count)"
     }
@@ -897,6 +913,7 @@ private struct Bubble: View {
 
     /// Plain words for what bud is doing. Colour only when it's your move or something broke.
     private var state: (text: String, tint: Color, busy: Bool)? {
+        if companion.chromePause != nil { return ("Chrome paused", Paper.inkPrimary, false) }
         if case .problem(let detail) = companion.link {
             return (detail, Paper.inkSecondary, false)
         }
@@ -1087,7 +1104,7 @@ struct ApprovalCard: View {
         // The browser caution is read in full before turning it on, never behind a scroll;
         // it is written short enough to fit the deck at this height.
         if inWindow {
-            return approval.isQuestion ? 260 : 200
+            return approval.isQuestion || approval.requiresFullPreview ? 260 : 200
         }
         let height: CGFloat = approval.isQuestion ? 190 : approval.tool == "enable_browser" ? 135 : 94
         let hasProblem = companion.approvalFailures[approval.id] != nil || companion.decisionProblem != nil
@@ -1190,6 +1207,16 @@ struct ApprovalCard: View {
                     if !approval.facts.isEmpty { facts }
                     if approval.tool == "enable_browser" {
                         BrowserCaution()
+                    } else if approval.requiresFullPreview {
+                        if !approval.hasFullPreview {
+                            Text("Full send preview unavailable. Ask Bud to prepare it again.")
+                                .foregroundStyle(Paper.inkSecondary)
+                        }
+                        if let text = approval.body {
+                            Text(verbatim: text.isEmpty ? "Empty body" : text)
+                                .lineSpacing(3)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     } else if let text = approval.body, !approval.isQuestion {
                         EmailBody(text: text)
                     }
@@ -1208,6 +1235,8 @@ struct ApprovalCard: View {
                             .foregroundStyle(Paper.inkSecondary)
                     }
                 }
+                .font(Paper.Typography.callout)
+                .lineLimit(nil)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
                     layout.height = $0
@@ -1294,6 +1323,7 @@ struct ApprovalCard: View {
                 .frame(minWidth: inWindow ? 34 : nil, maxWidth: inWindow ? nil : .infinity)
         }
         .buttonStyle(CardButton(kind: .primary))
+        .disabled(!approval.hasFullPreview)
         .help(label)
         .accessibilityLabel(label)
     }
