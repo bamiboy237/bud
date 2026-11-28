@@ -21,6 +21,7 @@ missing.
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -46,7 +47,7 @@ from pydantic_ai.toolsets.abstract import ToolsetTool
 
 from bud.composio.binding import ConnectionError
 from bud.core.setup import SetupEntry, SetupInitiation, SetupStatus
-from bud.harness.actions import Policy
+from bud.harness.actions import BROWSER_TARGET, STALE_BROWSER_TARGET, Policy, TargetDescription
 
 if TYPE_CHECKING:
     from bud.core.browser_view import BrowserView
@@ -88,6 +89,7 @@ PORT = 19989
 # Beside Bud's own copy of browse, outside the workspace, so shell commands cannot touch the
 # relay's token or pairing.
 RELAY_HOME = Path.home() / ".bud" / "browse"
+BROWSE_ENV = ("PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "USER", "LOGNAME", "TERM", "SHELL")
 EXTENSION_URL = "https://chromewebstore.google.com/detail/mfnicocicmmlkpjnaffgihfjhdgjkdjg"
 INSTALL = "curl -fsSL https://opencode.ai/browse/install | bash"
 CAUTION = (
@@ -129,7 +131,11 @@ class Relay:
 
     def env(self) -> dict[str, str]:
         return {
-            **os.environ,
+            **{
+                name: value
+                for name in BROWSE_ENV
+                if (value := os.environ.get(name)) is not None and not value.startswith("()")
+            },
             "OPENCODE_BROWSER_HOME": str(self.home),
             "OPENCODE_BROWSER_PORT": str(self.port),
             "OPENCODE_BROWSER_TOOLS": "plain",
@@ -372,6 +378,24 @@ class BrowseTools(AbstractToolset[None]):
                 tools = await connection.get_tools(ctx)
                 if name not in tools:
                     return f"{name} is not available right now, so nothing was done."
+                tab = tool_args.get("tab")
+                target = (ctx.tool_call_metadata or {}).get(BROWSER_TARGET)
+                targeted = (
+                    name in NEEDS_TAB
+                    or name == "browser_navigate"
+                    or (name == TABS and tool_args.get("action") == "close")
+                )
+                # The handback and remote tool lookup have both finished at this point.
+                if (
+                    targeted
+                    and tab is not None
+                    and (target is not None or ctx.tool_call_approved)
+                    and (
+                        not isinstance(target, str)
+                        or target != _page_fingerprint(await _tab_entry(self.path, self.relay, tab))
+                    )
+                ):
+                    return STALE_BROWSER_TARGET.copy()
                 result = await connection.call_tool(name, tool_args, ctx, tools[name])
                 if self.view is not None:
                     tab = _tool_tab(name, tool_args, result)
@@ -436,6 +460,19 @@ async def _tabs(path: Path, relay: Relay) -> list[dict[str, Any]]:
         )
     except (OSError, ValueError, AttributeError, RuntimeError):
         return []
+
+
+async def _tab_entry(path: Path, relay: Relay, tab: object) -> dict[str, Any]:
+    for entry in await _tabs(path, relay):
+        if any(entry.get(key) is not None and str(tab) == str(entry[key]) for key in ("tab", "id")):
+            return entry
+    return {}
+
+
+def _page_fingerprint(entry: dict[str, Any]) -> str | None:
+    url = entry.get("url")
+    # The display omits the query and fragment. Both can select a different target.
+    return hashlib.sha256(url.encode()).hexdigest() if isinstance(url, str) and url else None
 
 
 # A ref Browse hands out ("e21", or "a5" in aria mode). Anything else never reaches a script.
@@ -578,11 +615,13 @@ def describers(
             return "Opens a new tab."
         path = find()
         if path is None:
-            return "The tab could not be looked up."
-        for entry in await _tabs(path, relay):
-            if str(tab) in {str(entry[key]) for key in ("tab", "id") if entry.get(key)}:
-                return f"The tab shows {_site(entry.get('url'))}."
-        return "The tab is not one Browse knows."
+            return TargetDescription("The tab could not be looked up.", None)
+        entry = await _tab_entry(path, relay, tab)
+        if not entry:
+            return TargetDescription("The tab is not one Browse knows.", None)
+        return TargetDescription(
+            f"The tab shows {_site(entry.get('url'))}.", _page_fingerprint(entry)
+        )
 
     async def step(tool_args: dict[str, Any]) -> str:
         """Which site, and for a step on one element, what that element is."""
@@ -592,18 +631,24 @@ def describers(
             not isinstance(ref, str)
             or tab is None
             or path is None
-            or not site.startswith("The tab shows")
+            or not isinstance(site, TargetDescription)
+            or site.fingerprint is None
         ):
             return site
         element = await _element(path, relay, tab, ref)
-        if element is None:
-            return f"{site} The element could not be looked up."
-        return f"{site} It acts on: {element} (label and link read from the page)."
+        details = (
+            f"It acts on: {element} (label and link read from the page)."
+            if element is not None
+            else "The element could not be looked up."
+        )
+        return TargetDescription(f"{site} {details}", site.fingerprint)
 
     async def tabs(tool_args: dict[str, Any]) -> str:
         action = tool_args.get("action")
         if action == "close" and tool_args.get("tab") is not None:
-            return f"Closes a tab. {await where(tool_args)}"
+            site = await where(tool_args)
+            if isinstance(site, TargetDescription):
+                return TargetDescription(f"Closes a tab. {site}", site.fingerprint)
         if action == "close":
             return "Closes tabs Bud opened."
         if action == "new":
@@ -619,10 +664,10 @@ def describers(
             if view is None:
                 return await call(tool_args)
             if view.private:
-                return "Browser details are paused for private input."
+                return TargetDescription("Browser details are paused for private input.", None)
             async with view.lock:
                 if view.private:
-                    return "Browser details are paused for private input."
+                    return TargetDescription("Browser details are paused for private input.", None)
                 return await call(tool_args)
 
         return read

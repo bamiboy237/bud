@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import errno
+import fcntl
 import hashlib
 import json
 import os
 import platform
+import plistlib
 import re
 import secrets
 import shutil
@@ -15,14 +16,16 @@ import subprocess
 import sys
 import tarfile
 import tomllib
-from collections.abc import Callable
-from contextlib import closing, suppress
+from collections.abc import Callable, Generator
+from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-from uuid import uuid4
+from uuid import UUID, uuid4
+
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from bud import __version__
 from bud.config import HOST, PORT, Settings
@@ -30,7 +33,7 @@ from bud.core.auth import owner_token
 from bud.core.events import Event
 from bud.core.projection import runs
 from bud.release import UpdateError, UpdateRollbackError
-from bud.release.backup import backup_data_dir, restore_backup
+from bud.release.backup import _atomic_write_bytes, backup_data_dir, restore_backup
 from bud.release.service import CommandRunner, RuntimeFetcher, ServiceManager
 
 DEFAULT_GITHUB_REPO = "bamiboy237/bud"
@@ -39,6 +42,8 @@ DEFAULT_APP_DIR = Path("/Applications")
 _EXECUTING_STATUSES = frozenset({"queued", "running", "stopping"})
 _SHA256_LINE = re.compile(r"^\s*([0-9a-fA-F]{64})\s+\*?(.+?)\s*$")
 _VERSION_RE = re.compile(r"^v?(\d+(?:\.\d+)*)(?:[-.](.+))?$")
+_UPDATE_MARKER = ".pending-update.json"
+_RELEASE_LINKS = ("releases/current", "bin/bud", "bin/bud-tui")
 
 HttpGetter = Callable[[str], bytes]
 
@@ -61,6 +66,31 @@ class UpdateResult:
     backup_dir: Path
     app_updated: bool
     service_restarted: bool
+
+
+class _PendingUpdate(BaseModel):
+    model_config = ConfigDict(ser_json_bytes="base64", val_json_bytes="base64")
+
+    id: UUID
+    previous_version: str | None
+    previous_links: tuple[str | None, str | None, str | None]
+    target_app: Path
+    had_app: bool
+    swap_app: bool
+    app_was_running: bool
+    manage_service: bool
+    service_was_running: bool
+    previous_plist: bytes | None
+    previous_port: int
+    backup_dir: Path | None = None
+
+    @property
+    def stash_app(self) -> Path:
+        return self.target_app.with_name(f".prev-Bud.app-{self.id.hex}")
+
+    @property
+    def staged_app(self) -> Path:
+        return self.target_app.with_name(f".staged-Bud.app-{self.id.hex}")
 
 
 def _default_runner(command: list[str], *, cwd: Path | None = None) -> tuple[int, str, str]:
@@ -130,7 +160,11 @@ def is_newer_version(candidate: str, current: str) -> bool:
 
 
 def current_release_version(bud_home: Path) -> str | None:
-    manifest = bud_home.expanduser() / "releases" / "current" / "manifest.json"
+    releases = bud_home.expanduser() / "releases"
+    pending = _load_pending(releases / _UPDATE_MARKER)
+    if pending is not None:
+        return pending.previous_version
+    manifest = releases / "current" / "manifest.json"
     if not manifest.is_file():
         return None
     try:
@@ -571,22 +605,10 @@ def _atomic_symlink(link_path: Path, target: Path | str) -> None:
     try:
         os.symlink(target, temp_link)
         os.replace(temp_link, link_path)
+        _sync_dir(link_path.parent)
     finally:
         if temp_link.is_symlink() or temp_link.exists():
             temp_link.unlink(missing_ok=True)
-
-
-def _move_path(src: Path, dst: Path) -> None:
-    try:
-        os.replace(src, dst)
-    except OSError as exc:
-        if exc.errno != errno.EXDEV:
-            raise
-        if dst.is_dir() and not dst.is_symlink():
-            shutil.rmtree(dst)
-        elif dst.exists() or dst.is_symlink():
-            dst.unlink()
-        shutil.move(str(src), str(dst))
 
 
 def _is_app_running(target_app: Path) -> bool:
@@ -611,7 +633,7 @@ def _quit_app(target_app: Path) -> None:
 
 def _reopen_app(target_app: Path) -> None:
     if sys.platform == "darwin" and target_app.is_dir():
-        subprocess.run(["open", str(target_app)], check=False)
+        subprocess.run(["open", str(target_app)], check=True)
 
 
 def _active_runs_present(data_dir: Path) -> bool:
@@ -647,28 +669,31 @@ def _active_runs_present(data_dir: Path) -> bool:
     return False
 
 
-def _swap_app_bundle(new_app: Path, target_app: Path, stash_app: Path) -> bool:
-    if not new_app.is_dir():
-        return False
-    target_app.parent.mkdir(parents=True, exist_ok=True)
-    staged = target_app.parent / f".Bud.app.staging-{uuid4().hex[:6]}"
-    try:
-        shutil.copytree(new_app, staged, symlinks=True)
-        if target_app.exists():
-            _move_path(target_app, stash_app)
-        _move_path(staged, target_app)
-        return True
-    finally:
-        if staged.exists():
-            shutil.rmtree(staged, ignore_errors=True)
+def _swap_app_bundle(new_app: Path, pending: _PendingUpdate) -> None:
+    pending.target_app.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(new_app, pending.staged_app, symlinks=True)
+    if pending.had_app:
+        os.replace(pending.target_app, pending.stash_app)
+    os.replace(pending.staged_app, pending.target_app)
+    _sync_dir(pending.target_app.parent)
 
 
-def _restore_app_bundle(target_app: Path, stash_app: Path) -> None:
-    if not stash_app.exists():
-        return
-    if target_app.exists():
-        shutil.rmtree(target_app, ignore_errors=True)
-    _move_path(stash_app, target_app)
+def _restore_app_bundle(pending: _PendingUpdate) -> None:
+    if pending.stash_app.exists() or pending.stash_app.is_symlink():
+        _remove_app_bundle(pending.target_app)
+        os.replace(pending.stash_app, pending.target_app)
+    elif not pending.had_app:
+        _remove_app_bundle(pending.target_app)
+    _remove_app_bundle(pending.staged_app)
+    if pending.target_app.parent.is_dir():
+        _sync_dir(pending.target_app.parent)
+
+
+def _remove_app_bundle(path: Path) -> None:
+    if path.is_symlink():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
 
 
 def _prune_old_releases(
@@ -714,6 +739,113 @@ def _healthcheck_credentials(bud_home: Path, *, port: int) -> tuple[str, str]:
     return f"http://{HOST}:{port}", token
 
 
+@contextmanager
+def _update_lock(home: Path) -> Generator[Path]:
+    releases = home / "releases"
+    releases.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (releases / ".update.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise UpdateError("Another Bud update or rollback is already running.") from None
+        yield releases / _UPDATE_MARKER
+
+
+def _sync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _save_pending(marker: Path, pending: _PendingUpdate) -> None:
+    _atomic_write_bytes(marker, pending.model_dump_json().encode())
+    _sync_dir(marker.parent)
+
+
+def _load_pending(marker: Path) -> _PendingUpdate | None:
+    try:
+        return _PendingUpdate.model_validate_json(marker.read_bytes())
+    except FileNotFoundError:
+        return None
+    except ValidationError as exc:
+        raise UpdateError(f"The update recovery marker at {marker} is invalid.") from exc
+
+
+def _clear_pending(marker: Path) -> None:
+    marker.unlink()
+    _sync_dir(marker.parent)
+
+
+def _configured_port(plist: bytes | None, fallback: int) -> int:
+    if plist is not None:
+        with suppress(
+            ValueError,
+            TypeError,
+            KeyError,
+            IndexError,
+            AttributeError,
+            plistlib.InvalidFileException,
+        ):
+            args = plistlib.loads(plist)["ProgramArguments"]
+            return int(args[args.index("--port") + 1])
+    return fallback
+
+
+def _recover_update(
+    home: Path,
+    marker: Path,
+    svc: ServiceManager,
+    fetcher: RuntimeFetcher | None,
+    health_timeout: float,
+) -> None:
+    pending = _load_pending(marker)
+    if pending is None:
+        return
+
+    if pending.backup_dir is not None:
+        if pending.manage_service:
+            svc.stop(timeout=15.0)
+        if pending.swap_app:
+            if _is_app_running(pending.target_app):
+                _quit_app(pending.target_app)
+            _restore_app_bundle(pending)
+        for relative, target in zip(_RELEASE_LINKS, pending.previous_links, strict=True):
+            link = home / relative
+            if target is not None:
+                _atomic_symlink(link, target)
+            elif link.is_symlink():
+                link.unlink()
+                _sync_dir(link.parent)
+        restore_backup(pending.backup_dir, home / "data")
+        if pending.manage_service:
+            if pending.previous_plist is None:
+                svc.plist_path.unlink(missing_ok=True)
+            else:
+                _atomic_write_bytes(svc.plist_path, pending.previous_plist, mode=0o644)
+        # A retry after restart must not overwrite writes made by the restored service.
+        pending.backup_dir = None
+        _save_pending(marker, pending)
+
+    try:
+        if pending.service_was_running and not svc.status()["loaded"]:
+            svc.start()
+        if pending.service_was_running:
+            url, token = _healthcheck_credentials(home, port=pending.previous_port)
+            svc.wait_healthy(
+                url,
+                token,
+                expected_version=pending.previous_version,
+                timeout=health_timeout,
+                fetcher=fetcher,
+            )
+    finally:
+        if pending.app_was_running:
+            _reopen_app(pending.target_app)
+    _clear_pending(marker)
+
+
 def apply_update(
     new_version: str,
     new_release_dir: Path,
@@ -729,118 +861,112 @@ def apply_update(
     health_timeout: float = 20.0,
 ) -> UpdateResult:
     """Atomically activate ``new_release_dir`` with pre-update backup and auto-rollback."""
-    home = bud_home.expanduser()
+    home = bud_home.expanduser().resolve()
+    new_release_dir = new_release_dir.expanduser().resolve()
     data_dir = home / "data"
-    if not force and _active_runs_present(data_dir):
-        raise UpdateError(
-            "Bud has an active run in progress. Wait for it to finish or re-run with --force."
-        )
-
     svc = service or ServiceManager(home)
-    previous_version = current_release_version(home)
-    current_link = home / "releases" / "current"
-    previous_release = current_link.resolve() if current_link.exists() else None
-    target_app = app_install_dir.expanduser() / "Bud.app"
-    app_was_running = _is_app_running(target_app)
-    stash_app = home / "releases" / f".prev-Bud.app-{uuid4().hex[:6]}"
-    app_swapped = False
 
-    if manage_service:
-        svc.stop(timeout=15.0)
-    if app_was_running:
-        _quit_app(target_app)
-
-    backup_dir = backup_data_dir(
-        data_dir,
-        home / "backups",
-        label=f"pre-{new_version}",
-        app_version=previous_version or __version__,
-    )
-
-    try:
-        _atomic_symlink(current_link, new_release_dir)
-        bud_bin = current_link / "bin" / "bud"
-        if bud_bin.exists() or bud_bin.is_symlink():
-            _atomic_symlink(
-                home / "bin" / "bud",
-                Path("..") / "releases" / "current" / "bin" / "bud",
-            )
-        tui_bin = current_link / "bin" / "bud-tui"
-        if tui_bin.exists():
-            _atomic_symlink(
-                home / "bin" / "bud-tui", Path("..") / "releases" / "current" / "bin" / "bud-tui"
+    with _update_lock(home) as marker:
+        _recover_update(home, marker, svc, fetcher, health_timeout)
+        if not force and _active_runs_present(data_dir):
+            raise UpdateError(
+                "Bud has an active run in progress. Wait for it to finish or re-run with --force."
             )
 
-        data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        (home / "workspace").mkdir(parents=True, exist_ok=True, mode=0o700)
+        current_link = home / _RELEASE_LINKS[0]
+        previous_release = current_link.resolve() if current_link.exists() else None
+        target_app = app_install_dir.expanduser().absolute() / "Bud.app"
+        previous_plist = (
+            svc.plist_path.read_bytes() if manage_service and svc.plist_path.is_file() else None
+        )
+        pending = _PendingUpdate(
+            id=uuid4(),
+            previous_version=current_release_version(home),
+            previous_links=tuple(
+                os.readlink(home / link) if (home / link).is_symlink() else None
+                for link in _RELEASE_LINKS
+            ),
+            target_app=target_app,
+            had_app=target_app.exists() or target_app.is_symlink(),
+            swap_app=install_app and (new_release_dir / "Bud.app").is_dir(),
+            app_was_running=_is_app_running(target_app),
+            manage_service=manage_service,
+            service_was_running=previous_plist is not None and bool(svc.status()["loaded"]),
+            previous_plist=previous_plist,
+            previous_port=_configured_port(previous_plist, port),
+        )
+        _save_pending(marker, pending)
 
-        if install_app:
-            app_swapped = _swap_app_bundle(new_release_dir / "Bud.app", target_app, stash_app)
-
-        if manage_service:
-            url, token = _healthcheck_credentials(home, port=port)
-            svc.install(bud_bin, port=port, start=True)
-            svc.wait_healthy(
-                url,
-                token,
-                expected_version=new_version,
-                timeout=health_timeout,
-                fetcher=fetcher,
-            )
-    except Exception as exc:
-        rollback_ok = False
-        with suppress(Exception):
+        try:
             if manage_service:
                 svc.stop(timeout=15.0)
-        with suppress(Exception):
-            if previous_release is not None:
-                _atomic_symlink(current_link, previous_release)
-            elif current_link.is_symlink():
-                current_link.unlink(missing_ok=True)
-        if app_swapped:
-            with suppress(Exception):
-                _restore_app_bundle(target_app, stash_app)
-        try:
-            restore_backup(backup_dir, data_dir)
-            if manage_service and previous_release is not None:
-                svc.install(current_link / "bin" / "bud", port=port, start=True)
+            if pending.app_was_running:
+                _quit_app(target_app)
+
+            backup_dir = backup_data_dir(
+                data_dir,
+                home / "backups",
+                label=f"pre-{new_version}",
+                app_version=pending.previous_version or __version__,
+            )
+            pending.backup_dir = backup_dir
+            _save_pending(marker, pending)
+
+            _atomic_symlink(current_link, new_release_dir)
+            bud_bin = current_link / "bin" / "bud"
+            for name in ("bud", "bud-tui"):
+                binary = current_link / "bin" / name
+                if binary.exists() or (name == "bud" and binary.is_symlink()):
+                    _atomic_symlink(home / "bin" / name, Path("../releases/current/bin") / name)
+
+            data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            (home / "workspace").mkdir(parents=True, exist_ok=True, mode=0o700)
+
+            if pending.swap_app:
+                _swap_app_bundle(new_release_dir / "Bud.app", pending)
+
+            if manage_service:
                 url, token = _healthcheck_credentials(home, port=port)
+                svc.install(bud_bin, port=port, start=True)
                 svc.wait_healthy(
                     url,
                     token,
-                    expected_version=previous_version,
+                    expected_version=new_version,
                     timeout=health_timeout,
                     fetcher=fetcher,
                 )
-            rollback_ok = True
-        except Exception:
-            rollback_ok = False
-        if app_was_running:
-            _reopen_app(target_app)
-        raise UpdateRollbackError(
-            f"Update to v{new_version} failed ({exc}); rollback "
-            f"{'succeeded' if rollback_ok else 'failed'}.",
-            rollback_ok=rollback_ok,
-        ) from exc
 
-    if stash_app.exists():
-        shutil.rmtree(stash_app, ignore_errors=True)
-    preserve = {new_release_dir}
-    if previous_release is not None:
-        preserve.add(previous_release)
-    _prune_old_releases(home, preserve=preserve)
+            if pending.app_was_running:
+                _reopen_app(target_app)
+        except Exception as exc:
+            try:
+                _recover_update(home, marker, svc, fetcher, health_timeout)
+            except Exception as recovery_error:
+                raise UpdateRollbackError(
+                    f"Update to v{new_version} failed ({exc}). Rollback failed ({recovery_error}).",
+                    rollback_ok=False,
+                ) from recovery_error
+            raise UpdateRollbackError(
+                f"Update to v{new_version} failed ({exc}). Rollback succeeded.",
+                rollback_ok=True,
+            ) from exc
 
-    if app_was_running:
-        _reopen_app(target_app)
+        _clear_pending(marker)
+        with suppress(OSError):
+            _remove_app_bundle(pending.stash_app)
+        preserve = {new_release_dir}
+        if previous_release is not None:
+            preserve.add(previous_release)
+        _prune_old_releases(home, preserve=preserve)
 
-    return UpdateResult(
-        previous_version=previous_version,
-        new_version=new_version,
-        release_dir=new_release_dir,
-        backup_dir=backup_dir,
-        app_updated=app_swapped,
-        service_restarted=manage_service,
-    )
+        return UpdateResult(
+            previous_version=pending.previous_version,
+            new_version=new_version,
+            release_dir=new_release_dir,
+            backup_dir=backup_dir,
+            app_updated=pending.swap_app,
+            service_restarted=manage_service,
+        )
 
 
 def rollback_release(
@@ -857,34 +983,36 @@ def rollback_release(
     """Restore ``data_dir`` from the latest (or named) backup and optionally switch release."""
     home = bud_home.expanduser()
     svc = service or ServiceManager(home)
-    backups_root = home / "backups"
-    if backup_dir is None:
-        candidates = sorted(
-            (
-                entry
-                for entry in backups_root.iterdir()
-                if entry.is_dir()
-                and not entry.name.startswith(".")
-                and (entry / "manifest.json").is_file()
-            ),
-            key=lambda p: p.name,
-            reverse=True,
-        )
-        if not candidates:
-            raise UpdateError(f"No verified backups found in {backups_root}.")
-        chosen_backup = candidates[0]
-    else:
-        chosen_backup = backup_dir.expanduser()
+    with _update_lock(home) as marker:
+        _recover_update(home, marker, svc, fetcher, health_timeout)
+        backups_root = home / "backups"
+        if backup_dir is None:
+            candidates = sorted(
+                (
+                    entry
+                    for entry in backups_root.iterdir()
+                    if entry.is_dir()
+                    and not entry.name.startswith(".")
+                    and (entry / "manifest.json").is_file()
+                ),
+                key=lambda p: p.name,
+                reverse=True,
+            )
+            if not candidates:
+                raise UpdateError(f"No verified backups found in {backups_root}.")
+            chosen_backup = candidates[0]
+        else:
+            chosen_backup = backup_dir.expanduser()
 
-    if manage_service:
-        svc.stop(timeout=15.0)
-    restore_backup(chosen_backup, home / "data")
-    if target_release is not None:
-        _atomic_symlink(home / "releases" / "current", target_release)
-    if manage_service:
-        bud_bin = home / "releases" / "current" / "bin" / "bud"
-        if bud_bin.exists():
-            svc.install(bud_bin, port=port, start=True)
-            url, token = _healthcheck_credentials(home, port=port)
-            svc.wait_healthy(url, token, timeout=health_timeout, fetcher=fetcher)
-    return chosen_backup
+        if manage_service:
+            svc.stop(timeout=15.0)
+        restore_backup(chosen_backup, home / "data")
+        if target_release is not None:
+            _atomic_symlink(home / "releases" / "current", target_release)
+        if manage_service:
+            bud_bin = home / "releases" / "current" / "bin" / "bud"
+            if bud_bin.exists():
+                svc.install(bud_bin, port=port, start=True)
+                url, token = _healthcheck_credentials(home, port=port)
+                svc.wait_healthy(url, token, timeout=health_timeout, fetcher=fetcher)
+        return chosen_backup

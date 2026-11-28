@@ -12,7 +12,7 @@ import json
 import re
 import sqlite3
 import threading
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Collection, Generator
 from contextlib import closing, contextmanager, suppress
 from datetime import date
 from hashlib import sha256
@@ -163,6 +163,13 @@ def split_memory_sections(content: str) -> list[str]:
     return facts
 
 
+def _memory_bullet(record: PreferenceRecord) -> str:
+    return (
+        f"- [{record.scope} | key: {record.key} | rev {record.revision} | "
+        f"updated {record.updated_at}] {record.value}"
+    )
+
+
 def render_memory_document(
     active: list[PreferenceRecord],
     forgotten: list[PreferenceRecord],
@@ -174,10 +181,7 @@ def render_memory_document(
         pref_lines = [PREFERENCES_HEADING, PREFERENCES_HEADER]
         used = sum(len(line) + 1 for line in pref_lines)
         for rec in active:
-            bullet = (
-                f"- [{rec.scope} | key: {rec.key} | rev {rec.revision} | "
-                f"updated {rec.updated_at}] {rec.value}"
-            )
+            bullet = _memory_bullet(rec)
             if used + len(bullet) + 1 > MAX_PREFERENCES_CHARS:
                 break
             pref_lines.append(bullet)
@@ -282,6 +286,41 @@ class PreferenceStore:
         with self._connect() as db:
             rows = db.execute(query, params).fetchall()
         return [self._row_to_record(row) for row in rows]
+
+    def _id(self, record: PreferenceRecord) -> str:
+        return sha256(f"{self.memory_scope}/{record.scope}/{record.key}".encode()).hexdigest()[:32]
+
+    def prompt_records(
+        self,
+        *,
+        scopes: Collection[str] | None = None,
+        snapshot: str | None = None,
+        earlier: Collection[PreferenceRecord] = (),
+    ) -> list[dict[str, str]]:
+        """Return active preferences in the selected prompt scopes or exact memory snapshot."""
+        lines = set(snapshot.splitlines()) if snapshot is not None else None
+        matching = {
+            self._id(record): record
+            for record in (*earlier, *self.list_preferences())
+            if (scopes is None or record.scope in scopes)
+            and (lines is None or _memory_bullet(record) in lines)
+        }
+        return [
+            {
+                "id": pref_id,
+                "text": record.value,
+                "scope": record.scope,
+                "source": record.source,
+            }
+            for pref_id, record in matching.items()
+        ]
+
+    async def forget_by_id(self, pref_id: str) -> bool:
+        for record in self.list_preferences():
+            if self._id(record) == pref_id:
+                result = await self.forget(record.scope, record.key)
+                return result["status"] == "forgotten"
+        return False
 
     def get(self, scope: str, key: str) -> PreferenceRecord | None:
         """Look up one preference by scope and key."""
@@ -464,11 +503,11 @@ class PreferenceStore:
         store = self.memory.store
         assert not callable(store)
         path = self.memory_path
-        all_rows = self.list_preferences(include_forgotten=True)
-        active = [rec for rec in all_rows if rec.status == "active"]
-        forgotten = [rec for rec in all_rows if rec.status == "forgotten"]
         for _ in range(8):
             current = await store.read(path, max_chars=MAX_MEMORY_CHARS)
+            all_rows = self.list_preferences(include_forgotten=True)
+            active = [rec for rec in all_rows if rec.status == "active"]
+            forgotten = [rec for rec in all_rows if rec.status == "forgotten"]
             existing = current.content if current else ""
             facts = split_memory_sections(existing)
             rendered = render_memory_document(active, forgotten, facts)

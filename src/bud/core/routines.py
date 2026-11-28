@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from croniter import croniter
 from pydantic import BaseModel, Field, SerializeAsAny
 
+from bud.core.events import MessageOrigin
 from bud.core.hub import Hub
 from bud.core.log import _is_job_session
 from bud.core.projection import (
@@ -51,6 +52,7 @@ OccurrenceExecutionStatus = Literal[
     "running",
     "awaiting_approval",
     "completed",
+    "quiet",
     "failed",
     "cancelled",
     "needs_review",
@@ -61,6 +63,7 @@ OccurrenceDeliveryStatus = Literal[
     "claimed",
     "dispatched",
     "confirmed",
+    "quiet",
     "failed",
     "needs_review",
     "not_required",
@@ -244,6 +247,10 @@ class RoutineDefinition(BaseModel):
     last_run_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+    last_reported_summary: str | None = None
+    last_reported_items: list[str] = Field(default_factory=list)
+    consecutive_failures: int = 0
+    last_failure_error: str | None = None
 
 
 class RoutineOccurrence(BaseModel):
@@ -266,6 +273,10 @@ class RoutineOccurrence(BaseModel):
     uncertain_tools: list[str] = []
     error: str | None = None
     completed_at: datetime | None = None
+    destination: RoutineDestination
+    quiet_note: str | None = None
+    queued_at: datetime | None = None
+    delivery_channel: str | None = None
 
     def to_view(self) -> RoutineOccurrenceView:
         return RoutineOccurrenceView(
@@ -290,6 +301,9 @@ class RoutineOccurrence(BaseModel):
             uncertain_tools=list(self.uncertain_tools),
             error=self.error,
             completed_at=self.completed_at.isoformat() if self.completed_at else None,
+            destination=self.destination,
+            quiet_note=self.quiet_note,
+            delivery_channel=self.delivery_channel,
         )
 
 
@@ -308,14 +322,16 @@ _ROUTINE_COLS = (
     "routine_id, routine_seq, source_id, revision, feed_id, title, skill, prompt, cron, "
     "timezone, missed_run_policy, overlap_policy, approval_expiry_seconds, budget_json, "
     "owner_request, destination_json, status, pause_reason, last_evaluated_at, next_run_at, "
-    "last_run_at, created_at, updated_at"
+    "last_run_at, created_at, updated_at, last_reported_summary, last_reported_items_json, "
+    "consecutive_failures, last_failure_error"
 )
 
 _OCC_COLS = (
     "occurrence_id, routine_id, routine_revision, feed_id, session_id, run_id, dedup_key, "
     "trigger_kind, scheduled_for, triggered_at, execution_status, delivery_status, "
     "dispatch_claim_id, delivery_receipt, delivery_confirmed_at, report_path, "
-    "uncertain_tools_json, error, completed_at"
+    "uncertain_tools_json, error, completed_at, destination_json, quiet_note, queued_at, "
+    "delivery_channel"
 )
 
 
@@ -394,6 +410,54 @@ class RoutineStore:
                 """
             )
 
+            db.execute("BEGIN IMMEDIATE")
+            for table, additions in (
+                (
+                    "routines",
+                    {
+                        "last_reported_summary": "TEXT",
+                        "last_reported_items_json": "TEXT NOT NULL DEFAULT '[]'",
+                        "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
+                        "last_failure_error": "TEXT",
+                    },
+                ),
+                (
+                    "routine_occurrences",
+                    {
+                        "destination_json": "TEXT",
+                        "quiet_note": "TEXT",
+                        "queued_at": "TEXT",
+                        "delivery_channel": "TEXT",
+                    },
+                ),
+            ):
+                existing = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+                for column, declaration in additions.items():
+                    if column not in existing:
+                        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+                if table != "routine_occurrences" or "destination_json" in existing:
+                    continue
+                db.execute(
+                    """UPDATE routine_occurrences AS occ SET destination_json = COALESCE(
+                           (SELECT json_extract(data, '$.destination') FROM events
+                            WHERE session_id = occ.session_id AND type = 'run.queued'
+                            ORDER BY seq LIMIT 1),
+                           (SELECT destination_json FROM routines
+                            WHERE routine_id = occ.routine_id))
+                       WHERE destination_json IS NULL"""
+                )
+                # Older builds issued local event IDs as receipts for iMessage.
+                db.execute(
+                    """UPDATE routine_occurrences AS occ
+                       SET delivery_status='failed', delivery_receipt=NULL,
+                           error='An iMessage receipt was unavailable. Check the local feed.'
+                       WHERE delivery_status='dispatched'
+                         AND json_extract(destination_json, '$.origin.channel')='imessage'
+                         AND (delivery_receipt IS NULL OR EXISTS (
+                             SELECT 1 FROM events WHERE id=occ.delivery_receipt
+                             AND type='routine.completed'))"""
+                )
+
     @staticmethod
     def _routine(row: tuple[Any, ...]) -> RoutineDefinition:
         return RoutineDefinition(
@@ -420,6 +484,10 @@ class RoutineStore:
             last_run_at=datetime.fromisoformat(row[20]) if row[20] else None,
             created_at=datetime.fromisoformat(row[21]),
             updated_at=datetime.fromisoformat(row[22]),
+            last_reported_summary=row[23],
+            last_reported_items=json.loads(row[24]),
+            consecutive_failures=row[25],
+            last_failure_error=row[26],
         )
 
     @staticmethod
@@ -444,6 +512,10 @@ class RoutineStore:
             uncertain_tools=json.loads(row[16]),
             error=row[17],
             completed_at=datetime.fromisoformat(row[18]) if row[18] else None,
+            destination=RoutineDestination.model_validate_json(row[19]),
+            quiet_note=row[20],
+            queued_at=datetime.fromisoformat(row[21]) if row[21] else None,
+            delivery_channel=row[22],
         )
 
     def _validate_skill(self, skill: str) -> str:
@@ -550,7 +622,7 @@ class RoutineStore:
             routine_seq = int(max_seq) + 1
             db.execute(
                 f"""INSERT INTO routines ({_ROUTINE_COLS})
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     routine_id,
                     routine_seq,
@@ -575,6 +647,10 @@ class RoutineStore:
                     None,
                     now_utc.isoformat(),
                     now_utc.isoformat(),
+                    None,
+                    "[]",
+                    0,
+                    None,
                 ),
             )
             self.log._insert(
@@ -623,6 +699,7 @@ class RoutineStore:
         title: str | None = None,
         skill: str | None = None,
         prompt: str | None = None,
+        owner_request: str | None = None,
         cron: str | None = None,
         timezone: str | None = None,
         missed_run_policy: MissedRunPolicy | None = None,
@@ -651,6 +728,8 @@ class RoutineStore:
                 if prompt is not None
                 else current.prompt
             )
+            if owner_request is not None:
+                self._validate_text(owner_request, "Owner request", max_len=10_000)
             new_skill = self._validate_skill(skill) if skill is not None else current.skill
             new_cron = validate_cron(cron) if cron is not None else current.cron
             new_tz = timezone if timezone is not None else current.timezone
@@ -693,7 +772,7 @@ class RoutineStore:
                     new_overlap,
                     new_expiry,
                     new_budget.model_dump_json(),
-                    new_prompt,
+                    current.owner_request if owner_request is None else owner_request,
                     new_dest.model_dump_json(),
                     now_utc.isoformat(),
                     next_run.isoformat() if next_run else None,
@@ -764,14 +843,16 @@ class RoutineStore:
             self.hub.wake(wake_feed)
         return self.get(routine_id)
 
-    def pause_for_stop(self, routine_id: str, *, now: datetime) -> list[str]:
+    def pause_for_stop(
+        self, routine_id: str, *, now: datetime, pause_reason: str = "owner"
+    ) -> list[str]:
         """Pause the schedule and record stop requests before another action can run."""
         sessions: list[str] = []
         reason = "Stopped by the user."
         now_utc = _as_utc(now)
         with self.log._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            wake_feed = self._pause_in_tx(db, routine_id, now_utc, "owner")
+            wake_feed = self._pause_in_tx(db, routine_id, now_utc, pause_reason)
             rows = db.execute(
                 f"SELECT {_OCC_COLS} FROM routine_occurrences WHERE routine_id = ? "
                 f"AND execution_status IN ({','.join('?' for _ in ACTIVE_OCCURRENCE_STATUSES)})",
@@ -866,9 +947,17 @@ class RoutineStore:
             db.execute(
                 """UPDATE routines
                    SET status='active', pause_reason=NULL, last_evaluated_at=?,
-                       next_run_at=?, updated_at=?
+                       next_run_at=?, updated_at=?, consecutive_failures=?
                    WHERE routine_id=?""",
-                (now_utc.isoformat(), next_run.isoformat(), now_utc.isoformat(), routine_id),
+                (
+                    now_utc.isoformat(),
+                    next_run.isoformat(),
+                    now_utc.isoformat(),
+                    0
+                    if current.pause_reason == "repeated_failures"
+                    else current.consecutive_failures,
+                    routine_id,
+                ),
             )
             self.log._insert(
                 db,
@@ -894,7 +983,7 @@ class RoutineStore:
         run_id = uuid4().hex
         cursor = db.execute(
             f"""INSERT OR IGNORE INTO routine_occurrences ({_OCC_COLS})
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 occ_id,
                 routine.routine_id,
@@ -913,6 +1002,10 @@ class RoutineStore:
                 None,
                 None,
                 "[]",
+                None,
+                None,
+                routine.destination.model_dump_json(),
+                None,
                 None,
                 None,
             ),
@@ -1149,7 +1242,7 @@ class RoutineStore:
         with self.log._connect() as db:
             rows = db.execute(
                 f"SELECT {_OCC_COLS} FROM routine_occurrences WHERE execution_status = 'pending' "
-                "ORDER BY triggered_at"
+                "ORDER BY rowid"
             ).fetchall()
         return [self._occ(row) for row in rows]
 
@@ -1170,13 +1263,39 @@ class RoutineStore:
             ).fetchall()
         return [row[0] for row in rows]
 
-    def mark_queued(self, occurrence_id: str) -> None:
+    def queue_execution(self, occ: RoutineOccurrence, run: dict, now: datetime) -> bool:
         with self.log._connect() as db:
-            db.execute(
-                "UPDATE routine_occurrences SET execution_status = 'queued' "
-                "WHERE occurrence_id = ? AND execution_status = 'pending'",
-                (occurrence_id,),
+            db.execute("BEGIN IMMEDIATE")
+            claimed = db.execute(
+                """UPDATE routine_occurrences
+                   SET execution_status='queued', queued_at=?
+                   WHERE occurrence_id=? AND execution_status='pending'
+                   AND (trigger_kind='manual' OR EXISTS (
+                       SELECT 1 FROM routines WHERE routine_id=? AND status='active'))
+                   AND NOT EXISTS (
+                       SELECT 1 FROM routine_occurrences AS other
+                       WHERE other.routine_id=? AND other.occurrence_id != ?
+                       AND (other.execution_status IN ('queued', 'running', 'awaiting_approval')
+                           OR (other.execution_status='completed'
+                               AND other.delivery_status IN ('pending', 'claimed'))
+                           OR (other.execution_status='pending'
+                               AND other.rowid < routine_occurrences.rowid)))
+                   """,
+                (
+                    now.isoformat(),
+                    occ.occurrence_id,
+                    occ.routine_id,
+                    occ.routine_id,
+                    occ.occurrence_id,
+                ),
+            ).rowcount
+            if not claimed:
+                return False
+            self.log._insert(
+                db, occ.session_id, "run.queued", run, once=True, key=f"{occ.run_id}:queued"
             )
+        self.hub.wake(occ.session_id)
+        return True
 
     def sync_execution(
         self,
@@ -1186,6 +1305,7 @@ class RoutineStore:
         uncertain_tools: list[str] | None = None,
         error: str | None = None,
         completed_at: datetime | None = None,
+        quiet_note: str | None = None,
     ) -> RoutineOccurrence | None:
         with self.log._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -1203,10 +1323,16 @@ class RoutineStore:
                 and self.log._stopped(db, occ.run_id)
             ):
                 return occ
+            if occ.execution_status in ("failed", "quiet", "completed") and (
+                status != occ.execution_status or status == "failed"
+            ):
+                return occ
             tools = uncertain_tools if uncertain_tools is not None else occ.uncertain_tools
             delivery = occ.delivery_status
             if status == "needs_review":
                 delivery = "needs_review"
+            elif status == "quiet":
+                delivery = "quiet"
             elif status in ("cancelled", "failed") and delivery == "pending":
                 delivery = "not_required"
             done_at = (
@@ -1217,7 +1343,7 @@ class RoutineStore:
                     if occ.completed_at is not None
                     else (
                         datetime.now(UTC).isoformat()
-                        if status in ("completed", "failed", "cancelled", "needs_review")
+                        if status in ("completed", "quiet", "failed", "cancelled", "needs_review")
                         else None
                     )
                 )
@@ -1225,7 +1351,7 @@ class RoutineStore:
             db.execute(
                 """UPDATE routine_occurrences
                    SET execution_status=?, delivery_status=?, uncertain_tools_json=?,
-                       error=?, completed_at=?
+                       error=?, completed_at=?, quiet_note=COALESCE(?, quiet_note)
                    WHERE occurrence_id=?""",
                 (
                     status,
@@ -1233,11 +1359,22 @@ class RoutineStore:
                     json.dumps(tools),
                     error if error is not None else occ.error,
                     done_at,
+                    quiet_note,
                     occ.occurrence_id,
                 ),
             )
             if status == "needs_review":
-                self._pause_in_tx(db, occ.routine_id, datetime.now(UTC), "uncertain")
+                self._pause_in_tx(
+                    db, occ.routine_id, completed_at or datetime.now(UTC), "uncertain"
+                )
+            elif status == "failed":
+                self._record_failure(db, occ, error or "The run failed.", completed_at)
+            elif status == "quiet":
+                db.execute(
+                    "UPDATE routines SET consecutive_failures=0, last_failure_error=NULL "
+                    "WHERE routine_id=?",
+                    (occ.routine_id,),
+                )
             updated = db.execute(
                 f"SELECT {_OCC_COLS} FROM routine_occurrences WHERE occurrence_id = ?",
                 (occ.occurrence_id,),
@@ -1245,59 +1382,104 @@ class RoutineStore:
             assert updated is not None
             return self._occ(updated)
 
-    def claim_delivery(self, occurrence_id: str) -> RoutineOccurrence | None:
-        """Persist a delivery dispatch claim BEFORE writing report/posting to destination."""
-        claim_id = f"deliver:{occurrence_id}"
-        with self.log._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                f"SELECT {_OCC_COLS} FROM routine_occurrences WHERE occurrence_id = ?",
-                (occurrence_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            occ = self._occ(row)
-            if occ.delivery_status != "pending":
-                return None
-            db.execute(
-                """UPDATE routine_occurrences
-                   SET delivery_status='claimed', dispatch_claim_id=?
-                   WHERE occurrence_id=? AND delivery_status='pending'""",
-                (claim_id, occurrence_id),
-            )
-            updated = db.execute(
-                f"SELECT {_OCC_COLS} FROM routine_occurrences WHERE occurrence_id = ?",
-                (occurrence_id,),
-            ).fetchone()
-            assert updated is not None
-            return self._occ(updated)
+    def _record_failure(
+        self, db: sqlite3.Connection, occ: RoutineOccurrence, error: str, now: datetime | None
+    ) -> None:
+        count, title, number = db.execute(
+            """UPDATE routines SET consecutive_failures=consecutive_failures+1,
+                      last_failure_error=? WHERE routine_id=?
+               RETURNING consecutive_failures, title, routine_seq""",
+            (error, occ.routine_id),
+        ).fetchone()
+        paused = (
+            count >= 5
+            and self._pause_in_tx(db, occ.routine_id, now or datetime.now(UTC), "repeated_failures")
+            is not None
+        )
+        if count != 1 and not paused:
+            return
+        message = (
+            f"Routine {number} ({title}) failed: {error}"
+            if count == 1
+            else f"Routine {number} ({title}) was paused after {count} failures. Error: {error}"
+        )
+        self.log._insert(
+            db,
+            occ.destination.feed_id,
+            "routine.failed",
+            {
+                "routine_id": occ.routine_id,
+                "occurrence_id": occ.occurrence_id,
+                "title": title,
+                "text": message,
+                "origin": occ.destination.origin.model_dump(),
+                "consecutive_failures": count,
+            },
+            once=True,
+            key=f"routine:occ:{occ.occurrence_id}:failed",
+        )
 
-    def mark_delivery_dispatched(
+    def deliver_report(
         self,
-        occurrence_id: str,
+        occ: RoutineOccurrence,
+        routine: RoutineDefinition,
+        text: str,
+        report_path: str | None,
+        items: list[str],
+        now: datetime,
         *,
-        receipt: str | None = None,
-        report_path: str | None = None,
-    ) -> RoutineOccurrence:
+        provenance: dict,
+    ) -> None:
+        destination = occ.destination
+        fallback = destination.origin.channel == "imessage"
+        key = f"routine:occ:{occ.occurrence_id}:delivery"
         with self.log._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                f"SELECT {_OCC_COLS} FROM routine_occurrences WHERE occurrence_id = ?",
-                (occurrence_id,),
+            state = db.execute(
+                "SELECT execution_status, delivery_status FROM routine_occurrences "
+                "WHERE occurrence_id=?",
+                (occ.occurrence_id,),
             ).fetchone()
-            if row is None:
-                raise RoutineNotFoundError(f"Unknown occurrence: {occurrence_id}")
-            occ = self._occ(row)
-            if occ.delivery_status == "confirmed":
-                return occ
-            db.execute(
-                """UPDATE routine_occurrences
-                   SET delivery_status='dispatched', delivery_receipt=COALESCE(?, delivery_receipt),
-                       report_path=COALESCE(?, report_path)
-                   WHERE occurrence_id=?""",
-                (receipt, report_path, occurrence_id),
+            if state not in (("completed", "pending"), ("completed", "claimed")):
+                return
+            event = self.log._insert(
+                db,
+                destination.feed_id,
+                "routine.completed",
+                {
+                    **provenance,
+                    "routine_id": routine.routine_id,
+                    "occurrence_id": occ.occurrence_id,
+                    "title": routine.title,
+                    "text": text
+                    + (
+                        "\n\nDelivered here because iMessage routine delivery is unavailable."
+                        if fallback
+                        else ""
+                    ),
+                    "report_path": report_path,
+                    "origin": (MessageOrigin() if fallback else destination.origin).model_dump(),
+                    **({"delivery_fallback": "imessage_unavailable"} if fallback else {}),
+                },
+                once=True,
+                key=key,
             )
-        return self.occurrence(occurrence_id)
+            if event is not None:
+                receipt = event.id
+            else:
+                receipt, report_path = db.execute(
+                    "SELECT id, json_extract(data, '$.report_path') FROM events "
+                    "WHERE session_id=? AND event_key=?",
+                    (destination.feed_id, key),
+                ).fetchone()
+            self._confirm_in_tx(db, occ, receipt, report_path, now, channel="local")
+            db.execute(
+                """UPDATE routines SET last_reported_summary=?, last_reported_items_json=?,
+                          consecutive_failures=0, last_failure_error=NULL WHERE routine_id=?""",
+                (" ".join(text.split())[:800], json.dumps(items[:30]), routine.routine_id),
+            )
+        self.hub.wake(destination.feed_id)
+        self.hub.wake(routine.feed_id)
 
     def confirm_delivery(
         self,
@@ -1320,39 +1502,44 @@ class RoutineStore:
             if occ.delivery_status == "confirmed":
                 return occ
             final_receipt = receipt or occ.delivery_receipt or occ.dispatch_claim_id
-            db.execute(
-                """UPDATE routine_occurrences
-                   SET delivery_status='confirmed',
-                       delivery_receipt=?,
-                       delivery_confirmed_at=?,
-                       report_path=COALESCE(?, report_path)
-                   WHERE occurrence_id=?""",
-                (final_receipt, now_utc.isoformat(), report_path, occurrence_id),
-            )
-            routine_row = db.execute(
-                "SELECT destination_json FROM routines WHERE routine_id = ?", (occ.routine_id,)
-            ).fetchone()
-            dest_feed = (
-                RoutineDestination.model_validate_json(routine_row[0]).feed_id
-                if routine_row is not None
-                else occ.feed_id
-            )
-            self.log._insert(
-                db,
-                dest_feed,
-                "routine.delivery_confirmed",
-                {
-                    "routine_id": occ.routine_id,
-                    "occurrence_id": occurrence_id,
-                    "dispatch_claim_id": occ.dispatch_claim_id,
-                    "delivery_receipt": final_receipt,
-                    "report_path": report_path or occ.report_path,
-                },
-                once=True,
-                key=f"routine:occ:{occurrence_id}:confirmed",
-            )
-        self.hub.wake(dest_feed)
+            self._confirm_in_tx(db, occ, final_receipt, report_path, now_utc)
+        self.hub.wake(occ.destination.feed_id)
         return self.occurrence(occurrence_id)
+
+    def _confirm_in_tx(
+        self,
+        db: sqlite3.Connection,
+        occ: RoutineOccurrence,
+        receipt: str | None,
+        report_path: str | None,
+        now: datetime,
+        *,
+        channel: str | None = None,
+    ) -> None:
+        claim = occ.dispatch_claim_id or f"deliver:{occ.occurrence_id}"
+        db.execute(
+            """UPDATE routine_occurrences
+               SET delivery_status='confirmed', dispatch_claim_id=?, delivery_receipt=?,
+                   delivery_confirmed_at=?, report_path=COALESCE(?, report_path),
+                   delivery_channel=COALESCE(?, delivery_channel)
+               WHERE occurrence_id=?""",
+            (claim, receipt, now.isoformat(), report_path, channel, occ.occurrence_id),
+        )
+        self.log._insert(
+            db,
+            occ.destination.feed_id,
+            "routine.delivery_confirmed",
+            {
+                "routine_id": occ.routine_id,
+                "occurrence_id": occ.occurrence_id,
+                "dispatch_claim_id": claim,
+                "delivery_receipt": receipt,
+                "report_path": report_path or occ.report_path,
+                **({"delivery_channel": channel} if channel else {}),
+            },
+            once=True,
+            key=f"routine:occ:{occ.occurrence_id}:confirmed",
+        )
 
     def mark_delivery_needs_review(self, occurrence_id: str, reason: str) -> RoutineOccurrence:
         with self.log._connect() as db:
@@ -1521,6 +1708,10 @@ class RoutineStore:
             destination=routine.destination,
             status=routine.status,
             pause_reason=routine.pause_reason,
+            last_reported_summary=routine.last_reported_summary,
+            last_reported_items=routine.last_reported_items,
+            consecutive_failures=routine.consecutive_failures,
+            last_failure_error=routine.last_failure_error,
             last_evaluated_at=routine.last_evaluated_at.isoformat(),
             next_run_at=routine.next_run_at.isoformat() if routine.next_run_at else None,
             last_run_at=routine.last_run_at.isoformat() if routine.last_run_at else None,

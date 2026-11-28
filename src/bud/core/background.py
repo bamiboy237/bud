@@ -1,13 +1,10 @@
-"""Background work the server runs without the model: reminders and long shell commands.
+"""Durable reminders, one-shot follow-ups, and long shell commands.
 
-A reminder is a stored due time; when it comes, its text goes straight into the chat, with
-no model turn. A command runs in the same sandbox as run_command but without its time limit,
-and its exit status and last lines go into the chat when it ends. Both are kept in SQLite, so
-a reminder survives a restart and fires late if Bud was down. A command a restart cut short
-is reported as interrupted, never run again.
+A reminder posts directly to chat. A follow-up queues a model run in the owner's chat.
+Timers survive a restart and fire late if Bud was down. Commands use the run_command
+sandbox. A restart reports an interrupted command without restarting it.
 
-Starting either is an approval like any other write: the reviewer judges it in auto mode and
-the owner in strict mode, and only a turn that carries the owner's own words may start one.
+Starting work requires an owner request and goes through the normal approval policy.
 """
 
 import asyncio
@@ -29,12 +26,13 @@ from bud.core.events import EventType
 
 logger = logging.getLogger(__name__)
 
-STARTS = frozenset({"remind_me", "run_in_background"})
+STARTS = frozenset({"remind_me", "schedule_follow_up", "run_in_background"})
 TOOLS = STARTS | {"list_background", "cancel_background"}
 GUIDANCE = """remind_me posts a reminder in this chat at a set time, with no job and no cost
 while it waits. Use it for "remind me", never start_task or a sleep. run_in_background runs a
 long shell command, such as a build or a download, while the chat goes on; its result appears
-in the chat when it ends. list_background and cancel_background manage both.
+in the chat when it ends. Use schedule_follow_up when the owner asks Bud to check a specific
+thread or fact later. list_background and cancel_background manage these items.
 """
 LONGEST_WAIT = timedelta(days=30)
 MAX_RUNNING = 3
@@ -58,13 +56,15 @@ class Publisher(Protocol):
 class Item:
     id: int
     session_id: str
-    kind: str  # "reminder" or "command"
+    kind: str
     title: str
     status: str  # waiting, running, done, failed, cancelled, interrupted
     due_at: datetime | None
     command: str | None
     timeout: float | None
     request: str
+    prompt: str | None = None
+    source_ref: str | None = None
 
     def view(self) -> dict[str, Any]:
         shown: dict[str, Any] = {"id": self.id, "kind": self.kind, "title": self.title}
@@ -74,7 +74,9 @@ class Item:
         return shown
 
 
-_COLUMNS = "id, session_id, kind, title, status, due_at, command, timeout, request"
+_COLUMNS = (
+    "id, session_id, kind, title, status, due_at, command, timeout, request, prompt, source_ref"
+)
 
 
 class Background:
@@ -91,6 +93,7 @@ class Background:
         self.run_shell = run_shell
         self.now = now
         self.hub: Publisher | None = None
+        self.wake_agent: Callable[[Item], bool] | None = None
         self._tasks: dict[int, asyncio.Task] = {}
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
@@ -100,6 +103,11 @@ class Background:
                 "status TEXT NOT NULL, due_at TEXT, command TEXT, timeout REAL, "
                 "request TEXT NOT NULL DEFAULT '', source TEXT UNIQUE)"
             )
+            db.execute("BEGIN IMMEDIATE")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(items)")}
+            for name in ("prompt", "source_ref"):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE items ADD COLUMN {name} TEXT")
         path.chmod(0o600)
 
     @contextlib.contextmanager
@@ -107,15 +115,18 @@ class Background:
         with contextlib.closing(sqlite3.connect(self.path, timeout=5)) as db, db:
             yield db
 
-    def bind(self, hub: Publisher) -> None:
+    def bind(self, hub: Publisher, wake_agent: Callable[[Item], bool] | None = None) -> None:
         self.hub = hub
+        self.wake_agent = wake_agent
 
     # The store
 
     def _row(self, row: tuple) -> Item:
-        id, session_id, kind, title, status, due_at, command, timeout, request = row
+        id, session_id, kind, title, status, due_at, command, timeout, request, prompt, ref = row
         due = datetime.fromisoformat(due_at) if due_at else None
-        return Item(id, session_id, kind, title, status, due, command, timeout, request)
+        return Item(
+            id, session_id, kind, title, status, due, command, timeout, request, prompt, ref
+        )
 
     def _get(self, id: int) -> Item | None:
         with self._db() as db:
@@ -187,6 +198,31 @@ class Background:
             self._watch(item)
         return item
 
+    def follow_up(
+        self,
+        session_id: str,
+        prompt: str,
+        source_ref: str,
+        due: datetime,
+        source: str | None = None,
+    ) -> Item:
+        item, created = self._insert(
+            source,
+            {
+                "session_id": session_id,
+                "kind": "follow_up",
+                "title": prompt[:80],
+                "status": "waiting",
+                "due_at": due.isoformat(),
+                "prompt": prompt,
+                "source_ref": source_ref,
+            },
+            cap=False,
+        )
+        if created:
+            self._watch(item)
+        return item
+
     def start(
         self,
         session_id: str,
@@ -236,16 +272,18 @@ class Background:
         return stopped
 
     def _watch(self, item: Item) -> None:
+        if item.id in self._tasks:
+            return
         task = asyncio.get_running_loop().create_task(self._follow(item))
         self._tasks[item.id] = task
         task.add_done_callback(lambda _: self._tasks.pop(item.id, None))
 
     async def _follow(self, item: Item) -> None:
         try:
-            if item.kind == "reminder":
-                await self._fire(item)
-            else:
+            if item.kind == "command":
                 await self._run(item)
+            else:
+                await self._fire(item)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -258,13 +296,24 @@ class Background:
         # Re-check the wall clock often: a sleeping Mac pauses the loop's own clock.
         while (wait := (item.due_at - self.now()).total_seconds()) > 0:
             await asyncio.sleep(min(wait, CHECK_SECONDS))
-        if not self._claim(item.id, "waiting", "done"):
-            return  # cancelled while it waited
-        late = self.now() - item.due_at
-        text = f"Reminder: {item.title}"
-        if late > LATE:
-            text += f" (late: Bud was not running at {_clock(item.due_at)})"
-        self._publish(item, "done", text)
+        if item.status == "waiting" and not self._claim(item.id, "waiting", "running"):
+            return
+        while True:
+            try:
+                if item.kind == "follow_up":
+                    accepted = self.wake_agent is not None and self.wake_agent(item)
+                else:
+                    late = self.now() - item.due_at
+                    text = f"Reminder: {item.title}"
+                    if late > LATE:
+                        text += f" (late: Bud was not running at {_clock(item.due_at)})"
+                    accepted = self._publish(item, "done", text)
+                if accepted:
+                    self._claim(item.id, "running", "done")
+                    return
+            except Exception:
+                logger.exception("Timer %d could not deliver. It will retry.", item.id)
+            await asyncio.sleep(CHECK_SECONDS)
 
     async def _run(self, item: Item) -> None:
         assert self.run_shell is not None and item.command is not None
@@ -326,27 +375,28 @@ class Background:
             logger.warning("Did not save background log %d: %s", item.id, exc)
             return None
 
-    def _publish(self, item: Item, status: str, text: str, log: Path | None = None) -> None:
+    def _publish(self, item: Item, status: str, text: str, log: Path | None = None) -> bool:
         if self.hub is None:
             logger.warning("Background item %d finished before the hub was bound", item.id)
-            return
+            return False
         data: dict[str, Any] = {"id": item.id, "kind": item.kind, "title": item.title}
         data |= {"status": status, "text": text}
         if log is not None:
             data["report"] = f"background/{log.name}"
             data["report_path"] = str(log)
         self.hub.publish_once(item.session_id, "background.finished", data, key=f"bg:{item.id}")
+        return True
 
     # Server lifetime
 
     async def resume(self) -> None:
-        """At startup: wait again for every reminder, and report commands a restart cut off."""
+        """Restart timer watchers and report interrupted commands."""
         with self._db() as db:
             rows = db.execute(
                 f"SELECT {_COLUMNS} FROM items WHERE status IN ('waiting', 'running')"
             ).fetchall()
         for item in map(self._row, rows):
-            if item.kind == "reminder":
+            if item.kind != "command":
                 self._watch(item)
             elif self._claim(item.id, "running", "interrupted"):
                 self._publish(
@@ -402,24 +452,58 @@ class Background:
                 return {"error": "Set reminders from the main conversation, not from a job."}
             if owner_words(ctx) is None:
                 return {"error": "Only the person can ask for a reminder."}
+            due = due_time(minutes_from_now, at)
+            if isinstance(due, str):
+                return {"error": due}
+            item = background.remind(where, text, due, source(ctx))
+            return {"scheduled": item.view()}
+
+        async def schedule_follow_up(
+            ctx: RunContext[None],
+            prompt: Annotated[str, Field(min_length=1, max_length=1000)],
+            source_ref: Annotated[str, Field(min_length=1, max_length=1000)],
+            minutes_from_now: Annotated[float | None, Field(gt=0)] = None,
+            at: str | None = None,
+        ) -> dict[str, Any]:
+            """Wake Bud once to check a specific thread or fact in the owner's chat.
+
+            Args:
+                prompt: What to check and what finding warrants a reply.
+                source_ref: The thread ID, URL, or other stable reference to check.
+                minutes_from_now: Minutes until the check. Give this or `at`.
+                at: ISO time with a UTC offset.
+            """
+            where = session(ctx)
+            if (
+                where is None
+                or owner_words(ctx) is None
+                or (ctx.metadata or {}).get("bud_occurrence_id") is not None
+            ):
+                return {"error": "Only the owner can ask for a follow-up in their chat."}
+            due = due_time(minutes_from_now, at)
+            if isinstance(due, str):
+                return {"error": due}
+            item = background.follow_up(where, prompt, source_ref, due, source(ctx))
+            return {"scheduled": item.view()}
+
+        def due_time(minutes_from_now: float | None, at: str | None) -> datetime | str:
             if (minutes_from_now is None) == (at is None):
-                return {"error": "Give exactly one of minutes_from_now or at."}
+                return "Give exactly one of minutes_from_now or at."
             now = background.now()
             if at is not None:
                 try:
                     due = datetime.fromisoformat(at)
                 except ValueError:
-                    return {"error": "Give `at` as an ISO time with its offset."}
+                    return "Give `at` as an ISO time with its offset."
                 if due.tzinfo is None:
-                    return {"error": "Give `at` with its UTC offset, such as -06:00."}
+                    return "Give `at` with its UTC offset, such as -06:00."
             else:
                 due = now + timedelta(minutes=minutes_from_now or 0)
             if due <= now:
-                return {"error": "That time has already passed."}
+                return "That time has already passed."
             if due - now > LONGEST_WAIT:
-                return {"error": "Reminders can be at most 30 days away."}
-            item = background.remind(where, text, due, source(ctx))
-            return {"scheduled": item.view()}
+                return "Timers can be at most 30 days away."
+            return due
 
         async def run_in_background(
             ctx: RunContext[None],
@@ -453,7 +537,7 @@ class Background:
             return {"started": item.view()}
 
         async def list_background(ctx: RunContext[None]) -> dict[str, Any]:
-            """List this chat's waiting reminders and running background commands."""
+            """List this chat's reminders, follow-ups, and running background commands."""
             where = session(ctx)
             return {"items": [item.view() for item in background.items(where)] if where else []}
 
@@ -470,6 +554,7 @@ class Background:
 
         return [
             Tool(remind_me),
+            Tool(schedule_follow_up),
             Tool(run_in_background),
             Tool(list_background),
             Tool(cancel_background),

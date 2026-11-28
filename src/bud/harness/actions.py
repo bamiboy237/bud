@@ -12,10 +12,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from importlib import resources
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Self
 
-from dbos import DBOS
-from pydantic import BaseModel
+from dbos import DBOS, StepOptions
+from pydantic import AfterValidator, BaseModel, ConfigDict
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.capabilities.abstract import ValidatedToolArgs
@@ -59,6 +59,56 @@ Action = Literal["allow", "ask", "deny", "review"]
 RecordDecision = Callable[[dict[str, Any]], None]
 PriorDispatchCheck = Callable[[str, str, str], str | None]
 COMPOSIO_ACTION = "bud_composio_action"
+BROWSER_TARGET = "browser_target"
+STALE_BROWSER_TARGET = {
+    "successful": False,
+    "error": "The browser page changed or could not be verified. Nothing was done. "
+    "Check the current page and request fresh approval.",
+}
+SEND_ACTIONS = (
+    "send_email",
+    "send_mail",
+    "send_message",
+    "send_draft",
+    "send_sms",
+    "reply_email",
+    "reply_message",
+    "reply_to_email",
+    "reply_to_thread",
+    "forward_email",
+    "post_message",
+)
+
+
+def require_full_preview(tool: str) -> bool:
+    name = tool.lower()
+    return name == "gmail_send" or any(
+        name == action or name.endswith(f"_{action}") for action in SEND_ACTIONS
+    )
+
+
+class TargetDescription(str):
+    """Display text with a fingerprint of the browser page that supplied it."""
+
+    fingerprint: str | None
+
+    def __new__(cls, text: str, fingerprint: str | None) -> Self:
+        description = super().__new__(cls, text)
+        description.fingerprint = fingerprint
+        return description
+
+
+class _ToolRules(dict[str, Action]):
+    """Mode overlays use update. An explicit policy edit can replace a deny directly."""
+
+    def update(self, *args: Any, **kwargs: Action) -> None:
+        incoming: dict[str, Action] = dict(*args, **kwargs)
+        super().update(
+            (name, action) for name, action in incoming.items() if self.get(name) != "deny"
+        )
+
+    def copy(self) -> Self:
+        return type(self)(self)
 
 
 class UncertainSideEffectError(Exception):
@@ -76,7 +126,9 @@ class Policy(BaseModel):
     sets it (bud.core.profiles). A standing grant from the owner turns that tool's "ask" or
     "review" into "allow"; hard rules can never be granted."""
 
-    tools: dict[str, Action]
+    model_config = ConfigDict(validate_assignment=True)
+
+    tools: Annotated[dict[str, Action], AfterValidator(_ToolRules)]
     grants: frozenset[str] = frozenset()
     no_grants: frozenset[str] = frozenset()
     always_ask: frozenset[str] = frozenset()
@@ -84,7 +136,7 @@ class Policy(BaseModel):
     def decide(self, tool: str) -> Action:
         """Fails closed: a tool nobody classified is denied."""
         action = self.tools.get(tool)
-        if action is None:
+        if action is None or action == "deny":
             return "deny"
         if tool in self.always_ask:
             return "ask"
@@ -100,6 +152,8 @@ class Policy(BaseModel):
         """
         found = (tool.metadata or {}).get(COMPOSIO_ACTION)
         if tool.name not in self.tools and found is not None:
+            if tool.name in self.always_ask:
+                return "ask"
             return "allow" if isinstance(found, dict) and found.get("read_only") is True else "ask"
         return self.decide(tool.name)
 
@@ -356,10 +410,11 @@ class ActionGateway(WrapperToolset[None]):
         ctx: RunContext[None],
         tool: ToolsetTool[None],
         details: str | None,
+        target: str | None,
     ) -> ReviewResult:
         """Judge one call. Anything but an explicit ALLOW means the owner is asked."""
         # The policy overlay already keeps these off "review"; this is a second, explicit guard.
-        if never_reviewed(name) or name not in reviewable_tools():
+        if name in self.policy.always_ask or never_reviewed(name) or name not in reviewable_tools():
             return held("This kind of change always needs the owner.")
         if self.reviewer is None:
             return held("No reviewer is configured, so the owner decides.")
@@ -367,7 +422,12 @@ class ActionGateway(WrapperToolset[None]):
         if request is None:
             return held("There is no owner request to judge this call against.")
         session = (ctx.metadata or {}).get("bud_session_id")
-        if isinstance(session, str) and self.grants.has(session, request):
+        if (
+            target is None
+            and name not in self.policy.no_grants
+            and isinstance(session, str)
+            and self.grants.has(session, request)
+        ):
             return ReviewResult(
                 verdict=Verdict.ALLOW,
                 tier="session",
@@ -376,9 +436,18 @@ class ActionGateway(WrapperToolset[None]):
         if DBOS.workflow_id is not None and DBOS.step_id is None:
             # A checkpointed step: crash recovery replays this verdict instead of asking the
             # model again, so a retry cannot flip a verdict the journal already recorded.
-            return await DBOS.run_step_async(
-                {"name": "bud.review", "retries_allowed": False}, self.reviewer.review, request
-            )
+            options: StepOptions = {"name": "bud.review", "retries_allowed": False}
+            review = self.reviewer.review
+            if target is None:
+                return await DBOS.run_step_async(options, review, request)
+
+            async def review_page() -> tuple[ReviewResult, str]:
+                return await review(request), target
+
+            replay = await DBOS.run_step_async(options, review_page)
+            if not isinstance(replay, tuple) or replay[1] != target:
+                return held("The browser page changed since review. Request fresh approval.")
+            return replay[0]
         return await self.reviewer.review(request)
 
     async def call_tool(
@@ -392,7 +461,11 @@ class ActionGateway(WrapperToolset[None]):
         refusal = self._refusal(name, tool_args)
         if refusal is not None:
             action = "deny"
-        if action in ("ask", "review") and self._harmless(name, tool_args):
+        if (
+            action in ("ask", "review")
+            and name not in self.policy.always_ask
+            and self._harmless(name, tool_args)
+        ):
             action = "allow"
         found = (
             self._tainted(tool.tool_def, tool_args, ctx)
@@ -408,12 +481,14 @@ class ActionGateway(WrapperToolset[None]):
             action = "ask"  # the reviewer would see only part of the call
         rule: str = action
         outcome = "refused" if action == "deny" else "allowed"
-        # An owner-approved call already showed its facts; it runs without looking them up again.
         details = (
             await self._describe(name, tool_args)
             if action in ("ask", "review") and not ctx.tool_call_approved
             else None
         )
+        target = details.fingerprint if isinstance(details, TargetDescription) else None
+        if isinstance(details, TargetDescription) and target is None:
+            return STALE_BROWSER_TARGET.copy()
         if found:
             details = "\n".join(part for part in (details, taint_note(found)) if part)
         review: dict[str, Any] | None = None
@@ -437,15 +512,18 @@ class ActionGateway(WrapperToolset[None]):
                 # browser step approved on one page must not replay on another.
                 if (
                     action == "review"
+                    and BROWSER_TARGET not in held_review
                     and name not in self.policy.no_grants
                     and isinstance(session, str)
                     and request is not None
                 ):
                     self.grants.remember(session, request)
         elif action == "ask":
-            raise ApprovalRequired(metadata=await self._presentation(name, tool_args, ctx, details))
+            raise ApprovalRequired(
+                metadata=await self._presentation(name, tool_args, ctx, details, target)
+            )
         elif action == "review":
-            result = await self._review(name, tool_args, ctx, tool, details)
+            result = await self._review(name, tool_args, ctx, tool, details, target)
             review = result.public()
             if not result.allowed:
                 self.record(
@@ -462,10 +540,23 @@ class ActionGateway(WrapperToolset[None]):
                 raise ApprovalRequired(
                     metadata={
                         **review,
-                        **await self._presentation(name, tool_args, ctx, details),
+                        **await self._presentation(name, tool_args, ctx, details, target),
                     }
                 )
             rule = "auto-allow"
+        if ctx.tool_call_approved:
+            metadata = ctx.tool_call_metadata or {}
+            held_review = metadata.get("review")
+            approved_target = (
+                held_review.get(BROWSER_TARGET)
+                if isinstance(held_review, dict)
+                else metadata.get(BROWSER_TARGET)
+            )
+            target = approved_target if isinstance(approved_target, str) else None
+        if target is not None:
+            ctx = replace(
+                ctx, tool_call_metadata={**(ctx.tool_call_metadata or {}), BROWSER_TARGET: target}
+            )
         if action != "deny" and not ctx.tool_call_approved and name in self_hosted_writes():
             # The world and workspace writes refuse to run without an approval id, which they
             # use as a once-only key. A write the policy lets through gets a stable one, so a
@@ -526,7 +617,7 @@ class ActionGateway(WrapperToolset[None]):
         return result
 
     async def _presentation(
-        self, name: str, args: dict, ctx: RunContext[None], details: str | None
+        self, name: str, args: dict, ctx: RunContext[None], details: str | None, target: str | None
     ) -> dict:
         async def read(read_name: str, read_args: dict) -> Any:
             if self.policy.decide(read_name) != "allow":
@@ -548,7 +639,11 @@ class ActionGateway(WrapperToolset[None]):
             shown.update(self.stamp())
         if details is not None:
             # The card shows what the reviewer saw: facts Bud looked up, never model text.
-            shown["details"] = details
+            shown["details"] = str(details)
+        if target is not None:
+            shown[BROWSER_TARGET] = target
+        if require_full_preview(name):
+            shown["require_full_preview"] = True
         return shown
 
 

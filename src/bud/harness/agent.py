@@ -114,12 +114,11 @@ class Harness:
         reads: dict[str, Action] = dict.fromkeys(read_names, "allow")
         # It only changes how long Bud's own saved copy of a result lasts.
         reads["keep_tool_result"] = "allow"
-        self.policy = Policy(
-            tools=reads
-            | tools_policy
-            | {"read_tool_result": "allow", "read_tool_result_chars": "allow"}
-            | SKILL_RULES,
-            no_grants=policy.no_grants,
+        result_reads = dict.fromkeys(("read_tool_result", "read_tool_result_chars"), "allow")
+        denied = {name: action for name, action in policy.tools.items() if action == "deny"}
+        self.policy = Policy.model_validate(
+            policy.model_dump()
+            | {"tools": reads | tools_policy | result_reads | SKILL_RULES | denied}
         )
         self.results = SqliteResultStore(result_path, retention=retention)
         self.output_limits = build_output_limits(

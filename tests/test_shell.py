@@ -335,14 +335,16 @@ async def test_https_goes_through_connect_and_an_allowed_site_is_remembered(work
     try:
         # -p sends CONNECT through the proxy, the way HTTPS does.
         first = await tools["run_command"](ctx, f"curl -sS -m 5 -p {url}", 30)
+        repeat = await tools["run_command"](ctx, f"curl -sS -m 5 -p {url}", 30)
         server.close()
         server, port = await serve_once(b"again")
         second = await tools["run_command"](ctx, f"curl -sS -m 5 -p http://127.0.0.1:{port}/", 30)
     finally:
         server.close()
     assert first["stdout"] == "tunnelled"
+    assert repeat["stdout"] == "tunnelled"
     assert second["stdout"] == "again"
-    assert len(fake.requests) == 1
+    assert len(fake.requests) == 2
 
 
 def test_running_commands_never_asks_and_each_new_site_always_does():

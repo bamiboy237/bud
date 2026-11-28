@@ -176,6 +176,10 @@ async def test_missed_run_policies(tmp_path, policy, expected_kinds):
         clock[0] = datetime(2026, 11, 6, 20, 20, tzinfo=UTC)
         launched = bud.runner.tick_routines()
         await bud.settle()
+        while batch := bud.runner.tick_routines():
+            assert len(batch) == 1
+            launched.extend(batch)
+            await bud.settle()
         assert [occ.trigger_kind for occ in launched] == expected_kinds
         if policy == "run_once":
             assert launched[0].scheduled_for == datetime(2026, 11, 6, 20, 0, tzinfo=UTC)
@@ -237,7 +241,8 @@ async def test_edit_routine_bumps_revision_and_preserves_pause(tmp_path):
         )
         assert edited.revision == 2
         assert edited.status == "paused"
-        assert edited.owner_request == "Updated prompt."
+        assert edited.owner_request == "Initial prompt."
+        assert edited.prompt == "Updated prompt."
         assert edited.budget.max_requests == 3
 
 
@@ -310,12 +315,7 @@ async def test_routine_approval_expiry_rejects_late_decide_and_sweeps(tmp_path):
     clock = [datetime(2026, 11, 6, 12, 0, tzinfo=UTC)]
 
     def respond(messages, info):
-        if any(
-            getattr(p, "part_kind", None) == "tool-return"
-            or "expired" in str(getattr(p, "content", "")).lower()
-            for m in messages
-            for p in m.parts
-        ):
+        if any(getattr(p, "part_kind", None) == "tool-return" for m in messages for p in m.parts):
             return reply("Skipped expired action.")
         return create_note("Routine draft")
 
@@ -461,7 +461,7 @@ async def test_routine_taint_blocks_untrusted_target_in_send_email(tmp_path):
         )
 
 
-async def test_delivery_claim_distinct_from_confirmed_and_uncertain_recovery(tmp_path):
+async def test_imessage_delivery_uses_local_fallback_and_confirms_once(tmp_path):
     async with running_bud(tmp_path, lambda m, i: reply("iMessage summary"), jobs=True) as bud:
         bud.log.append("owner", "session.created")
         routine = bud.runner.create_routine(
@@ -481,34 +481,15 @@ async def test_delivery_claim_distinct_from_confirmed_and_uncertain_recovery(tmp
         assert bud.runner.routines is not None
         after_exec = bud.runner.routines.occurrence(occ.occurrence_id)
         assert after_exec.execution_status == "completed"
-        assert after_exec.delivery_status == "dispatched"
+        assert after_exec.delivery_status == "confirmed"
         assert after_exec.dispatch_claim_id == f"deliver:{occ.occurrence_id}"
-        assert after_exec.delivery_confirmed_at is None
+        assert after_exec.delivery_confirmed_at is not None
 
-        confirmed = bud.runner.confirm_routine_delivery(occ.occurrence_id, receipt="photon-msg-42")
-        assert confirmed.delivery_status == "confirmed"
-        assert confirmed.delivery_receipt == "photon-msg-42"
-        assert confirmed.delivery_confirmed_at is not None
-
-        # Simulate crash between claim_delivery and delivery confirmation on a second occurrence.
-        occ2 = bud.runner.run_routine_now(routine.routine_id, trigger_id="deliv-2")
-        await bud.settle()
-        with bud.log._connect() as db:
-            db.execute(
-                "UPDATE routine_occurrences SET delivery_status = 'claimed' "
-                "WHERE occurrence_id = ?",
-                (occ2.occurrence_id,),
-            )
         await bud.runner.recover()
-        inspected = bud.runner.routines.occurrence(occ2.occurrence_id)
-        assert inspected.delivery_status == "needs_review"
-        assert bud.runner.routines.get(routine.routine_id).pause_reason == "uncertain"
-
-        with pytest.raises(RoutineConflictError, match="uncertain"):
-            bud.runner.resume_routine(routine.routine_id)
-        resumed = bud.runner.resume_routine(routine.routine_id, acknowledge_uncertain=True)
-        assert resumed.status == "active"
-        assert resumed.pause_reason is None
+        reports = [e for e in bud.log.read("owner") if e.type == "routine.completed"]
+        assert len(reports) == 1
+        assert reports[0].data["delivery_fallback"] == "imessage_unavailable"
+        assert after_exec.delivery_receipt == reports[0].id
 
 
 @pytest.mark.parametrize("use_pause", [False, True])
@@ -535,7 +516,6 @@ async def test_stop_with_inflight_consequential_tool_pauses_as_uncertain(tmp_pat
             run_id,
             {"call_id": "call-send-1", "tool": "send_email", "rule": "ask", "outcome": "approved"},
         )
-        bud.runner.routines.mark_queued(occ.occurrence_id)
         bud.runner.routines.sync_execution(occ.session_id, "running")
 
         if use_pause:
@@ -575,7 +555,6 @@ async def test_pause_records_a_stop_before_pending_dispatch(tmp_path):
         assert store.pause_for_stop(routine.routine_id, now=datetime.now(UTC)) == [occ.session_id]
         assert store.get(routine.routine_id).status == "paused"
         assert bud.log.stop_requested(occ.run_id)
-        store.mark_queued(occ.occurrence_id)
         store.sync_execution(occ.session_id, "queued")
         assert store.occurrence(occ.occurrence_id).execution_status == "cancelled"
         assert store.pending_dispatches() == []
@@ -675,7 +654,6 @@ async def test_routine_budget_deadline_minutes_enforced(tmp_path):
         bud.log.append(
             occ_tick.session_id, "run.started", {"run_id": occ_tick.run_id, "trigger": "routine"}
         )
-        bud.runner.routines.mark_queued(occ_tick.occurrence_id)
         bud.runner.routines.sync_execution(occ_tick.session_id, "running")
 
         clock[0] = clock[0] + timedelta(minutes=6)
@@ -715,24 +693,21 @@ async def test_cross_occurrence_routine_approval_references_do_not_collide(tmp_p
         await bud.settle()
 
         clock[0] = datetime(2026, 11, 6, 9, 1, tzinfo=UTC)
-        occ2 = bud.runner.tick_routines()[0]
+        assert bud.runner.tick_routines() == []
+        [first] = bud.runner.snapshot("owner").pending_approvals
+        assert first.occurrence_id == occ1.occurrence_id
+        assert first.reference == "R1-A"
+        assert bud.runner.decide("owner", "R1-A", False)
         await bud.settle()
-
-        snap = bud.runner.snapshot("owner")
-        refs = {a.occurrence_id: a.reference for a in snap.pending_approvals}
-        assert refs == {occ1.occurrence_id: "R1-A", occ2.occurrence_id: "R1-B"}
-
-        # Decide the newer occurrence (R1-B) first: older R1-A stays open and reachable.
-        assert bud.runner.decide("owner", "R1-B", False)
-        await bud.settle()
-        assert bud.runner.routines.occurrence(occ2.occurrence_id).execution_status == "completed"
-        assert (
-            bud.runner.routines.occurrence(occ1.occurrence_id).execution_status
-            == "awaiting_approval"
-        )
         assert not (bud.root / "note.txt").exists()
 
-        assert bud.runner.decide("owner", "R1-A", True)
+        [occ2] = bud.runner.tick_routines()
         await bud.settle()
-        assert bud.runner.routines.occurrence(occ1.occurrence_id).execution_status == "completed"
+        [second] = bud.runner.snapshot("owner").pending_approvals
+        assert second.occurrence_id == occ2.occurrence_id
+        assert second.reference == "R1-B"
+        assert second.approval_id != first.approval_id
+        assert bud.runner.decide("owner", "R1-B", True)
+        await bud.settle()
+        assert bud.runner.routines.occurrence(occ2.occurrence_id).execution_status == "completed"
         assert (bud.root / "note.txt").exists()

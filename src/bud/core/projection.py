@@ -3,7 +3,7 @@
 from contextlib import suppress
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelMessagesTypeAdapter,
@@ -31,17 +31,68 @@ class RoutineCard(BaseModel):
     occurrence_id: str | None = None
 
 
+class WebSource(BaseModel):
+    title: str
+    url: str
+    domain: str
+    excerpt: str
+    status: Literal["read", "found"]
+
+
+class ApprovalReceipt(BaseModel):
+    approval_id: str
+    label: str
+    decision: Literal["approved", "denied", "expired"]
+    decided_at: str
+    status: Literal["confirmed", "denied", "unknown"]
+
+
+class MemoryUsed(BaseModel):
+    id: str
+    text: str
+    scope: str
+    source: str
+
+
+class BrowserFrame(BaseModel):
+    url: str
+    title: str
+    captured_at: str
+    frame_id: str
+
+
 class Turn(BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
+
     role: str
     text: str
     task_id: int | None = None
     # The event that holds this turn, so a client can jump to it.
     seq: int | None = None
     # What the reply's [S1]-style tags cite: session_id, seq, date, and a display label.
-    sources: dict[str, dict] | None = None
+    sources: dict[str, dict] | list[WebSource] | None = None
+    web_sources: list[WebSource] | None = None
+    approval_receipts: list[ApprovalReceipt] | None = None
+    memory_used: list[MemoryUsed] | None = None
+    browser_frames: list[BrowserFrame] | None = None
     attachments: list[Attachment] = Field(default_factory=list)
     routine: RoutineCard | None = None
     desktop_job_id: str | None = None
+
+
+TURN_METADATA = ("sources", "web_sources", "approval_receipts", "memory_used", "browser_frames")
+
+
+def turn_metadata(data: dict) -> dict:
+    return {key: data[key] for key in TURN_METADATA if key in data}
+
+
+def web_source_payload(data: dict) -> dict:
+    """Expose structured web sources while retaining the older citation map separately."""
+    sources = data.get("sources")
+    if isinstance(sources, dict):
+        return {**data, "citation_sources": sources, "sources": data.get("web_sources")}
+    return data
 
 
 class PendingApproval(BaseModel):
@@ -61,6 +112,8 @@ class PendingApproval(BaseModel):
     occurrence_id: str | None = None
     reference: str | None = None
     expires_at: str | None = None
+    next_run_at: str | None = None
+    timezone: str | None = None
 
 
 class QueuedMessage(BaseModel):
@@ -190,6 +243,9 @@ class RoutineOccurrenceView(BaseModel):
     uncertain_tools: list[str] = Field(default_factory=list)
     error: str | None = None
     completed_at: str | None = None
+    destination: RoutineDestination | None = None
+    quiet_note: str | None = None
+    delivery_channel: str | None = None
 
 
 class RoutineView(BaseModel):
@@ -209,6 +265,10 @@ class RoutineView(BaseModel):
     destination: RoutineDestination
     status: str
     pause_reason: str | None = None
+    last_reported_summary: str | None = None
+    last_reported_items: list[str] = Field(default_factory=list)
+    consecutive_failures: int = 0
+    last_failure_error: str | None = None
     last_evaluated_at: str
     next_run_at: str | None = None
     last_run_at: str | None = None
@@ -474,6 +534,8 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
                 )
                 blocks = {}
             case "run.waiting" | "run.completed":
+                if event.data.get("silent_completion"):
+                    continue
                 report = event.data.get("report")
                 run_id = event.data["run_id"]
                 slots = steered_slots.get(run_id, [])
@@ -494,7 +556,12 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
                     transcript.append(run_turns[run_id])
                 run_turns[run_id].text = text
                 run_turns[run_id].seq = event.seq
-                run_turns[run_id].sources = event.data.get("sources")
+                turn = run_turns[run_id]
+                turn.sources = event.data.get("sources")
+                turn.web_sources = event.data.get("web_sources")
+                turn.approval_receipts = event.data.get("approval_receipts")
+                turn.memory_used = event.data.get("memory_used")
+                turn.browser_frames = event.data.get("browser_frames")
             case "task.completed" | "task.failed" | "task.paused" | "task.cancelled":
                 transcript.append(
                     Turn(
@@ -535,6 +602,7 @@ def snapshot(session_id: str, events: list[Event]) -> Snapshot:
                             text=event.data.get("text", ""),
                             seq=event.seq,
                             routine=card,
+                            **turn_metadata(event.data),
                         )
                     )
             case "text.reset" | "text.delta":

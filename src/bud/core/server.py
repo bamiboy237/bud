@@ -15,7 +15,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
-from typing import Annotated, Any, TextIO
+from typing import Annotated, Any, Literal, TextIO
 from uuid import uuid4
 
 from dbos import DBOS
@@ -66,6 +66,7 @@ from bud.core.projection import (
     Snapshot,
     parked_approvals,
     undecided_approvals,
+    web_source_payload,
 )
 from bud.core.routines import (
     DEFAULT_APPROVAL_EXPIRY_SECONDS,
@@ -221,6 +222,7 @@ class EditRoutine(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=120)
     skill: str | None = Field(default=None, min_length=1, max_length=64)
     prompt: str | None = Field(default=None, min_length=1, max_length=10_000)
+    owner_request: str | None = Field(default=None, min_length=1, max_length=10_000)
     cron: str | None = Field(default=None, min_length=1, max_length=120)
     timezone: str | None = None
     missed_run_policy: MissedRunPolicy | None = None
@@ -758,7 +760,6 @@ def _create_app(
             logger.info("No model configured yet; starting server in onboarding mode.")
     log = EventLog(db_path)
     hub = Hub(log)
-    background.bind(hub)
     runner = compose_runner(
         hub,
         gateway,
@@ -777,6 +778,45 @@ def _create_app(
         runner_cls=Runner,
         allow_unconfigured=allow_unconfigured,
     )
+    background.bind(hub, runner.wake_follow_up)
+    if browser_view is not None:
+        view = browser_view
+
+        async def tab_details(path: Path, tab: str) -> dict[str, Any]:
+            return next(
+                (
+                    entry
+                    for entry in await browser._tabs(path, view.relay)
+                    if str(entry.get("tab", entry.get("id"))) == tab
+                ),
+                {},
+            )
+
+        async def capture_tab(tab: str) -> tuple[str, str, bytes] | None:
+            try:
+                async with asyncio.timeout(10), view.lock:
+                    if view.private or view.handoff_open:
+                        return None
+                    path = view._enabled_path()
+                    target = await view._available_tab(path, tab)
+                    old = await tab_details(path, target)
+                    url = old.get("url")
+                    if not isinstance(url, str):
+                        return None
+                    generation = view.preview_generation
+                    image = await view._capture(path, target, generation)
+                    current = await tab_details(path, target)
+                    if current.get("url") != url:
+                        return None
+                    view.check_preview(generation, target)
+                    title = current.get("title")
+                    return url, title[:160] if isinstance(title, str) else url, image
+            except (HTTPException, TimeoutError, OSError, RuntimeError):
+                return None
+
+        runner.bind_browser_capture(capture_tab)
+    else:
+        runner.bind_browser_capture(None)
     config_env_path = resolve_config_env_path(settings)
     model_choice = DefaultModelChoice(settings.data_dir / "default-model")
     model_locked = bool(model_id or active_profile.model.model_id)
@@ -929,8 +969,8 @@ def _create_app(
                 raise ConnectionError("Account binding changed during startup. Restart bud.")
             # Settle work from before the restart first, so a recovered run's new start is
             # never mistaken for one the restart cut off.
-            await background.resume()
             await runner.recover()
+            await background.resume()
             if connections is not None and connections.binding is not None:
                 # Cards asked under an account replaced while Bud was stopped close now. After
                 # recovery, so a run a denial resumes is launched once. A recovered run that
@@ -1304,6 +1344,22 @@ def _create_app(
                 )
         return JSONResponse(data, headers={"Cache-Control": "no-store"})
 
+    @app.post("/preferences/{pref_id}/forget")
+    async def forget_preference(pref_id: str) -> dict[str, str | bool]:
+        require_current_binding()
+        store = harness.preferences
+        if store is None or not await store.forget_by_id(pref_id):
+            raise HTTPException(404, "Preference not found.")
+        return {"ok": True, "id": pref_id}
+
+    @app.get("/browser/frames/{frame_id}")
+    def get_browser_frame(frame_id: str) -> Response:
+        require_current_binding()
+        data = runner.browser_frame(frame_id)
+        if data is None:
+            raise HTTPException(404, "Browser frame unavailable.")
+        return Response(data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
     @app.get("/models")
     def list_models() -> list[dict]:
         with refresh_lock:
@@ -1367,6 +1423,13 @@ def _create_app(
             with refresh_lock:
                 _apply_model(session_id, request.model)
         return {"session_id": session_id, "model": request.model or ""}
+
+    @app.get("/sessions/{session_id}/conversation")
+    def get_conversation(session_id: str) -> dict:
+        require_session(session_id)
+        data = runner.snapshot(session_id).model_dump()
+        data["transcript"] = [web_source_payload(turn) for turn in data["transcript"]]
+        return data
 
     @app.get("/sessions/{session_id}")
     def get_session(session_id: str) -> Snapshot:
@@ -1704,7 +1767,7 @@ def _create_app(
     def edit_routine(routine_id: str, body: EditRoutine) -> dict[str, Any]:
         store = _require_routines()
         require_current_binding()
-        changes = body.model_dump(exclude_unset=True)
+        changes = {name: getattr(body, name) for name in body.model_fields_set}
         try:
             routine = runner.edit_routine(routine_id, **changes)
         except RoutineNotFoundError as exc:
@@ -1790,6 +1853,7 @@ def _create_app(
     async def stream_events(
         session_id: str,
         last_event_id: Annotated[int, Header()] = 0,
+        source_format: Literal["web"] | None = None,
     ) -> StreamingResponse:
         require_session(session_id)
 
@@ -1798,7 +1862,16 @@ def _create_app(
             # learns it is connected now, not at the first event or keep-alive.
             yield ": connected\n\n"
             async for event in hub.subscribe(session_id, after=last_event_id):
-                yield ": keep-alive\n\n" if event is None else sse_frame(event)
+                if event is None:
+                    yield ": keep-alive\n\n"
+                    continue
+                if source_format == "web" and event.type in (
+                    "run.completed",
+                    "run.waiting",
+                    "routine.completed",
+                ):
+                    event = event.model_copy(update={"data": web_source_payload(event.data)})
+                yield sse_frame(event)
 
         return StreamingResponse(
             frames(),

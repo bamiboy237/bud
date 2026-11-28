@@ -7,8 +7,8 @@ It gets a minimal environment, so no API key or token leaks into it.
 The sandbox only knows "network on" or "network off", so a command reaches the network
 through a local proxy that runs for that command. Package registries and code hosts pass.
 Any other site goes to the decision model with the command and the owner's request; an
-allowed site is remembered for the rest of the process. A site the model does not allow is
-blocked and reported, and Bud can ask the owner with allow_network, which needs approval.
+approval can be reused for the same command, endpoint, and owner request. A site the model
+does not allow is blocked and reported, and Bud can ask the owner with allow_network.
 """
 
 import asyncio
@@ -69,6 +69,7 @@ ALWAYS = (
 )
 
 Judge = Callable[[str], Awaitable[bool]]
+EndpointJudge = Callable[[str, int], Awaitable[bool]]
 # Run before each command, inside the sandbox: make the workspace's Python environment once.
 PREPARE = "[ -x .venv/bin/python ] || uv venv -q .venv 2>/dev/null || python3 -m venv .venv\n"
 
@@ -180,10 +181,13 @@ def always_allowed(host: str) -> bool:
 class Proxy:
     """An HTTP proxy for one command: CONNECT for HTTPS, absolute URLs for plain HTTP."""
 
-    def __init__(self, judge: Judge) -> None:
+    def __init__(
+        self, judge: Judge | None = None, *, judge_endpoint: EndpointJudge | None = None
+    ) -> None:
         self.judge = judge
+        self.judge_endpoint = judge_endpoint
         self.blocked: set[str] = set()
-        self._decided: dict[str, asyncio.Task[bool]] = {}
+        self._decided: dict[tuple[str, int], asyncio.Future[bool]] = {}
         self._server: asyncio.Server | None = None
 
     async def start(self) -> int:
@@ -196,13 +200,19 @@ class Proxy:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self._server.wait_closed(), 2)
 
-    async def allowed(self, host: str) -> bool:
+    async def allowed(self, host: str, port: int = 443) -> bool:
         if always_allowed(host):
             return True
-        # One decision per host per command, even when several connections ask at once.
-        if host not in self._decided:
-            self._decided[host] = asyncio.ensure_future(self.judge(host))
-        allowed = await self._decided[host]
+        endpoint = (host, port)
+        if endpoint not in self._decided:
+            if self.judge_endpoint is not None:
+                decision = self.judge_endpoint(host, port)
+            elif self.judge is not None:
+                decision = self.judge(host)
+            else:
+                return False
+            self._decided[endpoint] = asyncio.ensure_future(decision)
+        allowed = await self._decided[endpoint]
         if not allowed:
             self.blocked.add(host)
         return allowed
@@ -219,7 +229,7 @@ class Proxy:
                 if url.scheme != "http":
                     raise ValueError("only absolute http:// URLs and CONNECT")
                 host, port = site(url.netloc, 80)
-            if not await self.allowed(host):
+            if not await self.allowed(host, port):
                 writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                 return
             if method == "CONNECT":
@@ -307,12 +317,18 @@ async def run(
     workspace: Path,
     command: str,
     timeout: float,
-    judge: Judge | None,
+    judge: Judge | None = None,
     private: Sequence[Path] = (),
+    *,
+    judge_endpoint: EndpointJudge | None = None,
 ) -> dict[str, Any]:
     """Runs a command offline unless given a judge for proxied network connections."""
     workspace = workspace.resolve()  # Seatbelt matches real paths, not links
-    proxy = Proxy(judge) if judge is not None else None
+    proxy = (
+        Proxy(judge, judge_endpoint=judge_endpoint)
+        if judge is not None or judge_endpoint is not None
+        else None
+    )
     port = await proxy.start() if proxy is not None else None
     (workspace / ".tmp").mkdir(exist_ok=True)
     process = await asyncio.create_subprocess_exec(
@@ -382,11 +398,18 @@ def available() -> bool:
 
 
 async def judge_site(
-    reviewer: ToolReviewer | None, host: str, command: str, owner_request: str
+    reviewer: ToolReviewer | None,
+    host: str,
+    command: str,
+    owner_request: str,
+    *,
+    port: int | None = None,
 ) -> bool:
     """Whether the decision model allows a command to reach `host`. No reviewer, no owner
     request, or any doubt means no: the site is blocked and Bud can ask the owner."""
-    args = {"host": host, "command": command}
+    args: dict[str, str | int] = {"host": host, "command": command}
+    if port is not None:
+        args["port"] = port
     if reviewer is None or not owner_request or too_long_to_review(args):
         return False
     result = await reviewer.review(
@@ -413,12 +436,12 @@ def runner(
     workspace = workspace.resolve()
 
     async def run_one(command: str, timeout: float, owner_request: str) -> dict[str, Any]:
-        async def judge(host: str) -> bool:
+        async def judge(host: str, port: int) -> bool:
             if host in grants.sites():
                 return True
-            return await judge_site(reviewer(), host, command, owner_request)
+            return await judge_site(reviewer(), host, command, owner_request, port=port)
 
-        return await run(workspace, command, timeout, judge, private)
+        return await run(workspace, command, timeout, private=private, judge_endpoint=judge)
 
     return run_one
 
@@ -432,11 +455,15 @@ def build_tools(
     """Local and network-capable commands. `reviewer` returns the decision model, if any.
     `private` are folders outside the home folder that commands must not read."""
     workspace = workspace.resolve()
-    remembered: set[str] = set()
+    remembered: set[tuple[str, int, str, str]] = set()
 
-    async def execute(command: str, timeout_seconds: int, judge: Judge | None) -> dict[str, Any]:
+    async def execute(
+        command: str, timeout_seconds: int, judge: EndpointJudge | None
+    ) -> dict[str, Any]:
         async def invoke() -> dict[str, Any]:
-            return await run(workspace, command, timeout_seconds, judge, private)
+            return await run(
+                workspace, command, timeout_seconds, private=private, judge_endpoint=judge
+            )
 
         if DBOS.workflow_id is not None and DBOS.step_id is None:
             # Crash recovery returns the recorded output instead of running the command again.
@@ -473,11 +500,12 @@ def build_tools(
         request = (ctx.metadata or {}).get("bud_request")
         owner_request = request if isinstance(request, str) else ""
 
-        async def judge(host: str) -> bool:
-            if host in remembered or host in grants.sites():
+        async def judge(host: str, port: int) -> bool:
+            scope = (host, port, command, owner_request)
+            if scope in remembered or host in grants.sites():
                 return True
-            if await judge_site(reviewer(), host, command, owner_request):
-                remembered.add(host)
+            if await judge_site(reviewer(), host, command, owner_request, port=port):
+                remembered.add(scope)
                 return True
             return False
 
